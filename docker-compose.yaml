@@ -7,6 +7,8 @@ services:
     environment:
       - TRADING_LOG_LEVEL=INFO
       - TRADING_RUN_MODE=paper
+    ports:
+      - "8080:8080"
     volumes:
       - ./data:/app/data
       - ./trading_bot/config:/app/trading_bot/config:ro

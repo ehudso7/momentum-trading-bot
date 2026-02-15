@@ -23,6 +23,7 @@ import time
 import structlog
 
 from trading_bot.config.settings import AppConfig, RunMode
+from trading_bot.dashboard.state import DashboardState
 from trading_bot.data.market_data import BacktestMarketData, LiveMarketData
 from trading_bot.data.news_client import NewsClient
 from trading_bot.data.polygon_client import PolygonClient
@@ -72,13 +73,14 @@ DISCLAIMER = """
 class TradingBot:
     """Main orchestrator for the trading bot."""
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, dashboard_state: DashboardState | None = None):
         self._config = config
         self._running = False
         self._starting_equity: float = config.starting_capital
         self._current_regime: str | None = None
         self._daily_plan_generated = False
         self._premarket_watchlist: list[str] = []
+        self._dashboard_state = dashboard_state
 
         # Wire up dependencies based on run mode
         if config.run_mode == RunMode.BACKTEST:
@@ -201,6 +203,9 @@ class TradingBot:
 
                 # Record tick for health monitoring
                 self._health.record_tick()
+
+                # Push state to dashboard
+                self._update_dashboard()
 
                 if tick_count % 10 == 0:
                     self._log_status()
@@ -624,6 +629,53 @@ class TradingBot:
                 details=health_status,
             )
 
+    def _update_dashboard(self) -> None:
+        """Push current state to the dashboard (if enabled)."""
+        if self._dashboard_state is None:
+            return
+
+        try:
+            equity = self._broker.get_account_equity()
+            buying_power = self._broker.get_buying_power()
+        except Exception:
+            equity = self._starting_equity + self._portfolio.get_daily_pnl()
+            buying_power = equity * 4
+
+        positions = self._portfolio.get_open_positions()
+        position_dicts = [
+            {
+                "symbol": p.symbol,
+                "signal_type": p.signal_type.value,
+                "entry_price": p.entry_price,
+                "current_price": p.current_price,
+                "shares": p.shares,
+                "shares_remaining": p.shares_remaining,
+                "stop_price": p.stop_price,
+                "pnl_unrealized": round(p.pnl_unrealized, 2),
+                "pnl_realized": round(p.pnl_realized, 2),
+                "scale_outs_completed": p.scale_outs_completed,
+                "trailing_stop_active": p.trailing_stop_active,
+                "trailing_stop_price": p.trailing_stop_price,
+                "entry_time": p.entry_time.isoformat(),
+            }
+            for p in positions
+        ]
+
+        journal_dicts = [e.to_dict() for e in self._portfolio.get_daily_journal_entries()]
+
+        self._dashboard_state.update(
+            equity=equity,
+            starting_equity=self._starting_equity,
+            daily_pnl=self._portfolio.get_daily_pnl(),
+            buying_power=buying_power,
+            open_positions=position_dicts,
+            journal_entries=journal_dicts,
+            circuit_breaker=self._circuit.get_status(),
+            health=self._health.get_health_status(),
+            regime=self._current_regime,
+            run_mode=self._config.run_mode.value,
+        )
+
     def stop(self) -> None:
         """Signal the bot to stop gracefully."""
         self._running = False
@@ -652,6 +704,12 @@ def main() -> None:
         default=None,
         help="Override log level (DEBUG, INFO, WARNING, ERROR)",
     )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8080,
+        help="Dashboard web UI port (default: 8080, 0 to disable)",
+    )
     args = parser.parse_args()
 
     # Load config
@@ -673,8 +731,17 @@ def main() -> None:
             print("Aborting. Use --mode paper for paper trading.")
             sys.exit(1)
 
+    # Start dashboard server (background thread)
+    dashboard_state: DashboardState | None = None
+    if args.dashboard_port and args.dashboard_port > 0:
+        from trading_bot.dashboard.app import start_dashboard_server
+
+        dashboard_state = DashboardState()
+        start_dashboard_server(dashboard_state, port=args.dashboard_port)
+        print(f"  Dashboard: http://localhost:{args.dashboard_port}")
+
     # Create and run bot
-    bot = TradingBot(config)
+    bot = TradingBot(config, dashboard_state=dashboard_state)
 
     # Graceful shutdown handlers
     def handle_signal(signum, frame):

@@ -18,5 +18,7 @@ USER botuser
 
 VOLUME /app/data
 
+EXPOSE 8080
+
 ENTRYPOINT ["trading-bot"]
 CMD ["--mode", "paper"]
