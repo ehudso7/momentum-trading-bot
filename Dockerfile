@@ -23,8 +23,6 @@ RUN mkdir -p data
 RUN useradd -m botuser && chown -R botuser:botuser /app
 USER botuser
 
-VOLUME /app/data
-
 EXPOSE 8080
 
 ENTRYPOINT ["trading-bot"]
