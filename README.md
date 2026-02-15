@@ -26,6 +26,7 @@ Automated momentum day-trading bot for US equities (NYSE/NASDAQ). Targets low-fl
 - **System Health Monitoring**: Memory usage, tick rate, error rate, API health tracking
 - **Resilient API Layer**: Retry with exponential backoff, rate limiting, error classification
 - **Realistic Paper Broker**: Slippage model, margin simulation, stale order cleanup
+- **Live Web Dashboard**: Real-time FastAPI dashboard with equity curve, positions, trades, health metrics
 
 ## Quick Start
 
@@ -77,6 +78,10 @@ trading-bot --mode backtest
 
 # Live trading (requires explicit confirmation)
 trading-bot --mode live
+
+# Dashboard available at http://localhost:8080
+# Disable dashboard: --dashboard-port 0
+# Custom port: --dashboard-port 3000
 ```
 
 ## Configuration
@@ -130,6 +135,10 @@ Health Monitor tracks system metrics continuously.
 ```
 trading_bot/
 ├── main.py                    # CLI entry point, orchestrator
+├── dashboard/
+│   ├── app.py                 # FastAPI dashboard server
+│   ├── state.py               # Thread-safe state container
+│   └── templates/index.html   # Dashboard HTML (Chart.js)
 ├── config/
 │   ├── settings.py            # Pydantic config with risk bounds
 │   ├── config.yaml            # Default values
@@ -168,12 +177,39 @@ trading_bot/
     └── reports.py             # Daily summary report generation
 ```
 
+## Dashboard
+
+A live web dashboard starts automatically on port 8080 when running in paper or live mode.
+
+```
+http://localhost:8080       # Dashboard UI
+http://localhost:8080/api/status         # JSON: full bot status
+http://localhost:8080/api/positions      # JSON: open positions
+http://localhost:8080/api/trades         # JSON: today's completed trades
+http://localhost:8080/api/equity-history # JSON: equity curve data
+http://localhost:8080/api/health         # JSON: system health metrics
+http://localhost:8080/api/circuit-breaker # JSON: circuit breaker state
+http://localhost:8080/api/docs          # Swagger API docs
+```
+
+The dashboard shows:
+- Account equity, daily P&L, and daily return %
+- Circuit breaker status with colored indicators
+- Market regime badge
+- Equity curve chart (Chart.js, auto-refreshes every 10s)
+- Open positions table with R-multiple, trailing stops, scale-out progress
+- Trade history table with P&L, R:R, hold time, exit reason
+- System health metrics (uptime, memory, tick rate, API errors)
+- Buying power and activity counts
+
+To disable: `trading-bot --mode paper --dashboard-port 0`
+
 ## Testing
 
-334 tests across 14 test modules covering all core modules:
+371 tests across 15 test modules covering all core modules:
 
 ```bash
-pytest tests/ -v                          # All tests (334 tests)
+pytest tests/ -v                          # All tests (371 tests)
 pytest tests/test_risk.py -v              # Risk management (critical)
 pytest tests/test_strategy.py -v          # Strategy signals
 pytest tests/test_circuit_breaker_recovery.py -v  # Circuit breaker recovery
