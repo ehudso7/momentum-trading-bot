@@ -1,12 +1,14 @@
 """
 In-memory paper broker for testing and development.
 
-Simulates order fills with configurable slippage.
+Simulates order fills with configurable, realistic slippage model.
 Requires no API keys or external connections.
 """
 
 from __future__ import annotations
 
+import math
+import random
 import uuid
 from datetime import datetime
 
@@ -18,11 +20,61 @@ from trading_bot.models.domain import OrderSide
 log = structlog.get_logger(__name__)
 
 
+class SlippageModel:
+    """Configurable slippage model for realistic paper fills."""
+
+    def __init__(
+        self,
+        base_bps: float = 5.0,
+        volume_impact_bps: float = 2.0,
+        volatility_multiplier: float = 1.0,
+    ):
+        self._base_bps = base_bps
+        self._volume_impact_bps = volume_impact_bps
+        self._volatility_multiplier = volatility_multiplier
+
+    def compute_slippage(
+        self,
+        side: OrderSide,
+        base_price: float,
+        qty: int,
+        avg_daily_volume: int = 1_000_000,
+    ) -> float:
+        """
+        Compute fill price after slippage.
+
+        Slippage components:
+        1. Base slippage (bid-ask spread proxy)
+        2. Volume impact (larger orders get worse fills)
+        3. Random noise (market microstructure)
+        """
+        # Base spread
+        slippage_bps = self._base_bps
+
+        # Volume impact: more slippage for larger orders relative to ADV
+        if avg_daily_volume > 0:
+            fill_ratio = qty / avg_daily_volume
+            slippage_bps += self._volume_impact_bps * math.log1p(fill_ratio * 100)
+
+        # Random noise (+/- 20% of base)
+        noise = random.uniform(-0.2, 0.2) * self._base_bps
+        slippage_bps += noise
+
+        slippage_bps = max(slippage_bps, 0.5)  # Minimum 0.5 bps
+        slippage_bps *= self._volatility_multiplier
+
+        slippage_mult = slippage_bps / 10_000
+        if side == OrderSide.BUY:
+            return round(base_price * (1 + slippage_mult), 4)
+        else:
+            return round(base_price * (1 - slippage_mult), 4)
+
+
 class PaperBroker(BrokerBase):
     """
     In-memory paper broker that simulates trading.
 
-    Fills market orders immediately at price + slippage.
+    Fills market orders immediately with configurable slippage model.
     Maintains position and equity tracking internally.
     """
 
@@ -30,14 +82,18 @@ class PaperBroker(BrokerBase):
         self,
         initial_equity: float = 25_000.0,
         slippage_bps: float = 5.0,
+        slippage_model: SlippageModel | None = None,
     ):
         self._initial_equity = initial_equity
         self._cash = initial_equity
         self._positions: dict[str, dict] = {}  # symbol -> position dict
         self._orders: dict[str, dict] = {}  # order_id -> order dict
-        self._slippage_bps = slippage_bps
+        self._pending_orders: dict[str, dict] = {}  # order_id -> pending stop/limit
+        self._slippage = slippage_model or SlippageModel(base_bps=slippage_bps)
         self._day_trades = 0
         self._last_prices: dict[str, float] = {}
+        self._order_timestamps: dict[str, datetime] = {}
+        self._stale_order_timeout_seconds = 300  # 5 minutes
 
     def get_account_equity(self) -> float:
         """Cash + market value of all positions."""
@@ -66,18 +122,12 @@ class PaperBroker(BrokerBase):
         ]
 
     def submit_market_order(self, symbol: str, qty: int, side: OrderSide) -> str:
-        """Simulate immediate fill with slippage."""
+        """Simulate immediate fill with realistic slippage model."""
         order_id = str(uuid.uuid4())[:8]
         base_price = self._last_prices.get(symbol, 10.0)
 
         # Apply slippage
-        slippage_mult = 1 + (self._slippage_bps / 10_000)
-        if side == OrderSide.BUY:
-            fill_price = base_price * slippage_mult  # pay more
-        else:
-            fill_price = base_price / slippage_mult  # receive less
-
-        fill_price = round(fill_price, 4)
+        fill_price = self._slippage.compute_slippage(side, base_price, qty)
 
         if side == OrderSide.BUY:
             cost = qty * fill_price
@@ -173,11 +223,15 @@ class PaperBroker(BrokerBase):
             "qty": qty,
             "stop_price": stop_price,
         }
+        self._order_timestamps[order_id] = datetime.utcnow()
+        self._pending_orders[order_id] = self._orders[order_id]
         return order_id
 
     def cancel_order(self, order_id: str) -> bool:
         if order_id in self._orders:
             self._orders[order_id]["status"] = "cancelled"
+            self._pending_orders.pop(order_id, None)
+            self._order_timestamps.pop(order_id, None)
             return True
         return False
 
@@ -208,3 +262,21 @@ class PaperBroker(BrokerBase):
         self._last_prices[symbol] = price
         if symbol in self._positions:
             self._positions[symbol]["current_price"] = price
+
+    def cleanup_stale_orders(self) -> list[str]:
+        """Cancel orders older than the timeout threshold. Returns cancelled IDs."""
+        now = datetime.utcnow()
+        stale_ids = []
+        for order_id, created_at in list(self._order_timestamps.items()):
+            age_seconds = (now - created_at).total_seconds()
+            if age_seconds > self._stale_order_timeout_seconds:
+                if order_id in self._pending_orders:
+                    self._orders[order_id]["status"] = "cancelled_stale"
+                    del self._pending_orders[order_id]
+                    stale_ids.append(order_id)
+                del self._order_timestamps[order_id]
+
+        if stale_ids:
+            log.info("paper.stale_orders_cancelled", count=len(stale_ids))
+
+        return stale_ids

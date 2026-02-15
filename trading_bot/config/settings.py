@@ -64,9 +64,9 @@ class RiskConfig(BaseModel):
     """
 
     risk_per_trade_pct: float = Field(1.0, ge=0.1, le=3.0)
-    max_daily_risk_pct: float = Field(3.0, ge=1.0, le=10.0)
+    max_daily_risk_pct: float = Field(3.0, ge=1.0, le=5.0)
     max_open_positions: int = Field(4, ge=1, le=10)
-    max_leverage: float = Field(4.0, ge=1.0, le=6.0)
+    max_leverage: float = Field(4.0, ge=1.0, le=4.0)
     pdt_equity_threshold: float = Field(25_000.0)
     stop_loss_atr_multiplier: float = Field(1.25, ge=0.5, le=3.0)
     drawdown_circuit_breaker_pct: float = Field(5.0, ge=1.0, le=15.0)
@@ -115,6 +115,17 @@ class ExitConfig(BaseModel):
         return self
 
 
+class NotificationConfig(BaseModel):
+    """Notification/webhook settings for trade alerts."""
+
+    enabled: bool = Field(False)
+    webhook_url: Optional[str] = Field(None)
+    notify_on_trade: bool = Field(True)
+    notify_on_circuit_breaker: bool = Field(True)
+    notify_on_daily_summary: bool = Field(True)
+    notify_on_error: bool = Field(True)
+
+
 class BrokerConfig(BaseModel):
     """Alpaca broker connection settings."""
 
@@ -131,6 +142,7 @@ class DataConfig(BaseModel):
     finnhub_api_key: Optional[SecretStr] = Field(None)
     use_polygon_news: bool = Field(True)
     float_cache_hours: int = Field(24, ge=1, le=168)
+    polygon_rate_limit_per_minute: int = Field(5, ge=1, le=100)
 
 
 class AppConfig(BaseSettings):
@@ -150,6 +162,7 @@ class AppConfig(BaseSettings):
     exit: ExitConfig = Field(default_factory=ExitConfig)
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     data: DataConfig = Field(default_factory=DataConfig)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     log_level: str = Field("INFO")
     log_json: bool = Field(False)
     journal_csv_path: str = Field("data/journal.csv")

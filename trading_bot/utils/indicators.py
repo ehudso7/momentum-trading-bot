@@ -180,6 +180,53 @@ def compute_parabolic_sar(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(index=df.index)
 
 
+def compute_rsi(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """
+    Compute Relative Strength Index.
+
+    Uses Wilder's smoothing method (EMA with alpha=1/length).
+
+    Args:
+        df: OHLCV DataFrame.
+        length: RSI period (default 14).
+
+    Returns:
+        pd.Series with RSI values (0-100).
+    """
+    df = _normalize_columns(df)
+    try:
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0)
+        loss = (-delta).clip(lower=0)
+
+        avg_gain = gain.ewm(alpha=1.0 / length, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1.0 / length, adjust=False).mean()
+
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return rsi.fillna(50.0)
+    except Exception:
+        return pd.Series(50.0, index=df.index)
+
+
+def compute_volume_ma(df: pd.DataFrame, length: int = 20) -> pd.Series:
+    """
+    Compute Volume Moving Average.
+
+    Args:
+        df: OHLCV DataFrame.
+        length: MA period (default 20).
+
+    Returns:
+        pd.Series with volume MA values.
+    """
+    df = _normalize_columns(df)
+    try:
+        return df["volume"].rolling(window=length, min_periods=1).mean()
+    except Exception:
+        return pd.Series(dtype=float, index=df.index)
+
+
 def compute_relative_volume(current_volume: float, avg_volume: float) -> float:
     """
     Compute relative volume ratio.
@@ -202,11 +249,14 @@ def enrich_dataframe(
     atr_length: int = 14,
     include_vwap: bool = True,
     include_psar: bool = True,
+    include_rsi: bool = True,
+    include_volume_ma: bool = True,
 ) -> pd.DataFrame:
     """
     Add all technical indicators to a DataFrame.
 
-    Adds columns: ema_{length}, atr_{atr_length}, and optionally vwap, psar_long, psar_short.
+    Adds columns: ema_{length}, ema_20, atr_{atr_length}, rsi_14,
+    volume_ma_20, and optionally vwap, psar_long, psar_short.
 
     Args:
         df: OHLCV DataFrame.
@@ -214,15 +264,22 @@ def enrich_dataframe(
         atr_length: ATR period.
         include_vwap: Whether to compute VWAP (requires intraday data).
         include_psar: Whether to compute Parabolic SAR.
+        include_rsi: Whether to compute RSI.
+        include_volume_ma: Whether to compute volume moving average.
 
     Returns:
         New DataFrame with indicator columns added.
     """
     result = _normalize_columns(df)
 
-    # EMA
+    # EMA (fast)
     ema = compute_ema(result, length=ema_length)
     result[f"ema_{ema_length}"] = ema
+
+    # EMA 20 (trend)
+    if ema_length != 20:
+        ema20 = compute_ema(result, length=20)
+        result["ema_20"] = ema20
 
     # ATR
     atr = compute_atr(result, length=atr_length)
@@ -232,6 +289,16 @@ def enrich_dataframe(
     if include_vwap:
         vwap = compute_vwap(result)
         result["vwap"] = vwap
+
+    # RSI
+    if include_rsi:
+        rsi = compute_rsi(result, length=14)
+        result["rsi_14"] = rsi
+
+    # Volume MA
+    if include_volume_ma:
+        vol_ma = compute_volume_ma(result, length=20)
+        result["volume_ma_20"] = vol_ma
 
     # Parabolic SAR
     if include_psar:

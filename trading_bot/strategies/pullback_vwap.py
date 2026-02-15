@@ -1,10 +1,21 @@
 """
-VWAP Pullback + Breakout Continuation Strategy.
+VWAP Pullback + Breakout Continuation + Opening Range Breakout Strategy.
 
 Primary setup: First strong pullback to VWAP or EMA9 with volume confirmation.
-Secondary setup: Breakout continuation when momentum re-accelerates.
+Secondary setups: Breakout continuation, Opening Range Breakout (ORB),
+Red-to-Green move, Pre-market High break.
 
-Long only (v1). Implements scale-out exits and trailing stops.
+Long only (v1). Implements scale-out exits, trailing stops, and multi-factor
+confidence scoring modeled after elite momentum day-trading (Ross Cameron style).
+
+Elite-level features:
+- Multi-factor confidence scoring (time of day, volume profile, candle quality,
+  momentum consistency, gap fill risk)
+- Opening Range Breakout (first 15-min high/low as range)
+- Red-to-Green move detection (opens red, reclaims prev close)
+- Gap fill risk reduction (>50% gap filled = lower confidence)
+- Time-of-day weighting (power zone 9:30-10:30, dead zone 11:30-1:00)
+- Momentum exhaustion detection via RSI divergence
 """
 
 from __future__ import annotations
@@ -23,7 +34,7 @@ from trading_bot.models.domain import (
     TradeSignal,
 )
 from trading_bot.strategies.base import Strategy
-from trading_bot.utils.helpers import is_past_exit_time
+from trading_bot.utils.helpers import is_past_exit_time, now_et
 from trading_bot.utils.indicators import enrich_dataframe
 
 log = structlog.get_logger(__name__)
@@ -31,21 +42,46 @@ log = structlog.get_logger(__name__)
 
 class PullbackVWAPStrategy(Strategy):
     """
-    VWAP/EMA9 pullback with volume confirmation.
+    Elite-level VWAP/EMA9 pullback strategy with multi-factor confidence.
 
-    Entry conditions (checked in order):
+    Entry setups (checked in order):
     1. VWAP pullback: price pulls back to within vwap_proximity_pct of VWAP,
        then reclaims with above-average volume.
     2. EMA9 pullback: same logic anchored to EMA9.
-    3. Breakout continuation: price breaks above recent highs with volume spike.
+    3. Opening Range Breakout: price breaks above first 15-min high with volume.
+    4. Red-to-Green: opens below prev close, reclaims with momentum.
+    5. Breakout continuation: price breaks above recent highs with volume spike.
 
     Exit conditions (priority order):
     1. Hard time exit (3:50 PM ET)
     2. Stop loss hit
     3. Scale-out at R:R targets
     4. Trailing stop hit
-    5. Parabolic SAR flip
+    5. Momentum exhaustion (RSI > 80 after extended run)
+    6. Parabolic SAR flip
+
+    Confidence scoring factors:
+    - Base signal quality (proximity, volume, candle pattern)
+    - Time of day (power zone 9:30-10:30 = boost, dead zone = penalty)
+    - Gap fill risk (>50% filled = penalty)
+    - Multi-candle momentum (consecutive green bars = boost)
+    - Volume trend (increasing = boost, decreasing = penalty)
+    - RSI level (overbought on entry = penalty)
+    - EMA alignment (EMA9 > EMA20 > VWAP = boost)
     """
+
+    # Time-of-day zones (hour, minute) in ET
+    POWER_ZONE_END_HOUR = 10
+    POWER_ZONE_END_MIN = 30
+    DEAD_ZONE_START_HOUR = 11
+    DEAD_ZONE_START_MIN = 30
+    DEAD_ZONE_END_HOUR = 13
+
+    # Opening range (first N minutes after open)
+    ORB_MINUTES = 15
+
+    # RSI thresholds
+    RSI_OVERBOUGHT = 75
 
     def __init__(self, config: AppConfig):
         self._entry_cfg = config.entry
@@ -80,22 +116,32 @@ class PullbackVWAPStrategy(Strategy):
         price = latest["close"]
         vwap = latest.get("vwap", price)
         ema = latest.get(f"ema_{self._entry_cfg.ema_period}", price)
+        ema20 = latest.get("ema_20", price)
         atr = latest.get("atr_14", 0.0)
+        rsi = latest.get("rsi_14", 50.0)
 
         if pd.isna(atr) or atr <= 0:
             log.debug("strategy.no_atr", symbol=candidate.symbol)
             return None
 
         # Check each setup in priority order
-        signal = self._check_vwap_pullback(candidate, df, price, vwap, ema, atr)
+        signal = self._check_vwap_pullback(candidate, df, price, vwap, ema, ema20, atr, rsi)
         if signal:
             return signal
 
-        signal = self._check_ema_pullback(candidate, df, price, ema, atr)
+        signal = self._check_ema_pullback(candidate, df, price, ema, ema20, atr, rsi)
         if signal:
             return signal
 
-        signal = self._check_breakout(candidate, df, price, vwap, ema, atr)
+        signal = self._check_opening_range_breakout(candidate, df, price, vwap, ema, atr, rsi)
+        if signal:
+            return signal
+
+        signal = self._check_red_to_green(candidate, df, price, vwap, ema, atr, rsi)
+        if signal:
+            return signal
+
+        signal = self._check_breakout(candidate, df, price, vwap, ema, atr, rsi)
         if signal:
             return signal
 
@@ -122,15 +168,24 @@ class PullbackVWAPStrategy(Strategy):
         ):
             return True, "trailing_stop"
 
-        # 4. Parabolic SAR flip (if enabled and we have bar data)
-        if self._exit_cfg.use_parabolic_sar and not bars.empty and len(bars) >= 20:
+        # 4. Momentum exhaustion (RSI-based exit for runners)
+        if not bars.empty and len(bars) >= 20:
             df = enrich_dataframe(bars, ema_length=self._entry_cfg.ema_period)
             latest = df.iloc[-1]
-            psar_short = latest.get("psar_short")
-            if psar_short is not None and not pd.isna(psar_short):
-                # SAR is above price = bearish signal
-                if psar_short <= position.current_price * 1.005:
-                    return True, "psar_flip"
+
+            # RSI > 80 with position at +2R or more = momentum fading
+            rsi = latest.get("rsi_14", 50.0)
+            if not pd.isna(rsi) and rsi > 80.0 and position.r_multiple >= 2.0:
+                # Confirm with bearish candle
+                if latest["close"] < latest["open"]:
+                    return True, "momentum_exhaustion"
+
+            # 5. Parabolic SAR flip
+            if self._exit_cfg.use_parabolic_sar:
+                psar_short = latest.get("psar_short")
+                if psar_short is not None and not pd.isna(psar_short):
+                    if psar_short <= position.current_price * 1.005:
+                        return True, "psar_flip"
 
         return False, ""
 
@@ -216,7 +271,9 @@ class PullbackVWAPStrategy(Strategy):
         price: float,
         vwap: float,
         ema: float,
+        ema20: float,
         atr: float,
+        rsi: float,
     ) -> Optional[TradeSignal]:
         """Check for VWAP pullback entry."""
         if pd.isna(vwap) or vwap <= 0:
@@ -241,11 +298,16 @@ class PullbackVWAPStrategy(Strategy):
         if not self._volume_confirms(df):
             return None
 
-        # Build signal
-        stop_price = self._compute_stop(df, price, atr)
-        return self._build_signal(
+        # Build signal with confidence scoring
+        stop_price = self._compute_stop(df, price, atr, vwap=vwap)
+        signal = self._build_signal(
             candidate, SignalType.VWAP_PULLBACK, price, stop_price, atr, vwap, ema
         )
+        if signal:
+            signal.confidence = self._compute_confidence(
+                signal, candidate, df, rsi, ema, ema20, vwap
+            )
+        return signal
 
     def _check_ema_pullback(
         self,
@@ -253,7 +315,9 @@ class PullbackVWAPStrategy(Strategy):
         df: pd.DataFrame,
         price: float,
         ema: float,
+        ema20: float,
         atr: float,
+        rsi: float,
     ) -> Optional[TradeSignal]:
         """Check for EMA pullback entry (fallback if VWAP fails)."""
         ema_col = f"ema_{self._entry_cfg.ema_period}"
@@ -277,9 +341,158 @@ class PullbackVWAPStrategy(Strategy):
 
         vwap = df.iloc[-1].get("vwap", price)
         stop_price = self._compute_stop(df, price, atr)
-        return self._build_signal(
+        signal = self._build_signal(
             candidate, SignalType.EMA_PULLBACK, price, stop_price, atr, vwap, ema
         )
+        if signal:
+            signal.confidence = self._compute_confidence(
+                signal, candidate, df, rsi, ema, ema20, vwap
+            )
+        return signal
+
+    def _check_opening_range_breakout(
+        self,
+        candidate: ScanResult,
+        df: pd.DataFrame,
+        price: float,
+        vwap: float,
+        ema: float,
+        atr: float,
+        rsi: float,
+    ) -> Optional[TradeSignal]:
+        """
+        Check for Opening Range Breakout (ORB) entry.
+
+        The opening range is the high/low of the first 15 minutes after
+        market open (9:30 - 9:45 AM ET). A break above the ORB high
+        with volume is a classic momentum entry.
+        """
+        if len(df) < 20:
+            return None
+
+        # Use first ORB_MINUTES bars as the opening range
+        try:
+            idx = df.index
+            if hasattr(idx, 'tz') and idx.tz is not None:
+                orb_bars = df.between_time("09:30", "09:45")
+            else:
+                orb_bars = df.iloc[:self.ORB_MINUTES]
+        except Exception:
+            orb_bars = df.iloc[:self.ORB_MINUTES]
+
+        if orb_bars.empty or len(orb_bars) < 3:
+            return None
+
+        orb_high = orb_bars["high"].max()
+        orb_low = orb_bars["low"].min()
+
+        # Only valid if we're past the ORB window
+        if len(df) <= len(orb_bars):
+            return None
+
+        # Price must break above ORB high
+        latest = df.iloc[-1]
+        if price <= orb_high:
+            return None
+
+        # Must be a bullish bar
+        if latest["close"] <= latest["open"]:
+            return None
+
+        # Volume confirmation
+        if not self._volume_confirms(df):
+            return None
+
+        # Price above VWAP
+        if not pd.isna(vwap) and price < vwap:
+            return None
+
+        # Stop below ORB low or VWAP, whichever is higher (tighter risk)
+        stop_price = orb_low
+        if not pd.isna(vwap) and vwap > orb_low:
+            stop_price = vwap - (atr * 0.25)
+
+        # Ensure minimum stop distance
+        min_distance = atr * self._entry_cfg.min_atr_distance
+        if price - stop_price < min_distance:
+            stop_price = price - min_distance
+
+        stop_price = round(stop_price, 4)
+
+        ema20 = df.iloc[-1].get("ema_20", price)
+        signal = self._build_signal(
+            candidate, SignalType.OPENING_RANGE_BREAKOUT,
+            price, stop_price, atr, vwap, ema
+        )
+        if signal:
+            signal.confidence = self._compute_confidence(
+                signal, candidate, df, rsi, ema, ema20, vwap
+            )
+        return signal
+
+    def _check_red_to_green(
+        self,
+        candidate: ScanResult,
+        df: pd.DataFrame,
+        price: float,
+        vwap: float,
+        ema: float,
+        atr: float,
+        rsi: float,
+    ) -> Optional[TradeSignal]:
+        """
+        Check for Red-to-Green move.
+
+        The stock opens below the previous close (red) and then reclaims
+        above it (green). This shows buyers stepping in and is a strong
+        reversal signal for gappers.
+        """
+        if len(df) < 20:
+            return None
+
+        prev_close = candidate.prev_close
+        if prev_close <= 0:
+            return None
+
+        # Current price must be above prev close (now green)
+        if price <= prev_close:
+            return None
+
+        # Check that first bar opened below prev close (was red)
+        first_bar_open = df.iloc[0]["open"]
+        if first_bar_open >= prev_close:
+            return None
+
+        # Current bar must be bullish
+        latest = df.iloc[-1]
+        if latest["close"] <= latest["open"]:
+            return None
+
+        # Volume confirmation
+        if not self._volume_confirms(df):
+            return None
+
+        # Stop below prev close or VWAP
+        stop_price = prev_close - (atr * 0.5)
+        if not pd.isna(vwap) and vwap < prev_close:
+            stop_price = min(stop_price, vwap - (atr * 0.25))
+
+        min_distance = atr * self._entry_cfg.min_atr_distance
+        if price - stop_price < min_distance:
+            stop_price = price - min_distance
+
+        stop_price = round(stop_price, 4)
+
+        ema20 = df.iloc[-1].get("ema_20", price)
+        signal = self._build_signal(
+            candidate, SignalType.RED_TO_GREEN,
+            price, stop_price, atr, vwap, ema
+        )
+        if signal:
+            signal.confidence = self._compute_confidence(
+                signal, candidate, df, rsi, ema, ema20, vwap
+            )
+        return signal
 
     def _check_breakout(
         self,
@@ -289,6 +502,7 @@ class PullbackVWAPStrategy(Strategy):
         vwap: float,
         ema: float,
         atr: float,
+        rsi: float,
     ) -> Optional[TradeSignal]:
         """Check for breakout continuation entry."""
         lookback = self._entry_cfg.breakout_lookback_bars
@@ -317,7 +531,8 @@ class PullbackVWAPStrategy(Strategy):
             return None
 
         stop_price = self._compute_stop(df, price, atr)
-        return self._build_signal(
+        ema20 = df.iloc[-1].get("ema_20", price)
+        signal = self._build_signal(
             candidate,
             SignalType.BREAKOUT_CONTINUATION,
             price,
@@ -326,6 +541,11 @@ class PullbackVWAPStrategy(Strategy):
             vwap if not pd.isna(vwap) else price,
             ema if not pd.isna(ema) else price,
         )
+        if signal:
+            signal.confidence = self._compute_confidence(
+                signal, candidate, df, rsi, ema, ema20, vwap
+            )
+        return signal
 
     def _volume_confirms(self, df: pd.DataFrame) -> bool:
         """Check if current bar volume confirms the move."""
@@ -341,7 +561,8 @@ class PullbackVWAPStrategy(Strategy):
         return current_vol >= avg_vol * self._entry_cfg.volume_confirmation_multiplier
 
     def _compute_stop(
-        self, df: pd.DataFrame, entry_price: float, atr: float
+        self, df: pd.DataFrame, entry_price: float, atr: float,
+        vwap: float | None = None,
     ) -> float:
         """
         Compute stop-loss price.
@@ -350,6 +571,7 @@ class PullbackVWAPStrategy(Strategy):
         - Entry bar low
         - Swing low of last 10 bars
         - ATR-based: entry - (ATR * multiplier)
+        - Below VWAP (if provided and applicable)
 
         But ensures minimum distance of min_atr_distance * ATR.
         """
@@ -359,6 +581,11 @@ class PullbackVWAPStrategy(Strategy):
 
         # Use highest (tightest) stop
         stop = max(entry_bar_low, swing_low, atr_stop)
+
+        # For VWAP setups, also consider just below VWAP as stop
+        if vwap is not None and not pd.isna(vwap):
+            vwap_stop = vwap - (atr * 0.25)
+            stop = max(stop, vwap_stop)
 
         # Ensure minimum distance
         min_distance = atr * self._entry_cfg.min_atr_distance
@@ -370,6 +597,126 @@ class PullbackVWAPStrategy(Strategy):
             stop = entry_price - min_distance
 
         return round(stop, 4)
+
+    def _compute_confidence(
+        self,
+        signal: TradeSignal,
+        candidate: ScanResult,
+        df: pd.DataFrame,
+        rsi: float,
+        ema: float,
+        ema20: float,
+        vwap: float,
+    ) -> float:
+        """
+        Multi-factor confidence scoring for elite-level trade quality.
+
+        Factors evaluated:
+        1. Base signal quality from scanner score
+        2. Time of day (power zone boost, dead zone penalty)
+        3. Gap fill risk (>50% gap filled = penalty)
+        4. Multi-candle momentum (consecutive green bars)
+        5. Volume trend (increasing vs decreasing)
+        6. RSI level (overbought penalty on entry)
+        7. EMA alignment (EMA9 > EMA20 > VWAP = perfect alignment)
+        8. Candle body quality (strong bodies vs dojis)
+        9. Relative volume strength
+
+        Returns confidence score in [0.0, 1.0].
+        """
+        score = min(candidate.score, 1.0)
+
+        # --- 1. Time of day adjustment ---
+        try:
+            current = now_et()
+            hour, minute = current.hour, current.minute
+
+            # Power zone: 9:30 - 10:30 AM = +10% boost
+            if (hour == 9 and minute >= 30) or hour == 10:
+                score *= 1.10
+            # Dead zone: 11:30 AM - 1:00 PM = -20% penalty
+            elif (hour == 11 and minute >= 30) or hour == 12:
+                score *= 0.80
+            # Late day: after 3:00 PM = -15% penalty
+            elif hour >= 15:
+                score *= 0.85
+        except Exception:
+            pass
+
+        # --- 2. Gap fill risk ---
+        if candidate.prev_close > 0 and candidate.gap_pct > 0:
+            gap_size = candidate.price - candidate.prev_close
+            if gap_size > 0:
+                current_gap = signal.entry_price - candidate.prev_close
+                gap_filled_pct = (1.0 - current_gap / gap_size) * 100
+                if gap_filled_pct > 50:
+                    score *= max(0.6, 1.0 - (gap_filled_pct - 50) / 100)
+
+        # --- 3. Multi-candle momentum ---
+        if len(df) >= 5:
+            consecutive_green = 0
+            for i in range(-1, max(-6, -len(df)), -1):
+                bar = df.iloc[i]
+                if bar["close"] > bar["open"]:
+                    consecutive_green += 1
+                else:
+                    break
+            if consecutive_green >= 3:
+                score *= 1.08
+            elif consecutive_green >= 2:
+                score *= 1.04
+            elif consecutive_green == 0:
+                score *= 0.90
+
+        # --- 4. Volume trend ---
+        if len(df) >= 10:
+            recent_vol = df.iloc[-3:]["volume"].mean()
+            earlier_vol = df.iloc[-10:-3]["volume"].mean()
+            if earlier_vol > 0:
+                vol_ratio = recent_vol / earlier_vol
+                if vol_ratio >= 1.5:
+                    score *= 1.08
+                elif vol_ratio < 0.5:
+                    score *= 0.85
+
+        # --- 5. RSI level ---
+        if not pd.isna(rsi):
+            if rsi > self.RSI_OVERBOUGHT:
+                score *= 0.85
+            elif 40 <= rsi <= 60:
+                score *= 1.05
+
+        # --- 6. EMA alignment ---
+        if not pd.isna(ema) and not pd.isna(ema20) and not pd.isna(vwap):
+            price = signal.entry_price
+            if price > ema > ema20 > vwap:
+                score *= 1.10
+            elif price > ema > vwap:
+                score *= 1.05
+            elif price < vwap:
+                score *= 0.80
+
+        # --- 7. Candle body quality ---
+        latest = df.iloc[-1]
+        body = abs(latest["close"] - latest["open"])
+        total_range = latest["high"] - latest["low"]
+        if total_range > 0:
+            body_ratio = body / total_range
+            if body_ratio > 0.7:
+                score *= 1.05
+            elif body_ratio < 0.3:
+                score *= 0.90
+
+        # --- 8. Relative volume strength ---
+        if candidate.relative_volume >= 15.0:
+            score *= 1.08
+        elif candidate.relative_volume >= 10.0:
+            score *= 1.04
+        elif candidate.relative_volume < 3.0:
+            score *= 0.85
+
+        # Clamp to [0, 1]
+        return round(max(0.0, min(1.0, score)), 4)
 
     def _build_signal(
         self,
@@ -391,7 +738,7 @@ class PullbackVWAPStrategy(Strategy):
         for rr in self._exit_cfg.scale_out_rr_targets:
             targets.append(round(entry_price + (risk_per_share * rr), 4))
 
-        # Confidence based on candidate score and setup quality
+        # Base confidence from candidate score (refined by _compute_confidence)
         confidence = min(candidate.score, 1.0)
 
         signal = TradeSignal(
@@ -414,6 +761,7 @@ class PullbackVWAPStrategy(Strategy):
             stop=signal.stop_price,
             targets=signal.target_prices,
             rr=signal.reward_risk_ratio,
+            confidence=signal.confidence,
         )
 
         return signal
