@@ -12,11 +12,20 @@ Automated momentum day-trading bot for US equities (NYSE/NASDAQ). Targets low-fl
 
 - **Momentum Scanner**: Finds low-float gappers with high relative volume and catalyst presence
 - **VWAP Pullback Strategy**: Entries on pullback to VWAP/EMA9 with volume confirmation
-- **Strict Risk Management**: 1% risk per trade, max 4x leverage, circuit breakers
-- **Scale-Out Exits**: 1/3 at 1:1 R:R, 1/3 at 2:1 R:R, trail remainder
+- **Multiple Entry Setups**: VWAP pullback, EMA pullback, Opening Range Breakout (ORB), Red-to-Green, Breakout Continuation
+- **Multi-Factor Confidence Scoring**: Time of day, gap fill risk, candle quality, momentum, EMA alignment, RSI, volume trend
+- **Market Regime Detection**: SPY-based regime classifier (bullish, bearish, high-vol, range-bound, low-vol) auto-adjusts sizing/stops
+- **AI Trading Advisor**: Rule-based expert system for entry/exit edge cases, daily planning, circuit breaker recommendations
+- **Strict Risk Management**: 1% risk per trade, max 4x leverage, circuit breakers with auto-recovery
+- **Correlation Checking**: Prevents concentrated sector/price risk across open positions (SIC codes + return correlation)
+- **Scale-Out Exits**: 1/3 at 1:1 R:R, 1/3 at 2:1 R:R, trail remainder with ATR-based trailing stops
 - **Hard Time Exit**: Flat all positions by 3:50 PM ET
 - **Three Run Modes**: Backtest, Paper (default), Live
-- **Trade Journal**: CSV logging of every trade with P&L tracking
+- **Trade Journal**: CSV logging of every trade with P&L tracking and daily summary reports
+- **Webhook Notifications**: Slack/Discord alerts for trade opens/closes, circuit breaker events, daily summaries
+- **System Health Monitoring**: Memory usage, tick rate, error rate, API health tracking
+- **Resilient API Layer**: Retry with exponential backoff, rate limiting, error classification
+- **Realistic Paper Broker**: Slippage model, margin simulation, stale order cleanup
 
 ## Quick Start
 
@@ -43,13 +52,19 @@ pip install -e ".[dev]"
 cp trading_bot/config/.env.example .env
 ```
 
-Edit `.env` with your API keys:
+Edit `.env` with your API keys (see `.env.example` for detailed setup instructions):
 
-```
+```bash
+# Required: Get a free key at https://polygon.io/dashboard/signup
 POLYGON_API_KEY=your_key_here
+
+# Required: Get free keys at https://app.alpaca.markets/signup
+# Use Paper Trading keys first (switch to Paper Trading > API Keys)
 ALPACA_API_KEY=your_key_here
 ALPACA_API_SECRET=your_secret_here
 ```
+
+> **Note:** Without API keys, the bot runs in local paper mode with simulated data. No real market connection is needed to explore the codebase or run tests.
 
 ### 4. Run
 
@@ -97,13 +112,17 @@ TRADING_LOG_LEVEL=DEBUG                  # Verbose logging
 ## Architecture
 
 ```
-Scanner (Polygon.io)
-  → Strategy (VWAP pullback evaluation)
-    → Risk Check (position sizer: shares = risk$ / stop_distance)
-      → Execution (Alpaca broker)
-        → Portfolio Manager (scale-outs, trailing stops, journal)
+Pre-market: Scanner (Polygon.io) → Watchlist
+Market hours:
+  Scanner → Regime Detection (SPY) → Strategy Evaluate (multi-setup)
+    → AI Advisor (entry recommendation) → Correlation Check
+      → Risk Check (position sizer: shares = risk$ / stop_distance)
+        → Execution (Alpaca broker) → Portfolio Manager
+          → Scale-outs, Trailing Stops, Journal, Notifications
 
-Circuit Breaker monitors all activity and halts on safety breaches.
+Circuit Breaker monitors all activity (checked FIRST every tick).
+Hard Time Exit checked SECOND (3:50 PM ET).
+Health Monitor tracks system metrics continuously.
 ```
 
 ### Project Structure
@@ -114,39 +133,50 @@ trading_bot/
 ├── config/
 │   ├── settings.py            # Pydantic config with risk bounds
 │   ├── config.yaml            # Default values
-│   └── .env.example           # API key template
+│   └── .env.example           # API key template (with setup guide)
 ├── models/domain.py           # Shared data classes
 ├── data/
-│   ├── polygon_client.py      # Polygon.io wrapper
+│   ├── polygon_client.py      # Polygon.io wrapper with rate limiting
 │   ├── market_data.py         # Unified data interface
 │   └── news_client.py         # Catalyst detection
 ├── scanners/
 │   └── momentum_gappers.py    # Momentum scanner
 ├── strategies/
 │   ├── base.py                # Strategy ABC
-│   └── pullback_vwap.py       # VWAP pullback strategy
+│   ├── pullback_vwap.py       # VWAP pullback + ORB + Red-to-Green strategy
+│   ├── regime.py              # Market regime detection (SPY-based)
+│   └── advisor.py             # Rule-based trading advisor (edge case mgmt)
 ├── risk/
 │   ├── position_sizer.py      # Position sizing + risk checks
-│   └── circuit_breaker.py     # Safety circuit breaker
+│   ├── circuit_breaker.py     # Safety circuit breaker with auto-recovery
+│   └── correlation.py         # Sector/price correlation checker
 ├── execution/
 │   ├── broker_base.py         # Broker ABC
 │   ├── alpaca_broker.py       # Alpaca implementation
-│   └── paper_broker.py        # In-memory paper broker
+│   └── paper_broker.py        # In-memory paper broker with slippage model
 ├── portfolio/
 │   └── manager.py             # Position lifecycle + journal
 ├── backtest/
 │   └── engine.py              # Walk-forward backtesting
 └── utils/
     ├── logger.py              # structlog setup
-    ├── indicators.py          # VWAP, EMA, ATR, PSAR
-    └── helpers.py             # Market hours utilities
+    ├── indicators.py          # VWAP, EMA, ATR, RSI, PSAR, Bollinger
+    ├── helpers.py             # Market hours utilities
+    ├── resilience.py          # Retry logic, rate limiting, error classification
+    ├── health.py              # System health monitoring
+    ├── notifications.py       # Webhook notifications (Slack, Discord, etc.)
+    └── reports.py             # Daily summary report generation
 ```
 
 ## Testing
 
+334 tests across 14 test modules covering all core modules:
+
 ```bash
-pytest tests/ -v                          # All tests
+pytest tests/ -v                          # All tests (334 tests)
 pytest tests/test_risk.py -v              # Risk management (critical)
+pytest tests/test_strategy.py -v          # Strategy signals
+pytest tests/test_circuit_breaker_recovery.py -v  # Circuit breaker recovery
 pytest tests/ -v --cov=trading_bot        # With coverage
 ```
 
@@ -177,6 +207,10 @@ This software is provided "as is" without warranty of any kind. Trading stocks, 
 - Past performance and backtests do not guarantee future results
 - Consult a financial advisor before making investment decisions
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
 ## License
 
-MIT
+MIT -- see [LICENSE](LICENSE) for details.
