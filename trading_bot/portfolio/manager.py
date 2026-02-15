@@ -1,5 +1,6 @@
 """
-Portfolio manager: position tracking, scale-outs, trailing stops, and trade journal.
+Portfolio manager: position tracking, scale-outs, trailing stops, trade journal,
+position reconciliation, and partial fill handling.
 
 Orchestrates the lifecycle of each position from open to close,
 including partial exits at R:R targets and trailing stop management.
@@ -64,7 +65,107 @@ class PortfolioManager:
         self._positions: dict[str, PositionInfo] = {}
         self._daily_pnl: float = 0.0
         self._journal_path = Path(config.journal_csv_path)
+        self._journal_entries: list[JournalEntry] = []
         self._ensure_journal_file()
+
+    def reconcile_positions(self) -> None:
+        """
+        Reconcile internal position state with broker's actual positions.
+
+        Called on restart to recover from crashes. If the broker has positions
+        that we don't track internally, we add them as "recovered" positions.
+        If we track positions the broker doesn't have, we clean them up.
+        """
+        try:
+            broker_positions = self._broker.get_positions()
+        except Exception as e:
+            log.error("portfolio.reconcile_error", error=str(e))
+            return
+
+        broker_symbols = {p["symbol"] for p in broker_positions}
+        internal_symbols = set(self._positions.keys())
+
+        # Positions broker has that we don't track
+        for bp in broker_positions:
+            symbol = bp["symbol"]
+            if symbol not in internal_symbols:
+                log.warning(
+                    "portfolio.reconcile_found_untracked",
+                    symbol=symbol,
+                    qty=bp["qty"],
+                    entry=bp["avg_entry_price"],
+                )
+                # Create a recovery position with conservative stop
+                entry_price = bp["avg_entry_price"]
+                current_price = bp["current_price"]
+                # Conservative stop: 3% below entry
+                stop_price = entry_price * 0.97
+
+                from trading_bot.models.domain import SignalType
+                self._positions[symbol] = PositionInfo(
+                    symbol=symbol,
+                    side=OrderSide.BUY,
+                    entry_price=entry_price,
+                    current_price=current_price,
+                    shares=bp["qty"],
+                    shares_remaining=bp["qty"],
+                    stop_price=stop_price,
+                    target_prices=[
+                        entry_price * 1.03,
+                        entry_price * 1.06,
+                    ],
+                    status=PositionStatus.OPEN,
+                    pnl_unrealized=bp.get("unrealized_pl", 0.0),
+                    pnl_realized=0.0,
+                    scale_outs_completed=0,
+                    entry_time=now_et(),
+                    signal_type=SignalType.VWAP_PULLBACK,
+                    broker_order_ids=[],
+                )
+
+        # Positions we track but broker doesn't have (already closed externally)
+        for symbol in internal_symbols - broker_symbols:
+            log.warning(
+                "portfolio.reconcile_stale_position",
+                symbol=symbol,
+            )
+            pos = self._positions[symbol]
+            # Log as closed with unknown reason
+            entry = self._close_position(pos, pos.current_price, "reconcile_missing")
+            if entry:
+                self._journal_entries.append(entry)
+
+        # Remove stale positions
+        for symbol in internal_symbols - broker_symbols:
+            self._positions.pop(symbol, None)
+
+        # Update quantities for matching positions
+        for bp in broker_positions:
+            symbol = bp["symbol"]
+            if symbol in self._positions:
+                pos = self._positions[symbol]
+                if pos.shares_remaining != bp["qty"]:
+                    log.info(
+                        "portfolio.reconcile_qty_mismatch",
+                        symbol=symbol,
+                        internal=pos.shares_remaining,
+                        broker=bp["qty"],
+                    )
+                    # Broker is source of truth for partial fills
+                    difference = pos.shares_remaining - bp["qty"]
+                    if difference > 0:
+                        # Some shares were sold (partial fill we missed)
+                        pnl = difference * (bp["current_price"] - pos.entry_price)
+                        pos.pnl_realized += pnl
+                        pos.shares_remaining = bp["qty"]
+                        if pos.shares_remaining == 0:
+                            pos.status = PositionStatus.CLOSED
+
+        log.info(
+            "portfolio.reconciled",
+            internal=len(self._positions),
+            broker=len(broker_positions),
+        )
 
     def open_position(
         self, signal: TradeSignal, risk_result: RiskCheckResult
@@ -81,14 +182,30 @@ class PortfolioManager:
             side=OrderSide.BUY,
         )
 
+        # Check for partial fill
+        actual_shares = risk_result.shares
+        try:
+            order_status = self._broker.get_order_status(order_id)
+            if order_status.get("filled_qty", 0) > 0:
+                actual_shares = order_status["filled_qty"]
+                if actual_shares != risk_result.shares:
+                    log.warning(
+                        "portfolio.partial_fill",
+                        symbol=signal.symbol,
+                        requested=risk_result.shares,
+                        filled=actual_shares,
+                    )
+        except Exception:
+            pass  # Use requested shares if we can't check
+
         # Create position tracking
         position = PositionInfo(
             symbol=signal.symbol,
             side=OrderSide.BUY,
             entry_price=signal.entry_price,
             current_price=signal.entry_price,
-            shares=risk_result.shares,
-            shares_remaining=risk_result.shares,
+            shares=actual_shares,
+            shares_remaining=actual_shares,
             stop_price=signal.stop_price,
             target_prices=signal.target_prices,
             status=PositionStatus.OPEN,
@@ -105,7 +222,7 @@ class PortfolioManager:
         log.info(
             "portfolio.opened",
             symbol=signal.symbol,
-            shares=risk_result.shares,
+            shares=actual_shares,
             entry=signal.entry_price,
             stop=signal.stop_price,
             risk=format_currency(risk_result.risk_dollars),
@@ -184,6 +301,7 @@ class PortfolioManager:
             if symbol in self._positions:
                 del self._positions[symbol]
 
+        self._journal_entries.extend(journal_entries)
         return journal_entries
 
     def close_position(self, symbol: str, reason: str) -> Optional[JournalEntry]:
@@ -194,6 +312,8 @@ class PortfolioManager:
         position = self._positions[symbol]
         entry = self._close_position(position, position.current_price, reason)
         del self._positions[symbol]
+        if entry:
+            self._journal_entries.append(entry)
         return entry
 
     def close_all(self, reason: str = "end_of_day") -> list[JournalEntry]:
@@ -222,9 +342,14 @@ class PortfolioManager:
     def get_daily_pnl(self) -> float:
         return self._daily_pnl
 
+    def get_daily_journal_entries(self) -> list[JournalEntry]:
+        """Get all journal entries from today's session."""
+        return list(self._journal_entries)
+
     def reset_daily(self) -> None:
         """Reset daily P&L tracking."""
         self._daily_pnl = 0.0
+        self._journal_entries.clear()
 
     # --- Private methods ---
 
@@ -243,8 +368,20 @@ class PortfolioManager:
         )
         position.broker_order_ids.append(order_id)
 
+        # Check actual fill for partial fill handling
+        actual_exit_price = exit_price
+        actual_shares = position.shares_remaining
+        try:
+            order_status = self._broker.get_order_status(order_id)
+            if order_status.get("filled_avg_price", 0) > 0:
+                actual_exit_price = order_status["filled_avg_price"]
+            if order_status.get("filled_qty", 0) > 0:
+                actual_shares = order_status["filled_qty"]
+        except Exception:
+            pass
+
         # Calculate final P&L
-        close_pnl = position.shares_remaining * (exit_price - position.entry_price)
+        close_pnl = actual_shares * (actual_exit_price - position.entry_price)
         total_pnl = position.pnl_realized + close_pnl
         self._daily_pnl += total_pnl
 
@@ -255,7 +392,7 @@ class PortfolioManager:
         # Calculate R multiple
         risk_per_share = abs(position.entry_price - position.stop_price)
         rr_ratio = (
-            (exit_price - position.entry_price) / risk_per_share
+            (actual_exit_price - position.entry_price) / risk_per_share
             if risk_per_share > 0
             else 0.0
         )
@@ -272,7 +409,7 @@ class PortfolioManager:
             side=position.side.value,
             signal_type=position.signal_type.value,
             entry_price=position.entry_price,
-            exit_price=exit_price,
+            exit_price=actual_exit_price,
             shares=position.shares,
             pnl=round(total_pnl, 2),
             rr_ratio=round(rr_ratio, 2),
@@ -306,10 +443,22 @@ class PortfolioManager:
         )
         position.broker_order_ids.append(order_id)
 
+        # Check actual fill
+        actual_shares = shares
+        actual_price = price
+        try:
+            order_status = self._broker.get_order_status(order_id)
+            if order_status.get("filled_qty", 0) > 0:
+                actual_shares = order_status["filled_qty"]
+            if order_status.get("filled_avg_price", 0) > 0:
+                actual_price = order_status["filled_avg_price"]
+        except Exception:
+            pass
+
         # Track realized P&L from scale-out
-        scale_pnl = shares * (price - position.entry_price)
+        scale_pnl = actual_shares * (actual_price - position.entry_price)
         position.pnl_realized += scale_pnl
-        position.shares_remaining -= shares
+        position.shares_remaining -= actual_shares
         position.scale_outs_completed += 1
 
         if position.shares_remaining > 0:
@@ -320,7 +469,7 @@ class PortfolioManager:
         log.info(
             "portfolio.scale_out",
             symbol=position.symbol,
-            shares_sold=shares,
+            shares_sold=actual_shares,
             remaining=position.shares_remaining,
             pnl=format_currency(scale_pnl),
             reason=reason,

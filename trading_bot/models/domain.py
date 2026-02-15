@@ -16,6 +16,9 @@ class SignalType(str, Enum):
     VWAP_PULLBACK = "vwap_pullback"
     EMA_PULLBACK = "ema_pullback"
     BREAKOUT_CONTINUATION = "breakout_continuation"
+    OPENING_RANGE_BREAKOUT = "opening_range_breakout"
+    RED_TO_GREEN = "red_to_green"
+    PREMARKET_HIGH_BREAK = "premarket_high_break"
 
 
 class OrderSide(str, Enum):

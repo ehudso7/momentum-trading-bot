@@ -1,5 +1,5 @@
 """
-Alpaca broker implementation using alpaca-py SDK.
+Alpaca broker implementation using alpaca-py SDK with retry logic.
 
 Supports both paper and live trading via the same interface.
 Paper trading uses Alpaca's paper trading environment.
@@ -12,6 +12,7 @@ import structlog
 from trading_bot.config.settings import BrokerConfig
 from trading_bot.execution.broker_base import BrokerBase
 from trading_bot.models.domain import OrderSide
+from trading_bot.utils.resilience import retry_with_backoff
 
 log = structlog.get_logger(__name__)
 
@@ -35,14 +36,17 @@ class AlpacaBroker(BrokerBase):
         self._paper = config.alpaca_paper
         log.info("alpaca.connected", paper=self._paper)
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_account_equity(self) -> float:
         account = self._client.get_account()
         return float(account.equity)
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_buying_power(self) -> float:
         account = self._client.get_account()
         return float(account.buying_power)
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_positions(self) -> list[dict]:
         positions = self._client.get_all_positions()
         return [
@@ -57,6 +61,7 @@ class AlpacaBroker(BrokerBase):
             for p in positions
         ]
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_market_order(self, symbol: str, qty: int, side: OrderSide) -> str:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
@@ -78,6 +83,7 @@ class AlpacaBroker(BrokerBase):
         )
         return str(order.id)
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_limit_order(
         self, symbol: str, qty: int, side: OrderSide, limit_price: float
     ) -> str:
@@ -103,6 +109,7 @@ class AlpacaBroker(BrokerBase):
         )
         return str(order.id)
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_stop_order(self, symbol: str, qty: int, stop_price: float) -> str:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
@@ -152,6 +159,7 @@ class AlpacaBroker(BrokerBase):
             log.error("alpaca.close_all_error", error=str(e))
             return False
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_order_status(self, order_id: str) -> dict:
         try:
             order = self._client.get_order_by_id(order_id)
