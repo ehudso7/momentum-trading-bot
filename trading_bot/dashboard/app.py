@@ -85,10 +85,13 @@ def create_app(state: DashboardState) -> FastAPI:
             "run_mode": snap.run_mode,
             "circuit_breaker": snap.circuit_breaker,
             "health": snap.health,
+            "market_status": snap.market_status,
+            "market_status_detail": snap.market_status_detail,
             "open_positions_count": len(snap.open_positions),
             "total_trades_today": len(snap.journal_entries),
             "last_updated": snap.last_updated,
             "bot_running": snap.bot_running,
+            "last_error": snap.last_error,
         }
 
     @app.get("/api/positions")

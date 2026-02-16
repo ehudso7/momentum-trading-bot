@@ -9,6 +9,7 @@
     :root {
       --bg: #0f1117;
       --surface: #1a1d29;
+      --surface-2: #222536;
       --border: #2a2d3a;
       --text: #e1e4ea;
       --muted: #8b8fa3;
@@ -17,6 +18,7 @@
       --yellow: #ffc312;
       --blue: #3498ff;
       --purple: #a55eea;
+      --cyan: #00d2d3;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -35,12 +37,16 @@
       padding: 16px 24px;
       border-bottom: 1px solid var(--border);
       background: var(--surface);
+      flex-wrap: wrap;
+      gap: 8px;
     }
+    .header-left { display: flex; align-items: center; gap: 12px; }
     header h1 { font-size: 18px; font-weight: 600; }
-    .mode-badge {
+    .header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .badge {
       padding: 4px 12px;
       border-radius: 4px;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 1px;
@@ -48,6 +54,13 @@
     .mode-paper { background: var(--blue); color: #fff; }
     .mode-live { background: var(--red); color: #fff; }
     .mode-backtest { background: var(--purple); color: #fff; }
+
+    /* Market status badges */
+    .market-open { background: rgba(0,196,140,0.15); color: var(--green); border: 1px solid rgba(0,196,140,0.3); }
+    .market-premarket { background: rgba(52,152,255,0.15); color: var(--blue); border: 1px solid rgba(52,152,255,0.3); }
+    .market-closed { background: rgba(139,143,163,0.15); color: var(--muted); border: 1px solid rgba(139,143,163,0.3); }
+    .market-holiday { background: rgba(255,195,18,0.15); color: var(--yellow); border: 1px solid rgba(255,195,18,0.3); }
+    .market-unknown { background: rgba(139,143,163,0.15); color: var(--muted); border: 1px solid rgba(139,143,163,0.3); }
 
     /* Grid Layout */
     .grid {
@@ -57,6 +70,7 @@
       padding: 20px 24px;
     }
     .full-width { grid-column: 1 / -1; }
+    .span-2 { grid-column: span 2; }
 
     /* Cards */
     .card {
@@ -95,9 +109,13 @@
       margin-right: 6px;
     }
     .status-normal { background: var(--green); }
-    .status-warning { background: var(--yellow); }
+    .status-warning { background: var(--yellow); animation: pulse 2s infinite; }
     .status-cooldown { background: var(--yellow); }
-    .status-halted { background: var(--red); }
+    .status-halted { background: var(--red); animation: pulse 1s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
 
     /* Tables */
     table {
@@ -145,60 +163,115 @@
     .regime-range_bound { background: rgba(52,152,255,0.15); color: var(--blue); }
     .regime-low_volatility { background: rgba(139,143,163,0.15); color: var(--muted); }
 
+    /* Error banner */
+    .error-banner {
+      background: rgba(255,71,87,0.1);
+      border: 1px solid rgba(255,71,87,0.3);
+      border-radius: 6px;
+      padding: 10px 16px;
+      color: var(--red);
+      font-size: 13px;
+      display: none;
+    }
+    .error-banner.visible { display: block; }
+
     /* Meta bar */
     .meta-bar {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       padding: 8px 24px;
       font-size: 11px;
       color: var(--muted);
       border-top: 1px solid var(--border);
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .refresh-indicator {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      margin-right: 4px;
+      opacity: 0.6;
     }
 
     /* No data */
     .empty { color: var(--muted); font-style: italic; padding: 20px 0; text-align: center; }
+
+    /* Scrollable table wrapper */
+    .table-wrap { overflow-x: auto; }
   </style>
 </head>
 <body>
 
 <header>
-  <h1>Momentum Trading Bot</h1>
-  <div>
-    <span class="mode-badge mode-{{ snap.run_mode }}">{{ snap.run_mode }}</span>
+  <div class="header-left">
+    <h1>Momentum Trading Bot</h1>
+  </div>
+  <div class="header-right">
+    <span id="market-badge" class="badge market-{{ snap.market_status }}">
+      {% if snap.market_status == 'open' %}MARKET OPEN
+      {% elif snap.market_status == 'premarket' %}PRE-MARKET
+      {% elif snap.market_status == 'holiday' %}HOLIDAY
+      {% elif snap.market_status == 'closed' %}CLOSED
+      {% else %}LOADING
+      {% endif %}
+    </span>
+    <span class="badge mode-{{ snap.run_mode }}">{{ snap.run_mode }}</span>
     {% if snap.regime %}
-    <span class="regime-badge regime-{{ snap.regime }}">{{ snap.regime | replace("_", " ") }}</span>
+    <span id="regime-badge" class="regime-badge regime-{{ snap.regime }}">{{ snap.regime | replace("_", " ") }}</span>
+    {% else %}
+    <span id="regime-badge" class="regime-badge" style="display:none;"></span>
     {% endif %}
   </div>
 </header>
 
 <div class="grid">
+  <!-- Error Banner -->
+  <div class="full-width">
+    <div id="error-banner" class="error-banner {{ 'visible' if snap.last_error else '' }}">
+      <strong>Error:</strong> <span id="error-text">{{ snap.last_error or '' }}</span>
+    </div>
+  </div>
+
+  <!-- Market Status Detail -->
+  <div class="card full-width" id="market-detail-card" style="{{ '' if snap.market_status in ('holiday', 'closed') else 'display:none;' }}">
+    <h2>Market Status</h2>
+    <div class="sub-stat" id="market-detail" style="font-size: 15px; color: var(--yellow);">
+      {{ snap.market_status_detail }}
+    </div>
+  </div>
+
   <!-- Equity -->
   <div class="card">
     <h2>Account Equity</h2>
-    <div class="big-number">${{ "{:,.2f}".format(snap.equity) }}</div>
+    <div class="big-number" id="equity">${{ "{:,.2f}".format(snap.equity) }}</div>
     <div class="sub-stat">Start: ${{ "{:,.2f}".format(snap.starting_equity) }}</div>
   </div>
 
   <!-- Daily P&L -->
   <div class="card">
     <h2>Daily P&L</h2>
-    <div class="big-number {{ 'pos' if snap.daily_pnl >= 0 else 'neg' }}">
+    {% set pnl_class = 'pos' if snap.daily_pnl >= 0 else 'neg' %}
+    <div class="big-number {{ pnl_class }}" id="daily-pnl">
       {{ "+" if snap.daily_pnl >= 0 else "" }}${{ "{:,.2f}".format(snap.daily_pnl) }}
     </div>
     {% set pct = ((snap.equity - snap.starting_equity) / snap.starting_equity * 100) if snap.starting_equity > 0 else 0 %}
-    <div class="sub-stat {{ 'pos' if pct >= 0 else 'neg' }}">{{ "{:+.2f}".format(pct) }}%</div>
+    <div class="sub-stat {{ 'pos' if pct >= 0 else 'neg' }}" id="daily-pnl-pct">{{ "{:+.2f}".format(pct) }}%</div>
   </div>
 
   <!-- Circuit Breaker -->
   <div class="card">
     <h2>Circuit Breaker</h2>
     {% set cb_state = snap.circuit_breaker.get('state', 'unknown') %}
-    <div class="big-number">
+    <div class="big-number" id="cb-state">
       <span class="status-dot status-{{ cb_state }}"></span>
       {{ cb_state | upper }}
     </div>
-    <div class="sub-stat">
-      Drawdown: {{ snap.circuit_breaker.get('drawdown_pct', 0) }}%
+    <div class="sub-stat" id="cb-detail">
+      Drawdown: {{ "{:.1f}".format(snap.circuit_breaker.get('drawdown_pct', 0)) }}%
       &middot; Losses: {{ snap.circuit_breaker.get('consecutive_losses', 0) }}
     </div>
   </div>
@@ -206,8 +279,35 @@
   <!-- Quick Stats -->
   <div class="card">
     <h2>Today's Activity</h2>
-    <div class="big-number">{{ snap.open_positions | length }} / {{ snap.journal_entries | length }}</div>
+    <div class="big-number" id="activity">{{ snap.open_positions | length }} / {{ snap.journal_entries | length }}</div>
     <div class="sub-stat">Open positions / Completed trades</div>
+  </div>
+
+  <!-- Buying Power -->
+  <div class="card">
+    <h2>Buying Power</h2>
+    <div class="big-number" id="buying-power">${{ "{:,.0f}".format(snap.buying_power) }}</div>
+    <div class="sub-stat">Available margin</div>
+  </div>
+
+  <!-- Performance -->
+  <div class="card">
+    <h2>Performance</h2>
+    <div id="performance-content">
+    {% if snap.journal_entries %}
+    {% set winners = snap.journal_entries | selectattr('pnl') | list | selectattr('pnl', 'gt', 0) | list %}
+    {% set total = snap.journal_entries | length %}
+    {% set win_count = winners | length %}
+    {% set gross = snap.journal_entries | map(attribute='pnl') | sum %}
+    <table>
+      <tr><td>Trades</td><td>{{ total }}</td></tr>
+      <tr><td>Win Rate</td><td>{{ "{:.0f}".format(win_count / total * 100 if total > 0 else 0) }}%</td></tr>
+      <tr><td>Total P&L</td><td class="{{ 'pos' if gross >= 0 else 'neg' }}">${{ "{:,.2f}".format(gross) }}</td></tr>
+    </table>
+    {% else %}
+    <div class="empty">No trades yet</div>
+    {% endif %}
+    </div>
   </div>
 
   <!-- Equity Chart -->
@@ -220,7 +320,8 @@
 
   <!-- Open Positions -->
   <div class="card full-width">
-    <h2>Open Positions</h2>
+    <h2>Open Positions (<span id="position-count">{{ snap.open_positions | length }}</span>)</h2>
+    <div id="positions-content" class="table-wrap">
     {% if snap.open_positions %}
     <table>
       <thead>
@@ -231,6 +332,7 @@
           <th>Current</th>
           <th>Shares</th>
           <th>Stop</th>
+          <th>Trailing</th>
           <th>P&L</th>
           <th>R-Multiple</th>
         </tr>
@@ -247,7 +349,8 @@
           <td>${{ "{:.2f}".format(p.get('current_price', 0)) }}</td>
           <td>{{ p.get('shares_remaining', 0) }} / {{ p.get('shares', 0) }}</td>
           <td>${{ "{:.2f}".format(p.get('stop_price', 0)) }}</td>
-          <td class="{{ 'pos' if pnl >= 0 else 'neg' }}">{{ "{:+.2f}".format(pnl) }}</td>
+          <td>{% if p.get('trailing_stop_active') %}${{ "{:.2f}".format(p.get('trailing_stop_price', 0)) }}{% else %}&mdash;{% endif %}</td>
+          <td class="{{ 'pos' if pnl >= 0 else 'neg' }}">${{ "{:+.2f}".format(pnl) }}</td>
           <td class="{{ 'pos' if r_mult >= 0 else 'neg' }}">{{ "{:+.1f}".format(r_mult) }}R</td>
         </tr>
         {% endfor %}
@@ -256,11 +359,13 @@
     {% else %}
     <div class="empty">No open positions</div>
     {% endif %}
+    </div>
   </div>
 
   <!-- Trade History -->
   <div class="card full-width">
-    <h2>Trade History (Today)</h2>
+    <h2>Trade History (<span id="trade-count">{{ snap.journal_entries | length }}</span>)</h2>
+    <div id="trades-content" class="table-wrap">
     {% if snap.journal_entries %}
     <table>
       <thead>
@@ -284,7 +389,7 @@
           <td>${{ "{:.2f}".format(t.get('entry_price', 0)) }}</td>
           <td>${{ "{:.2f}".format(t.get('exit_price', 0)) }}</td>
           <td>{{ t.get('shares', 0) }}</td>
-          <td class="{{ 'pos' if t.get('pnl', 0) >= 0 else 'neg' }}">{{ "{:+.2f}".format(t.get('pnl', 0)) }}</td>
+          <td class="{{ 'pos' if t.get('pnl', 0) >= 0 else 'neg' }}">${{ "{:+.2f}".format(t.get('pnl', 0)) }}</td>
           <td>{{ "{:.1f}".format(t.get('rr_ratio', 0)) }}</td>
           <td>{{ "{:.0f}".format(t.get('hold_time_minutes', 0)) }}m</td>
           <td>{{ t.get('exit_reason', '') }}</td>
@@ -295,48 +400,88 @@
     {% else %}
     <div class="empty">No completed trades yet</div>
     {% endif %}
+    </div>
   </div>
 
-  <!-- Health -->
+  <!-- System Health -->
   <div class="card">
     <h2>System Health</h2>
+    <div id="health-content">
     <table>
-      <tr><td>Uptime</td><td>{{ "{:.0f}".format(snap.health.get('uptime_seconds', 0) / 60) }} min</td></tr>
-      <tr><td>Ticks</td><td>{{ snap.health.get('tick_count_today', 0) }}</td></tr>
-      <tr><td>Memory</td><td>{{ snap.health.get('memory_usage_mb', 0) }} MB</td></tr>
-      <tr><td>API Errors (5m)</td><td class="{{ 'neg' if snap.health.get('api_error_count_5min', 0) > 0 else '' }}">{{ snap.health.get('api_error_count_5min', 0) }}</td></tr>
-      <tr><td>Last Scan</td><td>{{ snap.health.get('last_scan_candidates', 0) }} candidates</td></tr>
+      <tr><td>Uptime</td><td id="h-uptime">{{ "{:.0f}".format(snap.health.get('uptime_seconds', 0) / 60) }} min</td></tr>
+      <tr><td>Ticks</td><td id="h-ticks">{{ snap.health.get('tick_count_today', 0) }}</td></tr>
+      <tr><td>Memory</td><td id="h-mem">{{ snap.health.get('memory_usage_mb', 0) }} MB</td></tr>
+      <tr>
+        <td>API Errors (5m)</td>
+        <td id="h-errors" class="{{ 'neg' if snap.health.get('api_error_count_5min', 0) > 0 else '' }}">
+          {{ snap.health.get('api_error_count_5min', 0) }}
+        </td>
+      </tr>
+      <tr><td>Total Errors</td><td id="h-errors-total">{{ snap.health.get('api_error_count_total', 0) }}</td></tr>
+      <tr><td>Last Scan</td><td id="h-scan">{{ snap.health.get('last_scan_candidates', 0) }} candidates</td></tr>
+      <tr>
+        <td>Last Trade</td>
+        <td id="h-trade">{{ snap.health.get('last_trade_symbol', 'None') }}</td>
+      </tr>
+    </table>
+    </div>
+  </div>
+
+  <!-- Scan Activity -->
+  <div class="card">
+    <h2>Scanner</h2>
+    <table>
+      <tr>
+        <td>Last Scan</td>
+        <td id="scan-time">
+          {% if snap.health.get('last_scan_at') %}
+          {{ snap.health.get('last_scan_at', '')[:19] }}
+          {% else %}
+          No scans yet
+          {% endif %}
+        </td>
+      </tr>
+      <tr><td>Candidates Found</td><td id="scan-count">{{ snap.health.get('last_scan_candidates', 0) }}</td></tr>
+      <tr><td>Open Positions</td><td id="scan-positions">{{ snap.health.get('open_positions_count', 0) }}</td></tr>
     </table>
   </div>
 
-  <!-- Trade Stats -->
+  <!-- Connection Status -->
   <div class="card">
-    <h2>Performance</h2>
-    {% if snap.journal_entries %}
-    {% set winners = snap.journal_entries | selectattr('pnl') | list | selectattr('pnl', 'gt', 0) | list %}
-    {% set total = snap.journal_entries | length %}
-    {% set win_count = winners | length %}
-    {% set gross = snap.journal_entries | map(attribute='pnl') | sum %}
+    <h2>Connection</h2>
     <table>
-      <tr><td>Trades</td><td>{{ total }}</td></tr>
-      <tr><td>Win Rate</td><td>{{ "{:.0f}".format(win_count / total * 100 if total > 0 else 0) }}%</td></tr>
-      <tr><td>Total P&L</td><td class="{{ 'pos' if gross >= 0 else 'neg' }}">${{ "{:,.2f}".format(gross) }}</td></tr>
+      <tr>
+        <td>Bot Status</td>
+        <td id="bot-status">
+          {% if snap.bot_running %}
+          <span class="status-dot status-normal"></span> Running
+          {% else %}
+          <span class="status-dot status-halted"></span> Stopped
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>CB State</td>
+        <td id="conn-cb">{{ snap.circuit_breaker.get('state', 'unknown') | upper }}</td>
+      </tr>
+      <tr>
+        <td>Dashboard</td>
+        <td id="conn-dash"><span class="status-dot status-normal"></span> Connected</td>
+      </tr>
     </table>
-    {% else %}
-    <div class="empty">No trades yet</div>
-    {% endif %}
-  </div>
-
-  <!-- Buying Power -->
-  <div class="card">
-    <h2>Buying Power</h2>
-    <div class="big-number">${{ "{:,.0f}".format(snap.buying_power) }}</div>
-    <div class="sub-stat">Available margin</div>
   </div>
 </div>
 
 <div class="meta-bar">
-  <span>Last updated: <span id="last-updated">{{ snap.last_updated or "waiting..." }}</span></span>
+  <span>
+    <span class="refresh-indicator" id="refresh-dot"></span>
+    Last updated: <span id="last-updated">{{ snap.last_updated or "waiting..." }}</span>
+    {% if snap.market_status_detail and snap.market_status in ('holiday', 'closed') %}
+    &middot; <span id="market-detail-footer">{{ snap.market_status_detail }}</span>
+    {% else %}
+    <span id="market-detail-footer"></span>
+    {% endif %}
+  </span>
   <span>Auto-refresh: 10s</span>
 </div>
 
@@ -400,7 +545,49 @@
     }
   });
 
-  // --- Auto-refresh via API ---
+  // --- Helper functions ---
+  function $(id) { return document.getElementById(id); }
+  function cls(v) { return v >= 0 ? 'pos' : 'neg'; }
+  function fmtMoney(v) {
+    const sign = v >= 0 ? '+' : '';
+    return sign + '$' + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  }
+
+  // --- Build position row HTML ---
+  function buildPositionRow(p) {
+    const pnl = (p.pnl_unrealized || 0) + (p.pnl_realized || 0);
+    const risk = (p.entry_price || 0) - (p.stop_price || 0);
+    const rMult = risk !== 0 ? ((p.current_price || 0) - (p.entry_price || 0)) / risk : 0;
+    const trailing = p.trailing_stop_active ? '$' + (p.trailing_stop_price || 0).toFixed(2) : '&mdash;';
+    return `<tr>
+      <td><strong>${p.symbol || ''}</strong></td>
+      <td>${p.signal_type || ''}</td>
+      <td>$${(p.entry_price || 0).toFixed(2)}</td>
+      <td>$${(p.current_price || 0).toFixed(2)}</td>
+      <td>${p.shares_remaining || 0} / ${p.shares || 0}</td>
+      <td>$${(p.stop_price || 0).toFixed(2)}</td>
+      <td>${trailing}</td>
+      <td class="${cls(pnl)}">$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</td>
+      <td class="${cls(rMult)}">${rMult >= 0 ? '+' : ''}${rMult.toFixed(1)}R</td>
+    </tr>`;
+  }
+
+  // --- Build trade row HTML ---
+  function buildTradeRow(t) {
+    return `<tr>
+      <td><strong>${t.symbol || ''}</strong></td>
+      <td>${t.signal_type || ''}</td>
+      <td>$${(t.entry_price || 0).toFixed(2)}</td>
+      <td>$${(t.exit_price || 0).toFixed(2)}</td>
+      <td>${t.shares || 0}</td>
+      <td class="${cls(t.pnl || 0)}">$${(t.pnl || 0) >= 0 ? '+' : ''}${(t.pnl || 0).toFixed(2)}</td>
+      <td>${(t.rr_ratio || 0).toFixed(1)}</td>
+      <td>${Math.round(t.hold_time_minutes || 0)}m</td>
+      <td>${t.exit_reason || ''}</td>
+    </tr>`;
+  }
+
+  // --- Full auto-refresh ---
   async function refresh() {
     try {
       const [statusRes, posRes, tradesRes, equityRes] = await Promise.all([
@@ -410,12 +597,152 @@
         fetch('/api/equity-history'),
       ]);
 
+      // Flash refresh indicator
+      const dot = $('refresh-dot');
+      if (dot) { dot.style.opacity = '1'; setTimeout(() => dot.style.opacity = '0.6', 500); }
+
       if (statusRes.ok) {
-        const status = await statusRes.json();
-        document.getElementById('last-updated').textContent =
-          status.last_updated ? new Date(status.last_updated).toLocaleTimeString() : 'waiting...';
+        const s = await statusRes.json();
+
+        // Last updated
+        $('last-updated').textContent = s.last_updated || 'waiting...';
+
+        // Equity
+        $('equity').textContent = '$' + (s.equity || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+        // Daily P&L
+        const pnl = s.daily_pnl || 0;
+        const pnlEl = $('daily-pnl');
+        pnlEl.textContent = fmtMoney(pnl);
+        pnlEl.className = 'big-number ' + cls(pnl);
+
+        const pct = s.daily_return_pct || 0;
+        const pctEl = $('daily-pnl-pct');
+        pctEl.textContent = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+        pctEl.className = 'sub-stat ' + cls(pct);
+
+        // Buying power
+        $('buying-power').textContent = '$' + Math.round(s.buying_power || 0).toLocaleString();
+
+        // Circuit breaker
+        const cb = s.circuit_breaker || {};
+        const cbState = cb.state || 'unknown';
+        $('cb-state').innerHTML = `<span class="status-dot status-${cbState}"></span> ${cbState.toUpperCase()}`;
+        $('cb-detail').innerHTML = `Drawdown: ${(cb.drawdown_pct || 0).toFixed(1)}% &middot; Losses: ${cb.consecutive_losses || 0}`;
+        $('conn-cb').textContent = cbState.toUpperCase();
+
+        // Activity
+        $('activity').textContent = `${s.open_positions_count || 0} / ${s.total_trades_today || 0}`;
+
+        // Market status
+        const mBadge = $('market-badge');
+        const mLabels = {open: 'MARKET OPEN', premarket: 'PRE-MARKET', closed: 'CLOSED', holiday: 'HOLIDAY'};
+        mBadge.textContent = mLabels[s.market_status] || 'LOADING';
+        mBadge.className = 'badge market-' + (s.market_status || 'unknown');
+
+        // Market detail card
+        const mDetailCard = $('market-detail-card');
+        const mDetail = $('market-detail');
+        if (s.market_status === 'holiday' || s.market_status === 'closed') {
+          mDetailCard.style.display = '';
+          mDetail.textContent = s.market_status_detail || '';
+        } else {
+          mDetailCard.style.display = 'none';
+        }
+        const mFooter = $('market-detail-footer');
+        if (mFooter) {
+          if ((s.market_status === 'holiday' || s.market_status === 'closed') && s.market_status_detail) {
+            mFooter.textContent = ' \u00b7 ' + s.market_status_detail;
+          } else {
+            mFooter.textContent = '';
+          }
+        }
+
+        // Regime badge
+        const rBadge = $('regime-badge');
+        if (s.regime) {
+          rBadge.textContent = s.regime.replace(/_/g, ' ');
+          rBadge.className = 'regime-badge regime-' + s.regime;
+          rBadge.style.display = '';
+        } else {
+          rBadge.style.display = 'none';
+        }
+
+        // Error banner
+        const errBanner = $('error-banner');
+        if (s.last_error) {
+          $('error-text').textContent = s.last_error;
+          errBanner.classList.add('visible');
+        } else {
+          errBanner.classList.remove('visible');
+        }
+
+        // Health
+        const h = s.health || {};
+        $('h-uptime').textContent = Math.round((h.uptime_seconds || 0) / 60) + ' min';
+        $('h-ticks').textContent = h.tick_count_today || 0;
+        $('h-mem').textContent = (h.memory_usage_mb || 0) + ' MB';
+        const errCount = h.api_error_count_5min || 0;
+        $('h-errors').textContent = errCount;
+        $('h-errors').className = errCount > 0 ? 'neg' : '';
+        $('h-errors-total').textContent = h.api_error_count_total || 0;
+        $('h-scan').textContent = (h.last_scan_candidates || 0) + ' candidates';
+        $('h-trade').textContent = h.last_trade_symbol || 'None';
+        $('scan-count').textContent = h.last_scan_candidates || 0;
+        $('scan-positions').textContent = h.open_positions_count || 0;
+        if (h.last_scan_at) {
+          $('scan-time').textContent = h.last_scan_at.substring(0, 19);
+        }
+
+        // Bot status
+        $('bot-status').innerHTML = s.bot_running
+          ? '<span class="status-dot status-normal"></span> Running'
+          : '<span class="status-dot status-halted"></span> Stopped';
       }
 
+      // Positions table
+      if (posRes.ok) {
+        const positions = await posRes.json();
+        $('position-count').textContent = positions.length;
+        if (positions.length > 0) {
+          const header = `<table><thead><tr>
+            <th>Symbol</th><th>Setup</th><th>Entry</th><th>Current</th>
+            <th>Shares</th><th>Stop</th><th>Trailing</th><th>P&L</th><th>R-Multiple</th>
+          </tr></thead><tbody>${positions.map(buildPositionRow).join('')}</tbody></table>`;
+          $('positions-content').innerHTML = header;
+        } else {
+          $('positions-content').innerHTML = '<div class="empty">No open positions</div>';
+        }
+      }
+
+      // Trades table
+      if (tradesRes.ok) {
+        const trades = await tradesRes.json();
+        $('trade-count').textContent = trades.length;
+        if (trades.length > 0) {
+          const reversed = [...trades].reverse();
+          const header = `<table><thead><tr>
+            <th>Symbol</th><th>Setup</th><th>Entry</th><th>Exit</th>
+            <th>Shares</th><th>P&L</th><th>R:R</th><th>Hold Time</th><th>Exit Reason</th>
+          </tr></thead><tbody>${reversed.map(buildTradeRow).join('')}</tbody></table>`;
+          $('trades-content').innerHTML = header;
+
+          // Update performance card
+          const totalTrades = trades.length;
+          const winners = trades.filter(t => (t.pnl || 0) > 0).length;
+          const grossPnl = trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+          $('performance-content').innerHTML = `<table>
+            <tr><td>Trades</td><td>${totalTrades}</td></tr>
+            <tr><td>Win Rate</td><td>${totalTrades > 0 ? Math.round(winners / totalTrades * 100) : 0}%</td></tr>
+            <tr><td>Total P&L</td><td class="${cls(grossPnl)}">$${grossPnl.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td></tr>
+          </table>`;
+        } else {
+          $('trades-content').innerHTML = '<div class="empty">No completed trades yet</div>';
+          $('performance-content').innerHTML = '<div class="empty">No trades yet</div>';
+        }
+      }
+
+      // Equity chart
       if (equityRes.ok) {
         const eqData = await equityRes.json();
         chart.data.labels = eqData.map(d => {
@@ -426,7 +753,8 @@
         chart.update('none');
       }
     } catch (e) {
-      // Silent fail on refresh errors
+      // Show connection error
+      $('conn-dash').innerHTML = '<span class="status-dot status-halted"></span> Disconnected';
     }
   }
 

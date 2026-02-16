@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+import pytz
+
+ET = pytz.timezone("US/Eastern")
+
 
 @dataclass
 class DashboardSnapshot:
@@ -40,6 +44,10 @@ class DashboardSnapshot:
     # Market regime
     regime: str | None = None
 
+    # Market status
+    market_status: str = "unknown"  # open, closed, premarket, holiday
+    market_status_detail: str = ""  # e.g. "Presidents' Day" or "Next open: Tue 9:30 AM"
+
     # Equity history (list of {timestamp, equity} for charting)
     equity_history: list[dict[str, Any]] = field(default_factory=list)
 
@@ -47,6 +55,7 @@ class DashboardSnapshot:
     run_mode: str = "paper"
     last_updated: str | None = None
     bot_running: bool = False
+    last_error: str | None = None
 
 
 class DashboardState:
@@ -69,14 +78,21 @@ class DashboardState:
         health: dict[str, Any],
         regime: str | None,
         run_mode: str,
+        market_status: str = "unknown",
+        market_status_detail: str = "",
+        last_error: str | None = None,
     ) -> None:
         """Called by the bot on each tick to push latest state."""
-        now = datetime.utcnow().isoformat()
+        now_eastern = datetime.now(ET)
+        now_str = now_eastern.strftime("%I:%M:%S %p ET")
 
         with self._lock:
             # Append to equity history (keep last 500 points)
             self._equity_history.append(
-                {"timestamp": now, "equity": round(equity, 2)}
+                {
+                    "timestamp": now_eastern.isoformat(),
+                    "equity": round(equity, 2),
+                }
             )
             if len(self._equity_history) > 500:
                 self._equity_history = self._equity_history[-500:]
@@ -91,10 +107,13 @@ class DashboardState:
                 circuit_breaker=circuit_breaker,
                 health=health,
                 regime=regime,
+                market_status=market_status,
+                market_status_detail=market_status_detail,
                 equity_history=list(self._equity_history),
                 run_mode=run_mode,
-                last_updated=now,
+                last_updated=now_str,
                 bot_running=True,
+                last_error=last_error,
             )
 
     def get_snapshot(self) -> DashboardSnapshot:

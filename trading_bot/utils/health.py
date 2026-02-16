@@ -108,6 +108,7 @@ class HealthMonitor:
         now = datetime.utcnow()
         self._total_api_errors += 1
         self._recent_errors.append(now)
+        self._prune_old_errors()
         log.warning(
             "health.error_recorded",
             source=source,
