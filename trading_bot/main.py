@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
+import threading
 import time
 
 import structlog
@@ -80,6 +81,7 @@ class TradingBot:
     def __init__(self, config: AppConfig, dashboard_state: DashboardState | None = None):
         self._config = config
         self._running = False
+        self._shutdown_event = threading.Event()
         self._starting_equity: float = config.starting_capital
         self._current_regime: str | None = None
         self._daily_plan_generated = False
@@ -205,9 +207,20 @@ class TradingBot:
             )
 
         self._running = True
+        self._shutdown_event.clear()
         self._daily_plan_generated = False
         self._premarket_watchlist = []
         tick_count = 0
+
+        # Register signal handlers for graceful shutdown (Docker SIGTERM)
+        def _signal_handler(signum: int, _frame: object) -> None:
+            sig_name = signal.Signals(signum).name
+            log.info("bot.shutdown_signal", signal=sig_name)
+            self._running = False
+            self._shutdown_event.set()
+
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
 
         # Push initial state to dashboard before first tick
         self._update_dashboard()
@@ -226,7 +239,12 @@ class TradingBot:
                 if tick_count % 10 == 0:
                     self._log_status()
 
-                time.sleep(self._config.scanner.scan_interval_seconds)
+                # Signal-aware sleep: wakes immediately on SIGTERM/SIGINT
+                if self._shutdown_event.wait(
+                    timeout=self._config.scanner.scan_interval_seconds
+                ):
+                    log.info("bot.shutdown_event_received")
+                    break
 
             except KeyboardInterrupt:
                 log.info("bot.keyboard_interrupt")
@@ -263,7 +281,9 @@ class TradingBot:
                         reasons=cb_rec.reasons,
                     )
                     break
-                time.sleep(30)  # Back off on errors
+                # Signal-aware backoff: wake immediately on shutdown
+                if self._shutdown_event.wait(timeout=30):
+                    break
 
         # Push final state to dashboard before shutdown
         self._update_dashboard()
@@ -751,6 +771,7 @@ class TradingBot:
     def stop(self) -> None:
         """Signal the bot to stop gracefully."""
         self._running = False
+        self._shutdown_event.set()
 
 
 def main() -> None:

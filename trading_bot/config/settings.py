@@ -107,11 +107,15 @@ class ExitConfig(BaseModel):
             raise ValueError(
                 f"scale_out_ratios must sum to ~1.0, got {total:.3f}"
             )
+        if any(r <= 0 for r in self.scale_out_ratios):
+            raise ValueError("All scale_out_ratios must be positive")
         if len(self.scale_out_ratios) != len(self.scale_out_rr_targets) + 1:
             raise ValueError(
                 "scale_out_ratios must have exactly one more element than "
                 "scale_out_rr_targets (last portion is trailed)"
             )
+        if self.scale_out_rr_targets != sorted(self.scale_out_rr_targets):
+            raise ValueError("scale_out_rr_targets must be in ascending order")
         return self
 
 
@@ -212,10 +216,41 @@ class AppConfig(BaseSettings):
         return cls(**yaml_data)
 
     @model_validator(mode="after")
-    def validate_live_mode(self) -> "AppConfig":
+    def validate_safety(self) -> "AppConfig":
+        """Cross-field safety validation (NON-NEGOTIABLE)."""
+        # Live mode requires explicit paper=false
         if self.run_mode == RunMode.LIVE and self.broker.alpaca_paper:
             raise ValueError(
                 "Live mode requires broker.alpaca_paper=false. "
                 "This is a safety check to prevent accidental live trading."
             )
+
+        # Live mode requires real API keys (not empty or placeholder)
+        if self.run_mode == RunMode.LIVE:
+            key = self.broker.alpaca_api_key.get_secret_value()
+            if not key or key in ("", "your_alpaca_api_key_here"):
+                raise ValueError(
+                    "Live mode requires a valid Alpaca API key, "
+                    "not a placeholder."
+                )
+
+        # Max total exposure check: per-trade risk * max positions shouldn't
+        # exceed daily risk limit on a single bad tick
+        max_exposure = (
+            self.risk.risk_per_trade_pct * self.risk.max_open_positions
+        )
+        if max_exposure > self.risk.hard_daily_loss_limit_pct * 2:
+            raise ValueError(
+                f"Total risk exposure ({max_exposure:.1f}%) too high for "
+                f"daily loss limit ({self.risk.hard_daily_loss_limit_pct}%). "
+                f"Reduce risk_per_trade_pct or max_open_positions."
+            )
+
+        # Scanner price range must be valid
+        if self.scanner.min_price >= self.scanner.max_price:
+            raise ValueError(
+                f"scanner.min_price ({self.scanner.min_price}) must be less "
+                f"than scanner.max_price ({self.scanner.max_price})"
+            )
+
         return self

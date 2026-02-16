@@ -1,0 +1,41 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+dist
+build
+.venv
+venv
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Testing
+tests/
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Data (mounted as volume in production)
+data/
+*.csv
+
+# Documentation
+*.md
+LICENSE
+docs/
