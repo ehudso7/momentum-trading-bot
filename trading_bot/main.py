@@ -232,12 +232,14 @@ class TradingBot:
                 log.error("bot.tick_error", error=str(e), exc_info=True)
                 self._circuit.record_api_error()
                 self._health.record_error("tick")
+                self._update_dashboard()
                 self._notify.notify_error(
                     error_type="tick_error",
                     message=f"Error during tick: {e}",
                 )
                 if not self._circuit.is_trading_allowed:
                     log.critical("bot.circuit_breaker_halted")
+                    self._update_dashboard()
                     self._notify.notify_circuit_breaker(
                         state="halted",
                         reason="API errors exceeded threshold",
@@ -257,6 +259,9 @@ class TradingBot:
                     )
                     break
                 time.sleep(30)  # Back off on errors
+
+        # Push final state to dashboard before shutdown
+        self._update_dashboard()
 
         # Shutdown: close all positions
         entries = self._portfolio.close_all("shutdown")
