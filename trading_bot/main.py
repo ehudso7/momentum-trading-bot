@@ -206,6 +206,9 @@ class TradingBot:
         self._premarket_watchlist = []
         tick_count = 0
 
+        # Push initial state to dashboard before first tick
+        self._update_dashboard()
+
         while self._running:
             try:
                 self._tick()
