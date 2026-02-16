@@ -38,11 +38,13 @@ class MomentumGapperScanner:
         news_client: NewsClient,
         polygon_client,
         config: ScannerConfig,
+        fallback_client=None,
     ):
         self._data = market_data
         self._news = news_client
         self._polygon = polygon_client
         self._config = config
+        self._fallback = fallback_client
 
     def scan(self) -> list[ScanResult]:
         """
@@ -51,8 +53,8 @@ class MomentumGapperScanner:
         Each step is a filter that reduces the candidate pool.
         Logged at each stage for debugging.
         """
-        # Step 1: Fetch gainers from Polygon
-        raw_gainers = self._polygon.get_gainers()
+        # Step 1: Fetch gainers (Polygon primary, Alpaca fallback)
+        raw_gainers = self._fetch_gainers()
         log.info("scanner.raw_gainers", count=len(raw_gainers))
 
         if not raw_gainers:
@@ -110,6 +112,31 @@ class MomentumGapperScanner:
         )
 
         return results
+
+    def _fetch_gainers(self) -> list[dict]:
+        """
+        Fetch top gainers, trying Polygon first then falling back to Alpaca.
+
+        If Polygon fails (e.g. auth error on free plan), the Alpaca screener
+        is used automatically. If both fail, returns an empty list.
+        """
+        # Try Polygon first
+        try:
+            gainers = self._polygon.get_gainers()
+            if gainers:
+                return gainers
+        except Exception as e:
+            log.warning("scanner.polygon_failed", error=str(e)[:200])
+
+        # Fall back to Alpaca screener
+        if self._fallback is not None:
+            try:
+                log.info("scanner.using_alpaca_fallback")
+                return self._fallback.get_gainers()
+            except Exception as e:
+                log.error("scanner.alpaca_fallback_failed", error=str(e)[:200])
+
+        return []
 
     def _filter_price(self, snapshots: list[dict]) -> list[dict]:
         """Filter by price range [min_price, max_price]."""
