@@ -25,7 +25,7 @@ ENV/
 *.env.local
 
 # Data & logs
-data/
+/data/
 *.csv
 *.log
 
