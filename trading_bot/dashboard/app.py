@@ -46,12 +46,19 @@ def create_app(state: DashboardState) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> HTMLResponse:
         """Main dashboard page."""
-        snap = state.get_snapshot()
-        return templates.TemplateResponse(
-            request,
-            "index.html",
-            context={"snap": snap},
-        )
+        try:
+            snap = state.get_snapshot()
+            return templates.TemplateResponse(
+                request,
+                "index.html",
+                context={"snap": snap},
+            )
+        except Exception as e:
+            log.error("dashboard.render_error", error=str(e), exc_info=True)
+            return HTMLResponse(
+                content=f"<pre>Dashboard error: {e}</pre>",
+                status_code=500,
+            )
 
     # ------------------------------------------------------------------
     # JSON API routes
