@@ -41,9 +41,12 @@ from trading_bot.strategies.regime import RegimeDetector
 from trading_bot.utils.health import HealthMonitor
 from trading_bot.utils.helpers import (
     format_currency,
+    is_market_holiday,
     is_market_open,
     is_near_close,
     is_premarket,
+    now_et,
+    time_until_market_open,
 )
 from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager
@@ -232,14 +235,16 @@ class TradingBot:
                 log.error("bot.tick_error", error=str(e), exc_info=True)
                 self._circuit.record_api_error()
                 self._health.record_error("tick")
-                self._update_dashboard()
+                self._update_dashboard(last_error=str(e))
                 self._notify.notify_error(
                     error_type="tick_error",
                     message=f"Error during tick: {e}",
                 )
                 if not self._circuit.is_trading_allowed:
                     log.critical("bot.circuit_breaker_halted")
-                    self._update_dashboard()
+                    self._update_dashboard(
+                        last_error="Circuit breaker HALTED: API errors exceeded threshold"
+                    )
                     self._notify.notify_circuit_breaker(
                         state="halted",
                         reason="API errors exceeded threshold",
@@ -647,7 +652,51 @@ class TradingBot:
                 details=health_status,
             )
 
-    def _update_dashboard(self) -> None:
+    def _get_market_status(self) -> tuple[str, str]:
+        """Compute current market status and detail string."""
+        from datetime import timedelta as _td
+
+        from trading_bot.utils.helpers import (
+            MARKET_OPEN,
+            _nyse_holidays,
+        )
+
+        now = now_et()
+        today = now.date()
+
+        if is_market_open():
+            return "open", "Market is open"
+        elif is_premarket():
+            return "premarket", "Pre-market session"
+        else:
+            # Determine why we're closed
+            is_holiday = is_market_holiday(today)
+            if is_holiday and today.weekday() < 5:
+                label = "Market holiday"
+            elif today.weekday() >= 5:
+                label = "Weekend"
+            else:
+                label = "Market closed"
+
+            # Find next trading day
+            next_day = today + _td(days=1)
+            while next_day.weekday() >= 5 or next_day in _nyse_holidays(next_day.year):
+                next_day += _td(days=1)
+            next_open_dt = now.replace(
+                year=next_day.year,
+                month=next_day.month,
+                day=next_day.day,
+                hour=MARKET_OPEN.hour,
+                minute=MARKET_OPEN.minute,
+                second=0,
+                microsecond=0,
+            )
+            label += f" \u2022 Next open: {next_open_dt.strftime('%a %b %d, %I:%M %p ET')}"
+
+            status = "holiday" if (is_holiday and today.weekday() < 5) else "closed"
+            return status, label
+
+    def _update_dashboard(self, last_error: str | None = None) -> None:
         """Push current state to the dashboard (if enabled)."""
         if self._dashboard_state is None:
             return
@@ -681,6 +730,8 @@ class TradingBot:
 
         journal_dicts = [e.to_dict() for e in self._portfolio.get_daily_journal_entries()]
 
+        market_status, market_status_detail = self._get_market_status()
+
         self._dashboard_state.update(
             equity=equity,
             starting_equity=self._starting_equity,
@@ -692,6 +743,9 @@ class TradingBot:
             health=self._health.get_health_status(),
             regime=self._current_regime,
             run_mode=self._config.run_mode.value,
+            market_status=market_status,
+            market_status_detail=market_status_detail,
+            last_error=last_error,
         )
 
     def stop(self) -> None:
