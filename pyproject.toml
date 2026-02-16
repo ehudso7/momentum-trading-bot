@@ -63,6 +63,10 @@ trading-bot = "trading_bot.main:main"
 [tool.setuptools.packages.find]
 include = ["trading_bot*"]
 
+[tool.setuptools.package-data]
+"trading_bot.dashboard" = ["templates/*.html"]
+"trading_bot.config" = ["*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
