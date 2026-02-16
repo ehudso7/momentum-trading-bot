@@ -26,6 +26,7 @@ from trading_bot.config.settings import AppConfig, RunMode
 from trading_bot.dashboard.state import DashboardState
 from trading_bot.data.market_data import BacktestMarketData, LiveMarketData
 from trading_bot.data.news_client import NewsClient
+from trading_bot.data.alpaca_screener import AlpacaScreener
 from trading_bot.data.polygon_client import PolygonClient
 from trading_bot.execution.alpaca_broker import AlpacaBroker
 from trading_bot.execution.paper_broker import PaperBroker
@@ -106,8 +107,17 @@ class TradingBot:
                     self._broker = PaperBroker(initial_equity=config.starting_capital)
 
         self._news = NewsClient(polygon, config.scanner)
+        alpaca_screener = (
+            AlpacaScreener(config.broker)
+            if config.run_mode != RunMode.BACKTEST
+            else None
+        )
         self._scanner = MomentumGapperScanner(
-            self._market_data, self._news, polygon or PolygonClient(config.data), config.scanner
+            self._market_data,
+            self._news,
+            polygon or PolygonClient(config.data),
+            config.scanner,
+            fallback_client=alpaca_screener,
         )
         self._strategy = PullbackVWAPStrategy(config)
         self._sizer = PositionSizer(config.risk)
