@@ -1,18 +1,21 @@
 """
 FastAPI dashboard application.
 
-Serves both the HTML dashboard and JSON API endpoints.
+Serves the HTML dashboard, JSON API endpoints, and health probe endpoints.
 Designed to run in a background thread alongside the trading bot.
 """
 
 from __future__ import annotations
 
+import os
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
@@ -21,6 +24,7 @@ from trading_bot.dashboard.state import DashboardState
 log = structlog.get_logger(__name__)
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
+_START_TIME = datetime.now(timezone.utc)
 
 _dashboard_state: DashboardState | None = None
 
@@ -37,7 +41,71 @@ def create_app(state: DashboardState) -> FastAPI:
         redoc_url=None,
     )
 
+    # --- CORS middleware ---
+    allowed_origins = os.getenv(
+        "DASHBOARD_CORS_ORIGINS", "http://localhost:3000,http://localhost:8080"
+    ).split(",")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+        max_age=600,
+    )
+
+    # --- Global error handler ---
+    @app.exception_handler(Exception)
+    async def global_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        log.error("dashboard.unhandled_error", path=str(request.url.path), error=str(exc))
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
+        )
+
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+
+    # ------------------------------------------------------------------
+    # Health probe endpoints (for Docker/Railway/K8s)
+    # ------------------------------------------------------------------
+
+    @app.get("/healthz")
+    async def liveness() -> dict[str, Any]:
+        """Liveness probe: is the process alive?
+
+        Keep simple — no external dependency checks.
+        Used by Docker HEALTHCHECK and orchestrator liveness probes.
+        """
+        return {
+            "status": "alive",
+            "uptime_seconds": round(
+                (datetime.now(timezone.utc) - _START_TIME).total_seconds(), 1
+            ),
+        }
+
+    @app.get("/readyz")
+    async def readiness() -> JSONResponse:
+        """Readiness probe: is the bot ready to operate?
+
+        Checks that the bot has started and is pushing state updates.
+        Returns 503 if not ready.
+        """
+        snap = state.get_snapshot()
+        checks = {
+            "bot_running": snap.bot_running,
+            "has_updated": snap.last_updated is not None,
+            "circuit_breaker_ok": snap.circuit_breaker.get("state") != "halted",
+        }
+        ready = all(checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "not_ready",
+                "checks": checks,
+                "last_updated": snap.last_updated,
+                "market_status": snap.market_status,
+            },
+        )
 
     # ------------------------------------------------------------------
     # HTML routes

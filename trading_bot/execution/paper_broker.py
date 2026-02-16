@@ -123,6 +123,11 @@ class PaperBroker(BrokerBase):
 
     def submit_market_order(self, symbol: str, qty: int, side: OrderSide) -> str:
         """Simulate immediate fill with realistic slippage model."""
+        if qty <= 0:
+            raise ValueError(f"Order qty must be positive, got {qty}")
+        if not symbol or not symbol.isalpha():
+            raise ValueError(f"Invalid symbol: {symbol!r}")
+
         order_id = str(uuid.uuid4())[:8]
         base_price = self._last_prices.get(symbol, 10.0)
 

@@ -39,12 +39,12 @@ class AlpacaBroker(BrokerBase):
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_account_equity(self) -> float:
         account = self._client.get_account()
-        return float(account.equity)
+        return float(account.equity or 0)
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_buying_power(self) -> float:
         account = self._client.get_account()
-        return float(account.buying_power)
+        return float(account.buying_power or 0)
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_positions(self) -> list[dict]:
