@@ -3,17 +3,23 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install dependencies first (cache layer)
-# Create a minimal stub package so pip can resolve the project's deps
+# Parse dependencies from pyproject.toml and install them separately
 COPY pyproject.toml ./
-RUN mkdir -p trading_bot && \
-    echo '"""Momentum Trading Bot."""' > trading_bot/__init__.py && \
-    pip install --no-cache-dir . && \
-    rm -rf trading_bot
+RUN pip install --no-cache-dir tomli 2>/dev/null; \
+    python -c "
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open('pyproject.toml', 'rb') as f:
+    deps = tomllib.load(f)['project']['dependencies']
+print('\n'.join(deps))
+" > /tmp/requirements.txt && \
+    pip install --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
 
-# Copy actual source
+# Copy source and install the package (deps already cached)
 COPY trading_bot/ trading_bot/
-
-# Reinstall with real source (deps already cached, this is fast)
 RUN pip install --no-cache-dir --no-deps .
 
 # Create data directory for journal
