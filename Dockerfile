@@ -3,18 +3,9 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install dependencies first (cache layer)
-# Parse dependencies from pyproject.toml and install them separately
+# Python 3.11+ has tomllib built-in — extract deps and install separately
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir tomli 2>/dev/null; \
-    python -c "
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
-with open('pyproject.toml', 'rb') as f:
-    deps = tomllib.load(f)['project']['dependencies']
-print('\n'.join(deps))
-" > /tmp/requirements.txt && \
+RUN python -c "import tomllib; deps=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print('\n'.join(deps))" > /tmp/requirements.txt && \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
 
