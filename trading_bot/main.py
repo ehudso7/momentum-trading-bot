@@ -29,6 +29,7 @@ from trading_bot.data.market_data import BacktestMarketData, LiveMarketData
 from trading_bot.data.news_client import NewsClient
 from trading_bot.data.alpaca_screener import AlpacaScreener
 from trading_bot.data.polygon_client import PolygonClient
+from trading_bot.data.yahoo_screener import YahooScreener
 from trading_bot.execution.alpaca_broker import AlpacaBroker
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.portfolio.manager import PortfolioManager
@@ -117,12 +118,18 @@ class TradingBot:
             if config.run_mode != RunMode.BACKTEST
             else None
         )
+        yahoo_screener = (
+            YahooScreener()
+            if config.run_mode != RunMode.BACKTEST
+            else None
+        )
         self._scanner = MomentumGapperScanner(
             self._market_data,
             self._news,
             polygon or PolygonClient(config.data),
             config.scanner,
             fallback_client=alpaca_screener,
+            yahoo_client=yahoo_screener,
         )
         self._strategy = PullbackVWAPStrategy(config)
         self._sizer = PositionSizer(config.risk)

@@ -39,12 +39,14 @@ class MomentumGapperScanner:
         polygon_client,
         config: ScannerConfig,
         fallback_client=None,
+        yahoo_client=None,
     ):
         self._data = market_data
         self._news = news_client
         self._polygon = polygon_client
         self._config = config
         self._fallback = fallback_client
+        self._yahoo = yahoo_client
 
     def scan(self) -> list[ScanResult]:
         """
@@ -62,19 +64,37 @@ class MomentumGapperScanner:
 
         # Step 2: Price filter
         candidates = self._filter_price(raw_gainers)
-        log.debug("scanner.after_price_filter", count=len(candidates))
+        log.info(
+            "scanner.after_price_filter",
+            count=len(candidates),
+            dropped=len(raw_gainers) - len(candidates),
+        )
 
         # Step 3: Gap filter
         candidates = self._filter_gap(candidates)
-        log.debug("scanner.after_gap_filter", count=len(candidates))
+        log.info(
+            "scanner.after_gap_filter",
+            count=len(candidates),
+            dropped=len(raw_gainers) - len(candidates),
+        )
 
         # Step 4: Float filter
+        before_float = len(candidates)
         candidates = self._filter_float(candidates)
-        log.debug("scanner.after_float_filter", count=len(candidates))
+        log.info(
+            "scanner.after_float_filter",
+            count=len(candidates),
+            dropped=before_float - len(candidates),
+        )
 
         # Step 5: Relative volume filter
+        before_vol = len(candidates)
         candidates = self._filter_volume(candidates)
-        log.debug("scanner.after_volume_filter", count=len(candidates))
+        log.info(
+            "scanner.after_volume_filter",
+            count=len(candidates),
+            dropped=before_vol - len(candidates),
+        )
 
         # Step 6: Build ScanResults with catalyst check and scoring
         results = []
@@ -115,28 +135,72 @@ class MomentumGapperScanner:
 
     def _fetch_gainers(self) -> list[dict]:
         """
-        Fetch top gainers, trying Polygon first then falling back to Alpaca.
+        Fetch top gainers from multiple sources with cascading fallbacks.
 
-        If Polygon fails (e.g. auth error on free plan), the Alpaca screener
-        is used automatically. If both fail, returns an empty list.
+        Priority: Polygon → Alpaca movers → Yahoo Finance → Alpaca most-active.
+        Combines results and deduplicates by symbol.
         """
-        # Try Polygon first
+        gainers: list[dict] = []
+
+        # Source 1: Polygon snapshot (requires paid plan)
         try:
-            gainers = self._polygon.get_gainers()
-            if gainers:
-                return gainers
+            polygon_gainers = self._polygon.get_gainers()
+            if polygon_gainers:
+                log.info("scanner.source_polygon", count=len(polygon_gainers))
+                gainers.extend(polygon_gainers)
         except Exception as e:
-            log.warning("scanner.polygon_failed", error=str(e)[:200])
+            log.info("scanner.polygon_failed", error=str(e)[:120])
 
-        # Fall back to Alpaca screener
-        if self._fallback is not None:
+        # Source 2: Alpaca movers (free with Alpaca keys)
+        if self._fallback is not None and not gainers:
             try:
-                log.info("scanner.using_alpaca_fallback")
-                return self._fallback.get_gainers()
+                log.info("scanner.trying_alpaca_movers")
+                alpaca_gainers = self._fallback.get_gainers()
+                if alpaca_gainers:
+                    log.info("scanner.source_alpaca_movers", count=len(alpaca_gainers))
+                    gainers.extend(alpaca_gainers)
             except Exception as e:
-                log.error("scanner.alpaca_fallback_failed", error=str(e)[:200])
+                log.warning("scanner.alpaca_movers_failed", error=str(e)[:120])
 
-        return []
+        # Source 3: Yahoo Finance day gainers (no API key needed)
+        if self._yahoo is not None and not gainers:
+            try:
+                log.info("scanner.trying_yahoo")
+                yahoo_gainers = self._yahoo.get_gainers()
+                if yahoo_gainers:
+                    log.info("scanner.source_yahoo", count=len(yahoo_gainers))
+                    gainers.extend(yahoo_gainers)
+            except Exception as e:
+                log.warning("scanner.yahoo_failed", error=str(e)[:120])
+
+        # Source 4: Alpaca most-active (catches high-volume movers)
+        if self._fallback is not None and not gainers:
+            try:
+                log.info("scanner.trying_alpaca_most_active")
+                if hasattr(self._fallback, "get_most_active"):
+                    active_gainers = self._fallback.get_most_active()
+                    if active_gainers:
+                        log.info(
+                            "scanner.source_alpaca_active",
+                            count=len(active_gainers),
+                        )
+                        gainers.extend(active_gainers)
+            except Exception as e:
+                log.warning("scanner.alpaca_active_failed", error=str(e)[:120])
+
+        # Deduplicate by symbol (keep first occurrence)
+        seen = set()
+        unique = []
+        for g in gainers:
+            sym = g.get("symbol", "")
+            if sym and sym not in seen:
+                seen.add(sym)
+                unique.append(g)
+
+        if not unique:
+            log.warning("scanner.all_sources_empty")
+
+        return unique
 
     def _filter_price(self, snapshots: list[dict]) -> list[dict]:
         """Filter by price range [min_price, max_price]."""
@@ -172,17 +236,18 @@ class MomentumGapperScanner:
             if float_shares is None:
                 # Keep but will score lower
                 results.append(s)
-                log.debug(
+                log.info(
                     "scanner.float_unknown",
                     symbol=s["symbol"],
                 )
             elif float_shares <= self._config.max_float_shares:
                 results.append(s)
             else:
-                log.debug(
+                log.info(
                     "scanner.float_too_high",
                     symbol=s["symbol"],
                     float_shares=float_shares,
+                    max_allowed=self._config.max_float_shares,
                 )
 
         return results
@@ -194,8 +259,17 @@ class MomentumGapperScanner:
             avg_vol = self._data.get_avg_volume(s["symbol"])
             current_vol = s.get("volume", 0)
 
-            if avg_vol > 0:
+            if current_vol > 0 and avg_vol > 0:
                 rvol = current_vol / avg_vol
+            elif current_vol == 0 and avg_vol > 0:
+                # Volume data missing from screener — keep candidate
+                # with benefit-of-doubt rvol (will score lower)
+                rvol = self._config.min_relative_volume
+                log.info(
+                    "scanner.volume_unknown_keeping",
+                    symbol=s["symbol"],
+                    avg_vol=int(avg_vol),
+                )
             else:
                 rvol = 0.0
 
@@ -204,10 +278,12 @@ class MomentumGapperScanner:
             if rvol >= self._config.min_relative_volume:
                 results.append(s)
             else:
-                log.debug(
+                log.info(
                     "scanner.low_rvol",
                     symbol=s["symbol"],
                     rvol=round(rvol, 2),
+                    current_vol=current_vol,
+                    avg_vol=int(avg_vol),
                 )
 
         return results
