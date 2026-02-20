@@ -88,6 +88,41 @@ class PullbackVWAPStrategy(Strategy):
         self._exit_cfg = config.exit
         self._risk_cfg = config.risk
 
+        # Regime-adaptive parameters (updated each tick by main loop)
+        self._current_regime: str = "low_volatility"
+        self._proximity_multiplier: float = 1.0
+
+    def set_regime(self, regime: str, adjustments: dict) -> None:
+        """
+        Update regime for adaptive entry parameters.
+
+        Called each tick by the main loop after regime detection.
+        Adjusts entry proximity thresholds to match market conditions:
+        - Low vol / range-bound: widen zones (more setups qualify)
+        - High vol: tighten zones (higher conviction required)
+        - Trending bullish: normal zones (go with the flow)
+        - Trending bearish: tighten significantly (be very selective)
+        """
+        self._current_regime = regime
+
+        # Map regime to proximity multiplier
+        # Higher = wider entry zone = more trades
+        # Lower = tighter entry zone = fewer but higher conviction
+        _PROXIMITY_MAP = {
+            "trending_bullish": 1.2,   # Bullish trend = slightly wider
+            "trending_bearish": 0.7,   # Bearish = very selective
+            "range_bound": 1.5,        # Range = widen to catch pullbacks
+            "high_volatility": 0.8,    # High vol = tighter, more conviction
+            "low_volatility": 1.8,     # Low vol = widen significantly
+        }
+        self._proximity_multiplier = _PROXIMITY_MAP.get(regime, 1.0)
+
+        log.info(
+            "strategy.regime_updated",
+            regime=regime,
+            proximity_multiplier=self._proximity_multiplier,
+        )
+
     def evaluate(
         self, candidate: ScanResult, bars: pd.DataFrame
     ) -> Optional[TradeSignal]:
@@ -334,14 +369,17 @@ class PullbackVWAPStrategy(Strategy):
         atr: float,
         rsi: float,
     ) -> Optional[TradeSignal]:
-        """Check for VWAP pullback entry."""
+        """Check for VWAP pullback entry with regime-adaptive proximity."""
         if pd.isna(vwap) or vwap <= 0:
             return None
 
         proximity_pct = abs(price - vwap) / vwap * 100
 
-        # Price must be near VWAP (within proximity threshold)
-        if proximity_pct > self._entry_cfg.vwap_proximity_pct:
+        # Regime-adaptive proximity threshold
+        adaptive_proximity = self._entry_cfg.vwap_proximity_pct * self._proximity_multiplier
+
+        # Price must be near VWAP (within adaptive proximity threshold)
+        if proximity_pct > adaptive_proximity:
             return None
 
         # Price must be reclaiming (current close > open = bullish bar)
@@ -353,7 +391,7 @@ class PullbackVWAPStrategy(Strategy):
         if price < vwap:
             return None
 
-        # Volume confirmation: current bar volume > multiplier * recent avg
+        # Volume confirmation: check last 3 bars, not just current
         if not self._volume_confirms(df):
             return None
 
@@ -378,14 +416,17 @@ class PullbackVWAPStrategy(Strategy):
         atr: float,
         rsi: float,
     ) -> Optional[TradeSignal]:
-        """Check for EMA pullback entry (fallback if VWAP fails)."""
+        """Check for EMA pullback entry with regime-adaptive proximity."""
         ema_col = f"ema_{self._entry_cfg.ema_period}"
         if ema_col not in df.columns or pd.isna(ema) or ema <= 0:
             return None
 
         proximity_pct = abs(price - ema) / ema * 100
 
-        if proximity_pct > self._entry_cfg.vwap_proximity_pct * 1.5:
+        # Regime-adaptive EMA proximity (wider than VWAP by 1.5x baseline)
+        adaptive_proximity = self._entry_cfg.vwap_proximity_pct * 1.5 * self._proximity_multiplier
+
+        if proximity_pct > adaptive_proximity:
             return None
 
         latest = df.iloc[-1]
@@ -607,17 +648,29 @@ class PullbackVWAPStrategy(Strategy):
         return signal
 
     def _volume_confirms(self, df: pd.DataFrame) -> bool:
-        """Check if current bar volume confirms the move."""
+        """
+        Check if any of the last 3 bars had confirming volume.
+
+        Elite traders don't need the exact current candle to spike —
+        they look for a recent volume surge in the area. Checking
+        the last 3 bars catches volume spikes between scan ticks.
+        """
         if len(df) < 10:
             return False
 
-        current_vol = df.iloc[-1]["volume"]
-        avg_vol = df.iloc[-10:-1]["volume"].mean()
+        avg_vol = df.iloc[-10:-3]["volume"].mean()
 
         if avg_vol <= 0:
             return False
 
-        return current_vol >= avg_vol * self._entry_cfg.volume_confirmation_multiplier
+        threshold = avg_vol * self._entry_cfg.volume_confirmation_multiplier
+
+        # Check if ANY of the last 3 bars had confirming volume
+        for i in range(-3, 0):
+            if df.iloc[i]["volume"] >= threshold:
+                return True
+
+        return False
 
     def _compute_stop(
         self, df: pd.DataFrame, entry_price: float, atr: float,

@@ -137,8 +137,8 @@ class TestScannerFallback:
             fallback_client=fallback_client,
         )
 
-    def test_polygon_success_no_fallback_used(self):
-        """When Polygon works, fallback is not called."""
+    def test_polygon_success_also_merges_fallback(self):
+        """When Polygon works, fallback results are merged (not excluded)."""
         gainer = _make_gainer("TEST", price=10.0, change_pct=20.0, volume=5_000_000)
         scanner = self._make_scanner(
             polygon_gainers=[gainer],
@@ -147,7 +147,8 @@ class TestScannerFallback:
         results = scanner.scan()
         symbols = [r.symbol for r in results]
         assert "TEST" in symbols
-        assert "FALLBACK" not in symbols
+        # All sources are now merged, so FALLBACK should also appear
+        assert "FALLBACK" in symbols
 
     def test_polygon_auth_error_uses_fallback(self):
         """When Polygon throws an auth error, fallback is used."""

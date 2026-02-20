@@ -246,10 +246,9 @@ class TradingBot:
                 if tick_count % 10 == 0:
                     self._log_status()
 
-                # Signal-aware sleep: wakes immediately on SIGTERM/SIGINT
-                if self._shutdown_event.wait(
-                    timeout=self._config.scanner.scan_interval_seconds
-                ):
+                # Signal-aware sleep with adaptive interval
+                interval = self._get_adaptive_scan_interval()
+                if self._shutdown_event.wait(timeout=interval):
                     log.info("bot.shutdown_event_received")
                     break
 
@@ -383,6 +382,11 @@ class TradingBot:
                 "max_positions_override": None,
                 "volume_confirmation_multiplier": 1.0,
             }
+
+        # Push regime to strategy for adaptive entry parameters
+        self._strategy.set_regime(
+            self._current_regime or "low_volatility", regime_adjustments
+        )
             self._health.record_error("regime_detection")
 
         # 4. Generate daily plan on first tick of the day (via advisor)
@@ -678,6 +682,45 @@ class TradingBot:
                 message="System health check failed",
                 details=health_status,
             )
+
+    def _get_adaptive_scan_interval(self) -> int:
+        """
+        Adaptive scan interval based on time of day.
+
+        Elite traders react fastest during the opening drive and slow down
+        during the dead zone. This mirrors that behavior:
+
+        - 9:30-10:00 (opening drive):  10s — maximum opportunity window
+        - 10:00-10:30 (power zone):    15s — still high-probability setups
+        - 10:30-11:30 (active morning): 30s — moderate scanning
+        - 11:30-13:00 (dead zone):     60s — low probability, conserve API
+        - 13:00-15:30 (afternoon):     30s — second wind opportunity
+        - 15:30-16:00 (close):         60s — manage only, no new entries
+        - Pre-market/closed:           60s — watchlist building only
+        """
+        if not is_market_open():
+            return self._config.scanner.scan_interval_seconds
+
+        now = now_et()
+        hour, minute = now.hour, now.minute
+
+        # Opening drive: 9:30-10:00
+        if hour == 9 and minute >= 30:
+            return 10
+        # Power zone: 10:00-10:30
+        if hour == 10 and minute < 30:
+            return 15
+        # Active morning: 10:30-11:30
+        if (hour == 10 and minute >= 30) or (hour == 11 and minute < 30):
+            return 30
+        # Dead zone: 11:30-13:00
+        if (hour == 11 and minute >= 30) or hour == 12:
+            return 60
+        # Afternoon push: 13:00-15:30
+        if hour >= 13 and (hour < 15 or (hour == 15 and minute < 30)):
+            return 30
+        # Closing: 15:30+
+        return 60
 
     def _get_market_status(self) -> tuple[str, str]:
         """Compute current market status and detail string."""
