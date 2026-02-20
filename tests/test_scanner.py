@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from freezegun import freeze_time
 
 from trading_bot.config.settings import ScannerConfig
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner
@@ -118,6 +119,7 @@ class TestMomentumGapperScanner:
         symbols = [r.symbol for r in results]
         assert "UNKNOWN" in symbols
 
+    @freeze_time("2026-02-21 03:00:00")  # 10 PM ET — market closed, no tod normalization
     def test_volume_filter_excludes_low_rvol(self):
         """Stocks with relative volume < min_relative_volume (2x) are excluded."""
         scanner = self._make_scanner(
@@ -129,6 +131,47 @@ class TestMomentumGapperScanner:
         results = scanner.scan()
         symbols = [r.symbol for r in results]
         assert "LOWVOL" not in symbols
+
+    @freeze_time("2026-02-20 15:00:00")  # 10 AM ET — 30 min into trading
+    def test_rvol_normalization_early_morning(self):
+        """Early morning volume is normalized by time-of-day factor."""
+        scanner = self._make_scanner(
+            gainers=[
+                # 20K volume at 10 AM with 100K avg daily
+                # Raw rvol = 0.2x (would fail)
+                # Normalized: 30min / 390min = 0.077, projected = 20K/0.077 = 260K
+                # Normalized rvol = 260K/100K = 2.6x (should pass 2x threshold)
+                _make_gainer("EARLYBIRD", price=10.0, change_pct=20.0, volume=20_000),
+            ]
+        )
+        results = scanner.scan()
+        symbols = [r.symbol for r in results]
+        assert "EARLYBIRD" in symbols
+
+    def test_rvol_compute_static(self):
+        """Test _compute_rvol directly for correctness."""
+        # With tod_factor=1.0 (market closed): raw rvol
+        assert MomentumGapperScanner._compute_rvol(100_000, 100_000, 1.0) == pytest.approx(1.0)
+        assert MomentumGapperScanner._compute_rvol(200_000, 100_000, 1.0) == pytest.approx(2.0)
+
+        # With tod_factor=0.1 (early morning): projects volume 10x
+        assert MomentumGapperScanner._compute_rvol(20_000, 100_000, 0.1) == pytest.approx(2.0)
+
+        # Edge: zero avg volume
+        assert MomentumGapperScanner._compute_rvol(100_000, 0, 1.0) == 0.0
+
+    def test_time_of_day_factor_outside_market(self):
+        """Factor is 1.0 when market is closed (no normalization)."""
+        with freeze_time("2026-02-21 03:00:00"):  # 10 PM ET
+            factor = MomentumGapperScanner._time_of_day_factor()
+            assert factor == 1.0
+
+    @freeze_time("2026-02-20 15:00:00")  # 10:00 AM ET = 30 min into 390 min day
+    def test_time_of_day_factor_during_market(self):
+        """Factor reflects fraction of trading day elapsed."""
+        factor = MomentumGapperScanner._time_of_day_factor()
+        # 30 min / 390 min ≈ 0.077
+        assert 0.05 < factor < 0.12
 
     def test_scoring_higher_gap_higher_score(self):
         """Higher gap percentage results in higher score."""
