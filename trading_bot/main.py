@@ -382,12 +382,12 @@ class TradingBot:
                 "max_positions_override": None,
                 "volume_confirmation_multiplier": 1.0,
             }
+            self._health.record_error("regime_detection")
 
         # Push regime to strategy for adaptive entry parameters
         self._strategy.set_regime(
             self._current_regime or "low_volatility", regime_adjustments
         )
-            self._health.record_error("regime_detection")
 
         # 4. Generate daily plan on first tick of the day (via advisor)
         if not self._daily_plan_generated:
