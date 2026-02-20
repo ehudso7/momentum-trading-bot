@@ -21,15 +21,17 @@ backtest_symbols:
   - "PLTR"
 
 # Scanner: Pre-market & intraday momentum gapper filters
+# Note: Scan interval is ADAPTIVE based on time of day (10s–60s).
+# The value below is used only outside market hours.
 scanner:
-  min_gap_pct: 10.0          # Minimum gap-up percentage
+  min_gap_pct: 4.0           # Minimum gap-up percentage
   max_gap_pct: 200.0         # Avoid >200% extended runners
   max_float_shares: 50000000 # 50M shares max float
   ideal_float_shares: 20000000
-  min_relative_volume: 5.0   # 5x average volume minimum
+  min_relative_volume: 2.0   # 2x average volume minimum
   min_price: 2.0             # No pennystocks
-  max_price: 20.0            # Sweet spot for momentum
-  scan_interval_seconds: 60  # Scan every 60 seconds
+  max_price: 50.0            # Includes mid-cap momentum
+  scan_interval_seconds: 60  # Base interval (adaptive overrides during market hours)
   max_candidates: 20
   catalyst_keywords:
     - "FDA"

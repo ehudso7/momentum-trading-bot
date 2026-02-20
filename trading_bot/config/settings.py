@@ -26,14 +26,14 @@ class RunMode(str, Enum):
 class ScannerConfig(BaseModel):
     """Pre-market and intraday scanner filter thresholds."""
 
-    min_gap_pct: float = Field(10.0, ge=5.0, le=100.0)
+    min_gap_pct: float = Field(4.0, ge=2.0, le=100.0)
     max_gap_pct: float = Field(200.0, ge=50.0, le=500.0)
     max_float_shares: int = Field(50_000_000, ge=1_000_000)
     ideal_float_shares: int = Field(20_000_000, ge=500_000)
-    min_relative_volume: float = Field(5.0, ge=1.0)
+    min_relative_volume: float = Field(2.0, ge=1.0)
     min_price: float = Field(2.0, ge=0.50)
-    max_price: float = Field(20.0, le=100.0)
-    scan_interval_seconds: int = Field(60, ge=30, le=300)
+    max_price: float = Field(50.0, le=500.0)
+    scan_interval_seconds: int = Field(60, ge=5, le=300)
     catalyst_keywords: list[str] = Field(
         default_factory=lambda: [
             "FDA",
