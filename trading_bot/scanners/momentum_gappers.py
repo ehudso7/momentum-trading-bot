@@ -48,6 +48,12 @@ class MomentumGapperScanner:
         self._fallback = fallback_client
         self._yahoo = yahoo_client
 
+        # Candidate persistence: track how many consecutive scans
+        # each symbol has appeared in. Repeated appearances = building
+        # momentum = higher conviction.
+        self._appearance_count: dict[str, int] = {}
+        self._last_scan_symbols: set[str] = set()
+
     def scan(self) -> list[ScanResult]:
         """
         Full scan pipeline. Returns ranked list of momentum candidates.
@@ -96,16 +102,44 @@ class MomentumGapperScanner:
             dropped=before_vol - len(candidates),
         )
 
-        # Step 6: Build ScanResults with catalyst check and scoring
+        # Step 6: Update persistence tracking
+        current_symbols = {c["symbol"] for c in candidates}
+        for sym in current_symbols:
+            if sym in self._last_scan_symbols:
+                self._appearance_count[sym] = self._appearance_count.get(sym, 1) + 1
+            else:
+                self._appearance_count[sym] = 1
+        # Decay symbols that disappeared
+        for sym in list(self._appearance_count):
+            if sym not in current_symbols:
+                self._appearance_count[sym] = max(0, self._appearance_count[sym] - 1)
+                if self._appearance_count[sym] == 0:
+                    del self._appearance_count[sym]
+        self._last_scan_symbols = current_symbols
+
+        # Step 7: Build ScanResults with catalyst check, scoring, and persistence boost
         results = []
         for c in candidates:
             catalyst = self._news.find_catalyst(c["symbol"])
-            score = self._compute_score(
+            base_score = self._compute_score(
                 gap_pct=c["change_pct"],
                 relative_volume=c.get("relative_volume", 1.0),
                 float_shares=c.get("float_shares"),
                 has_catalyst=catalyst is not None,
             )
+
+            # Persistence boost: repeated appearances = building momentum
+            appearances = self._appearance_count.get(c["symbol"], 1)
+            if appearances >= 5:
+                persistence_boost = 1.15  # +15% for 5+ consecutive scans
+            elif appearances >= 3:
+                persistence_boost = 1.10  # +10% for 3+ scans
+            elif appearances >= 2:
+                persistence_boost = 1.05  # +5% for 2+ scans
+            else:
+                persistence_boost = 1.0
+
+            score = round(min(base_score * persistence_boost, 1.0), 4)
 
             results.append(
                 ScanResult(
@@ -121,7 +155,7 @@ class MomentumGapperScanner:
                 )
             )
 
-        # Step 7: Sort by score (descending) and limit
+        # Step 8: Sort by score (descending) and limit
         results.sort(key=lambda r: r.score, reverse=True)
         results = results[: self._config.max_candidates]
 
@@ -135,10 +169,17 @@ class MomentumGapperScanner:
 
     def _fetch_gainers(self) -> list[dict]:
         """
-        Fetch top gainers from multiple sources with cascading fallbacks.
+        Fetch top gainers by merging ALL available data sources.
 
-        Priority: Polygon → Alpaca movers → Yahoo Finance → Alpaca most-active.
-        Combines results and deduplicates by symbol.
+        Unlike a cascade (try one, fall back to next), this always pulls
+        from every working source and merges results. More raw candidates
+        = more chances to find the needle in the haystack.
+
+        Sources (all attempted in parallel):
+          1. Polygon snapshot (paid plan)
+          2. Alpaca movers (free)
+          3. Alpaca most-active (free, catches high-volume plays)
+          4. Yahoo Finance day gainers (free, no API key)
         """
         gainers: list[dict] = []
 
@@ -151,10 +192,9 @@ class MomentumGapperScanner:
         except Exception as e:
             log.info("scanner.polygon_failed", error=str(e)[:120])
 
-        # Source 2: Alpaca movers (free with Alpaca keys)
-        if self._fallback is not None and not gainers:
+        # Source 2: Alpaca movers (always try — free with Alpaca keys)
+        if self._fallback is not None:
             try:
-                log.info("scanner.trying_alpaca_movers")
                 alpaca_gainers = self._fallback.get_gainers()
                 if alpaca_gainers:
                     log.info("scanner.source_alpaca_movers", count=len(alpaca_gainers))
@@ -162,10 +202,19 @@ class MomentumGapperScanner:
             except Exception as e:
                 log.warning("scanner.alpaca_movers_failed", error=str(e)[:120])
 
-        # Source 3: Yahoo Finance day gainers (no API key needed)
-        if self._yahoo is not None and not gainers:
+        # Source 3: Alpaca most-active (always try — catches volume plays)
+        if self._fallback is not None and hasattr(self._fallback, "get_most_active"):
             try:
-                log.info("scanner.trying_yahoo")
+                active_gainers = self._fallback.get_most_active()
+                if active_gainers:
+                    log.info("scanner.source_alpaca_active", count=len(active_gainers))
+                    gainers.extend(active_gainers)
+            except Exception as e:
+                log.warning("scanner.alpaca_active_failed", error=str(e)[:120])
+
+        # Source 4: Yahoo Finance (always try — broadest coverage)
+        if self._yahoo is not None:
+            try:
                 yahoo_gainers = self._yahoo.get_gainers()
                 if yahoo_gainers:
                     log.info("scanner.source_yahoo", count=len(yahoo_gainers))
@@ -173,22 +222,7 @@ class MomentumGapperScanner:
             except Exception as e:
                 log.warning("scanner.yahoo_failed", error=str(e)[:120])
 
-        # Source 4: Alpaca most-active (catches high-volume movers)
-        if self._fallback is not None and not gainers:
-            try:
-                log.info("scanner.trying_alpaca_most_active")
-                if hasattr(self._fallback, "get_most_active"):
-                    active_gainers = self._fallback.get_most_active()
-                    if active_gainers:
-                        log.info(
-                            "scanner.source_alpaca_active",
-                            count=len(active_gainers),
-                        )
-                        gainers.extend(active_gainers)
-            except Exception as e:
-                log.warning("scanner.alpaca_active_failed", error=str(e)[:120])
-
-        # Deduplicate by symbol (keep first occurrence)
+        # Deduplicate by symbol (keep first occurrence — priority order)
         seen = set()
         unique = []
         for g in gainers:

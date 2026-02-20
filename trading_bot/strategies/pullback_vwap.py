@@ -88,6 +88,41 @@ class PullbackVWAPStrategy(Strategy):
         self._exit_cfg = config.exit
         self._risk_cfg = config.risk
 
+        # Regime-adaptive parameters (updated each tick by main loop)
+        self._current_regime: str = "low_volatility"
+        self._proximity_multiplier: float = 1.0
+
+    def set_regime(self, regime: str, adjustments: dict) -> None:
+        """
+        Update regime for adaptive entry parameters.
+
+        Called each tick by the main loop after regime detection.
+        Adjusts entry proximity thresholds to match market conditions:
+        - Low vol / range-bound: widen zones (more setups qualify)
+        - High vol: tighten zones (higher conviction required)
+        - Trending bullish: normal zones (go with the flow)
+        - Trending bearish: tighten significantly (be very selective)
+        """
+        self._current_regime = regime
+
+        # Map regime to proximity multiplier
+        # Higher = wider entry zone = more trades
+        # Lower = tighter entry zone = fewer but higher conviction
+        _PROXIMITY_MAP = {
+            "trending_bullish": 1.2,   # Bullish trend = slightly wider
+            "trending_bearish": 0.7,   # Bearish = very selective
+            "range_bound": 1.5,        # Range = widen to catch pullbacks
+            "high_volatility": 0.8,    # High vol = tighter, more conviction
+            "low_volatility": 1.8,     # Low vol = widen significantly
+        }
+        self._proximity_multiplier = _PROXIMITY_MAP.get(regime, 1.0)
+
+        log.info(
+            "strategy.regime_updated",
+            regime=regime,
+            proximity_multiplier=self._proximity_multiplier,
+        )
+
     def evaluate(
         self, candidate: ScanResult, bars: pd.DataFrame
     ) -> Optional[TradeSignal]:
@@ -124,26 +159,85 @@ class PullbackVWAPStrategy(Strategy):
             log.debug("strategy.no_atr", symbol=candidate.symbol)
             return None
 
-        # Check each setup in priority order
-        signal = self._check_vwap_pullback(candidate, df, price, vwap, ema, ema20, atr, rsi)
-        if signal:
-            return signal
+        # Check each setup in priority order, with multi-bar lookback
+        # Try current bar first, then check recent bars for missed signals
+        setups = [
+            ("vwap_pullback", self._check_vwap_pullback),
+            ("ema_pullback", self._check_ema_pullback),
+            ("orb", self._check_opening_range_breakout),
+            ("red_to_green", self._check_red_to_green),
+            ("breakout", self._check_breakout),
+        ]
 
-        signal = self._check_ema_pullback(candidate, df, price, ema, ema20, atr, rsi)
-        if signal:
-            return signal
+        rejection_reasons = []
 
-        signal = self._check_opening_range_breakout(candidate, df, price, vwap, ema, atr, rsi)
-        if signal:
-            return signal
+        for setup_name, check_fn in setups:
+            if setup_name == "vwap_pullback":
+                signal = check_fn(candidate, df, price, vwap, ema, ema20, atr, rsi)
+            elif setup_name == "ema_pullback":
+                signal = check_fn(candidate, df, price, ema, ema20, atr, rsi)
+            elif setup_name in ("orb", "red_to_green"):
+                signal = check_fn(candidate, df, price, vwap, ema, atr, rsi)
+            else:
+                signal = check_fn(candidate, df, price, vwap, ema, atr, rsi)
 
-        signal = self._check_red_to_green(candidate, df, price, vwap, ema, atr, rsi)
-        if signal:
-            return signal
+            if signal:
+                return signal
 
-        signal = self._check_breakout(candidate, df, price, vwap, ema, atr, rsi)
-        if signal:
-            return signal
+        # If no signal on current bar, check last 2 bars for missed entries
+        for lookback_offset in [2, 3]:
+            if len(df) < lookback_offset + 20:
+                continue
+            lb_df = df.iloc[:-lookback_offset + 1]
+            lb_latest = lb_df.iloc[-1]
+            lb_price = lb_latest["close"]
+            lb_vwap = lb_latest.get("vwap", lb_price)
+            lb_ema = lb_latest.get(f"ema_{self._entry_cfg.ema_period}", lb_price)
+            lb_ema20 = lb_latest.get("ema_20", lb_price)
+            lb_atr = lb_latest.get("atr_14", 0.0)
+            lb_rsi = lb_latest.get("rsi_14", 50.0)
+
+            if pd.isna(lb_atr) or lb_atr <= 0:
+                continue
+
+            # Only try VWAP, EMA, and ORB for lookback (not breakout)
+            for setup_name, check_fn in setups[:3]:
+                if setup_name == "vwap_pullback":
+                    signal = check_fn(candidate, lb_df, lb_price, lb_vwap, lb_ema, lb_ema20, lb_atr, lb_rsi)
+                elif setup_name == "ema_pullback":
+                    signal = check_fn(candidate, lb_df, lb_price, lb_ema, lb_ema20, lb_atr, lb_rsi)
+                else:
+                    signal = check_fn(candidate, lb_df, lb_price, lb_vwap, lb_ema, lb_atr, lb_rsi)
+
+                if signal:
+                    # Use current price for entry, not the lookback bar's price
+                    signal.entry_price = round(price, 4)
+                    # Revalidate stop distance with current price
+                    if signal.stop_price >= price:
+                        signal.stop_price = round(price - (atr * self._entry_cfg.min_atr_distance), 4)
+                    log.info(
+                        "strategy.lookback_signal",
+                        symbol=candidate.symbol,
+                        type=signal.signal_type.value,
+                        lookback_bars=lookback_offset - 1,
+                    )
+                    return signal
+
+        # Log why no signal was generated (diagnostic)
+        log.info(
+            "strategy.no_signal",
+            symbol=candidate.symbol,
+            price=round(price, 4),
+            vwap=round(vwap, 4) if not pd.isna(vwap) else None,
+            ema9=round(ema, 4) if not pd.isna(ema) else None,
+            atr=round(atr, 4),
+            rsi=round(rsi, 1) if not pd.isna(rsi) else None,
+            vwap_dist_pct=round(abs(price - vwap) / vwap * 100, 2) if not pd.isna(vwap) and vwap > 0 else None,
+            ema_dist_pct=round(abs(price - ema) / ema * 100, 2) if not pd.isna(ema) and ema > 0 else None,
+            bar_bullish=df.iloc[-1]["close"] > df.iloc[-1]["open"],
+            vol_confirms=self._volume_confirms(df),
+            bars_available=len(df),
+        )
 
         return None
 
@@ -275,14 +369,17 @@ class PullbackVWAPStrategy(Strategy):
         atr: float,
         rsi: float,
     ) -> Optional[TradeSignal]:
-        """Check for VWAP pullback entry."""
+        """Check for VWAP pullback entry with regime-adaptive proximity."""
         if pd.isna(vwap) or vwap <= 0:
             return None
 
         proximity_pct = abs(price - vwap) / vwap * 100
 
-        # Price must be near VWAP (within proximity threshold)
-        if proximity_pct > self._entry_cfg.vwap_proximity_pct:
+        # Regime-adaptive proximity threshold
+        adaptive_proximity = self._entry_cfg.vwap_proximity_pct * self._proximity_multiplier
+
+        # Price must be near VWAP (within adaptive proximity threshold)
+        if proximity_pct > adaptive_proximity:
             return None
 
         # Price must be reclaiming (current close > open = bullish bar)
@@ -294,7 +391,7 @@ class PullbackVWAPStrategy(Strategy):
         if price < vwap:
             return None
 
-        # Volume confirmation: current bar volume > multiplier * recent avg
+        # Volume confirmation: check last 3 bars, not just current
         if not self._volume_confirms(df):
             return None
 
@@ -319,14 +416,17 @@ class PullbackVWAPStrategy(Strategy):
         atr: float,
         rsi: float,
     ) -> Optional[TradeSignal]:
-        """Check for EMA pullback entry (fallback if VWAP fails)."""
+        """Check for EMA pullback entry with regime-adaptive proximity."""
         ema_col = f"ema_{self._entry_cfg.ema_period}"
         if ema_col not in df.columns or pd.isna(ema) or ema <= 0:
             return None
 
         proximity_pct = abs(price - ema) / ema * 100
 
-        if proximity_pct > self._entry_cfg.vwap_proximity_pct * 1.5:
+        # Regime-adaptive EMA proximity (wider than VWAP by 1.5x baseline)
+        adaptive_proximity = self._entry_cfg.vwap_proximity_pct * 1.5 * self._proximity_multiplier
+
+        if proximity_pct > adaptive_proximity:
             return None
 
         latest = df.iloc[-1]
@@ -548,17 +648,29 @@ class PullbackVWAPStrategy(Strategy):
         return signal
 
     def _volume_confirms(self, df: pd.DataFrame) -> bool:
-        """Check if current bar volume confirms the move."""
+        """
+        Check if any of the last 3 bars had confirming volume.
+
+        Elite traders don't need the exact current candle to spike —
+        they look for a recent volume surge in the area. Checking
+        the last 3 bars catches volume spikes between scan ticks.
+        """
         if len(df) < 10:
             return False
 
-        current_vol = df.iloc[-1]["volume"]
-        avg_vol = df.iloc[-10:-1]["volume"].mean()
+        avg_vol = df.iloc[-10:-3]["volume"].mean()
 
         if avg_vol <= 0:
             return False
 
-        return current_vol >= avg_vol * self._entry_cfg.volume_confirmation_multiplier
+        threshold = avg_vol * self._entry_cfg.volume_confirmation_multiplier
+
+        # Check if ANY of the last 3 bars had confirming volume
+        for i in range(-3, 0):
+            if df.iloc[i]["volume"] >= threshold:
+                return True
+
+        return False
 
     def _compute_stop(
         self, df: pd.DataFrame, entry_price: float, atr: float,

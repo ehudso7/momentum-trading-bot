@@ -312,6 +312,7 @@ class TestGetRegimeAdjustments:
         "stop_multiplier",
         "max_positions_override",
         "volume_confirmation_multiplier",
+        "proximity_multiplier",
     }
 
     def test_trending_bullish_adjustments(self, detector: RegimeDetector):
