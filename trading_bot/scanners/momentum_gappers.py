@@ -25,8 +25,15 @@ from trading_bot.config.settings import ScannerConfig
 from trading_bot.data.market_data import MarketDataProvider
 from trading_bot.data.news_client import NewsClient
 from trading_bot.models.domain import ScanResult
+from trading_bot.utils.helpers import now_et, is_market_open, MARKET_OPEN, MARKET_CLOSE
 
 log = structlog.get_logger(__name__)
+
+# Total regular market minutes (9:30 AM - 4:00 PM ET)
+_MARKET_MINUTES = (
+    MARKET_CLOSE.hour * 60 + MARKET_CLOSE.minute
+    - MARKET_OPEN.hour * 60 - MARKET_OPEN.minute
+)  # 390
 
 
 class MomentumGapperScanner:
@@ -69,37 +76,52 @@ class MomentumGapperScanner:
             return []
 
         # Step 2: Price filter
+        before_price = set(s["symbol"] for s in raw_gainers)
         candidates = self._filter_price(raw_gainers)
+        after_price = set(s["symbol"] for s in candidates)
+        dropped_price = before_price - after_price
         log.info(
             "scanner.after_price_filter",
             count=len(candidates),
-            dropped=len(raw_gainers) - len(candidates),
+            dropped=len(dropped_price),
+            dropped_symbols=sorted(dropped_price)[:10] if dropped_price else [],
         )
 
         # Step 3: Gap filter
+        before_gap = set(s["symbol"] for s in candidates)
         candidates = self._filter_gap(candidates)
+        after_gap = set(s["symbol"] for s in candidates)
+        dropped_gap = before_gap - after_gap
         log.info(
             "scanner.after_gap_filter",
             count=len(candidates),
-            dropped=len(raw_gainers) - len(candidates),
+            dropped=len(dropped_gap),
+            dropped_symbols=sorted(dropped_gap)[:10] if dropped_gap else [],
         )
 
         # Step 4: Float filter
-        before_float = len(candidates)
+        before_float = set(s["symbol"] for s in candidates)
         candidates = self._filter_float(candidates)
+        after_float = set(s["symbol"] for s in candidates)
+        dropped_float = before_float - after_float
         log.info(
             "scanner.after_float_filter",
             count=len(candidates),
-            dropped=before_float - len(candidates),
+            dropped=len(dropped_float),
+            dropped_symbols=sorted(dropped_float)[:10] if dropped_float else [],
         )
 
         # Step 5: Relative volume filter
-        before_vol = len(candidates)
+        before_vol = set(s["symbol"] for s in candidates)
         candidates = self._filter_volume(candidates)
+        after_vol = set(s["symbol"] for s in candidates)
+        dropped_vol = before_vol - after_vol
         log.info(
             "scanner.after_volume_filter",
             count=len(candidates),
-            dropped=before_vol - len(candidates),
+            dropped=len(dropped_vol),
+            tod_factor=round(self._time_of_day_factor(), 3),
+            dropped_symbols=sorted(dropped_vol)[:10] if dropped_vol else [],
         )
 
         # Step 6: Update persistence tracking
@@ -288,13 +310,14 @@ class MomentumGapperScanner:
 
     def _filter_volume(self, snapshots: list[dict]) -> list[dict]:
         """Filter by relative volume >= min_relative_volume."""
+        tod_factor = self._time_of_day_factor()
         results = []
         for s in snapshots:
             avg_vol = self._data.get_avg_volume(s["symbol"])
             current_vol = s.get("volume", 0)
 
             if current_vol > 0 and avg_vol > 0:
-                rvol = current_vol / avg_vol
+                rvol = self._compute_rvol(current_vol, avg_vol, tod_factor)
             elif current_vol == 0 and avg_vol > 0:
                 # Volume data missing from screener — keep candidate
                 # with benefit-of-doubt rvol (will score lower)
@@ -316,11 +339,56 @@ class MomentumGapperScanner:
                     "scanner.low_rvol",
                     symbol=s["symbol"],
                     rvol=round(rvol, 2),
+                    raw_rvol=round(current_vol / avg_vol, 2) if avg_vol > 0 else 0,
                     current_vol=current_vol,
                     avg_vol=int(avg_vol),
+                    tod_factor=round(tod_factor, 3),
                 )
 
         return results
+
+    @staticmethod
+    def _time_of_day_factor() -> float:
+        """
+        Fraction of the trading day elapsed (0.0–1.0).
+
+        Used to normalize intraday volume against full-day averages.
+        At 9:30 AM this returns ~0.003 (1 minute / 390 minutes).
+        At 4:00 PM this returns 1.0.
+        Outside market hours returns 1.0 (no normalization).
+        """
+        if not is_market_open():
+            return 1.0
+
+        now = now_et()
+        current_minutes = now.hour * 60 + now.minute
+        open_minutes = MARKET_OPEN.hour * 60 + MARKET_OPEN.minute
+        elapsed = max(1, current_minutes - open_minutes)
+        return min(elapsed / _MARKET_MINUTES, 1.0)
+
+    @staticmethod
+    def _compute_rvol(
+        current_vol: int, avg_daily_vol: float, tod_factor: float
+    ) -> float:
+        """
+        Compute relative volume normalized by time of day.
+
+        Without normalization, at 9:58 AM only ~7% of daily volume has
+        accumulated, making rvol appear artificially low (0.07x instead
+        of the true 2x+). This projects the current volume to a full-day
+        equivalent before comparing to the average.
+
+        Example:
+          - 10:00 AM, stock has 200K volume, avg daily = 1M
+          - Raw rvol = 200K / 1M = 0.2x (WRONG — would be filtered out)
+          - tod_factor = 30min / 390min = 0.077
+          - Projected daily = 200K / 0.077 = 2.6M
+          - Normalized rvol = 2.6M / 1M = 2.6x (CORRECT — passes filter)
+        """
+        if avg_daily_vol <= 0:
+            return 0.0
+        projected_daily = current_vol / tod_factor if tod_factor > 0 else current_vol
+        return projected_daily / avg_daily_vol
 
     def _compute_score(
         self,
