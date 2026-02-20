@@ -58,10 +58,10 @@ class TestMomentumGapperScanner:
         assert "OK" in symbols
 
     def test_price_filter_excludes_high(self):
-        """Stocks above $20 are excluded."""
+        """Stocks above max_price ($50) are excluded."""
         scanner = self._make_scanner(
             gainers=[
-                _make_gainer("HIGH", price=25.0, change_pct=30.0, volume=1_000_000),
+                _make_gainer("HIGH", price=55.0, change_pct=30.0, volume=1_000_000),
                 _make_gainer("OK", price=15.0, change_pct=30.0, volume=1_000_000),
             ]
         )
@@ -70,10 +70,10 @@ class TestMomentumGapperScanner:
         assert "HIGH" not in symbols
 
     def test_gap_filter_excludes_low_gap(self):
-        """Stocks with gap < 10% are excluded."""
+        """Stocks with gap < min_gap_pct (4%) are excluded."""
         scanner = self._make_scanner(
             gainers=[
-                _make_gainer("LOWGAP", price=10.0, change_pct=5.0, volume=1_000_000),
+                _make_gainer("LOWGAP", price=10.0, change_pct=3.0, volume=1_000_000),
                 _make_gainer("HIGHGAP", price=10.0, change_pct=25.0, volume=1_000_000),
             ]
         )
@@ -119,13 +119,13 @@ class TestMomentumGapperScanner:
         assert "UNKNOWN" in symbols
 
     def test_volume_filter_excludes_low_rvol(self):
-        """Stocks with relative volume < 5x are excluded."""
+        """Stocks with relative volume < min_relative_volume (2x) are excluded."""
         scanner = self._make_scanner(
             gainers=[
                 _make_gainer("LOWVOL", price=10.0, change_pct=20.0, volume=100_000),
             ]
         )
-        # avg_volume=100_000, current=100_000 -> rvol=1x < 5x
+        # avg_volume=100_000, current=100_000 -> rvol=1x < 2x
         results = scanner.scan()
         symbols = [r.symbol for r in results]
         assert "LOWVOL" not in symbols
