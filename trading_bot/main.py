@@ -466,7 +466,21 @@ class TradingBot:
             # Fetch intraday bars
             bars = self._market_data.get_intraday_bars(candidate.symbol)
             if bars.empty:
+                log.warning(
+                    "bot.empty_bars",
+                    symbol=candidate.symbol,
+                    detail="No intraday bars from Polygon or yfinance",
+                )
                 continue
+
+            log.info(
+                "bot.evaluating_candidate",
+                symbol=candidate.symbol,
+                bars_count=len(bars),
+                score=round(candidate.score, 3),
+                gap_pct=round(candidate.gap_pct, 1),
+                rvol=round(candidate.relative_volume, 1),
+            )
 
             # Evaluate strategy
             signal = self._strategy.evaluate(candidate, bars)

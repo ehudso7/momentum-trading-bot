@@ -108,12 +108,23 @@ class PullbackVWAPStrategy(Strategy):
         # Map regime to proximity multiplier
         # Higher = wider entry zone = more trades
         # Lower = tighter entry zone = fewer but higher conviction
+        #
+        # Key insight: momentum gappers often trade 3-5% above VWAP
+        # after the gap. The multiplier must be wide enough to catch
+        # the first pullback toward VWAP, not just stocks sitting on it.
+        #
+        # With base vwap_proximity_pct=1.5%:
+        #   low_vol: 1.5% * 2.5 = 3.75% zone (catches shallow pullbacks)
+        #   range:   1.5% * 2.0 = 3.0%  zone
+        #   bullish: 1.5% * 1.5 = 2.25% zone
+        #   high_vol: 1.5% * 1.0 = 1.5% zone (tight, high conviction)
+        #   bearish: 1.5% * 0.8 = 1.2%  zone (very selective)
         _PROXIMITY_MAP = {
-            "trending_bullish": 1.2,   # Bullish trend = slightly wider
-            "trending_bearish": 0.7,   # Bearish = very selective
-            "range_bound": 1.5,        # Range = widen to catch pullbacks
-            "high_volatility": 0.8,    # High vol = tighter, more conviction
-            "low_volatility": 1.8,     # Low vol = widen significantly
+            "trending_bullish": 1.5,   # Bullish trend = wider for momentum
+            "trending_bearish": 0.8,   # Bearish = selective
+            "range_bound": 2.0,        # Range = wider to catch pullbacks
+            "high_volatility": 1.0,    # High vol = standard, conviction
+            "low_volatility": 2.5,     # Low vol = widest, catch shallow pullbacks
         }
         self._proximity_multiplier = _PROXIMITY_MAP.get(regime, 1.0)
 
@@ -470,11 +481,22 @@ class PullbackVWAPStrategy(Strategy):
         if len(df) < 20:
             return None
 
-        # Use first ORB_MINUTES bars as the opening range
+        # Identify today's opening range (first 15 min after 9:30 AM ET).
+        # Must handle both timezone-aware indexes (Polygon) and naive
+        # indexes (yfinance fallback with multi-day data).
+        orb_bars = pd.DataFrame()
         try:
             idx = df.index
             if hasattr(idx, 'tz') and idx.tz is not None:
                 orb_bars = df.between_time("09:30", "09:45")
+            elif hasattr(idx, 'date'):
+                # Naive DatetimeIndex — filter to today's bars, take first 15
+                today = idx[-1].date() if hasattr(idx[-1], 'date') else None
+                if today is not None:
+                    today_bars = df[idx.date == today]
+                    orb_bars = today_bars.iloc[:self.ORB_MINUTES]
+                else:
+                    orb_bars = df.iloc[:self.ORB_MINUTES]
             else:
                 orb_bars = df.iloc[:self.ORB_MINUTES]
         except Exception:
@@ -486,7 +508,7 @@ class PullbackVWAPStrategy(Strategy):
         orb_high = orb_bars["high"].max()
         orb_low = orb_bars["low"].min()
 
-        # Only valid if we're past the ORB window
+        # Only valid if we have bars after the ORB window
         if len(df) <= len(orb_bars):
             return None
 

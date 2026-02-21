@@ -99,7 +99,12 @@ class LiveMarketData(MarketDataProvider):
     def get_intraday_bars(
         self, symbol: str, interval_minutes: int = 1, lookback_bars: int = 100
     ) -> pd.DataFrame:
-        """Get intraday bars from Polygon aggregates."""
+        """
+        Get intraday bars from Polygon aggregates, with yfinance fallback.
+
+        If 1-minute bars fail from both sources, tries 5-minute bars as
+        a last resort (wider availability, still usable for strategy).
+        """
         from_date = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")
         to_date = datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -113,9 +118,24 @@ class LiveMarketData(MarketDataProvider):
         )
 
         if df.empty:
-            # Fallback to yfinance
-            log.debug("market_data.intraday_fallback", symbol=symbol)
+            # Fallback 1: yfinance 1-minute bars
+            log.info("market_data.intraday_fallback_yf", symbol=symbol)
             df = self._yf_intraday(symbol, interval_minutes, lookback_bars)
+
+        if df.empty and interval_minutes == 1:
+            # Fallback 2: try 5-minute bars (much wider availability)
+            log.info("market_data.intraday_fallback_5min", symbol=symbol)
+            df = self._yf_intraday(symbol, 5, lookback_bars)
+            if df.empty:
+                # Fallback 3: try 2-minute bars
+                df = self._yf_intraday(symbol, 2, lookback_bars)
+
+        if df.empty:
+            log.warning(
+                "market_data.intraday_all_failed",
+                symbol=symbol,
+                detail="No intraday data available from any source",
+            )
 
         return df.tail(lookback_bars) if not df.empty else df
 
@@ -126,15 +146,16 @@ class LiveMarketData(MarketDataProvider):
         try:
             ticker = yf.Ticker(symbol)
             interval = f"{interval_minutes}m"
-            hist = ticker.history(period="2d", interval=interval)
+            hist = ticker.history(period="5d", interval=interval)
             if not hist.empty:
                 hist.columns = [c.lower() for c in hist.columns]
                 return hist.tail(lookback_bars)
         except Exception as e:
-            log.error(
-                "market_data.intraday_fallback_error",
+            log.warning(
+                "market_data.yf_intraday_error",
                 symbol=symbol,
-                error=str(e),
+                interval=f"{interval_minutes}m",
+                error=str(e)[:120],
             )
         return pd.DataFrame()
 
