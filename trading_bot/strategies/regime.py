@@ -290,34 +290,34 @@ _REGIME_ADJUSTMENTS: dict[MarketRegime, dict] = {
         "stop_multiplier": 1.0,
         "max_positions_override": None,
         "volume_confirmation_multiplier": 1.0,
-        "proximity_multiplier": 1.2,  # Slightly wider — go with the trend
+        "proximity_multiplier": 1.5,  # Wider for momentum — ride the trend
     },
     MarketRegime.TRENDING_BEARISH: {
         "position_size_multiplier": 0.5,
         "stop_multiplier": 0.8,
         "max_positions_override": None,
         "volume_confirmation_multiplier": 1.0,
-        "proximity_multiplier": 0.7,  # Very tight — be selective against trend
+        "proximity_multiplier": 0.8,  # Selective against trend
     },
     MarketRegime.RANGE_BOUND: {
         "position_size_multiplier": 0.75,
         "stop_multiplier": 1.0,
         "max_positions_override": None,
         "volume_confirmation_multiplier": 1.0,
-        "proximity_multiplier": 1.5,  # Wider — catch range pullbacks
+        "proximity_multiplier": 2.0,  # Wide — catch range pullbacks
     },
     MarketRegime.HIGH_VOLATILITY: {
         "position_size_multiplier": 0.6,
         "stop_multiplier": 1.3,
         "max_positions_override": 2,
         "volume_confirmation_multiplier": 1.0,
-        "proximity_multiplier": 0.8,  # Tighter — need conviction in chaos
+        "proximity_multiplier": 1.0,  # Standard — conviction needed in chaos
     },
     MarketRegime.LOW_VOLATILITY: {
         "position_size_multiplier": 1.0,
         "stop_multiplier": 1.0,
         "max_positions_override": None,
         "volume_confirmation_multiplier": 1.5,
-        "proximity_multiplier": 1.8,  # Much wider — setups are rare, cast wide net
+        "proximity_multiplier": 2.5,  # Widest — gappers sit far above VWAP
     },
 }
