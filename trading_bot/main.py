@@ -105,12 +105,7 @@ class TradingBot:
             if config.run_mode == RunMode.LIVE:
                 self._broker = AlpacaBroker(config.broker)
             else:  # PAPER
-                # Use Alpaca paper if keys provided, else local paper broker
-                if config.broker.alpaca_api_key.get_secret_value() and \
-                   config.broker.alpaca_api_key.get_secret_value() != "your_alpaca_api_key_here":
-                    self._broker = AlpacaBroker(config.broker)
-                else:
-                    self._broker = PaperBroker(initial_equity=config.starting_capital)
+                self._broker = PaperBroker(initial_equity=config.starting_capital)
 
         self._news = NewsClient(polygon, config.scanner)
         alpaca_screener = (
