@@ -78,6 +78,8 @@ class RiskConfig(BaseModel):
     max_daily_risk_pct: float = Field(3.0, ge=1.0, le=5.0)
     max_open_positions: int = Field(4, ge=1, le=10)
     max_leverage: float = Field(4.0, ge=1.0, le=4.0)
+    max_position_value_pct: float = Field(20.0, ge=5.0, le=50.0)
+    min_stop_distance_pct: float = Field(1.0, ge=0.25, le=5.0)
     pdt_equity_threshold: float = Field(25_000.0)
     stop_loss_atr_multiplier: float = Field(1.25, ge=0.5, le=3.0)
     drawdown_circuit_breaker_pct: float = Field(5.0, ge=1.0, le=15.0)

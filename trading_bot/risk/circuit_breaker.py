@@ -51,6 +51,7 @@ class CircuitBreaker:
         self._state: CircuitState = CircuitState.NORMAL
         self._consecutive_losses: int = 0
         self._daily_pnl: float = 0.0
+        self._unrealized_pnl: float = 0.0
         self._starting_equity: float = 0.0
         self._api_errors: deque[datetime] = deque()
         self._api_error_window = timedelta(minutes=5)
@@ -110,13 +111,15 @@ class CircuitBreaker:
         if self._starting_equity <= 0:
             return self._state
 
-        # 1. Daily drawdown check
+        # 1. Daily drawdown check (includes both realized and unrealized P&L)
         if self._starting_equity > 0:
-            drawdown_pct = abs(min(0, self._daily_pnl)) / self._starting_equity * 100
+            total_pnl = self._daily_pnl + self._unrealized_pnl
+            drawdown_pct = abs(min(0, total_pnl)) / self._starting_equity * 100
             if drawdown_pct >= self._config.drawdown_circuit_breaker_pct:
                 self._halt(
                     f"daily_drawdown: {drawdown_pct:.2f}% >= "
-                    f"{self._config.drawdown_circuit_breaker_pct}%"
+                    f"{self._config.drawdown_circuit_breaker_pct}% "
+                    f"(realized={self._daily_pnl:.2f}, unrealized={self._unrealized_pnl:.2f})"
                 )
                 return self._state
 
@@ -149,6 +152,17 @@ class CircuitBreaker:
             self._warn(f"api_errors_rising: {error_count} in 5 minutes")
 
         return self._state
+
+    def update_unrealized_pnl(self, unrealized_pnl: float) -> None:
+        """
+        Update unrealized P&L from open positions.
+
+        Called each tick so the circuit breaker can halt trading
+        before a catastrophic open position grows into a fatal loss.
+        Without this, the circuit breaker only sees realized P&L
+        (after a trade closes), which is too late.
+        """
+        self._unrealized_pnl = unrealized_pnl
 
     def record_trade_result(self, pnl: float) -> None:
         """Update counters after a trade closes."""
@@ -201,6 +215,7 @@ class CircuitBreaker:
         """Reset for a new trading day."""
         self._starting_equity = equity
         self._daily_pnl = 0.0
+        self._unrealized_pnl = 0.0
         self._consecutive_losses = 0
         self._api_errors.clear()
         self._api_error_counts.clear()
@@ -248,8 +263,9 @@ class CircuitBreaker:
             "consecutive_losses": self._consecutive_losses,
             "api_errors_5min": len(self._api_errors),
             "api_error_summary": self.get_error_summary(),
+            "unrealized_pnl": round(self._unrealized_pnl, 2),
             "drawdown_pct": (
-                round(abs(min(0, self._daily_pnl)) / self._starting_equity * 100, 2)
+                round(abs(min(0, self._daily_pnl + self._unrealized_pnl)) / self._starting_equity * 100, 2)
                 if self._starting_equity > 0
                 else 0.0
             ),

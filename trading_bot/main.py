@@ -33,7 +33,7 @@ from trading_bot.data.yahoo_screener import YahooScreener
 from trading_bot.execution.alpaca_broker import AlpacaBroker
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.portfolio.manager import PortfolioManager
-from trading_bot.risk.circuit_breaker import CircuitBreaker
+from trading_bot.risk.circuit_breaker import CircuitBreaker, CircuitState
 from trading_bot.risk.correlation import CorrelationChecker
 from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner
@@ -317,10 +317,38 @@ class TradingBot:
 
     def _tick(self) -> None:
         """Single iteration of the main trading loop."""
+        # 0. Feed unrealized P&L to circuit breaker so it can halt
+        #    BEFORE a catastrophic open position is closed at a loss.
+        open_positions = self._portfolio.get_open_positions()
+        unrealized = sum(p.pnl_unrealized for p in open_positions)
+        self._circuit.update_unrealized_pnl(unrealized)
+
         # 1. Check circuit breaker FIRST (NON-NEGOTIABLE)
         state = self._circuit.check()
         if not self._circuit.is_trading_allowed:
             log.warning("bot.circuit_active", state=state.value)
+
+            # EMERGENCY: close all open positions when circuit breaker halts
+            # to prevent unrealized losses from growing further.
+            if state == CircuitState.HALTED and open_positions:
+                log.critical(
+                    "bot.emergency_close",
+                    positions=len(open_positions),
+                    unrealized_pnl=round(unrealized, 2),
+                )
+                entries = self._portfolio.close_all("circuit_breaker_halt")
+                for entry in entries:
+                    self._notify.notify_trade_closed(
+                        symbol=entry.symbol,
+                        side=entry.side,
+                        shares=entry.shares,
+                        entry_price=entry.entry_price,
+                        exit_price=entry.exit_price,
+                        pnl=entry.pnl,
+                        rr_ratio=entry.rr_ratio,
+                        hold_time_minutes=entry.hold_time_minutes,
+                        exit_reason=entry.exit_reason,
+                    )
 
             # Notify and get advisor recommendation on circuit breaker trigger
             cb_status = self._circuit.get_status()
@@ -862,6 +890,11 @@ def main() -> None:
         default=8080,
         help="Dashboard web UI port (default: 8080, 0 to disable)",
     )
+    parser.add_argument(
+        "--reset-paper",
+        action="store_true",
+        help="Reset paper trading account to default $100K balance, then exit",
+    )
     args = parser.parse_args()
 
     # Load config
@@ -873,6 +906,20 @@ def main() -> None:
 
     # Setup logging
     setup_logging(config.log_level, json_output=config.log_json)
+
+    # Paper account reset
+    if args.reset_paper:
+        print("\n  Resetting Alpaca paper trading account...")
+        broker = AlpacaBroker(config.broker)
+        if broker.reset_paper_account():
+            print("  Done. You can now start the bot normally.")
+        else:
+            print("\n  If the API reset doesn't work, you can:")
+            print("  1. Go to https://app.alpaca.markets")
+            print("  2. Navigate to Paper Trading > Settings")
+            print("  3. Generate new API keys (this creates a fresh account)")
+            print("  4. Update ALPACA_API_KEY and ALPACA_API_SECRET in your .env")
+        sys.exit(0)
 
     # Live mode safety confirmation
     if config.run_mode == RunMode.LIVE:
