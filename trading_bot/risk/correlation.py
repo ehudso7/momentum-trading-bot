@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import structlog
 
 from trading_bot.data.market_data import MarketDataProvider
@@ -213,6 +214,78 @@ class CorrelationChecker:
         self._cache[cache_key] = (corr, datetime.utcnow())
 
         return corr
+
+    def is_intraday_correlated(
+        self,
+        new_symbol: str,
+        existing_symbols: list[str],
+        bars_cache: dict[str, pd.DataFrame],
+        threshold: float = 0.6,
+    ) -> bool:
+        """
+        Check intraday return correlation using recent 1-minute bars.
+        
+        Momentum gappers often move together because of shared retail
+        flow, not sector similarity. This checks the last 30 minutes
+        of 1-min bar returns for correlation.
+        
+        Args:
+            new_symbol: Candidate symbol.
+            existing_symbols: Currently held symbols.
+            bars_cache: Dict mapping symbol -> recent 1-min bars DataFrame.
+            threshold: Correlation threshold (default 0.6, tighter than daily).
+        
+        Returns:
+            True if correlated with any existing position.
+        """
+        if not existing_symbols:
+            return False
+        
+        new_bars = bars_cache.get(new_symbol)
+        if new_bars is None or new_bars.empty or len(new_bars) < 15:
+            return False
+        
+        try:
+            new_bars_copy = new_bars.copy()
+            new_bars_copy.columns = [c.lower() for c in new_bars_copy.columns]
+            new_returns = new_bars_copy["close"].tail(30).pct_change().dropna()
+            
+            if len(new_returns) < 10:
+                return False
+            
+            for existing in existing_symbols:
+                exist_bars = bars_cache.get(existing)
+                if exist_bars is None or exist_bars.empty or len(exist_bars) < 15:
+                    continue
+                
+                exist_copy = exist_bars.copy()
+                exist_copy.columns = [c.lower() for c in exist_copy.columns]
+                exist_returns = exist_copy["close"].tail(30).pct_change().dropna()
+                
+                if len(exist_returns) < 10:
+                    continue
+                
+                # Align by position (both are recent 1-min bars)
+                min_len = min(len(new_returns), len(exist_returns))
+                nr = new_returns.values[-min_len:]
+                er = exist_returns.values[-min_len:]
+                
+                if np.std(nr) == 0 or np.std(er) == 0:
+                    continue
+                
+                corr = float(np.corrcoef(nr, er)[0, 1])
+                if not np.isnan(corr) and abs(corr) > threshold:
+                    log.info(
+                        "correlation.intraday_correlated",
+                        new_symbol=new_symbol,
+                        existing_symbol=existing,
+                        correlation=round(corr, 4),
+                    )
+                    return True
+        except Exception as e:
+            log.debug("correlation.intraday_error", error=str(e))
+        
+        return False
 
     # ------------------------------------------------------------------
     # Private helpers
