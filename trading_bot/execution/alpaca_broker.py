@@ -16,6 +16,9 @@ from trading_bot.utils.resilience import retry_with_backoff
 
 log = structlog.get_logger(__name__)
 
+# Alpaca paper trading base URL
+_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+
 
 class AlpacaBroker(BrokerBase):
     """
@@ -188,3 +191,68 @@ class AlpacaBroker(BrokerBase):
             return int(account.daytrade_count) if account.daytrade_count else 0
         except Exception:
             return 0
+
+    def reset_paper_account(self) -> bool:
+        """
+        Reset the Alpaca paper trading account to default $100K balance.
+
+        Uses the undocumented but functional DELETE /v2/account endpoint
+        on the paper trading API. This is the same action that the Alpaca
+        dashboard "Reset Account" button used before it was removed.
+
+        Returns True if reset succeeded, False otherwise.
+        """
+        if not self._paper:
+            log.error("alpaca.reset_refused", reason="Cannot reset a LIVE account")
+            return False
+
+        import requests
+
+        api_key = self._client._api_key
+        secret_key = self._client._secret_key
+
+        headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+        }
+
+        # Close all positions and cancel orders first
+        try:
+            self._client.cancel_orders()
+            log.info("alpaca.reset_orders_cancelled")
+        except Exception as e:
+            log.warning("alpaca.reset_cancel_orders_error", error=str(e))
+
+        try:
+            self._client.close_all_positions(cancel_orders=True)
+            log.info("alpaca.reset_positions_closed")
+        except Exception as e:
+            log.warning("alpaca.reset_close_positions_error", error=str(e))
+
+        # Reset via DELETE /v2/account
+        url = f"{_PAPER_BASE_URL}/v2/account"
+        try:
+            resp = requests.delete(url, headers=headers, timeout=30)
+            if resp.status_code in (200, 204):
+                account = self._client.get_account()
+                new_equity = float(account.equity or 0)
+                log.info(
+                    "alpaca.reset_success",
+                    new_equity=new_equity,
+                )
+                print(f"  Paper account reset successful! New equity: ${new_equity:,.2f}")
+                return True
+            else:
+                log.error(
+                    "alpaca.reset_api_failed",
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+                print(f"  API reset failed (HTTP {resp.status_code}). "
+                      f"Try creating new paper API keys at https://app.alpaca.markets")
+                return False
+        except Exception as e:
+            log.error("alpaca.reset_error", error=str(e))
+            print(f"  Reset error: {e}")
+            print("  Alternative: Create new paper trading API keys at https://app.alpaca.markets")
+            return False

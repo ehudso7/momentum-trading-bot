@@ -17,6 +17,17 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings
 
 
+def _strip_whitespace(value: object) -> object:
+    """Recursively strip whitespace from string values in config data."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return {k: _strip_whitespace(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_whitespace(item) for item in value]
+    return value
+
+
 class RunMode(str, Enum):
     BACKTEST = "backtest"
     PAPER = "paper"
@@ -67,6 +78,8 @@ class RiskConfig(BaseModel):
     max_daily_risk_pct: float = Field(3.0, ge=1.0, le=5.0)
     max_open_positions: int = Field(4, ge=1, le=10)
     max_leverage: float = Field(4.0, ge=1.0, le=4.0)
+    max_position_value_pct: float = Field(20.0, ge=5.0, le=50.0)
+    min_stop_distance_pct: float = Field(1.0, ge=0.25, le=5.0)
     pdt_equity_threshold: float = Field(25_000.0)
     stop_loss_atr_multiplier: float = Field(1.25, ge=0.5, le=3.0)
     drawdown_circuit_breaker_pct: float = Field(5.0, ge=1.0, le=15.0)
@@ -159,7 +172,7 @@ class AppConfig(BaseSettings):
     """
 
     run_mode: RunMode = Field(RunMode.PAPER)
-    starting_capital: float = Field(25_000.0, ge=100.0)
+    starting_capital: float = Field(100_000.0, ge=100.0)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     entry: EntryConfig = Field(default_factory=EntryConfig)
@@ -181,6 +194,14 @@ class AppConfig(BaseSettings):
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def strip_env_whitespace(cls, data: dict) -> dict:
+        """Strip trailing whitespace/tabs from env var values before validation."""
+        if isinstance(data, dict):
+            return {k: _strip_whitespace(v) for k, v in data.items()}
+        return data
 
     @classmethod
     def from_yaml(cls, path: str = "trading_bot/config/config.yaml") -> "AppConfig":

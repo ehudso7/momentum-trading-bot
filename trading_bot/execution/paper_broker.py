@@ -80,7 +80,7 @@ class PaperBroker(BrokerBase):
 
     def __init__(
         self,
-        initial_equity: float = 25_000.0,
+        initial_equity: float = 100_000.0,
         slippage_bps: float = 5.0,
         slippage_model: SlippageModel | None = None,
     ):

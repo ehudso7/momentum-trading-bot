@@ -33,7 +33,7 @@ from trading_bot.data.yahoo_screener import YahooScreener
 from trading_bot.execution.alpaca_broker import AlpacaBroker
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.portfolio.manager import PortfolioManager
-from trading_bot.risk.circuit_breaker import CircuitBreaker
+from trading_bot.risk.circuit_breaker import CircuitBreaker, CircuitState
 from trading_bot.risk.correlation import CorrelationChecker
 from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner
@@ -105,12 +105,7 @@ class TradingBot:
             if config.run_mode == RunMode.LIVE:
                 self._broker = AlpacaBroker(config.broker)
             else:  # PAPER
-                # Use Alpaca paper if keys provided, else local paper broker
-                if config.broker.alpaca_api_key.get_secret_value() and \
-                   config.broker.alpaca_api_key.get_secret_value() != "your_alpaca_api_key_here":
-                    self._broker = AlpacaBroker(config.broker)
-                else:
-                    self._broker = PaperBroker(initial_equity=config.starting_capital)
+                self._broker = PaperBroker(initial_equity=config.starting_capital)
 
         self._news = NewsClient(polygon, config.scanner)
         alpaca_screener = (
@@ -322,10 +317,38 @@ class TradingBot:
 
     def _tick(self) -> None:
         """Single iteration of the main trading loop."""
+        # 0. Feed unrealized P&L to circuit breaker so it can halt
+        #    BEFORE a catastrophic open position is closed at a loss.
+        open_positions = self._portfolio.get_open_positions()
+        unrealized = sum(p.pnl_unrealized for p in open_positions)
+        self._circuit.update_unrealized_pnl(unrealized)
+
         # 1. Check circuit breaker FIRST (NON-NEGOTIABLE)
         state = self._circuit.check()
         if not self._circuit.is_trading_allowed:
             log.warning("bot.circuit_active", state=state.value)
+
+            # EMERGENCY: close all open positions when circuit breaker halts
+            # to prevent unrealized losses from growing further.
+            if state == CircuitState.HALTED and open_positions:
+                log.critical(
+                    "bot.emergency_close",
+                    positions=len(open_positions),
+                    unrealized_pnl=round(unrealized, 2),
+                )
+                entries = self._portfolio.close_all("circuit_breaker_halt")
+                for entry in entries:
+                    self._notify.notify_trade_closed(
+                        symbol=entry.symbol,
+                        side=entry.side,
+                        shares=entry.shares,
+                        entry_price=entry.entry_price,
+                        exit_price=entry.exit_price,
+                        pnl=entry.pnl,
+                        rr_ratio=entry.rr_ratio,
+                        hold_time_minutes=entry.hold_time_minutes,
+                        exit_reason=entry.exit_reason,
+                    )
 
             # Notify and get advisor recommendation on circuit breaker trigger
             cb_status = self._circuit.get_status()
@@ -929,6 +952,7 @@ def main() -> None:
         "--reset-paper",
         action="store_true",
         help="Reset the Alpaca paper trading account to its initial state and exit",
+        help="Reset paper trading account to default $100K balance, then exit",
     )
     args = parser.parse_args()
 
@@ -946,6 +970,19 @@ def main() -> None:
     if args.reset_paper:
         _reset_paper_account(config)
         return
+    # Paper account reset
+    if args.reset_paper:
+        print("\n  Resetting Alpaca paper trading account...")
+        broker = AlpacaBroker(config.broker)
+        if broker.reset_paper_account():
+            print("  Done. You can now start the bot normally.")
+        else:
+            print("\n  If the API reset doesn't work, you can:")
+            print("  1. Go to https://app.alpaca.markets")
+            print("  2. Navigate to Paper Trading > Settings")
+            print("  3. Generate new API keys (this creates a fresh account)")
+            print("  4. Update ALPACA_API_KEY and ALPACA_API_SECRET in your .env")
+        sys.exit(0)
 
     # Live mode safety confirmation
     if config.run_mode == RunMode.LIVE:

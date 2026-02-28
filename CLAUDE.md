@@ -4,7 +4,7 @@
 
 Automated momentum day-trading bot for US equities (NYSE/NASDAQ).
 Targets low-float momentum gappers with VWAP/EMA pullback entry strategy.
-Built for small account growth ($500–$25k+) with strict risk management.
+Built for account growth with strict risk management (default $100k starting capital).
 Deployed on Railway with live dashboard.
 
 ## Quick Start
