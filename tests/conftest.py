@@ -31,7 +31,7 @@ from trading_bot.models.domain import (
 def default_config() -> AppConfig:
     """AppConfig with all defaults for testing (paper mode)."""
     return AppConfig(
-        starting_capital=25_000.0,
+        starting_capital=100_000.0,
         scanner=ScannerConfig(),
         risk=RiskConfig(),
         entry=EntryConfig(),

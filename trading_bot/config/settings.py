@@ -17,6 +17,17 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings
 
 
+def _strip_whitespace(value: object) -> object:
+    """Recursively strip whitespace from string values in config data."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return {k: _strip_whitespace(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_whitespace(item) for item in value]
+    return value
+
+
 class RunMode(str, Enum):
     BACKTEST = "backtest"
     PAPER = "paper"
@@ -159,7 +170,7 @@ class AppConfig(BaseSettings):
     """
 
     run_mode: RunMode = Field(RunMode.PAPER)
-    starting_capital: float = Field(25_000.0, ge=100.0)
+    starting_capital: float = Field(100_000.0, ge=100.0)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     entry: EntryConfig = Field(default_factory=EntryConfig)
@@ -181,6 +192,14 @@ class AppConfig(BaseSettings):
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def strip_env_whitespace(cls, data: dict) -> dict:
+        """Strip trailing whitespace/tabs from env var values before validation."""
+        if isinstance(data, dict):
+            return {k: _strip_whitespace(v) for k, v in data.items()}
+        return data
 
     @classmethod
     def from_yaml(cls, path: str = "trading_bot/config/config.yaml") -> "AppConfig":
