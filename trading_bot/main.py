@@ -951,7 +951,6 @@ def main() -> None:
     parser.add_argument(
         "--reset-paper",
         action="store_true",
-        help="Reset the Alpaca paper trading account to its initial state and exit",
         help="Reset paper trading account to default $100K balance, then exit",
     )
     args = parser.parse_args()
@@ -970,19 +969,6 @@ def main() -> None:
     if args.reset_paper:
         _reset_paper_account(config)
         return
-    # Paper account reset
-    if args.reset_paper:
-        print("\n  Resetting Alpaca paper trading account...")
-        broker = AlpacaBroker(config.broker)
-        if broker.reset_paper_account():
-            print("  Done. You can now start the bot normally.")
-        else:
-            print("\n  If the API reset doesn't work, you can:")
-            print("  1. Go to https://app.alpaca.markets")
-            print("  2. Navigate to Paper Trading > Settings")
-            print("  3. Generate new API keys (this creates a fresh account)")
-            print("  4. Update ALPACA_API_KEY and ALPACA_API_SECRET in your .env")
-        sys.exit(0)
 
     # Live mode safety confirmation
     if config.run_mode == RunMode.LIVE:
