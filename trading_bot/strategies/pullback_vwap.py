@@ -34,6 +34,9 @@ from trading_bot.models.domain import (
     TradeSignal,
 )
 from trading_bot.strategies.base import Strategy
+from trading_bot.strategies.multi_timeframe import MultiTimeframeConfirm
+from trading_bot.strategies.volume_profile import VolumeExhaustionDetector
+from trading_bot.strategies.microstructure import MicrostructureScorer
 from trading_bot.utils.helpers import is_past_exit_time, now_et
 from trading_bot.utils.indicators import enrich_dataframe
 
@@ -91,6 +94,10 @@ class PullbackVWAPStrategy(Strategy):
         # Regime-adaptive parameters (updated each tick by main loop)
         self._current_regime: str = "low_volatility"
         self._proximity_multiplier: float = 1.0
+
+        self._mtf = MultiTimeframeConfirm()
+        self._volume_exhaust = VolumeExhaustionDetector()
+        self._microstructure = MicrostructureScorer()
 
     def set_regime(self, regime: str, adjustments: dict) -> None:
         """
@@ -168,6 +175,11 @@ class PullbackVWAPStrategy(Strategy):
 
         if pd.isna(atr) or atr <= 0:
             log.debug("strategy.no_atr", symbol=candidate.symbol)
+            return None
+
+        # Volume exhaustion filter
+        if self._volume_exhaust.is_exhausted(bars):
+            log.info("strategy.volume_exhausted", symbol=candidate.symbol)
             return None
 
         # Check each setup in priority order, with multi-bar lookback
@@ -848,6 +860,9 @@ class PullbackVWAPStrategy(Strategy):
             score *= 1.04
         elif candidate.relative_volume < 3.0:
             score *= 0.85
+
+        # --- 9. Microstructure quality ---
+        score *= self._microstructure.score(df, signal.entry_price)
 
         # Clamp to [0, 1]
         return round(max(0.0, min(1.0, score)), 4)
