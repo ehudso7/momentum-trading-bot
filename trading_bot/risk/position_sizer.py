@@ -71,6 +71,20 @@ class PositionSizer:
                 positions_count=len(current_positions),
             )
 
+        # 1b. Enforce minimum stop distance floor (prevents micro-stops
+        # that create outsized positions via shares = risk$ / tiny_stop).
+        min_stop_distance = entry_price * (self._config.min_stop_distance_pct / 100.0)
+        if stop_distance < min_stop_distance:
+            log.warning(
+                "risk.stop_distance_floored",
+                symbol="unknown",
+                original_distance=round(stop_distance, 4),
+                min_distance=round(min_stop_distance, 4),
+                entry_price=entry_price,
+                stop_price=stop_price,
+            )
+            stop_distance = min_stop_distance
+
         # 2. Calculate position size
         risk_dollars = equity * (self._config.risk_per_trade_pct / 100.0)
         shares = math.floor(risk_dollars / stop_distance)
@@ -86,6 +100,36 @@ class PositionSizer:
             )
 
         position_cost = shares * entry_price
+
+        # 2b. Cap single-position value to max_position_value_pct of equity.
+        # This prevents a tight stop from creating a position that is a
+        # disproportionate share of the account, even within leverage limits.
+        max_position_value = equity * (self._config.max_position_value_pct / 100.0)
+        if position_cost > max_position_value:
+            capped_shares = math.floor(max_position_value / entry_price)
+            if capped_shares <= 0:
+                return RiskCheckResult(
+                    approved=False,
+                    shares=0,
+                    risk_dollars=risk_dollars,
+                    reason="position_value_cap_reduces_to_zero_shares",
+                    leverage_used=0.0,
+                    positions_count=len(current_positions),
+                )
+            log.info(
+                "risk.position_value_capped",
+                original_shares=shares,
+                capped_shares=capped_shares,
+                position_value=round(capped_shares * entry_price, 2),
+                max_pct=self._config.max_position_value_pct,
+                equity=round(equity, 2),
+            )
+            shares = capped_shares
+            position_cost = shares * entry_price
+            warnings.append(
+                f"shares_capped_for_concentration: {shares} shares "
+                f"({self._config.max_position_value_pct}% equity cap)"
+            )
 
         # 3. Max open positions check
         if len(current_positions) >= self._config.max_open_positions:
