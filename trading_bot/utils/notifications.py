@@ -8,6 +8,7 @@ failures are logged but never interrupt trading logic.
 
 from __future__ import annotations
 
+import queue
 import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -41,6 +42,10 @@ class NotificationManager:
         self._config = config
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+        self._queue: queue.Queue = queue.Queue(maxsize=100)
+        self._fallback_webhook_url: Optional[str] = getattr(config, 'fallback_webhook_url', None)
+        self._worker = threading.Thread(target=self._process_queue, daemon=True)
+        self._worker.start()
 
     # --- Public notification methods ---
 
@@ -192,49 +197,39 @@ class NotificationManager:
             "data": data,
         }
 
+    def _process_queue(self) -> None:
+        """Background worker that processes notification queue with retry."""
+        while True:
+            try:
+                payload = self._queue.get(timeout=5)
+                try:
+                    self._send(payload)
+                except Exception as e:
+                    log.warning("notification.primary_failed", error=str(e)[:100])
+                    # Try fallback webhook
+                    if self._fallback_webhook_url:
+                        try:
+                            self._session.post(
+                                self._fallback_webhook_url,
+                                json=payload,
+                                timeout=_WEBHOOK_TIMEOUT,
+                            )
+                            log.info("notification.fallback_sent")
+                        except Exception:
+                            log.error("notification.fallback_also_failed")
+                self._queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
     def _send_async(self, payload: dict[str, Any]) -> None:
-        """
-        Fire-and-forget: dispatch the webhook POST in a daemon thread.
-
-        If notifications are disabled or the webhook URL is not configured,
-        this is a no-op.
-        """
-        if not self._config.enabled:
-            log.debug(
-                "notification.disabled",
-                event_type=payload.get("event_type"),
-            )
+        if not self._config.enabled or not self._config.webhook_url:
             return
-
-        if not self._config.webhook_url:
-            log.debug(
-                "notification.no_webhook_url",
-                event_type=payload.get("event_type"),
-            )
-            return
-
-        thread = threading.Thread(
-            target=self._send_safe,
-            args=(payload,),
-            daemon=True,
-        )
-        thread.start()
-
-    def _send_safe(self, payload: dict[str, Any]) -> None:
-        """
-        Wrapper that swallows all exceptions from _send.
-
-        Used as the actual thread target so that failures never escape
-        the daemon thread and never interrupt the main trading loop.
-        """
         try:
-            self._send(payload)
-        except Exception as e:
-            log.error(
-                "notification.failed",
-                event_type=payload.get("event_type"),
-                error=str(e)[:200],
-            )
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            log.warning("notification.queue_full")
 
     @retry_with_backoff(
         max_retries=2,
