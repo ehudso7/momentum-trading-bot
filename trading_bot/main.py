@@ -861,6 +861,64 @@ class TradingBot:
         self._shutdown_event.set()
 
 
+def _reset_paper_account(config: AppConfig) -> None:
+    """Reset the Alpaca paper trading account to its initial state."""
+    import requests
+
+    api_key = config.broker.alpaca_api_key.get_secret_value()
+    api_secret = config.broker.alpaca_api_secret.get_secret_value()
+
+    if not api_key or api_key in ("", "your_alpaca_api_key_here"):
+        print("ERROR: Alpaca API key not configured. Set ALPACA_API_KEY in .env or environment.")
+        sys.exit(1)
+    if not api_secret or api_secret in ("", "your_alpaca_api_secret_here"):
+        print("ERROR: Alpaca API secret not configured. Set ALPACA_API_SECRET in .env or environment.")
+        sys.exit(1)
+
+    base_url = config.broker.alpaca_base_url or "https://paper-api.alpaca.markets"
+    if "paper" not in base_url:
+        print("ERROR: --reset-paper can only be used with a paper trading account.")
+        print(f"  Current base URL: {base_url}")
+        sys.exit(1)
+
+    print(f"Resetting Alpaca paper trading account at {base_url} ...")
+
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+
+    try:
+        resp = requests.delete(f"{base_url}/v2/account", headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            print("Paper account reset successfully!")
+            print(f"  Account ID:    {data.get('id', 'N/A')}")
+            print(f"  Status:        {data.get('status', 'N/A')}")
+            print(f"  Cash:          ${float(data.get('cash', 0)):,.2f}")
+            print(f"  Equity:        ${float(data.get('equity', 0)):,.2f}")
+            print(f"  Buying Power:  ${float(data.get('buying_power', 0)):,.2f}")
+        elif resp.status_code == 401:
+            print("ERROR: Authentication failed. Check your ALPACA_API_KEY and ALPACA_API_SECRET.")
+            sys.exit(1)
+        elif resp.status_code == 403:
+            print("ERROR: Not authorized. Ensure you are using paper trading credentials.")
+            sys.exit(1)
+        else:
+            print(f"ERROR: Unexpected response (HTTP {resp.status_code})")
+            print(f"  Body: {resp.text}")
+            sys.exit(1)
+    except requests.ConnectionError:
+        print(f"ERROR: Could not connect to {base_url}")
+        sys.exit(1)
+    except requests.Timeout:
+        print("ERROR: Request timed out")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -893,6 +951,7 @@ def main() -> None:
     parser.add_argument(
         "--reset-paper",
         action="store_true",
+        help="Reset the Alpaca paper trading account to its initial state and exit",
         help="Reset paper trading account to default $100K balance, then exit",
     )
     args = parser.parse_args()
@@ -907,6 +966,10 @@ def main() -> None:
     # Setup logging
     setup_logging(config.log_level, json_output=config.log_json)
 
+    # Handle --reset-paper: reset Alpaca paper account and exit
+    if args.reset_paper:
+        _reset_paper_account(config)
+        return
     # Paper account reset
     if args.reset_paper:
         print("\n  Resetting Alpaca paper trading account...")
