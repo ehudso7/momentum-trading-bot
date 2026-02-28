@@ -85,8 +85,8 @@ class TestBacktestEngine:
 
         result = engine._compute_metrics("TEST", trades)
         assert result.max_drawdown_pct > 0
-        # Peak equity: 25200, trough: 24900, DD = 300/25200 = ~1.19%
-        assert result.max_drawdown_pct == pytest.approx(1.19, abs=0.1)
+        # Peak equity: 100200, trough: 99900, DD = 300/100200 = ~0.30%
+        assert result.max_drawdown_pct == pytest.approx(0.30, abs=0.1)
 
     def test_report_format(self, default_config: AppConfig):
         """Report generates valid string output."""

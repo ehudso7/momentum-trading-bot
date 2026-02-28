@@ -6,7 +6,7 @@
 # ========================================
 
 run_mode: "paper"          # backtest | paper | live
-starting_capital: 25000.0
+starting_capital: 100000.0
 log_level: "INFO"
 log_json: false
 journal_csv_path: "data/journal.csv"
