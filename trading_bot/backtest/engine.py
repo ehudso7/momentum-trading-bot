@@ -20,6 +20,8 @@ import structlog
 import yfinance as yf
 
 from trading_bot.config.settings import AppConfig
+from trading_bot.execution.paper_broker import SlippageModel
+from trading_bot.models.domain import OrderSide
 from trading_bot.utils.indicators import enrich_dataframe
 
 log = structlog.get_logger(__name__)
@@ -74,6 +76,7 @@ class BacktestEngine:
         self._scale_targets = config.exit.scale_out_rr_targets
         self._scale_ratios = config.exit.scale_out_ratios
         self._starting_capital = config.starting_capital
+        self._slippage = SlippageModel(base_bps=5.0, volume_impact_bps=2.0)
 
     def run(
         self,
@@ -172,6 +175,7 @@ class BacktestEngine:
         stop_price = 0.0
         shares = 0
         entry_date = ""
+        avg_volume = float(df["volume"].mean())
 
         ema_col = "ema_9"
         atr_col = "atr_14"
@@ -190,7 +194,9 @@ class BacktestEngine:
             if in_trade:
                 # Check stop loss
                 if row["low"] <= stop_price:
-                    exit_price = stop_price
+                    exit_price = self._slippage.compute_slippage(
+                        OrderSide.SELL, stop_price, shares, int(avg_volume)
+                    )
                     pnl = shares * (exit_price - entry_price)
                     trades.append(
                         BacktestTrade(
@@ -221,7 +227,9 @@ class BacktestEngine:
                 risk = entry_price - stop_price
                 target_2r = entry_price + (risk * 2.0)
                 if row["high"] >= target_2r:
-                    exit_price = target_2r
+                    exit_price = self._slippage.compute_slippage(
+                        OrderSide.SELL, target_2r, shares, int(avg_volume)
+                    )
                     pnl = shares * (exit_price - entry_price)
                     trades.append(
                         BacktestTrade(
@@ -261,8 +269,10 @@ class BacktestEngine:
                 if row["volume"] < prev["volume"] * 1.2:
                     continue
 
-                # Calculate position
-                entry_price = price
+                # Calculate position with slippage on entry
+                entry_price = self._slippage.compute_slippage(
+                    OrderSide.BUY, price, shares if shares > 0 else 1, int(avg_volume)
+                )
                 stop_price = round(entry_price - (atr * self._stop_atr_mult), 4)
                 stop_distance = entry_price - stop_price
 

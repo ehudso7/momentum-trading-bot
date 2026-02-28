@@ -12,7 +12,7 @@ This is a Python-based automated momentum day-trading bot. It has a single servi
 pytest tests/ -v
 ```
 
-All 442 tests should pass. No linter is configured for this project.
+All 496 tests should pass. No linter is configured for this project.
 
 ### Running the application
 

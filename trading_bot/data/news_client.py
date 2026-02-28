@@ -21,6 +21,21 @@ log = structlog.get_logger(__name__)
 class NewsClient:
     """Fetches and filters news for catalyst detection."""
 
+    POSITIVE_KEYWORDS = [
+        "approve", "approved", "approval", "grant", "granted",
+        "beat", "beats", "exceed", "exceeded", "surpass",
+        "upgrade", "upgraded", "raise", "raised", "higher",
+        "breakthrough", "positive", "success", "successful",
+        "strong", "record", "growth", "soar", "surge",
+    ]
+    NEGATIVE_KEYWORDS = [
+        "reject", "rejected", "rejection", "deny", "denied",
+        "miss", "missed", "below", "disappoint", "disappointing",
+        "downgrade", "downgraded", "lower", "lowered", "cut",
+        "fail", "failed", "failure", "negative", "weak",
+        "decline", "drop", "fall", "warning", "recall",
+    ]
+
     def __init__(
         self,
         polygon_client: Optional[PolygonClient],
@@ -87,6 +102,47 @@ class NewsClient:
     def has_catalyst(self, symbol: str) -> bool:
         """Boolean check for catalyst presence."""
         return self.find_catalyst(symbol) is not None
+
+    def classify_sentiment(self, symbol: str) -> str:
+        """
+        Classify news sentiment for a symbol.
+        
+        Returns: "positive", "negative", or "neutral"
+        """
+        if not self._polygon or not self._polygon.is_configured:
+            return "neutral"
+        
+        try:
+            articles = self._polygon.get_news(symbol, limit=5)
+            positive_count = 0
+            negative_count = 0
+            
+            for article in articles:
+                pub_time = article.get("published_utc", "")
+                if pub_time and not self._is_recent(pub_time, hours=12):
+                    continue
+                
+                text = (
+                    f"{article.get('title', '')} {article.get('description', '')}"
+                ).lower()
+                
+                for kw in self.POSITIVE_KEYWORDS:
+                    if kw in text:
+                        positive_count += 1
+                        break
+                
+                for kw in self.NEGATIVE_KEYWORDS:
+                    if kw in text:
+                        negative_count += 1
+                        break
+            
+            if positive_count > negative_count:
+                return "positive"
+            elif negative_count > positive_count:
+                return "negative"
+            return "neutral"
+        except Exception:
+            return "neutral"
 
     def _is_recent(self, published_utc: str, hours: int = 24) -> bool:
         """Check if a publication timestamp is within the last N hours."""

@@ -103,10 +103,10 @@ class ExitConfig(BaseModel):
     """Exit and profit-taking parameters."""
 
     scale_out_ratios: list[float] = Field(
-        default_factory=lambda: [0.333, 0.333, 0.334]
+        default_factory=lambda: [0.25, 0.25, 0.25, 0.25]
     )
     scale_out_rr_targets: list[float] = Field(
-        default_factory=lambda: [1.0, 2.0]
+        default_factory=lambda: [1.0, 2.0, 3.0]
     )
     trailing_stop_atr_multiplier: float = Field(1.5, ge=0.5, le=4.0)
     trailing_stop_breakeven_buffer_pct: float = Field(0.5, ge=0.1, le=2.0)
