@@ -895,6 +895,11 @@ def main() -> None:
         default=8080,
         help="Dashboard web UI port (default: 8080, 0 to disable)",
     )
+    parser.add_argument(
+        "--reset-paper",
+        action="store_true",
+        help="Reset paper trading account to default $100K balance, then exit",
+    )
     args = parser.parse_args()
 
     # Load config
@@ -906,6 +911,20 @@ def main() -> None:
 
     # Setup logging
     setup_logging(config.log_level, json_output=config.log_json)
+
+    # Paper account reset
+    if args.reset_paper:
+        print("\n  Resetting Alpaca paper trading account...")
+        broker = AlpacaBroker(config.broker)
+        if broker.reset_paper_account():
+            print("  Done. You can now start the bot normally.")
+        else:
+            print("\n  If the API reset doesn't work, you can:")
+            print("  1. Go to https://app.alpaca.markets")
+            print("  2. Navigate to Paper Trading > Settings")
+            print("  3. Generate new API keys (this creates a fresh account)")
+            print("  4. Update ALPACA_API_KEY and ALPACA_API_SECRET in your .env")
+        sys.exit(0)
 
     # Live mode safety confirmation
     if config.run_mode == RunMode.LIVE:
