@@ -141,10 +141,7 @@ def create_app(state: DashboardState) -> FastAPI:
             "starting_equity": snap.starting_equity,
             "daily_pnl": snap.daily_pnl,
             "daily_return_pct": (
-                round(
-                    (snap.equity - snap.starting_equity) / snap.starting_equity * 100,
-                    2,
-                )
+                round(snap.daily_pnl / snap.starting_equity * 100, 2)
                 if snap.starting_equity > 0
                 else 0.0
             ),

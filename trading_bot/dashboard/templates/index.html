@@ -258,7 +258,7 @@
     <div class="big-number {{ pnl_class }}" id="daily-pnl">
       {{ "+" if snap.daily_pnl >= 0 else "" }}${{ "{:,.2f}".format(snap.daily_pnl) }}
     </div>
-    {% set pct = ((snap.equity - snap.starting_equity) / snap.starting_equity * 100) if snap.starting_equity > 0 else 0 %}
+    {% set pct = (snap.daily_pnl / snap.starting_equity * 100) if snap.starting_equity > 0 else 0 %}
     <div class="sub-stat {{ 'pos' if pct >= 0 else 'neg' }}" id="daily-pnl-pct">{{ "{:+.2f}".format(pct) }}%</div>
   </div>
 
