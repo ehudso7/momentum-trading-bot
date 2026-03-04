@@ -105,6 +105,8 @@ class PositionInfo:
     trailing_stop_active: bool = False
     trailing_stop_price: Optional[float] = None
     broker_order_ids: list[str] = field(default_factory=list)
+    broker_stop_order_id: Optional[str] = None
+    broker_tp_order_id: Optional[str] = None
 
     @property
     def total_pnl(self) -> float:
@@ -169,4 +171,32 @@ class JournalEntry:
             "exit_time": self.exit_time,
             "exit_reason": self.exit_reason,
             "notes": self.notes,
+        }
+
+
+@dataclass
+class RejectedSignal:
+    """A trade signal that passed scanning but was rejected before execution."""
+
+    timestamp: datetime
+    symbol: str
+    stage: str  # "strategy", "risk", "correlation", "advisor"
+    reason: str
+    entry_price: float = 0.0
+    stop_price: float = 0.0
+    signal_type: str = ""
+    gap_pct: float = 0.0
+    score: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": self.symbol,
+            "stage": self.stage,
+            "reason": self.reason,
+            "entry_price": self.entry_price,
+            "stop_price": self.stop_price,
+            "signal_type": self.signal_type,
+            "gap_pct": round(self.gap_pct, 1),
+            "score": round(self.score, 3),
         }

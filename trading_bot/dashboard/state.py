@@ -51,6 +51,10 @@ class DashboardSnapshot:
     # Equity history (list of {timestamp, equity} for charting)
     equity_history: list[dict[str, Any]] = field(default_factory=list)
 
+    # Rejected signals
+    rejected_signals_count: int = 0
+    rejected_by_stage: dict[str, int] = field(default_factory=dict)
+
     # Metadata
     run_mode: str = "paper"
     last_updated: str | None = None
@@ -81,6 +85,8 @@ class DashboardState:
         market_status: str = "unknown",
         market_status_detail: str = "",
         last_error: str | None = None,
+        rejected_signals_count: int = 0,
+        rejected_by_stage: dict[str, int] | None = None,
     ) -> None:
         """Called by the bot on each tick to push latest state."""
         now_eastern = datetime.now(ET)
@@ -110,6 +116,8 @@ class DashboardState:
                 market_status=market_status,
                 market_status_detail=market_status_detail,
                 equity_history=list(self._equity_history),
+                rejected_signals_count=rejected_signals_count,
+                rejected_by_stage=rejected_by_stage or {},
                 run_mode=run_mode,
                 last_updated=now_str,
                 bot_running=True,
