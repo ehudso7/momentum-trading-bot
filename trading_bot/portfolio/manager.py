@@ -173,19 +173,31 @@ class PortfolioManager:
         """
         Open a new position based on a validated trade signal.
 
-        Submits market order via broker and creates PositionInfo tracking.
+        Uses bracket orders so stop-loss and take-profit live on the exchange,
+        enforced even if the bot is down between ticks.
         """
-        # Submit entry order
-        order_id = self._broker.submit_market_order(
+        # Use first target for the bracket take-profit
+        tp_price = signal.target_prices[0] if signal.target_prices else (
+            signal.entry_price + 2 * abs(signal.entry_price - signal.stop_price)
+        )
+
+        # Submit bracket order: entry + stop + take-profit as one atomic unit
+        bracket_ids = self._broker.submit_bracket_order(
             symbol=signal.symbol,
             qty=risk_result.shares,
             side=OrderSide.BUY,
+            stop_price=signal.stop_price,
+            take_profit_price=tp_price,
         )
+
+        entry_order_id = bracket_ids["entry_order_id"]
+        stop_order_id = bracket_ids.get("stop_order_id", "")
+        tp_order_id = bracket_ids.get("tp_order_id", "")
 
         # Check for partial fill
         actual_shares = risk_result.shares
         try:
-            order_status = self._broker.get_order_status(order_id)
+            order_status = self._broker.get_order_status(entry_order_id)
             if order_status.get("filled_qty", 0) > 0:
                 actual_shares = order_status["filled_qty"]
                 if actual_shares != risk_result.shares:
@@ -214,7 +226,9 @@ class PortfolioManager:
             scale_outs_completed=0,
             entry_time=now_et(),
             signal_type=signal.signal_type,
-            broker_order_ids=[order_id],
+            broker_order_ids=[entry_order_id],
+            broker_stop_order_id=stop_order_id,
+            broker_tp_order_id=tp_order_id,
         )
 
         self._positions[signal.symbol] = position
@@ -225,7 +239,9 @@ class PortfolioManager:
             shares=actual_shares,
             entry=signal.entry_price,
             stop=signal.stop_price,
+            target=tp_price,
             risk=format_currency(risk_result.risk_dollars),
+            bracket=bool(stop_order_id),
         )
 
         return position
@@ -237,11 +253,12 @@ class PortfolioManager:
         Update all open positions. Called every tick.
 
         For each position:
-        1. Fetch latest price
-        2. Check for exits (stop, time, PSAR)
-        3. Check for scale-outs at R:R targets
-        4. Update trailing stop
-        5. Update unrealized P&L
+        1. Check if broker-side stop/TP already filled (bracket OCO)
+        2. Fetch latest price
+        3. Check for exits (stop, time, PSAR)
+        4. Check for scale-outs at R:R targets
+        5. Update trailing stop (and replace broker stop order)
+        6. Update unrealized P&L
 
         Returns list of journal entries for any closed trades.
         """
@@ -253,7 +270,14 @@ class PortfolioManager:
                 symbols_to_remove.append(symbol)
                 continue
 
-            # 1. Update current price
+            # 1. Check if the broker-side stop or take-profit already fired
+            broker_closed = self._check_bracket_fills(position)
+            if broker_closed:
+                journal_entries.append(broker_closed)
+                symbols_to_remove.append(symbol)
+                continue
+
+            # 2. Update current price
             price = market_data.get_current_price(symbol)
             if price is None:
                 log.warning("portfolio.price_unavailable", symbol=symbol)
@@ -264,37 +288,63 @@ class PortfolioManager:
                 position.shares_remaining * (price - position.entry_price)
             )
 
-            # 2. Get bar data for strategy decisions
+            # 3. Get bar data for strategy decisions
             bars = market_data.get_intraday_bars(symbol, lookback_bars=50)
 
-            # 3. Check full exit conditions
+            # 4. Check full exit conditions
             should_exit, exit_reason = strategy.should_exit(position, bars)
             if should_exit:
+                # Cancel broker-side bracket legs before our own close
+                self._cancel_bracket_legs(position)
                 entry = self._close_position(position, price, exit_reason)
                 if entry:
                     journal_entries.append(entry)
                 symbols_to_remove.append(symbol)
                 continue
 
-            # 4. Check scale-outs
+            # 5. Check scale-outs
             scale_result = strategy.compute_scale_out(position, price)
             if scale_result:
                 shares_to_sell, scale_reason = scale_result
                 self._execute_scale_out(position, shares_to_sell, price, scale_reason)
 
-            # 5. Update trailing stop
+            # 6. Update trailing stop (and replace broker-side stop)
             new_stop = strategy.get_trailing_stop(position, bars)
             if new_stop and (
                 not position.trailing_stop_price
                 or new_stop > position.trailing_stop_price
             ):
                 position.trailing_stop_active = True
+                old_stop = position.trailing_stop_price
                 position.trailing_stop_price = new_stop
-                log.debug(
-                    "portfolio.trailing_stop_updated",
-                    symbol=symbol,
-                    new_stop=round(new_stop, 4),
-                )
+
+                # Replace the broker-side stop order at the new price
+                if position.broker_stop_order_id:
+                    try:
+                        new_stop_id = self._broker.replace_stop_order(
+                            order_id=position.broker_stop_order_id,
+                            qty=position.shares_remaining,
+                            new_stop_price=new_stop,
+                        )
+                        position.broker_stop_order_id = new_stop_id
+                        log.info(
+                            "portfolio.broker_stop_updated",
+                            symbol=symbol,
+                            old_stop=round(old_stop or 0, 4),
+                            new_stop=round(new_stop, 4),
+                        )
+                    except Exception as e:
+                        log.error(
+                            "portfolio.broker_stop_replace_error",
+                            symbol=symbol,
+                            error=str(e),
+                        )
+                else:
+                    log.debug(
+                        "portfolio.trailing_stop_updated",
+                        symbol=symbol,
+                        new_stop=round(new_stop, 4),
+                    )
 
         # Clean up closed positions
         for symbol in symbols_to_remove:
@@ -353,12 +403,100 @@ class PortfolioManager:
 
     # --- Private methods ---
 
+    def _check_bracket_fills(self, position: PositionInfo) -> Optional[JournalEntry]:
+        """
+        Check if the broker-side stop or take-profit leg already filled.
+
+        Returns a JournalEntry if the position was closed by the broker,
+        otherwise None.
+        """
+        for order_id, leg_type in [
+            (position.broker_stop_order_id, "broker_stop"),
+            (position.broker_tp_order_id, "broker_take_profit"),
+        ]:
+            if not order_id:
+                continue
+            try:
+                status = self._broker.get_order_status(order_id)
+                if status.get("status") in ("filled", "partially_filled"):
+                    fill_price = status.get("filled_avg_price", position.current_price)
+                    filled_qty = status.get("filled_qty", position.shares_remaining)
+
+                    log.info(
+                        "portfolio.bracket_filled",
+                        symbol=position.symbol,
+                        leg=leg_type,
+                        fill_price=fill_price,
+                        filled_qty=filled_qty,
+                    )
+
+                    # Update position state — broker already closed it
+                    close_pnl = filled_qty * (fill_price - position.entry_price)
+                    total_pnl = position.pnl_realized + close_pnl
+                    self._daily_pnl += total_pnl
+
+                    if self._circuit:
+                        self._circuit.record_trade_result(total_pnl)
+
+                    risk_per_share = abs(position.entry_price - position.stop_price)
+                    rr_ratio = (
+                        (fill_price - position.entry_price) / risk_per_share
+                        if risk_per_share > 0
+                        else 0.0
+                    )
+                    hold_minutes = (now_et() - position.entry_time).total_seconds() / 60
+
+                    position.status = PositionStatus.CLOSED
+                    position.shares_remaining = 0
+
+                    entry = JournalEntry(
+                        date=now_et().strftime("%Y-%m-%d"),
+                        symbol=position.symbol,
+                        side=position.side.value,
+                        signal_type=position.signal_type.value,
+                        entry_price=position.entry_price,
+                        exit_price=fill_price,
+                        shares=position.shares,
+                        pnl=round(total_pnl, 2),
+                        rr_ratio=round(rr_ratio, 2),
+                        hold_time_minutes=round(hold_minutes, 1),
+                        entry_time=position.entry_time.strftime("%H:%M:%S"),
+                        exit_time=now_et().strftime("%H:%M:%S"),
+                        exit_reason=leg_type,
+                    )
+                    self._log_to_journal(entry)
+                    return entry
+            except Exception as e:
+                log.debug(
+                    "portfolio.bracket_check_error",
+                    symbol=position.symbol,
+                    order_id=order_id,
+                    error=str(e),
+                )
+        return None
+
+    def _cancel_bracket_legs(self, position: PositionInfo) -> None:
+        """Cancel any outstanding broker-side bracket legs before closing."""
+        for order_id in [position.broker_stop_order_id, position.broker_tp_order_id]:
+            if order_id:
+                try:
+                    self._broker.cancel_order(order_id)
+                except Exception as e:
+                    log.debug(
+                        "portfolio.cancel_bracket_error",
+                        order_id=order_id,
+                        error=str(e),
+                    )
+
     def _close_position(
         self, position: PositionInfo, exit_price: float, reason: str
     ) -> Optional[JournalEntry]:
         """Execute full close and create journal entry."""
         if position.shares_remaining <= 0:
             return None
+
+        # Cancel bracket legs — we're handling the exit ourselves
+        self._cancel_bracket_legs(position)
 
         # Submit sell order for remaining shares
         order_id = self._broker.submit_market_order(
@@ -463,8 +601,34 @@ class PortfolioManager:
 
         if position.shares_remaining > 0:
             position.status = PositionStatus.PARTIALLY_CLOSED
+
+            # Replace broker-side stop for reduced share count
+            if position.broker_stop_order_id:
+                effective_stop = position.trailing_stop_price or position.stop_price
+                try:
+                    new_stop_id = self._broker.replace_stop_order(
+                        order_id=position.broker_stop_order_id,
+                        qty=position.shares_remaining,
+                        new_stop_price=effective_stop,
+                    )
+                    position.broker_stop_order_id = new_stop_id
+                except Exception as e:
+                    log.error(
+                        "portfolio.scale_out_stop_replace_error",
+                        symbol=position.symbol,
+                        error=str(e),
+                    )
+
+            # Cancel take-profit leg after first scale-out
+            if position.broker_tp_order_id:
+                try:
+                    self._broker.cancel_order(position.broker_tp_order_id)
+                    position.broker_tp_order_id = None
+                except Exception:
+                    pass
         else:
             position.status = PositionStatus.CLOSED
+            self._cancel_bracket_legs(position)
 
         log.info(
             "portfolio.scale_out",

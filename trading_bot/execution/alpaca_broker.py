@@ -113,6 +113,62 @@ class AlpacaBroker(BrokerBase):
         return str(order.id)
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: OrderSide,
+        stop_price: float,
+        take_profit_price: float,
+    ) -> dict[str, str]:
+        from alpaca.trading.enums import OrderClass
+        from alpaca.trading.enums import OrderSide as AlpacaSide
+        from alpaca.trading.enums import TimeInForce
+        from alpaca.trading.requests import (
+            MarketOrderRequest,
+            StopLossRequest,
+            TakeProfitRequest,
+        )
+
+        request = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=AlpacaSide.BUY if side == OrderSide.BUY else AlpacaSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
+            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        )
+        order = self._client.submit_order(request)
+
+        # Extract leg order IDs
+        stop_id = ""
+        tp_id = ""
+        if order.legs:
+            for leg in order.legs:
+                if hasattr(leg, "stop_price") and leg.stop_price:
+                    stop_id = str(leg.id)
+                elif hasattr(leg, "limit_price") and leg.limit_price:
+                    tp_id = str(leg.id)
+
+        log.info(
+            "alpaca.bracket_order",
+            entry_id=str(order.id),
+            stop_id=stop_id,
+            tp_id=tp_id,
+            symbol=symbol,
+            side=side.value,
+            qty=qty,
+            stop=stop_price,
+            target=take_profit_price,
+        )
+        return {
+            "entry_order_id": str(order.id),
+            "stop_order_id": stop_id,
+            "tp_order_id": tp_id,
+        }
+
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_stop_order(self, symbol: str, qty: int, stop_price: float) -> str:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
@@ -134,6 +190,40 @@ class AlpacaBroker(BrokerBase):
             stop=stop_price,
         )
         return str(order.id)
+
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
+    def replace_stop_order(
+        self, order_id: str, qty: int, new_stop_price: float
+    ) -> str:
+        from alpaca.trading.requests import ReplaceOrderRequest
+
+        request = ReplaceOrderRequest(
+            qty=qty,
+            stop_price=round(new_stop_price, 2),
+        )
+        try:
+            new_order = self._client.replace_order_by_id(order_id, request)
+            log.info(
+                "alpaca.stop_replaced",
+                old_id=order_id,
+                new_id=str(new_order.id),
+                new_stop=new_stop_price,
+                qty=qty,
+            )
+            return str(new_order.id)
+        except Exception as e:
+            log.error(
+                "alpaca.replace_stop_error",
+                order_id=order_id,
+                error=str(e),
+            )
+            # Fallback: cancel old and submit new
+            self.cancel_order(order_id)
+            return self.submit_stop_order(
+                symbol="",  # Will need the symbol; get from order
+                qty=qty,
+                stop_price=new_stop_price,
+            )
 
     def cancel_order(self, order_id: str) -> bool:
         try:

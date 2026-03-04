@@ -46,6 +46,25 @@ class BrokerBase(ABC):
         ...
 
     @abstractmethod
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: OrderSide,
+        stop_price: float,
+        take_profit_price: float,
+    ) -> dict[str, str]:
+        """
+        Submit a bracket order: entry + stop-loss + take-profit as one atomic unit.
+
+        The stop and take-profit legs are OCO (one-cancels-other) on the
+        exchange, so the stop is enforced even if the bot is down.
+
+        Returns dict with keys: entry_order_id, stop_order_id, tp_order_id.
+        """
+        ...
+
+    @abstractmethod
     def submit_limit_order(
         self, symbol: str, qty: int, side: OrderSide, limit_price: float
     ) -> str:
@@ -62,6 +81,18 @@ class BrokerBase(ABC):
         Submit a stop (sell) order.
 
         Returns order ID string.
+        """
+        ...
+
+    @abstractmethod
+    def replace_stop_order(
+        self, order_id: str, qty: int, new_stop_price: float
+    ) -> str:
+        """
+        Replace an existing stop order with a new stop price/quantity.
+
+        Used when trailing stop ratchets up or after scale-outs reduce shares.
+        Returns new order ID string.
         """
         ...
 

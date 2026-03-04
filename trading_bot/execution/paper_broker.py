@@ -207,6 +207,76 @@ class PaperBroker(BrokerBase):
 
         return order_id
 
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: OrderSide,
+        stop_price: float,
+        take_profit_price: float,
+    ) -> dict[str, str]:
+        """
+        Simulate a bracket order: entry fills immediately, stop and take-profit
+        become pending orders that are checked on each price update.
+        """
+        # Fill the entry
+        entry_order_id = self.submit_market_order(symbol, qty, side)
+        entry_status = self.get_order_status(entry_order_id)
+        if entry_status.get("status") != "filled":
+            return {
+                "entry_order_id": entry_order_id,
+                "stop_order_id": "",
+                "tp_order_id": "",
+            }
+
+        # Create stop-loss leg
+        stop_order_id = str(uuid.uuid4())[:8]
+        self._orders[stop_order_id] = {
+            "id": stop_order_id,
+            "status": "pending",
+            "symbol": symbol,
+            "type": "stop",
+            "qty": qty,
+            "stop_price": stop_price,
+            "bracket_parent": entry_order_id,
+        }
+        self._pending_orders[stop_order_id] = self._orders[stop_order_id]
+        self._order_timestamps[stop_order_id] = datetime.utcnow()
+
+        # Create take-profit leg
+        tp_order_id = str(uuid.uuid4())[:8]
+        self._orders[tp_order_id] = {
+            "id": tp_order_id,
+            "status": "pending",
+            "symbol": symbol,
+            "type": "take_profit",
+            "qty": qty,
+            "limit_price": take_profit_price,
+            "bracket_parent": entry_order_id,
+        }
+        self._pending_orders[tp_order_id] = self._orders[tp_order_id]
+        self._order_timestamps[tp_order_id] = datetime.utcnow()
+
+        # Link them as OCO pair
+        self._orders[stop_order_id]["oco_partner"] = tp_order_id
+        self._orders[tp_order_id]["oco_partner"] = stop_order_id
+
+        log.info(
+            "paper.bracket_order_created",
+            symbol=symbol,
+            entry_id=entry_order_id,
+            stop_id=stop_order_id,
+            tp_id=tp_order_id,
+            stop_price=stop_price,
+            tp_price=take_profit_price,
+        )
+
+        return {
+            "entry_order_id": entry_order_id,
+            "stop_order_id": stop_order_id,
+            "tp_order_id": tp_order_id,
+        }
+
     def submit_limit_order(
         self, symbol: str, qty: int, side: OrderSide, limit_price: float
     ) -> str:
@@ -231,6 +301,32 @@ class PaperBroker(BrokerBase):
         self._order_timestamps[order_id] = datetime.utcnow()
         self._pending_orders[order_id] = self._orders[order_id]
         return order_id
+
+    def replace_stop_order(
+        self, order_id: str, qty: int, new_stop_price: float
+    ) -> str:
+        """Cancel old stop and create a new one at the updated price/qty."""
+        old_order = self._orders.get(order_id, {})
+        symbol = old_order.get("symbol", "")
+        oco_partner = old_order.get("oco_partner")
+
+        self.cancel_order(order_id)
+        new_id = self.submit_stop_order(symbol, qty, new_stop_price)
+
+        # Preserve OCO link if this was part of a bracket
+        if oco_partner and oco_partner in self._orders:
+            self._orders[new_id]["oco_partner"] = oco_partner
+            self._orders[oco_partner]["oco_partner"] = new_id
+
+        log.info(
+            "paper.stop_replaced",
+            old_id=order_id,
+            new_id=new_id,
+            symbol=symbol,
+            new_stop=new_stop_price,
+            new_qty=qty,
+        )
+        return new_id
 
     def cancel_order(self, order_id: str) -> bool:
         if order_id in self._orders:
@@ -262,11 +358,79 @@ class PaperBroker(BrokerBase):
     def get_day_trade_count(self) -> int:
         return self._day_trades
 
-    def update_price(self, symbol: str, price: float) -> None:
-        """Update the last known price for a symbol (for simulation)."""
+    def update_price(self, symbol: str, price: float) -> list[dict]:
+        """
+        Update the last known price for a symbol and check pending orders.
+
+        Returns list of order dicts that were triggered/filled this tick.
+        """
         self._last_prices[symbol] = price
         if symbol in self._positions:
             self._positions[symbol]["current_price"] = price
+
+        # Check pending stop and take-profit orders for this symbol
+        triggered = []
+        for order_id in list(self._pending_orders.keys()):
+            order = self._pending_orders[order_id]
+            if order.get("symbol") != symbol:
+                continue
+
+            filled = False
+            if order.get("type") == "stop" and price <= order["stop_price"]:
+                # Stop triggered — fill at stop price with slippage
+                fill_price = self._slippage.compute_slippage(
+                    OrderSide.SELL, order["stop_price"], order["qty"]
+                )
+                filled = True
+            elif order.get("type") == "take_profit" and price >= order["limit_price"]:
+                # Take-profit triggered — fill at limit price
+                fill_price = order["limit_price"]
+                filled = True
+
+            if filled:
+                qty = min(
+                    order["qty"],
+                    self._positions.get(symbol, {}).get("qty", 0),
+                )
+                if qty <= 0:
+                    continue
+
+                self._cash += qty * fill_price
+                self._positions[symbol]["qty"] -= qty
+                if self._positions[symbol]["qty"] == 0:
+                    del self._positions[symbol]
+                    self._day_trades += 1
+
+                order["status"] = "filled"
+                order["filled_qty"] = qty
+                order["filled_avg_price"] = fill_price
+                order["filled_at"] = datetime.utcnow().isoformat()
+                del self._pending_orders[order_id]
+                self._order_timestamps.pop(order_id, None)
+                triggered.append(order)
+
+                log.info(
+                    "paper.bracket_leg_filled",
+                    order_id=order_id,
+                    type=order["type"],
+                    symbol=symbol,
+                    price=fill_price,
+                    qty=qty,
+                )
+
+                # Cancel OCO partner
+                partner_id = order.get("oco_partner")
+                if partner_id and partner_id in self._pending_orders:
+                    self._orders[partner_id]["status"] = "cancelled_oco"
+                    del self._pending_orders[partner_id]
+                    self._order_timestamps.pop(partner_id, None)
+                    log.info(
+                        "paper.oco_cancelled",
+                        cancelled_id=partner_id,
+                        triggered_by=order_id,
+                    )
+
+        return triggered
 
     def cleanup_stale_orders(self) -> list[str]:
         """Cancel orders older than the timeout threshold. Returns cancelled IDs."""

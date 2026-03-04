@@ -16,10 +16,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import signal
 import sys
 import threading
 import time
+from pathlib import Path
 
 import structlog
 
@@ -52,6 +54,7 @@ from trading_bot.utils.helpers import (
 )
 from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager
+from trading_bot.models.domain import RejectedSignal
 from trading_bot.utils.reports import DailySummaryReport
 
 log = structlog.get_logger(__name__)
@@ -151,6 +154,14 @@ class TradingBot:
 
         # AI trading advisor
         self._advisor = TradingAdvisor()
+
+        # Rejected signal shadow journal
+        self._rejected_signals: list[RejectedSignal] = []
+        self._rejected_csv = Path(config.journal_csv_path).parent / "rejected_signals.csv"
+        self._ensure_rejected_csv()
+
+        # Daily auto-reset tracking
+        self._last_trading_date: str | None = None
 
     def run(self) -> None:
         """Main run loop. Dispatches to backtest or live/paper loop."""
@@ -317,7 +328,10 @@ class TradingBot:
 
     def _tick(self) -> None:
         """Single iteration of the main trading loop."""
-        # 0. Feed unrealized P&L to circuit breaker so it can halt
+        # 0a. Check if a new trading day started (auto-reset daily state)
+        self._check_daily_reset()
+
+        # 0b. Feed unrealized P&L to circuit breaker so it can halt
         #    BEFORE a catastrophic open position is closed at a loss.
         open_positions = self._portfolio.get_open_positions()
         unrealized = sum(p.pnl_unrealized for p in open_positions)
@@ -508,6 +522,15 @@ class TradingBot:
             # Evaluate strategy
             signal = self._strategy.evaluate(candidate, bars)
             if signal is None:
+                self._record_rejection(RejectedSignal(
+                    timestamp=now_et(),
+                    symbol=candidate.symbol,
+                    stage="strategy",
+                    reason="no_valid_setup",
+                    entry_price=candidate.price,
+                    gap_pct=candidate.gap_pct,
+                    score=candidate.score,
+                ))
                 continue
 
             # Risk check
@@ -527,11 +550,17 @@ class TradingBot:
             )
 
             if not risk_result.approved:
-                log.info(
-                    "bot.risk_rejected",
+                self._record_rejection(RejectedSignal(
+                    timestamp=now_et(),
                     symbol=candidate.symbol,
+                    stage="risk",
                     reason=risk_result.reason,
-                )
+                    entry_price=signal.entry_price,
+                    stop_price=signal.stop_price,
+                    signal_type=signal.signal_type.value,
+                    gap_pct=candidate.gap_pct,
+                    score=candidate.score,
+                ))
                 continue
 
             # Log warnings
@@ -562,11 +591,17 @@ class TradingBot:
                         market_data=self._market_data,
                     )
                     if is_correlated:
-                        log.info(
-                            "bot.correlation_rejected",
+                        self._record_rejection(RejectedSignal(
+                            timestamp=now_et(),
                             symbol=candidate.symbol,
-                            existing=existing_symbols,
-                        )
+                            stage="correlation",
+                            reason=f"correlated_with_{existing_symbols}",
+                            entry_price=signal.entry_price,
+                            stop_price=signal.stop_price,
+                            signal_type=signal.signal_type.value,
+                            gap_pct=candidate.gap_pct,
+                            score=candidate.score,
+                        ))
                         continue
                 except Exception as e:
                     log.warning(
@@ -592,11 +627,17 @@ class TradingBot:
                 reasons=advisor_rec.reasons,
             )
             if advisor_rec.action == "skip":
-                log.info(
-                    "bot.advisor_skip",
+                self._record_rejection(RejectedSignal(
+                    timestamp=now_et(),
                     symbol=candidate.symbol,
-                    reasons=advisor_rec.reasons,
-                )
+                    stage="advisor",
+                    reason="; ".join(advisor_rec.reasons),
+                    entry_price=signal.entry_price,
+                    stop_price=signal.stop_price,
+                    signal_type=signal.signal_type.value,
+                    gap_pct=candidate.gap_pct,
+                    score=candidate.score,
+                ))
                 continue
 
             # Execute trade
@@ -628,6 +669,86 @@ class TradingBot:
                 regime=self._current_regime,
             )
 
+    def _ensure_rejected_csv(self) -> None:
+        """Create the rejected signals CSV if it doesn't exist."""
+        headers = [
+            "timestamp", "symbol", "stage", "reason",
+            "entry_price", "stop_price", "signal_type", "gap_pct", "score",
+        ]
+        self._rejected_csv.parent.mkdir(parents=True, exist_ok=True)
+        if not self._rejected_csv.exists():
+            try:
+                with open(self._rejected_csv, "w", newline="") as f:
+                    csv.DictWriter(f, fieldnames=headers).writeheader()
+            except Exception as e:
+                log.error("bot.rejected_csv_create_error", error=str(e))
+
+    def _record_rejection(self, rejection: RejectedSignal) -> None:
+        """Log a rejected signal to both memory and CSV."""
+        self._rejected_signals.append(rejection)
+        try:
+            with open(self._rejected_csv, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rejection.to_dict().keys()))
+                writer.writerow(rejection.to_dict())
+        except Exception as e:
+            log.debug("bot.rejected_csv_write_error", error=str(e))
+
+        log.info(
+            "bot.signal_rejected",
+            symbol=rejection.symbol,
+            stage=rejection.stage,
+            reason=rejection.reason,
+        )
+
+    def _check_daily_reset(self) -> None:
+        """
+        Reset daily state when a new trading day starts.
+
+        The bot runs 24/7 on Railway and doesn't restart each day.
+        This detects when the date changes and resets daily counters.
+        """
+        today = now_et().strftime("%Y-%m-%d")
+        if self._last_trading_date is None:
+            self._last_trading_date = today
+            return
+
+        if today != self._last_trading_date:
+            log.info(
+                "bot.daily_reset",
+                previous_date=self._last_trading_date,
+                new_date=today,
+            )
+
+            # Generate end-of-day report for previous day
+            self._generate_daily_summary()
+
+            # Reset all daily counters
+            try:
+                equity = self._broker.get_account_equity()
+            except Exception:
+                equity = self._starting_equity + self._portfolio.get_daily_pnl()
+
+            self._starting_equity = equity
+            self._circuit.reset_daily(equity)
+            self._sizer.reset_daily()
+            self._portfolio.reset_daily()
+            self._daily_plan_generated = False
+            self._premarket_watchlist = []
+            self._rejected_signals.clear()
+            self._last_trading_date = today
+
+            # Reconcile positions on new day
+            try:
+                self._portfolio.reconcile_positions()
+            except Exception as e:
+                log.error("bot.daily_reconcile_error", error=str(e))
+
+            log.info(
+                "bot.new_day_started",
+                equity=format_currency(equity),
+                date=today,
+            )
+
     def _premarket_scan(self) -> None:
         """
         Run scanner during pre-market hours to build a watchlist.
@@ -656,7 +777,7 @@ class TradingBot:
         )
 
     def _generate_daily_summary(self) -> None:
-        """Generate and log a daily summary report at end of day / shutdown."""
+        """Generate, log, persist, and notify a daily summary report."""
         try:
             ending_equity = self._broker.get_account_equity()
         except Exception:
@@ -677,8 +798,25 @@ class TradingBot:
         log.info("bot.daily_summary_report")
         print(summary_text)
 
-        # Send daily summary notification
+        # Persist report to file for review across redeploys
         report_data = report.generate()
+        try:
+            reports_dir = Path(self._config.journal_csv_path).parent / "daily_reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_date = report_data.get("date", now_et().strftime("%Y-%m-%d"))
+            report_file = reports_dir / f"report_{report_date}.txt"
+            with open(report_file, "w") as f:
+                f.write(summary_text)
+                f.write(f"\n\nRejected signals today: {len(self._rejected_signals)}\n")
+                for stage in ["strategy", "risk", "correlation", "advisor"]:
+                    count = sum(1 for r in self._rejected_signals if r.stage == stage)
+                    if count:
+                        f.write(f"  {stage}: {count}\n")
+            log.info("bot.report_saved", path=str(report_file))
+        except Exception as e:
+            log.error("bot.report_save_error", error=str(e))
+
+        # Send daily summary notification
         self._notify.notify_daily_summary(
             date=report_data.get("date", ""),
             total_trades=report_data.get("total_trades", 0),
@@ -839,6 +977,11 @@ class TradingBot:
 
         market_status, market_status_detail = self._get_market_status()
 
+        # Compute rejection stats by stage
+        rejected_by_stage: dict[str, int] = {}
+        for r in self._rejected_signals:
+            rejected_by_stage[r.stage] = rejected_by_stage.get(r.stage, 0) + 1
+
         self._dashboard_state.update(
             equity=equity,
             starting_equity=self._starting_equity,
@@ -853,6 +996,8 @@ class TradingBot:
             market_status=market_status,
             market_status_detail=market_status_detail,
             last_error=last_error,
+            rejected_signals_count=len(self._rejected_signals),
+            rejected_by_stage=rejected_by_stage,
         )
 
     def stop(self) -> None:
