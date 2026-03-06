@@ -38,9 +38,9 @@ def is_premarket() -> bool:
 
 def is_market_open() -> bool:
     """
-    True if current ET time is between 9:30 AM and 4:00 PM on a trading day.
+    True if current ET time is between 9:30 AM and market close on a trading day.
 
-    Accounts for weekends and NYSE market holidays.
+    Accounts for weekends, NYSE market holidays, and early close days.
     """
     now = now_et()
     # Monday=0, Sunday=6
@@ -49,13 +49,49 @@ def is_market_open() -> bool:
     if is_market_holiday(now.date()):
         return False
     t = now.time()
-    return MARKET_OPEN <= t < MARKET_CLOSE
+    close = _early_close_time(now.date()) or MARKET_CLOSE
+    return MARKET_OPEN <= t < close
+
+
+def _early_close_time(d: date) -> time | None:
+    """
+    Return 1:00 PM ET if *d* is an NYSE early-close day, else None.
+
+    NYSE early-close days (1:00 PM ET):
+      - Day before Independence Day (July 3, or July 2 if July 3 is weekend)
+      - Black Friday (day after Thanksgiving)
+      - Christmas Eve (Dec 24, or Dec 23 if Dec 24 is weekend)
+    """
+    year = d.year
+    early_close_dates: list[date] = []
+
+    # Day before Independence Day
+    jul4 = _observe(date(year, 7, 4))
+    day_before_jul4 = jul4 - timedelta(days=1)
+    if day_before_jul4.weekday() < 5:
+        early_close_dates.append(day_before_jul4)
+
+    # Black Friday: day after Thanksgiving (4th Thursday in November)
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    black_friday = thanksgiving + timedelta(days=1)
+    early_close_dates.append(black_friday)
+
+    # Christmas Eve
+    xmas = _observe(date(year, 12, 25))
+    day_before_xmas = xmas - timedelta(days=1)
+    if day_before_xmas.weekday() < 5:
+        early_close_dates.append(day_before_xmas)
+
+    if d in early_close_dates:
+        return time(13, 0)
+    return None
 
 
 def is_near_close(minutes_before: int = 10) -> bool:
     """
-    True if within `minutes_before` of 4:00 PM ET.
+    True if within `minutes_before` of market close.
 
+    Accounts for early close days (1:00 PM ET).
     Used to trigger the hard time exit (default: 3:50 PM).
     """
     now = now_et()
@@ -63,7 +99,10 @@ def is_near_close(minutes_before: int = 10) -> bool:
         return False
     if is_market_holiday(now.date()):
         return False
-    close_dt = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    early = _early_close_time(now.date())
+    close_hour = early.hour if early else 16
+    close_minute = early.minute if early else 0
+    close_dt = now.replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
     threshold = close_dt - timedelta(minutes=minutes_before)
     return threshold <= now < close_dt
 
@@ -105,9 +144,22 @@ def parse_time_et(time_str: str) -> time:
 
     Returns:
         time object.
+
+    Raises:
+        ValueError: If the string is not valid HH:MM format.
     """
+    if not time_str or ":" not in time_str:
+        raise ValueError(f"Invalid time format (expected HH:MM): {time_str!r}")
     parts = time_str.split(":")
-    return time(int(parts[0]), int(parts[1]))
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time format (expected HH:MM): {time_str!r}")
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"Invalid time format (non-numeric): {time_str!r}")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"Invalid time values (h={h}, m={m}): {time_str!r}")
+    return time(h, m)
 
 
 def is_past_exit_time(exit_time_str: str) -> bool:

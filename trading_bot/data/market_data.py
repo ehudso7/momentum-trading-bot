@@ -17,6 +17,7 @@ import structlog
 import yfinance as yf
 
 from trading_bot.data.polygon_client import PolygonClient
+from trading_bot.utils.helpers import now_et
 from trading_bot.utils.resilience import retry_with_backoff
 
 log = structlog.get_logger(__name__)
@@ -76,21 +77,57 @@ class LiveMarketData(MarketDataProvider):
         self._cache_timestamps: dict[str, datetime] = {}
         self._float_cache_hours = float_cache_hours
         self._avg_volume_cache: dict[str, float] = {}
+        self._avg_volume_cache_time: dict[str, datetime] = {}
 
     def get_current_price(self, symbol: str) -> Optional[float]:
-        """Get current price from Polygon snapshot with yfinance fallback."""
+        """Get current price from Polygon snapshot with yfinance fallback.
+
+        Includes staleness detection: if the Polygon snapshot is older than
+        120 seconds during market hours, log a warning (price may be from
+        a halt or API lag).
+        """
         snap = self._polygon.get_snapshot(symbol)
-        if snap:
+        if snap and snap.get("price"):
+            # Staleness check during market hours
+            updated = snap.get("updated")
+            if updated:
+                age_seconds = (datetime.utcnow() - updated).total_seconds()
+                if age_seconds > 120:
+                    log.warning(
+                        "market_data.stale_price",
+                        symbol=symbol,
+                        age_seconds=round(age_seconds, 0),
+                        price=snap["price"],
+                        detail="Price data may be stale (halt or API lag)",
+                    )
             return snap["price"]
         # Fallback to yfinance
         return self._yf_current_price(symbol)
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def _yf_current_price(self, symbol: str) -> Optional[float]:
+        """Get current price from yfinance.
+
+        Uses fast_info['lastPrice'] for real-time-ish data instead of
+        history(period='1d') which returns previous day's close during
+        market hours.
+        """
         try:
             ticker = yf.Ticker(symbol)
+            # fast_info provides a more current quote than history()
+            fast = getattr(ticker, "fast_info", None)
+            if fast:
+                last_price = fast.get("lastPrice") or fast.get("last_price")
+                if last_price and last_price > 0:
+                    return float(last_price)
+            # Final fallback: history (may return previous day close)
             hist = ticker.history(period="1d")
             if not hist.empty:
+                log.debug(
+                    "market_data.yf_using_history_close",
+                    symbol=symbol,
+                    detail="fast_info unavailable, using history close (may be stale)",
+                )
                 return float(hist["Close"].iloc[-1])
         except Exception as e:
             log.error("market_data.price_fallback_error", symbol=symbol, error=str(e))
@@ -105,8 +142,9 @@ class LiveMarketData(MarketDataProvider):
         If 1-minute bars fail from both sources, tries 5-minute bars as
         a last resort (wider availability, still usable for strategy).
         """
-        from_date = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")
-        to_date = datetime.utcnow().strftime("%Y-%m-%d")
+        today_et = now_et().date()
+        from_date = (today_et - timedelta(days=2)).strftime("%Y-%m-%d")
+        to_date = today_et.strftime("%Y-%m-%d")
 
         df = self._polygon.get_aggregates(
             symbol=symbol,
@@ -232,7 +270,34 @@ class LiveMarketData(MarketDataProvider):
             info = ticker.info
             float_shares = info.get("floatShares")
             if float_shares:
-                return int(float_shares)
+                float_int = int(float_shares)
+                # Sanity bounds: reject clearly invalid float data
+                if float_int < 10_000:
+                    log.warning(
+                        "market_data.float_too_small",
+                        symbol=symbol,
+                        float_shares=float_int,
+                    )
+                    return None
+                if float_int > 10_000_000_000:
+                    log.warning(
+                        "market_data.float_too_large",
+                        symbol=symbol,
+                        float_shares=float_int,
+                    )
+                    return None
+                # Cross-check: float shouldn't exceed shares outstanding
+                shares_out = info.get("sharesOutstanding")
+                if shares_out and float_int > int(shares_out) * 1.1:
+                    log.warning(
+                        "market_data.float_exceeds_outstanding",
+                        symbol=symbol,
+                        float_shares=float_int,
+                        shares_outstanding=int(shares_out),
+                    )
+                    # Use shares outstanding as more reliable
+                    return int(shares_out)
+                return float_int
         except Exception as e:
             log.error("market_data.float_error", symbol=symbol, error=str(e))
         return None
@@ -245,9 +310,11 @@ class LiveMarketData(MarketDataProvider):
         return None
 
     def get_avg_volume(self, symbol: str, days: int = 20) -> float:
-        """Get average daily volume over last N days."""
+        """Get average daily volume over last N days. Cached for 4 hours."""
         if symbol in self._avg_volume_cache:
-            return self._avg_volume_cache[symbol]
+            cache_time = self._avg_volume_cache_time.get(symbol, datetime.min)
+            if (datetime.utcnow() - cache_time).total_seconds() < 14400:  # 4 hours
+                return self._avg_volume_cache[symbol]
 
         df = self.get_daily_bars(symbol, days=days)
         if df.empty:
@@ -255,6 +322,7 @@ class LiveMarketData(MarketDataProvider):
 
         avg_vol = float(df["volume"].mean())
         self._avg_volume_cache[symbol] = avg_vol
+        self._avg_volume_cache_time[symbol] = datetime.utcnow()
         return avg_vol
 
 

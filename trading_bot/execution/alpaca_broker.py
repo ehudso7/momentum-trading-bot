@@ -31,9 +31,11 @@ class AlpacaBroker(BrokerBase):
     def __init__(self, config: BrokerConfig):
         from alpaca.trading.client import TradingClient
 
+        self._api_key = config.alpaca_api_key.get_secret_value()
+        self._api_secret = config.alpaca_api_secret.get_secret_value()
         self._client = TradingClient(
-            api_key=config.alpaca_api_key.get_secret_value(),
-            secret_key=config.alpaca_api_secret.get_secret_value(),
+            api_key=self._api_key,
+            secret_key=self._api_secret,
             paper=config.alpaca_paper,
         )
         self._paper = config.alpaca_paper
@@ -77,6 +79,22 @@ class AlpacaBroker(BrokerBase):
             time_in_force=TimeInForce.DAY,
         )
         order = self._client.submit_order(request)
+
+        # Check for immediate rejection before returning
+        status_str = str(order.status).lower() if order.status else ""
+        if status_str in ("rejected", "canceled", "expired"):
+            log.error(
+                "alpaca.order_rejected",
+                order_id=str(order.id),
+                status=status_str,
+                symbol=symbol,
+                side=side.value,
+                qty=qty,
+            )
+            raise RuntimeError(
+                f"Order {order.id} rejected by Alpaca: status={status_str}"
+            )
+
         log.info(
             "alpaca.market_order",
             order_id=str(order.id),
@@ -308,12 +326,9 @@ class AlpacaBroker(BrokerBase):
 
         import requests
 
-        api_key = self._client._api_key
-        secret_key = self._client._secret_key
-
         headers = {
-            "APCA-API-KEY-ID": api_key,
-            "APCA-API-SECRET-KEY": secret_key,
+            "APCA-API-KEY-ID": self._api_key,
+            "APCA-API-SECRET-KEY": self._api_secret,
         }
 
         # Close all positions and cancel orders first

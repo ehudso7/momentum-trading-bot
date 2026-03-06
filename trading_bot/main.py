@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import signal
 import sys
@@ -133,7 +134,8 @@ class TradingBot:
         self._sizer = PositionSizer(config.risk)
         self._circuit = CircuitBreaker(config.risk)
         self._portfolio = PortfolioManager(
-            self._broker, config, circuit_breaker=self._circuit
+            self._broker, config, circuit_breaker=self._circuit,
+            market_data=self._market_data,
         )
 
         # --- New feature modules ---
@@ -155,8 +157,8 @@ class TradingBot:
         # AI trading advisor
         self._advisor = TradingAdvisor()
 
-        # Rejected signal shadow journal
-        self._rejected_signals: list[RejectedSignal] = []
+        # Rejected signal shadow journal (capped to prevent unbounded growth)
+        self._rejected_signals: collections.deque[RejectedSignal] = collections.deque(maxlen=5000)
         self._rejected_csv = Path(config.journal_csv_path).parent / "rejected_signals.csv"
         self._ensure_rejected_csv()
 
@@ -225,16 +227,6 @@ class TradingBot:
         self._premarket_watchlist = []
         tick_count = 0
 
-        # Register signal handlers for graceful shutdown (Docker SIGTERM)
-        def _signal_handler(signum: int, _frame: object) -> None:
-            sig_name = signal.Signals(signum).name
-            log.info("bot.shutdown_signal", signal=sig_name)
-            self._running = False
-            self._shutdown_event.set()
-
-        signal.signal(signal.SIGTERM, _signal_handler)
-        signal.signal(signal.SIGINT, _signal_handler)
-
         # Push initial state to dashboard before first tick
         self._update_dashboard()
 
@@ -302,6 +294,20 @@ class TradingBot:
 
         # Shutdown: close all positions
         entries = self._portfolio.close_all("shutdown")
+
+        # Verify all positions actually closed at the broker
+        try:
+            remaining = self._broker.get_positions()
+            if remaining:
+                log.critical(
+                    "bot.shutdown_positions_remaining",
+                    count=len(remaining),
+                    symbols=[p["symbol"] for p in remaining],
+                    detail="Attempting broker-side close_all as last resort",
+                )
+                self._broker.close_all_positions()
+        except Exception as e:
+            log.error("bot.shutdown_verify_error", error=str(e))
 
         # Notify on trade closures during shutdown
         for entry in entries:
@@ -533,13 +539,29 @@ class TradingBot:
                 ))
                 continue
 
-            # Risk check
+            # Risk check — equity is critical for position sizing.
+            # If broker API is down, skip new entries rather than sizing
+            # based on stale/wrong starting_capital.
             try:
                 equity = self._broker.get_account_equity()
                 buying_power = self._broker.get_buying_power()
-            except Exception:
-                equity = self._config.starting_capital
-                buying_power = equity * 4
+            except Exception as e:
+                log.error(
+                    "bot.equity_api_failed",
+                    symbol=candidate.symbol,
+                    error=str(e),
+                )
+                self._health.record_error("equity_api")
+                continue  # Skip this candidate — can't size without equity
+
+            # Guard against zero/negative equity (API returned garbage)
+            if equity <= 0:
+                log.error(
+                    "bot.zero_equity",
+                    equity=equity,
+                    detail="Broker returned zero equity — skipping all entries",
+                )
+                break
 
             risk_result = self._sizer.calculate(
                 equity=equity,
@@ -642,6 +664,15 @@ class TradingBot:
 
             # Execute trade
             position = self._portfolio.open_position(signal, risk_result)
+
+            # Check if entry was rejected by broker
+            if position.shares == 0:
+                log.warning(
+                    "bot.entry_rejected_by_broker",
+                    symbol=candidate.symbol,
+                )
+                continue
+
             self._sizer.record_trade_risk(risk_result.risk_dollars)
             open_symbols.add(position.symbol)
 

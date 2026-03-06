@@ -18,6 +18,7 @@ from typing import Optional
 import structlog
 
 from trading_bot.config.settings import RiskConfig
+from trading_bot.utils.helpers import now_et
 
 log = structlog.get_logger(__name__)
 
@@ -65,6 +66,23 @@ class CircuitBreaker:
 
     @property
     def is_trading_allowed(self) -> bool:
+        """
+        Trading is allowed in NORMAL, WARNING, and COOLDOWN states,
+        BUT only if drawdown hasn't exceeded the hard daily limit.
+
+        COOLDOWN after a halt should not allow NEW trades if the daily
+        drawdown is still above threshold — only position management.
+        """
+        if self._state == CircuitState.HALTED:
+            return False
+        if self._state == CircuitState.COOLDOWN:
+            # COOLDOWN allows position management but blocks new entries
+            # if drawdown still exceeds threshold
+            if self._starting_equity > 0:
+                total_pnl = self._daily_pnl + self._unrealized_pnl
+                drawdown_pct = abs(min(0, total_pnl)) / self._starting_equity * 100
+                if drawdown_pct >= self._config.drawdown_circuit_breaker_pct:
+                    return False
         return self._state in (
             CircuitState.NORMAL,
             CircuitState.WARNING,
@@ -82,7 +100,7 @@ class CircuitBreaker:
         Returns current circuit state after evaluation.
         Includes auto-recovery logic: HALTED -> COOLDOWN -> WARNING.
         """
-        now = datetime.utcnow()
+        now = now_et()
 
         # --- Auto-recovery: HALTED -> COOLDOWN ---
         if self._state == CircuitState.HALTED and self._halted_at is not None:
@@ -120,6 +138,16 @@ class CircuitBreaker:
                     f"daily_drawdown: {drawdown_pct:.2f}% >= "
                     f"{self._config.drawdown_circuit_breaker_pct}% "
                     f"(realized={self._daily_pnl:.2f}, unrealized={self._unrealized_pnl:.2f})"
+                )
+                return self._state
+
+            # 1b. Hard daily loss limit (realized P&L only — absolute floor)
+            realized_loss_pct = abs(min(0, self._daily_pnl)) / self._starting_equity * 100
+            if realized_loss_pct >= self._config.hard_daily_loss_limit_pct:
+                self._halt(
+                    f"hard_daily_loss: realized {realized_loss_pct:.2f}% >= "
+                    f"{self._config.hard_daily_loss_limit_pct}% "
+                    f"(realized={self._daily_pnl:.2f})"
                 )
                 return self._state
 
@@ -189,7 +217,7 @@ class CircuitBreaker:
                         "timeout", "rate_limit", "auth", "server_error").
                         When provided, the count for that type is incremented.
         """
-        self._api_errors.append(datetime.utcnow())
+        self._api_errors.append(now_et())
 
         if error_type is not None:
             self._api_error_counts[error_type] += 1
@@ -238,7 +266,7 @@ class CircuitBreaker:
         """Transition to HALTED state."""
         if self._state != CircuitState.HALTED:
             self._state = CircuitState.HALTED
-            self._halted_at = datetime.utcnow()
+            self._halted_at = now_et()
             self._cooldown_entered_at = None
             log.critical("circuit.HALTED", reason=reason)
 
@@ -250,7 +278,7 @@ class CircuitBreaker:
 
     def _prune_old_errors(self) -> None:
         """Remove API errors older than the 5-minute window."""
-        cutoff = datetime.utcnow() - self._api_error_window
+        cutoff = now_et() - self._api_error_window
         while self._api_errors and self._api_errors[0] < cutoff:
             self._api_errors.popleft()
 

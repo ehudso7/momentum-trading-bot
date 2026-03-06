@@ -78,10 +78,10 @@ class RiskConfig(BaseModel):
     max_daily_risk_pct: float = Field(3.0, ge=1.0, le=5.0)
     max_open_positions: int = Field(4, ge=1, le=10)
     max_leverage: float = Field(4.0, ge=1.0, le=4.0)
-    max_position_value_pct: float = Field(20.0, ge=5.0, le=50.0)
-    min_stop_distance_pct: float = Field(1.0, ge=0.25, le=5.0)
+    max_position_value_pct: float = Field(10.0, ge=5.0, le=50.0)
+    min_stop_distance_pct: float = Field(2.0, ge=0.25, le=5.0)
     pdt_equity_threshold: float = Field(25_000.0)
-    stop_loss_atr_multiplier: float = Field(1.25, ge=0.5, le=3.0)
+    stop_loss_atr_multiplier: float = Field(1.5, ge=0.5, le=3.0)
     drawdown_circuit_breaker_pct: float = Field(5.0, ge=1.0, le=15.0)
     max_consecutive_losses: int = Field(5, ge=2, le=20)
     hard_daily_loss_limit_pct: float = Field(5.0, ge=1.0, le=15.0)
@@ -112,6 +112,28 @@ class ExitConfig(BaseModel):
     trailing_stop_breakeven_buffer_pct: float = Field(0.5, ge=0.1, le=2.0)
     hard_time_exit: str = Field("15:50")  # 3:50 PM ET
     use_parabolic_sar: bool = Field(True)
+
+    @model_validator(mode="after")
+    def validate_hard_time_exit(self) -> "ExitConfig":
+        """Validate hard_time_exit is a valid HH:MM between 15:00 and 16:00."""
+        try:
+            parts = self.hard_time_exit.split(":")
+            if len(parts) != 2:
+                raise ValueError("must be HH:MM format")
+            h, m = int(parts[0]), int(parts[1])
+            if not (0 <= m <= 59):
+                raise ValueError(f"invalid minutes: {m}")
+            if not (15 <= h <= 16):
+                raise ValueError(
+                    f"hard_time_exit must be between 15:00 and 16:00, got {self.hard_time_exit}"
+                )
+            if h == 16 and m > 0:
+                raise ValueError(
+                    f"hard_time_exit must be at or before 16:00, got {self.hard_time_exit}"
+                )
+        except ValueError:
+            raise
+        return self
 
     @model_validator(mode="after")
     def validate_scale_out(self) -> "ExitConfig":
