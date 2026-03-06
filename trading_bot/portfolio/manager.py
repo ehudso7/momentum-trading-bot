@@ -572,9 +572,16 @@ class PortfolioManager:
                 continue
             try:
                 status = self._broker.get_order_status(order_id)
-                if status.get("status") in ("filled", "partially_filled"):
+                order_status = status.get("status")
+                if order_status in ("filled", "partially_filled"):
                     fill_price = status.get("filled_avg_price", position.current_price)
                     filled_qty = status.get("filled_qty", position.shares_remaining)
+
+                    # For partially_filled, only account for actually filled shares
+                    if order_status == "partially_filled":
+                        filled_qty = status.get("filled_qty", 0)
+                        if filled_qty <= 0:
+                            continue  # No shares actually filled yet
 
                     log.info(
                         "portfolio.bracket_filled",
@@ -582,6 +589,7 @@ class PortfolioManager:
                         leg=leg_type,
                         fill_price=fill_price,
                         filled_qty=filled_qty,
+                        partial=(order_status == "partially_filled"),
                     )
 
                     # Update position state — broker already closed it
@@ -600,8 +608,21 @@ class PortfolioManager:
                     )
                     hold_minutes = (now_et() - position.entry_time).total_seconds() / 60
 
-                    position.status = PositionStatus.CLOSED
-                    position.shares_remaining = 0
+                    position.shares_remaining -= filled_qty
+                    if position.shares_remaining <= 0:
+                        position.shares_remaining = 0
+                        position.status = PositionStatus.CLOSED
+                    else:
+                        # Partial fill: position still open with remaining shares
+                        position.status = PositionStatus.PARTIALLY_CLOSED
+                        position.pnl_realized += close_pnl
+                        log.warning(
+                            "portfolio.bracket_partial_fill",
+                            symbol=position.symbol,
+                            filled=filled_qty,
+                            remaining=position.shares_remaining,
+                        )
+                        return None  # Don't create journal entry yet
 
                     entry = JournalEntry(
                         date=now_et().strftime("%Y-%m-%d"),
@@ -621,7 +642,7 @@ class PortfolioManager:
                     self._log_to_journal(entry)
                     return entry
             except Exception as e:
-                log.debug(
+                log.warning(
                     "portfolio.bracket_check_error",
                     symbol=position.symbol,
                     order_id=order_id,
@@ -636,7 +657,7 @@ class PortfolioManager:
                 try:
                     self._broker.cancel_order(order_id)
                 except Exception as e:
-                    log.debug(
+                    log.warning(
                         "portfolio.cancel_bracket_error",
                         order_id=order_id,
                         error=str(e),
@@ -698,12 +719,33 @@ class PortfolioManager:
             try:
                 order_status = self._broker.get_order_status(order_id)
                 status_str = str(order_status.get("status", ""))
-                if status_str == "rejected":
+                if status_str in ("rejected", "cancelled", "expired", "error"):
                     log.critical(
                         "portfolio.sell_order_rejected",
                         symbol=position.symbol,
                         order_id=order_id,
+                        status=status_str,
+                        detail="Sell order NOT filled — position may still be open!",
                     )
+                    # Re-submit stop protection since we cancelled bracket legs
+                    try:
+                        stop_id = self._broker.submit_stop_order(
+                            symbol=position.symbol,
+                            qty=position.shares_remaining,
+                            stop_price=position.stop_price,
+                        )
+                        position.broker_stop_order_id = stop_id
+                        log.warning(
+                            "portfolio.emergency_stop_resubmitted",
+                            symbol=position.symbol,
+                            stop_price=position.stop_price,
+                        )
+                    except Exception:
+                        log.critical(
+                            "portfolio.no_stop_after_rejected_sell",
+                            symbol=position.symbol,
+                        )
+                    return None  # Do NOT mark position as closed
                 if order_status.get("filled_avg_price", 0) > 0:
                     actual_exit_price = order_status["filled_avg_price"]
                 if order_status.get("filled_qty", 0) > 0:
@@ -767,18 +809,36 @@ class PortfolioManager:
         self, position: PositionInfo, shares: int, price: float, reason: str
     ) -> None:
         """Execute a partial scale-out."""
-        order_id = self._broker.submit_market_order(
-            symbol=position.symbol,
-            qty=shares,
-            side=OrderSide.SELL,
-        )
+        try:
+            order_id = self._broker.submit_market_order(
+                symbol=position.symbol,
+                qty=shares,
+                side=OrderSide.SELL,
+            )
+        except Exception as e:
+            log.error(
+                "portfolio.scale_out_order_failed",
+                symbol=position.symbol,
+                shares=shares,
+                error=str(e),
+            )
+            return
         position.broker_order_ids.append(order_id)
 
-        # Check actual fill
+        # Check actual fill — do NOT decrement shares if rejected
         actual_shares = shares
         actual_price = price
         try:
             order_status = self._broker.get_order_status(order_id)
+            status_str = str(order_status.get("status", ""))
+            if status_str in ("rejected", "cancelled", "expired", "error"):
+                log.error(
+                    "portfolio.scale_out_rejected",
+                    symbol=position.symbol,
+                    order_id=order_id,
+                    status=status_str,
+                )
+                return  # Do NOT decrement shares_remaining
             if order_status.get("filled_qty", 0) > 0:
                 actual_shares = order_status["filled_qty"]
             if order_status.get("filled_avg_price", 0) > 0:

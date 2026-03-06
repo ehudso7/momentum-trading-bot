@@ -77,6 +77,22 @@ class AlpacaBroker(BrokerBase):
             time_in_force=TimeInForce.DAY,
         )
         order = self._client.submit_order(request)
+
+        # Check for immediate rejection before returning
+        status_str = str(order.status).lower() if order.status else ""
+        if status_str in ("rejected", "canceled", "expired"):
+            log.error(
+                "alpaca.order_rejected",
+                order_id=str(order.id),
+                status=status_str,
+                symbol=symbol,
+                side=side.value,
+                qty=qty,
+            )
+            raise RuntimeError(
+                f"Order {order.id} rejected by Alpaca: status={status_str}"
+            )
+
         log.info(
             "alpaca.market_order",
             order_id=str(order.id),
