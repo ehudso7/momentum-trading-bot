@@ -287,7 +287,34 @@ class PortfolioManager:
                     "portfolio.fallback_stop_failed",
                     symbol=signal.symbol,
                     error=str(e),
-                    detail="Position opened WITHOUT exchange-side stop protection!",
+                    detail="Cannot open position without stop protection — closing immediately!",
+                )
+                # Immediately close the position we just opened
+                try:
+                    self._broker.submit_market_order(
+                        symbol=signal.symbol,
+                        qty=actual_shares,
+                        side=OrderSide.SELL,
+                    )
+                except Exception:
+                    self._broker.close_position(signal.symbol)
+                # Return a zero-share closed position
+                return PositionInfo(
+                    symbol=signal.symbol,
+                    side=OrderSide.BUY,
+                    entry_price=signal.entry_price,
+                    current_price=signal.entry_price,
+                    shares=0,
+                    shares_remaining=0,
+                    stop_price=signal.stop_price,
+                    target_prices=signal.target_prices,
+                    status=PositionStatus.CLOSED,
+                    pnl_unrealized=0.0,
+                    pnl_realized=0.0,
+                    scale_outs_completed=0,
+                    entry_time=now_et(),
+                    signal_type=signal.signal_type,
+                    broker_order_ids=[entry_order_id],
                 )
 
         # Create position tracking
@@ -431,13 +458,35 @@ class PortfolioManager:
                             qty=position.shares_remaining,
                             new_stop_price=new_stop,
                         )
-                        position.broker_stop_order_id = new_stop_id
-                        log.info(
-                            "portfolio.broker_stop_updated",
-                            symbol=symbol,
-                            old_stop=round(old_stop or 0, 4),
-                            new_stop=round(new_stop, 4),
-                        )
+                        # Guard: replace_stop_order returns "" on double-failure
+                        if new_stop_id:
+                            position.broker_stop_order_id = new_stop_id
+                            log.info(
+                                "portfolio.broker_stop_updated",
+                                symbol=symbol,
+                                old_stop=round(old_stop or 0, 4),
+                                new_stop=round(new_stop, 4),
+                            )
+                        else:
+                            # Old stop was cancelled but new one failed — resubmit
+                            position.broker_stop_order_id = None
+                            log.error(
+                                "portfolio.broker_stop_lost",
+                                symbol=symbol,
+                                detail="Replace returned empty ID — submitting fresh stop",
+                            )
+                            try:
+                                fresh_id = self._broker.submit_stop_order(
+                                    symbol=symbol,
+                                    qty=position.shares_remaining,
+                                    stop_price=new_stop,
+                                )
+                                position.broker_stop_order_id = fresh_id
+                            except Exception:
+                                log.critical(
+                                    "portfolio.no_stop_protection",
+                                    symbol=symbol,
+                                )
                     except Exception as e:
                         log.error(
                             "portfolio.broker_stop_replace_error",
@@ -755,7 +804,23 @@ class PortfolioManager:
                         qty=position.shares_remaining,
                         new_stop_price=effective_stop,
                     )
-                    position.broker_stop_order_id = new_stop_id
+                    if new_stop_id:
+                        position.broker_stop_order_id = new_stop_id
+                    else:
+                        # Replace failed — resubmit a fresh stop
+                        position.broker_stop_order_id = None
+                        try:
+                            fresh_id = self._broker.submit_stop_order(
+                                symbol=position.symbol,
+                                qty=position.shares_remaining,
+                                stop_price=effective_stop,
+                            )
+                            position.broker_stop_order_id = fresh_id
+                        except Exception:
+                            log.critical(
+                                "portfolio.scale_out_no_stop",
+                                symbol=position.symbol,
+                            )
                 except Exception as e:
                     log.error(
                         "portfolio.scale_out_stop_replace_error",

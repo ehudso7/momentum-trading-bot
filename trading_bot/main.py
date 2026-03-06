@@ -538,13 +538,29 @@ class TradingBot:
                 ))
                 continue
 
-            # Risk check
+            # Risk check — equity is critical for position sizing.
+            # If broker API is down, skip new entries rather than sizing
+            # based on stale/wrong starting_capital.
             try:
                 equity = self._broker.get_account_equity()
                 buying_power = self._broker.get_buying_power()
-            except Exception:
-                equity = self._config.starting_capital
-                buying_power = equity * 4
+            except Exception as e:
+                log.error(
+                    "bot.equity_api_failed",
+                    symbol=candidate.symbol,
+                    error=str(e),
+                )
+                self._health.record_error("equity_api")
+                continue  # Skip this candidate — can't size without equity
+
+            # Guard against zero/negative equity (API returned garbage)
+            if equity <= 0:
+                log.error(
+                    "bot.zero_equity",
+                    equity=equity,
+                    detail="Broker returned zero equity — skipping all entries",
+                )
+                break
 
             risk_result = self._sizer.calculate(
                 equity=equity,
