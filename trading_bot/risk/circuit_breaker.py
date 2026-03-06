@@ -140,6 +140,16 @@ class CircuitBreaker:
                 )
                 return self._state
 
+            # 1b. Hard daily loss limit (realized P&L only — absolute floor)
+            realized_loss_pct = abs(min(0, self._daily_pnl)) / self._starting_equity * 100
+            if realized_loss_pct >= self._config.hard_daily_loss_limit_pct:
+                self._halt(
+                    f"hard_daily_loss: realized {realized_loss_pct:.2f}% >= "
+                    f"{self._config.hard_daily_loss_limit_pct}% "
+                    f"(realized={self._daily_pnl:.2f})"
+                )
+                return self._state
+
             # Warning at 75% of threshold
             if drawdown_pct >= self._config.drawdown_circuit_breaker_pct * 0.75:
                 self._warn(

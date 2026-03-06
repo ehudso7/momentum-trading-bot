@@ -103,6 +103,28 @@ class ExitConfig(BaseModel):
     use_parabolic_sar: bool = Field(True)
 
     @model_validator(mode="after")
+    def validate_hard_time_exit(self) -> "ExitConfig":
+        """Validate hard_time_exit is a valid HH:MM between 15:00 and 16:00."""
+        try:
+            parts = self.hard_time_exit.split(":")
+            if len(parts) != 2:
+                raise ValueError("must be HH:MM format")
+            h, m = int(parts[0]), int(parts[1])
+            if not (0 <= m <= 59):
+                raise ValueError(f"invalid minutes: {m}")
+            if not (15 <= h <= 16):
+                raise ValueError(
+                    f"hard_time_exit must be between 15:00 and 16:00, got {self.hard_time_exit}"
+                )
+            if h == 16 and m > 0:
+                raise ValueError(
+                    f"hard_time_exit must be at or before 16:00, got {self.hard_time_exit}"
+                )
+        except ValueError:
+            raise
+        return self
+
+    @model_validator(mode="after")
     def validate_scale_out(self) -> "ExitConfig":
         total = sum(self.scale_out_ratios)
         if not (0.99 <= total <= 1.01):

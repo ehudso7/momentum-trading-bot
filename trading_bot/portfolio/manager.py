@@ -391,6 +391,10 @@ class PortfolioManager:
                 continue
 
             position.current_price = price
+
+            # Feed price to paper broker so bracket stops/TPs trigger
+            if hasattr(self._broker, "update_price"):
+                self._broker.update_price(symbol, price)
             position.pnl_unrealized = (
                 position.shares_remaining * (price - position.entry_price)
             )

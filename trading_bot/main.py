@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import signal
 import sys
@@ -160,8 +161,8 @@ class TradingBot:
         # AI trading advisor
         self._advisor = TradingAdvisor()
 
-        # Rejected signal shadow journal
-        self._rejected_signals: list[RejectedSignal] = []
+        # Rejected signal shadow journal (capped to prevent unbounded growth)
+        self._rejected_signals: collections.deque[RejectedSignal] = collections.deque(maxlen=5000)
         self._rejected_csv = Path(config.journal_csv_path).parent / "rejected_signals.csv"
         self._ensure_rejected_csv()
 
@@ -307,6 +308,20 @@ class TradingBot:
 
         # Shutdown: close all positions
         entries = self._portfolio.close_all("shutdown")
+
+        # Verify all positions actually closed at the broker
+        try:
+            remaining = self._broker.get_positions()
+            if remaining:
+                log.critical(
+                    "bot.shutdown_positions_remaining",
+                    count=len(remaining),
+                    symbols=[p["symbol"] for p in remaining],
+                    detail="Attempting broker-side close_all as last resort",
+                )
+                self._broker.close_all_positions()
+        except Exception as e:
+            log.error("bot.shutdown_verify_error", error=str(e))
 
         # Notify on trade closures during shutdown
         for entry in entries:

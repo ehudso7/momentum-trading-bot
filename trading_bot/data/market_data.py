@@ -17,6 +17,7 @@ import structlog
 import yfinance as yf
 
 from trading_bot.data.polygon_client import PolygonClient
+from trading_bot.utils.helpers import now_et
 from trading_bot.utils.resilience import retry_with_backoff
 
 log = structlog.get_logger(__name__)
@@ -106,8 +107,9 @@ class LiveMarketData(MarketDataProvider):
         If 1-minute bars fail from both sources, tries 5-minute bars as
         a last resort (wider availability, still usable for strategy).
         """
-        from_date = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")
-        to_date = datetime.utcnow().strftime("%Y-%m-%d")
+        today_et = now_et().date()
+        from_date = (today_et - timedelta(days=2)).strftime("%Y-%m-%d")
+        to_date = today_et.strftime("%Y-%m-%d")
 
         df = self._polygon.get_aggregates(
             symbol=symbol,
