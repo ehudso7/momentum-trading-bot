@@ -123,6 +123,16 @@ class PolygonClient:
         prev_close = snap.prev_day.close if snap.prev_day else 0.0
         price = snap.day.close if snap.day.close else 0.0
 
+        # Extract update timestamp for staleness detection
+        updated_ns = getattr(snap, "updated", None)
+        updated_dt = None
+        if updated_ns:
+            try:
+                # Polygon returns nanosecond epoch timestamp
+                updated_dt = datetime.utcfromtimestamp(updated_ns / 1e9)
+            except (TypeError, ValueError, OSError):
+                pass
+
         return {
             "symbol": snap.ticker,
             "price": price,
@@ -132,6 +142,7 @@ class PolygonClient:
             "day_high": snap.day.high or 0.0,
             "day_low": snap.day.low or 0.0,
             "vwap": snap.day.vwap or 0.0,
+            "updated": updated_dt,
         }
 
     def get_ticker_details(self, symbol: str) -> Optional[dict]:

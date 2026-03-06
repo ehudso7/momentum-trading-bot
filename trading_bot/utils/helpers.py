@@ -144,9 +144,22 @@ def parse_time_et(time_str: str) -> time:
 
     Returns:
         time object.
+
+    Raises:
+        ValueError: If the string is not valid HH:MM format.
     """
+    if not time_str or ":" not in time_str:
+        raise ValueError(f"Invalid time format (expected HH:MM): {time_str!r}")
     parts = time_str.split(":")
-    return time(int(parts[0]), int(parts[1]))
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time format (expected HH:MM): {time_str!r}")
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"Invalid time format (non-numeric): {time_str!r}")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"Invalid time values (h={h}, m={m}): {time_str!r}")
+    return time(h, m)
 
 
 def is_past_exit_time(exit_time_str: str) -> bool:

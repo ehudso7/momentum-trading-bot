@@ -58,10 +58,12 @@ class PortfolioManager:
         broker: BrokerBase,
         config: AppConfig,
         circuit_breaker: Optional[CircuitBreaker] = None,
+        market_data: Optional[MarketDataProvider] = None,
     ):
         self._broker = broker
         self._config = config
         self._circuit = circuit_breaker
+        self._market_data = market_data
         self._positions: dict[str, PositionInfo] = {}
         self._daily_pnl: float = 0.0
         self._journal_path = Path(config.journal_csv_path)
@@ -208,13 +210,54 @@ class PortfolioManager:
         )
 
         # Submit bracket order: entry + stop + take-profit as one atomic unit
-        bracket_ids = self._broker.submit_bracket_order(
-            symbol=signal.symbol,
-            qty=risk_result.shares,
-            side=OrderSide.BUY,
-            stop_price=signal.stop_price,
-            take_profit_price=tp_price,
-        )
+        try:
+            bracket_ids = self._broker.submit_bracket_order(
+                symbol=signal.symbol,
+                qty=risk_result.shares,
+                side=OrderSide.BUY,
+                stop_price=signal.stop_price,
+                take_profit_price=tp_price,
+            )
+        except Exception as e:
+            log.error(
+                "portfolio.bracket_order_failed",
+                symbol=signal.symbol,
+                error=str(e),
+            )
+            # Check if entry was partially placed at the broker
+            try:
+                broker_positions = self._broker.get_positions()
+                for bp in broker_positions:
+                    if bp["symbol"] == signal.symbol:
+                        log.critical(
+                            "portfolio.orphaned_entry",
+                            symbol=signal.symbol,
+                            qty=bp["qty"],
+                            detail="Bracket failed but entry filled — closing orphan",
+                        )
+                        self._broker.close_position(signal.symbol)
+                        break
+            except Exception:
+                pass
+            # Return zero-share position to indicate failure
+            from trading_bot.models.domain import SignalType
+            return PositionInfo(
+                symbol=signal.symbol,
+                side=OrderSide.BUY,
+                entry_price=signal.entry_price,
+                current_price=signal.entry_price,
+                shares=0,
+                shares_remaining=0,
+                stop_price=signal.stop_price,
+                target_prices=signal.target_prices,
+                status=PositionStatus.CLOSED,
+                pnl_unrealized=0.0,
+                pnl_realized=0.0,
+                scale_outs_completed=0,
+                entry_time=now_et(),
+                signal_type=signal.signal_type,
+                broker_order_ids=[],
+            )
 
         entry_order_id = bracket_ids["entry_order_id"]
         stop_order_id = bracket_ids.get("stop_order_id", "")
@@ -518,10 +561,24 @@ class PortfolioManager:
             return None
 
         position = self._positions[symbol]
-        entry = self._close_position(position, position.current_price, reason)
+
+        # Fetch fresh price instead of using potentially stale current_price
+        exit_price = position.current_price
+        if self._market_data:
+            try:
+                fresh_price = self._market_data.get_current_price(symbol)
+                if fresh_price is not None:
+                    exit_price = fresh_price
+                    position.current_price = fresh_price
+            except Exception:
+                pass  # Use last known price
+
+        entry = self._close_position(position, exit_price, reason)
+        if entry is None:
+            # Sell was rejected — position is still open, don't remove
+            return None
         del self._positions[symbol]
-        if entry:
-            self._journal_entries.append(entry)
+        self._journal_entries.append(entry)
         return entry
 
     def close_all(self, reason: str = "end_of_day") -> list[JournalEntry]:

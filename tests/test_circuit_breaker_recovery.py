@@ -8,13 +8,14 @@ re-halting from COOLDOWN when new triggers occur.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 
 from trading_bot.config.settings import RiskConfig
 from trading_bot.risk.circuit_breaker import CircuitBreaker, CircuitState
+from trading_bot.utils.helpers import now_et
 
 
 # ---------------------------------------------------------------------------
@@ -57,40 +58,35 @@ class TestHaltedToCooldown:
         """If not enough time has passed, state remains HALTED."""
         # Simulate time just before cooldown expires (9 minutes for a 10-min cooldown)
         future = halted_cb._halted_at + timedelta(minutes=9)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = halted_cb.check()
         assert state == CircuitState.HALTED
 
     def test_transitions_to_cooldown_after_cooldown_minutes(self, halted_cb: CircuitBreaker):
         """Exactly at cooldown_minutes the state should become COOLDOWN."""
         future = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = halted_cb.check()
         assert state == CircuitState.COOLDOWN
 
     def test_transitions_to_cooldown_well_past_cooldown(self, halted_cb: CircuitBreaker):
         """Even long after cooldown_minutes, next check() moves to COOLDOWN."""
         future = halted_cb._halted_at + timedelta(minutes=60)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = halted_cb.check()
         assert state == CircuitState.COOLDOWN
 
     def test_cooldown_entered_at_is_set(self, halted_cb: CircuitBreaker):
         """_cooldown_entered_at is populated when entering COOLDOWN."""
         future = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             halted_cb.check()
         assert halted_cb._cooldown_entered_at is not None
 
     def test_trading_allowed_in_cooldown(self, halted_cb: CircuitBreaker):
         """COOLDOWN allows trading (is_trading_allowed is True)."""
         future = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             halted_cb.check()
         assert halted_cb.is_trading_allowed is True
 
@@ -102,9 +98,8 @@ class TestHaltedToCooldown:
         cb._state = CircuitState.HALTED
         cb._halted_at = None
 
-        future = datetime.utcnow() + timedelta(minutes=5)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        future = now_et() + timedelta(minutes=5)
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = cb.check()
         # Should remain HALTED because _halted_at is None
         assert state == CircuitState.HALTED
@@ -121,8 +116,7 @@ class TestCooldownToWarning:
         """If less than 5 minutes have passed in COOLDOWN, state stays COOLDOWN."""
         # First: transition to COOLDOWN
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = cooldown_entry
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
         assert halted_cb.state == CircuitState.COOLDOWN
 
@@ -132,8 +126,7 @@ class TestCooldownToWarning:
 
         # Now check 4 minutes into COOLDOWN -- should still be COOLDOWN
         four_min_later = cooldown_entry + timedelta(minutes=4)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = four_min_later
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=four_min_later):
             state = halted_cb.check()
         assert state == CircuitState.COOLDOWN
 
@@ -141,8 +134,7 @@ class TestCooldownToWarning:
         """After 5 minutes in COOLDOWN, check() transitions to WARNING."""
         # Transition to COOLDOWN
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = cooldown_entry
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
         assert halted_cb.state == CircuitState.COOLDOWN
 
@@ -151,8 +143,7 @@ class TestCooldownToWarning:
 
         # Now 5 minutes later
         five_min_later = cooldown_entry + timedelta(minutes=5)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = five_min_later
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=five_min_later):
             state = halted_cb.check()
         assert state == CircuitState.WARNING
 
@@ -160,16 +151,14 @@ class TestCooldownToWarning:
         """Transitioning to WARNING clears _cooldown_entered_at."""
         # Transition HALTED -> COOLDOWN -> WARNING
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = cooldown_entry
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
 
         # Clear original halt trigger
         halted_cb._consecutive_losses = 0
 
         warning_time = cooldown_entry + timedelta(minutes=5)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = warning_time
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=warning_time):
             halted_cb.check()
 
         assert halted_cb.state == CircuitState.WARNING
@@ -179,16 +168,14 @@ class TestCooldownToWarning:
         """WARNING allows trading."""
         # Full recovery: HALTED -> COOLDOWN -> WARNING
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = cooldown_entry
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
 
         # Clear original halt trigger
         halted_cb._consecutive_losses = 0
 
         warning_time = cooldown_entry + timedelta(minutes=5)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = warning_time
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=warning_time):
             halted_cb.check()
 
         assert halted_cb.is_trading_allowed is True
@@ -200,9 +187,8 @@ class TestCooldownToWarning:
         cb._state = CircuitState.COOLDOWN
         cb._cooldown_entered_at = None
 
-        future = datetime.utcnow() + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        future = now_et() + timedelta(minutes=10)
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = cb.check()
         # Remains COOLDOWN because _cooldown_entered_at is None
         assert state == CircuitState.COOLDOWN
@@ -230,14 +216,12 @@ class TestFullRecoveryCycle:
 
         # 29 minutes later: still HALTED
         t1 = halted_at + timedelta(minutes=29)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t1
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t1):
             assert cb.check() == CircuitState.HALTED
 
         # 30 minutes later: COOLDOWN
         t2 = halted_at + timedelta(minutes=30)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t2
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t2):
             assert cb.check() == CircuitState.COOLDOWN
         assert cb.is_trading_allowed is True
 
@@ -246,14 +230,12 @@ class TestFullRecoveryCycle:
 
         # 4 minutes into COOLDOWN: still COOLDOWN
         t3 = t2 + timedelta(minutes=4)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t3
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t3):
             assert cb.check() == CircuitState.COOLDOWN
 
         # 5 minutes into COOLDOWN: WARNING
         t4 = t2 + timedelta(minutes=5)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t4
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t4):
             assert cb.check() == CircuitState.WARNING
         assert cb.is_trading_allowed is True
 
@@ -379,8 +361,7 @@ class TestRehaltFromCooldown:
         """Helper: drive cb from HALTED into COOLDOWN state."""
         halted_at = cb._halted_at
         future = halted_at + timedelta(minutes=cb._cooldown_minutes)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             cb.check()
         assert cb.state == CircuitState.COOLDOWN
         return cb
@@ -499,14 +480,12 @@ class TestEdgeCases:
 
         # 59 minutes: still HALTED
         t1 = cb._halted_at + timedelta(minutes=59)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t1
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t1):
             assert cb.check() == CircuitState.HALTED
 
         # 60 minutes: COOLDOWN
         t2 = cb._halted_at + timedelta(minutes=60)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t2
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t2):
             assert cb.check() == CircuitState.COOLDOWN
 
     def test_warning_state_does_not_auto_become_normal(self, risk_config: RiskConfig):
@@ -519,8 +498,7 @@ class TestEdgeCases:
             cb.record_trade_result(-1.0)
 
         t1 = cb._halted_at + timedelta(minutes=1)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t1
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t1):
             cb.check()
         assert cb.state == CircuitState.COOLDOWN
 
@@ -529,23 +507,20 @@ class TestEdgeCases:
         cb._consecutive_losses = 0
 
         t2 = t1 + timedelta(minutes=5)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t2
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t2):
             cb.check()
         assert cb.state == CircuitState.WARNING
 
         # Many more check() calls later, still WARNING (not NORMAL)
         t3 = t2 + timedelta(hours=2)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = t3
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t3):
             cb.check()
         assert cb.state == CircuitState.WARNING
 
     def test_get_status_during_cooldown(self, halted_cb: CircuitBreaker):
         """get_status() reports COOLDOWN state and non-null cooldown_entered_at."""
         future = halted_cb._halted_at + timedelta(minutes=10)
-        with patch("trading_bot.risk.circuit_breaker.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = future
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             halted_cb.check()
 
         status = halted_cb.get_status()

@@ -139,7 +139,8 @@ class TradingBot:
         self._sizer = PositionSizer(config.risk)
         self._circuit = CircuitBreaker(config.risk)
         self._portfolio = PortfolioManager(
-            self._broker, config, circuit_breaker=self._circuit
+            self._broker, config, circuit_breaker=self._circuit,
+            market_data=self._market_data,
         )
 
         # --- New feature modules ---
@@ -230,16 +231,6 @@ class TradingBot:
         self._daily_plan_generated = False
         self._premarket_watchlist = []
         tick_count = 0
-
-        # Register signal handlers for graceful shutdown (Docker SIGTERM)
-        def _signal_handler(signum: int, _frame: object) -> None:
-            sig_name = signal.Signals(signum).name
-            log.info("bot.shutdown_signal", signal=sig_name)
-            self._running = False
-            self._shutdown_event.set()
-
-        signal.signal(signal.SIGTERM, _signal_handler)
-        signal.signal(signal.SIGINT, _signal_handler)
 
         # Push initial state to dashboard before first tick
         self._update_dashboard()

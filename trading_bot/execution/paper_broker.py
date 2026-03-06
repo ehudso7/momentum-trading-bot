@@ -10,12 +10,13 @@ from __future__ import annotations
 import math
 import random
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import structlog
 
 from trading_bot.execution.broker_base import BrokerBase
 from trading_bot.models.domain import OrderSide
+from trading_bot.utils.helpers import now_et
 
 log = structlog.get_logger(__name__)
 
@@ -165,7 +166,7 @@ class PaperBroker(BrokerBase):
                     "qty": qty,
                     "avg_entry_price": fill_price,
                     "current_price": fill_price,
-                    "opened_at": datetime.utcnow().isoformat(),
+                    "opened_at": now_et().isoformat(),
                 }
 
         else:  # SELL
@@ -193,7 +194,7 @@ class PaperBroker(BrokerBase):
             "qty": qty,
             "filled_qty": qty,
             "filled_avg_price": fill_price,
-            "filled_at": datetime.utcnow().isoformat(),
+            "filled_at": now_et().isoformat(),
         }
 
         log.info(
@@ -241,7 +242,7 @@ class PaperBroker(BrokerBase):
             "bracket_parent": entry_order_id,
         }
         self._pending_orders[stop_order_id] = self._orders[stop_order_id]
-        self._order_timestamps[stop_order_id] = datetime.utcnow()
+        self._order_timestamps[stop_order_id] = now_et()
 
         # Create take-profit leg
         tp_order_id = str(uuid.uuid4())[:8]
@@ -255,7 +256,7 @@ class PaperBroker(BrokerBase):
             "bracket_parent": entry_order_id,
         }
         self._pending_orders[tp_order_id] = self._orders[tp_order_id]
-        self._order_timestamps[tp_order_id] = datetime.utcnow()
+        self._order_timestamps[tp_order_id] = now_et()
 
         # Link them as OCO pair
         self._orders[stop_order_id]["oco_partner"] = tp_order_id
@@ -298,7 +299,7 @@ class PaperBroker(BrokerBase):
             "qty": qty,
             "stop_price": stop_price,
         }
-        self._order_timestamps[order_id] = datetime.utcnow()
+        self._order_timestamps[order_id] = now_et()
         self._pending_orders[order_id] = self._orders[order_id]
         return order_id
 
@@ -404,7 +405,7 @@ class PaperBroker(BrokerBase):
                 order["status"] = "filled"
                 order["filled_qty"] = qty
                 order["filled_avg_price"] = fill_price
-                order["filled_at"] = datetime.utcnow().isoformat()
+                order["filled_at"] = now_et().isoformat()
                 del self._pending_orders[order_id]
                 self._order_timestamps.pop(order_id, None)
                 triggered.append(order)
@@ -434,7 +435,7 @@ class PaperBroker(BrokerBase):
 
     def cleanup_stale_orders(self) -> list[str]:
         """Cancel orders older than the timeout threshold. Returns cancelled IDs."""
-        now = datetime.utcnow()
+        now = now_et()
         stale_ids = []
         for order_id, created_at in list(self._order_timestamps.items()):
             age_seconds = (now - created_at).total_seconds()
@@ -447,5 +448,29 @@ class PaperBroker(BrokerBase):
 
         if stale_ids:
             log.info("paper.stale_orders_cancelled", count=len(stale_ids))
+
+        # Prune terminal-state orders older than 1 hour to prevent unbounded growth
+        terminal_statuses = {"filled", "rejected", "cancelled", "cancelled_oco", "cancelled_stale", "expired"}
+        cutoff = now - timedelta(hours=1)
+        prune_ids = []
+        for order_id, order in list(self._orders.items()):
+            if order.get("status") in terminal_statuses:
+                filled_at = order.get("filled_at")
+                if filled_at:
+                    try:
+                        order_time = datetime.fromisoformat(filled_at)
+                        if order_time < cutoff:
+                            prune_ids.append(order_id)
+                    except (TypeError, ValueError):
+                        prune_ids.append(order_id)
+                elif order_id not in self._order_timestamps and order_id not in stale_ids:
+                    # No timestamp tracking and not just cancelled — safe to prune
+                    prune_ids.append(order_id)
+
+        for order_id in prune_ids:
+            del self._orders[order_id]
+
+        if prune_ids:
+            log.debug("paper.terminal_orders_pruned", count=len(prune_ids))
 
         return stale_ids

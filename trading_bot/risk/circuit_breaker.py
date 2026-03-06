@@ -18,6 +18,7 @@ from typing import Optional
 import structlog
 
 from trading_bot.config.settings import RiskConfig
+from trading_bot.utils.helpers import now_et
 
 log = structlog.get_logger(__name__)
 
@@ -99,7 +100,7 @@ class CircuitBreaker:
         Returns current circuit state after evaluation.
         Includes auto-recovery logic: HALTED -> COOLDOWN -> WARNING.
         """
-        now = datetime.utcnow()
+        now = now_et()
 
         # --- Auto-recovery: HALTED -> COOLDOWN ---
         if self._state == CircuitState.HALTED and self._halted_at is not None:
@@ -216,7 +217,7 @@ class CircuitBreaker:
                         "timeout", "rate_limit", "auth", "server_error").
                         When provided, the count for that type is incremented.
         """
-        self._api_errors.append(datetime.utcnow())
+        self._api_errors.append(now_et())
 
         if error_type is not None:
             self._api_error_counts[error_type] += 1
@@ -265,7 +266,7 @@ class CircuitBreaker:
         """Transition to HALTED state."""
         if self._state != CircuitState.HALTED:
             self._state = CircuitState.HALTED
-            self._halted_at = datetime.utcnow()
+            self._halted_at = now_et()
             self._cooldown_entered_at = None
             log.critical("circuit.HALTED", reason=reason)
 
@@ -277,7 +278,7 @@ class CircuitBreaker:
 
     def _prune_old_errors(self) -> None:
         """Remove API errors older than the 5-minute window."""
-        cutoff = datetime.utcnow() - self._api_error_window
+        cutoff = now_et() - self._api_error_window
         while self._api_errors and self._api_errors[0] < cutoff:
             self._api_errors.popleft()
 

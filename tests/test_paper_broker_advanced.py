@@ -186,7 +186,8 @@ class TestPaperBrokerCleanupStaleOrders:
         order_id = broker.submit_stop_order("TEST", 100, 9.0)
 
         # Make the order timestamp old (10 minutes ago)
-        broker._order_timestamps[order_id] = datetime.utcnow() - timedelta(minutes=10)
+        from trading_bot.utils.helpers import now_et
+        broker._order_timestamps[order_id] = now_et() - timedelta(minutes=10)
 
         stale_ids = broker.cleanup_stale_orders()
 
@@ -211,7 +212,8 @@ class TestPaperBrokerCleanupStaleOrders:
         fresh_id = broker.submit_stop_order("NEW", 50, 12.0)
 
         # Make only the first order stale
-        broker._order_timestamps[stale_id] = datetime.utcnow() - timedelta(minutes=10)
+        from trading_bot.utils.helpers import now_et
+        broker._order_timestamps[stale_id] = now_et() - timedelta(minutes=10)
 
         stale_ids = broker.cleanup_stale_orders()
 
