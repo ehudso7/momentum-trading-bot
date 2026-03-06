@@ -174,7 +174,9 @@ class PortfolioManager:
         Open a new position based on a validated trade signal.
 
         Uses bracket orders so stop-loss and take-profit live on the exchange,
-        enforced even if the bot is down between ticks.
+        enforced even if the bot is down between ticks.  When the broker
+        rejects or silently drops the bracket legs (e.g. Alpaca paper mode),
+        falls back to a standalone stop order.
         """
         # Use first target for the bracket take-profit
         tp_price = signal.target_prices[0] if signal.target_prices else (
@@ -194,6 +196,34 @@ class PortfolioManager:
         stop_order_id = bracket_ids.get("stop_order_id", "")
         tp_order_id = bracket_ids.get("tp_order_id", "")
 
+        # CRITICAL: If the bracket didn't create a stop leg, submit a
+        # standalone stop order so the position is ALWAYS protected.
+        if not stop_order_id:
+            log.warning(
+                "portfolio.bracket_stop_missing",
+                symbol=signal.symbol,
+                detail="Bracket did not create stop leg — submitting standalone stop",
+            )
+            try:
+                stop_order_id = self._broker.submit_stop_order(
+                    symbol=signal.symbol,
+                    qty=risk_result.shares,
+                    stop_price=signal.stop_price,
+                )
+                log.info(
+                    "portfolio.fallback_stop_placed",
+                    symbol=signal.symbol,
+                    stop_order_id=stop_order_id,
+                    stop_price=signal.stop_price,
+                )
+            except Exception as e:
+                log.critical(
+                    "portfolio.fallback_stop_failed",
+                    symbol=signal.symbol,
+                    error=str(e),
+                    detail="Position opened WITHOUT exchange-side stop protection!",
+                )
+
         # Check for partial fill
         actual_shares = risk_result.shares
         try:
@@ -209,6 +239,13 @@ class PortfolioManager:
                     )
         except Exception:
             pass  # Use requested shares if we can't check
+
+        # Compute max allowed loss for this position (hard cap)
+        max_loss_per_position = self._config.risk.risk_per_trade_pct * 3.0
+        max_loss_dollars = (
+            self._broker.get_account_equity()
+            * (max_loss_per_position / 100.0)
+        ) if hasattr(self, '_config') else actual_shares * abs(signal.entry_price - signal.stop_price) * 3.0
 
         # Create position tracking
         position = PositionInfo(
@@ -287,6 +324,31 @@ class PortfolioManager:
             position.pnl_unrealized = (
                 position.shares_remaining * (price - position.entry_price)
             )
+
+            # 2b. EMERGENCY: Max loss per position hard cap.
+            # If any single position loses more than 3x the intended risk,
+            # close immediately. This catches gap-throughs and halt-reopens
+            # where the stop was blown past.
+            max_loss_multiplier = 3.0
+            intended_risk = abs(position.entry_price - position.stop_price) * position.shares
+            max_allowed_loss = intended_risk * max_loss_multiplier
+            actual_loss = position.shares_remaining * (position.entry_price - price)
+            if actual_loss > max_allowed_loss and actual_loss > 0:
+                log.critical(
+                    "portfolio.emergency_max_loss_exit",
+                    symbol=symbol,
+                    actual_loss=round(actual_loss, 2),
+                    max_allowed=round(max_allowed_loss, 2),
+                    intended_risk=round(intended_risk, 2),
+                    price=price,
+                    entry=position.entry_price,
+                )
+                self._cancel_bracket_legs(position)
+                entry = self._close_position(position, price, "emergency_max_loss")
+                if entry:
+                    journal_entries.append(entry)
+                symbols_to_remove.append(symbol)
+                continue
 
             # 3. Get bar data for strategy decisions
             bars = market_data.get_intraday_bars(symbol, lookback_bars=50)

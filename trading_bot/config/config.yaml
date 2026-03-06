@@ -56,7 +56,9 @@ risk:
   max_open_positions: 4          # Max 4 concurrent positions
   max_leverage: 4.0              # Max 4x effective leverage
   pdt_equity_threshold: 25000.0  # PDT rule threshold
-  stop_loss_atr_multiplier: 1.25 # Stop = entry - 1.25*ATR
+  stop_loss_atr_multiplier: 1.5  # Stop = entry - 1.5*ATR (wider = smaller position)
+  max_position_value_pct: 10.0   # Max 10% of equity in single position
+  min_stop_distance_pct: 2.0     # Min 2% stop distance (prevents micro-stops)
   drawdown_circuit_breaker_pct: 5.0  # Halt at 5% daily drawdown
   max_consecutive_losses: 5      # Halt after 5 consecutive losses
   hard_daily_loss_limit_pct: 5.0 # Hard stop at 5% daily loss
