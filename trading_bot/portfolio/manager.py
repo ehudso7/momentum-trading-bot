@@ -124,16 +124,40 @@ class PortfolioManager:
                 )
 
         # Positions we track but broker doesn't have (already closed externally)
+        # DO NOT submit sell orders — the broker has no shares to sell.
+        # Just record the journal entry for accounting.
         for symbol in internal_symbols - broker_symbols:
             log.warning(
                 "portfolio.reconcile_stale_position",
                 symbol=symbol,
             )
             pos = self._positions[symbol]
-            # Log as closed with unknown reason
-            entry = self._close_position(pos, pos.current_price, "reconcile_missing")
-            if entry:
-                self._journal_entries.append(entry)
+            # Record as closed without sending any orders to broker
+            total_pnl = pos.pnl_realized + (
+                pos.shares_remaining * (pos.current_price - pos.entry_price)
+            )
+            self._daily_pnl += total_pnl
+            if self._circuit:
+                self._circuit.record_trade_result(total_pnl)
+            pos.status = PositionStatus.CLOSED
+            pos.shares_remaining = 0
+            entry = JournalEntry(
+                date=now_et().strftime("%Y-%m-%d"),
+                symbol=pos.symbol,
+                side=pos.side.value,
+                signal_type=pos.signal_type.value,
+                entry_price=pos.entry_price,
+                exit_price=pos.current_price,
+                shares=pos.shares,
+                pnl=round(total_pnl, 2),
+                rr_ratio=0.0,
+                hold_time_minutes=0.0,
+                entry_time=pos.entry_time.strftime("%H:%M:%S"),
+                exit_time=now_et().strftime("%H:%M:%S"),
+                exit_reason="reconcile_missing",
+            )
+            self._log_to_journal(entry)
+            self._journal_entries.append(entry)
 
         # Remove stale positions
         for symbol in internal_symbols - broker_symbols:
@@ -196,6 +220,48 @@ class PortfolioManager:
         stop_order_id = bracket_ids.get("stop_order_id", "")
         tp_order_id = bracket_ids.get("tp_order_id", "")
 
+        # Verify the entry order actually filled (not rejected/cancelled)
+        actual_shares = risk_result.shares
+        try:
+            order_status = self._broker.get_order_status(entry_order_id)
+            status_str = str(order_status.get("status", ""))
+            if status_str in ("rejected", "cancelled", "expired", "error"):
+                log.error(
+                    "portfolio.entry_order_rejected",
+                    symbol=signal.symbol,
+                    status=status_str,
+                    order_id=entry_order_id,
+                )
+                # Return a zero-share closed position so caller knows it failed
+                return PositionInfo(
+                    symbol=signal.symbol,
+                    side=OrderSide.BUY,
+                    entry_price=signal.entry_price,
+                    current_price=signal.entry_price,
+                    shares=0,
+                    shares_remaining=0,
+                    stop_price=signal.stop_price,
+                    target_prices=signal.target_prices,
+                    status=PositionStatus.CLOSED,
+                    pnl_unrealized=0.0,
+                    pnl_realized=0.0,
+                    scale_outs_completed=0,
+                    entry_time=now_et(),
+                    signal_type=signal.signal_type,
+                    broker_order_ids=[entry_order_id],
+                )
+            if order_status.get("filled_qty", 0) > 0:
+                actual_shares = order_status["filled_qty"]
+                if actual_shares != risk_result.shares:
+                    log.warning(
+                        "portfolio.partial_fill",
+                        symbol=signal.symbol,
+                        requested=risk_result.shares,
+                        filled=actual_shares,
+                    )
+        except Exception:
+            pass  # Use requested shares if we can't check
+
         # CRITICAL: If the bracket didn't create a stop leg, submit a
         # standalone stop order so the position is ALWAYS protected.
         if not stop_order_id:
@@ -207,7 +273,7 @@ class PortfolioManager:
             try:
                 stop_order_id = self._broker.submit_stop_order(
                     symbol=signal.symbol,
-                    qty=risk_result.shares,
+                    qty=actual_shares,
                     stop_price=signal.stop_price,
                 )
                 log.info(
@@ -223,29 +289,6 @@ class PortfolioManager:
                     error=str(e),
                     detail="Position opened WITHOUT exchange-side stop protection!",
                 )
-
-        # Check for partial fill
-        actual_shares = risk_result.shares
-        try:
-            order_status = self._broker.get_order_status(entry_order_id)
-            if order_status.get("filled_qty", 0) > 0:
-                actual_shares = order_status["filled_qty"]
-                if actual_shares != risk_result.shares:
-                    log.warning(
-                        "portfolio.partial_fill",
-                        symbol=signal.symbol,
-                        requested=risk_result.shares,
-                        filled=actual_shares,
-                    )
-        except Exception:
-            pass  # Use requested shares if we can't check
-
-        # Compute max allowed loss for this position (hard cap)
-        max_loss_per_position = self._config.risk.risk_per_trade_pct * 3.0
-        max_loss_dollars = (
-            self._broker.get_account_equity()
-            * (max_loss_per_position / 100.0)
-        ) if hasattr(self, '_config') else actual_shares * abs(signal.entry_price - signal.stop_price) * 3.0
 
         # Create position tracking
         position = PositionInfo(
@@ -559,26 +602,65 @@ class PortfolioManager:
 
         # Cancel bracket legs — we're handling the exit ourselves
         self._cancel_bracket_legs(position)
+        position.broker_stop_order_id = None
+        position.broker_tp_order_id = None
 
-        # Submit sell order for remaining shares
-        order_id = self._broker.submit_market_order(
-            symbol=position.symbol,
-            qty=position.shares_remaining,
-            side=OrderSide.SELL,
-        )
-        position.broker_order_ids.append(order_id)
+        # Submit sell order with retry on failure — leaving shares open
+        # with no stop is the worst possible outcome.
+        order_id = None
+        for attempt in range(3):
+            try:
+                order_id = self._broker.submit_market_order(
+                    symbol=position.symbol,
+                    qty=position.shares_remaining,
+                    side=OrderSide.SELL,
+                )
+                break
+            except Exception as e:
+                log.error(
+                    "portfolio.sell_order_failed",
+                    symbol=position.symbol,
+                    attempt=attempt + 1,
+                    error=str(e),
+                )
+                if attempt == 2:
+                    # Last resort: try broker's close_position API
+                    try:
+                        self._broker.close_position(position.symbol)
+                        log.warning(
+                            "portfolio.fallback_close_position",
+                            symbol=position.symbol,
+                        )
+                    except Exception as e2:
+                        log.critical(
+                            "portfolio.close_position_all_failed",
+                            symbol=position.symbol,
+                            error=str(e2),
+                            detail="POSITION MAY STILL BE OPEN ON BROKER!",
+                        )
+
+        if order_id:
+            position.broker_order_ids.append(order_id)
 
         # Check actual fill for partial fill handling
         actual_exit_price = exit_price
         actual_shares = position.shares_remaining
-        try:
-            order_status = self._broker.get_order_status(order_id)
-            if order_status.get("filled_avg_price", 0) > 0:
-                actual_exit_price = order_status["filled_avg_price"]
-            if order_status.get("filled_qty", 0) > 0:
-                actual_shares = order_status["filled_qty"]
-        except Exception:
-            pass
+        if order_id:
+            try:
+                order_status = self._broker.get_order_status(order_id)
+                status_str = str(order_status.get("status", ""))
+                if status_str == "rejected":
+                    log.critical(
+                        "portfolio.sell_order_rejected",
+                        symbol=position.symbol,
+                        order_id=order_id,
+                    )
+                if order_status.get("filled_avg_price", 0) > 0:
+                    actual_exit_price = order_status["filled_avg_price"]
+                if order_status.get("filled_qty", 0) > 0:
+                    actual_shares = order_status["filled_qty"]
+            except Exception:
+                pass
 
         # Calculate final P&L
         close_pnl = actual_shares * (actual_exit_price - position.entry_price)

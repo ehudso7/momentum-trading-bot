@@ -76,6 +76,7 @@ class LiveMarketData(MarketDataProvider):
         self._cache_timestamps: dict[str, datetime] = {}
         self._float_cache_hours = float_cache_hours
         self._avg_volume_cache: dict[str, float] = {}
+        self._avg_volume_cache_time: dict[str, datetime] = {}
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Get current price from Polygon snapshot with yfinance fallback."""
@@ -245,9 +246,11 @@ class LiveMarketData(MarketDataProvider):
         return None
 
     def get_avg_volume(self, symbol: str, days: int = 20) -> float:
-        """Get average daily volume over last N days."""
+        """Get average daily volume over last N days. Cached for 4 hours."""
         if symbol in self._avg_volume_cache:
-            return self._avg_volume_cache[symbol]
+            cache_time = self._avg_volume_cache_time.get(symbol, datetime.min)
+            if (datetime.utcnow() - cache_time).total_seconds() < 14400:  # 4 hours
+                return self._avg_volume_cache[symbol]
 
         df = self.get_daily_bars(symbol, days=days)
         if df.empty:
@@ -255,6 +258,7 @@ class LiveMarketData(MarketDataProvider):
 
         avg_vol = float(df["volume"].mean())
         self._avg_volume_cache[symbol] = avg_vol
+        self._avg_volume_cache_time[symbol] = datetime.utcnow()
         return avg_vol
 
 

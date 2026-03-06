@@ -647,6 +647,15 @@ class TradingBot:
 
             # Execute trade
             position = self._portfolio.open_position(signal, risk_result)
+
+            # Check if entry was rejected by broker
+            if position.shares == 0:
+                log.warning(
+                    "bot.entry_rejected_by_broker",
+                    symbol=candidate.symbol,
+                )
+                continue
+
             self._sizer.record_trade_risk(risk_result.risk_dollars)
             open_symbols.add(position.symbol)
 

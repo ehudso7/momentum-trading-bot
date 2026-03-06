@@ -65,6 +65,23 @@ class CircuitBreaker:
 
     @property
     def is_trading_allowed(self) -> bool:
+        """
+        Trading is allowed in NORMAL, WARNING, and COOLDOWN states,
+        BUT only if drawdown hasn't exceeded the hard daily limit.
+
+        COOLDOWN after a halt should not allow NEW trades if the daily
+        drawdown is still above threshold — only position management.
+        """
+        if self._state == CircuitState.HALTED:
+            return False
+        if self._state == CircuitState.COOLDOWN:
+            # COOLDOWN allows position management but blocks new entries
+            # if drawdown still exceeds threshold
+            if self._starting_equity > 0:
+                total_pnl = self._daily_pnl + self._unrealized_pnl
+                drawdown_pct = abs(min(0, total_pnl)) / self._starting_equity * 100
+                if drawdown_pct >= self._config.drawdown_circuit_breaker_pct:
+                    return False
         return self._state in (
             CircuitState.NORMAL,
             CircuitState.WARNING,
