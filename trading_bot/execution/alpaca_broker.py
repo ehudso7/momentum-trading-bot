@@ -218,9 +218,19 @@ class AlpacaBroker(BrokerBase):
                 error=str(e),
             )
             # Fallback: cancel old and submit new
+            # Look up the symbol from the original order
+            symbol = ""
+            try:
+                old_order = self._client.get_order_by_id(order_id)
+                symbol = old_order.symbol or ""
+            except Exception:
+                pass
             self.cancel_order(order_id)
+            if not symbol:
+                log.error("alpaca.replace_stop_no_symbol", order_id=order_id)
+                return ""
             return self.submit_stop_order(
-                symbol="",  # Will need the symbol; get from order
+                symbol=symbol,
                 qty=qty,
                 stop_price=new_stop_price,
             )
