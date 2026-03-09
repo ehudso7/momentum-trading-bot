@@ -36,6 +36,9 @@ data/
 *.csv
 
 # Documentation
-*.md
 LICENSE
 docs/
+# Exclude most .md files but keep README.md (needed by pyproject.toml build)
+CLAUDE.md
+CONTRIBUTING.md
+CHANGELOG.md
