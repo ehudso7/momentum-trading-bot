@@ -149,9 +149,12 @@ class TestPullbackVWAPStrategy:
         assert result is None
 
     def test_trailing_stop_not_active_before_scaleout(self, default_config: AppConfig):
-        """Trailing stop is None before first scale-out."""
+        """Trailing stop is None before first scale-out when below 0.5R."""
         strategy = PullbackVWAPStrategy(default_config)
-        position = _make_position(scale_outs=0)
+        # Position at +0.2R (below 0.5R threshold for early trailing)
+        position = _make_position(
+            entry_price=10.0, stop_price=9.50, current_price=10.10, scale_outs=0
+        )
         bars = _make_simple_bars(30)
 
         result = strategy.get_trailing_stop(position, bars)

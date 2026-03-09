@@ -388,9 +388,9 @@ class TestRecommendEntry:
 
     @patch("trading_bot.strategies.advisor.now_et", return_value=_morning_time())
     def test_daily_pnl_approaching_limit_reduces_size(self, mock_now):
-        """Daily P&L between -2.5% and -4% => reduce_size."""
-        # -750 / 25000 * 100 = -3.0%
-        bad_pos = _make_position(pnl_unrealized=-750.0, pnl_realized=0.0)
+        """Daily P&L between -0.5% and -1.0% => reduce_size."""
+        # -175 / 25000 * 100 = -0.7%
+        bad_pos = _make_position(pnl_unrealized=-175.0, pnl_realized=0.0)
         signal = _make_signal(confidence=0.85)
         scan = _make_scan()
         rec = self.advisor.recommend_entry(

@@ -344,11 +344,14 @@ class PullbackVWAPStrategy(Strategy):
         """
         Compute trailing stop level.
 
-        Activated after first scale-out. Uses ATR-based trailing.
+        Activated once position reaches 0.5R profit (breakeven protection)
+        or after first scale-out. Uses ATR-based trailing.
         Only ratchets UP, never down.
         """
-        # Only activate after at least one scale-out
-        if position.scale_outs_completed < 1:
+        # Activate breakeven protection early: once position is at +0.5R,
+        # start trailing to lock in gains and prevent winners turning to losers.
+        r_multiple = position.r_multiple
+        if position.scale_outs_completed < 1 and r_multiple < 0.5:
             return None
 
         if bars.empty or len(bars) < 20:
