@@ -443,10 +443,10 @@ class PortfolioManager:
             )
 
             # 2b. EMERGENCY: Max loss per position hard cap.
-            # If any single position loses more than 3x the intended risk,
+            # If any single position loses more than 2x the intended risk,
             # close immediately. This catches gap-throughs and halt-reopens
             # where the stop was blown past.
-            max_loss_multiplier = 3.0
+            max_loss_multiplier = 2.0
             intended_risk = abs(position.entry_price - position.stop_price) * position.shares
             max_allowed_loss = intended_risk * max_loss_multiplier
             actual_loss = position.shares_remaining * (position.entry_price - price)

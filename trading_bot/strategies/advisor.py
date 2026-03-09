@@ -100,15 +100,15 @@ class TradingAdvisor:
     """
 
     # Thresholds for decision-making
-    LOW_CONFIDENCE_THRESHOLD = 0.5
-    HIGH_CONFIDENCE_THRESHOLD = 0.75
+    LOW_CONFIDENCE_THRESHOLD = 0.65
+    HIGH_CONFIDENCE_THRESHOLD = 0.80
     LATE_DAY_HOUR = 14  # 2:30 PM ET boundary
     LATE_DAY_MINUTE = 30
     EXTENDED_GAP_PCT = 100.0
     SMALL_ACCOUNT_THRESHOLD = 2_000.0
     POWER_HOUR_START = 15  # 3:00 PM ET
-    MAX_POSITION_HOLD_HOURS = 3
-    NEGATIVE_2R = -2.0
+    MAX_POSITION_HOLD_HOURS = 2
+    NEGATIVE_2R = -1.5
     MAX_SCALE_OUTS_BEFORE_TRAIL_ONLY = 2
     DAILY_RISK_BUDGET_WARNING_PCT = 50.0
     VOLATILE_REGIME_RISK_REDUCTION = 0.40
@@ -169,13 +169,13 @@ class TradingAdvisor:
         )
         if equity > 0:
             daily_pnl_pct = (daily_pnl / equity) * 100
-            if daily_pnl_pct <= -4.0:
+            if daily_pnl_pct <= -1.0:
                 action = "skip"
                 reasons.append(
                     f"Daily P&L at {daily_pnl_pct:.1f}% -- near loss limit, "
                     f"skip new entries"
                 )
-            elif daily_pnl_pct <= -2.5:
+            elif daily_pnl_pct <= -0.5:
                 if action != "skip":
                     action = "reduce_size"
                 reasons.append(

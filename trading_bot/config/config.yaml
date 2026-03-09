@@ -51,24 +51,24 @@ scanner:
 
 # Risk management - NON-NEGOTIABLE safety parameters
 risk:
-  risk_per_trade_pct: 1.0        # Risk 1% of equity per trade
-  max_daily_risk_pct: 3.0        # Max 3% total daily risk
-  max_open_positions: 4          # Max 4 concurrent positions
-  max_leverage: 4.0              # Max 4x effective leverage
+  risk_per_trade_pct: 0.5        # Risk 0.5% of equity per trade (conservative)
+  max_daily_risk_pct: 1.5        # Max 1.5% total daily risk
+  max_open_positions: 3          # Max 3 concurrent positions
+  max_leverage: 2.0              # Max 2x effective leverage (conservative)
   pdt_equity_threshold: 25000.0  # PDT rule threshold
   stop_loss_atr_multiplier: 1.5  # Stop = entry - 1.5*ATR (wider = smaller position)
-  max_position_value_pct: 10.0   # Max 10% of equity in single position
+  max_position_value_pct: 8.0    # Max 8% of equity in single position
   min_stop_distance_pct: 2.0     # Min 2% stop distance (prevents micro-stops)
-  drawdown_circuit_breaker_pct: 5.0  # Halt at 5% daily drawdown
-  max_consecutive_losses: 5      # Halt after 5 consecutive losses
-  hard_daily_loss_limit_pct: 5.0 # Hard stop at 5% daily loss
-  api_error_halt_threshold: 5    # Halt after 5 API errors
+  drawdown_circuit_breaker_pct: 2.0  # Halt at 2% daily drawdown (tight)
+  max_consecutive_losses: 3      # Halt after 3 consecutive losses
+  hard_daily_loss_limit_pct: 2.0 # Hard stop at 2% daily loss
+  api_error_halt_threshold: 3    # Halt after 3 API errors
 
 # Entry signal parameters
 entry:
   vwap_proximity_pct: 1.5       # Within 1.5% of VWAP for pullback
   ema_period: 9                  # EMA period for pullback
-  volume_confirmation_multiplier: 1.5  # Volume must be 1.5x recent avg
+  volume_confirmation_multiplier: 2.0  # Volume must be 2x recent avg (stricter)
   min_atr_distance: 0.5         # Min stop distance in ATR units
   breakout_lookback_bars: 5     # Bars to check for breakout
   min_consolidation_bars: 3     # Min bars of consolidation
@@ -76,16 +76,14 @@ entry:
 # Exit and profit-taking
 exit:
   scale_out_ratios:              # How to divide position exits
-    - 0.25                       # 25% at first target
-    - 0.25                       # 25% at second target
-    - 0.25                       # 25% at third target
-    - 0.25                       # remainder trailed
+    - 0.34                       # 34% at first target (take profits early)
+    - 0.33                       # 33% at second target
+    - 0.33                       # remainder trailed
   scale_out_rr_targets:          # R:R targets for scale-outs
     - 1.0                        # First exit at 1:1 risk/reward
     - 2.0                        # Second exit at 2:1 risk/reward
-    - 3.0                        # Third exit at 3:1 risk/reward
-  trailing_stop_atr_multiplier: 1.5
-  trailing_stop_breakeven_buffer_pct: 0.5
+  trailing_stop_atr_multiplier: 1.2
+  trailing_stop_breakeven_buffer_pct: 0.3
   hard_time_exit: "15:50"       # Flat by 3:50 PM ET
   use_parabolic_sar: true
 
