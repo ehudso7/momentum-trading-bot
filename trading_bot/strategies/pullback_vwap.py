@@ -92,8 +92,11 @@ class PullbackVWAPStrategy(Strategy):
         self._risk_cfg = config.risk
 
         # Regime-adaptive parameters (updated each tick by main loop)
-        self._current_regime: str = "low_volatility"
+        self._current_regime: str = "range_bound"
         self._proximity_multiplier: float = 1.0
+
+        # Last rejection diagnostics (populated when evaluate() returns None)
+        self.last_rejection_details: dict[str, str] = {}
 
         self._mtf = MultiTimeframeConfirm()
         self._volume_exhaust = VolumeExhaustionDetector()
@@ -192,8 +195,6 @@ class PullbackVWAPStrategy(Strategy):
             ("breakout", self._check_breakout),
         ]
 
-        rejection_reasons = []
-
         for setup_name, check_fn in setups:
             if setup_name == "vwap_pullback":
                 signal = check_fn(candidate, df, price, vwap, ema, ema20, atr, rsi)
@@ -246,7 +247,12 @@ class PullbackVWAPStrategy(Strategy):
                     )
                     return signal
 
-        # Log why no signal was generated (diagnostic)
+        # --- Detailed diagnostics: why did every setup reject? ---
+        rejection_details = self._diagnose_rejections(
+            candidate, df, price, vwap, ema, ema20, atr, rsi,
+        )
+        self.last_rejection_details = rejection_details
+
         log.info(
             "strategy.no_signal",
             symbol=candidate.symbol,
@@ -260,6 +266,9 @@ class PullbackVWAPStrategy(Strategy):
             bar_bullish=df.iloc[-1]["close"] > df.iloc[-1]["open"],
             vol_confirms=self._volume_confirms(df),
             bars_available=len(df),
+            regime=self._current_regime,
+            proximity_multiplier=self._proximity_multiplier,
+            rejection_details=rejection_details,
         )
 
         return None
@@ -383,6 +392,104 @@ class PullbackVWAPStrategy(Strategy):
         return round(new_stop, 4)
 
     # --- Private helper methods ---
+
+    def _diagnose_rejections(
+        self,
+        candidate: ScanResult,
+        df: pd.DataFrame,
+        price: float,
+        vwap: float,
+        ema: float,
+        ema20: float,
+        atr: float,
+        rsi: float,
+    ) -> dict:
+        """
+        Diagnose why each setup rejected the candidate.
+
+        Returns a dict of {setup_name: rejection_reason} for logging.
+        This is called only when no signal was generated, so the slight
+        overhead of re-checking conditions is acceptable for diagnostics.
+        """
+        reasons: dict[str, str] = {}
+        latest = df.iloc[-1]
+        is_bullish = latest["close"] > latest["open"]
+        vol_ok = self._volume_confirms(df)
+
+        # --- VWAP Pullback ---
+        if pd.isna(vwap) or vwap <= 0:
+            reasons["vwap_pullback"] = "no_vwap_data"
+        else:
+            prox = abs(price - vwap) / vwap * 100
+            adaptive = self._entry_cfg.vwap_proximity_pct * self._proximity_multiplier
+            if prox > adaptive:
+                reasons["vwap_pullback"] = f"too_far_from_vwap({prox:.1f}%>{adaptive:.1f}%)"
+            elif not is_bullish:
+                reasons["vwap_pullback"] = "bearish_bar"
+            elif price < vwap:
+                reasons["vwap_pullback"] = "price_below_vwap"
+            elif not vol_ok:
+                reasons["vwap_pullback"] = "no_volume_confirmation"
+            else:
+                reasons["vwap_pullback"] = "build_signal_failed"
+
+        # --- EMA Pullback ---
+        ema_col = f"ema_{self._entry_cfg.ema_period}"
+        if ema_col not in df.columns or pd.isna(ema) or ema <= 0:
+            reasons["ema_pullback"] = "no_ema_data"
+        else:
+            prox = abs(price - ema) / ema * 100
+            adaptive = self._entry_cfg.vwap_proximity_pct * 1.5 * self._proximity_multiplier
+            if prox > adaptive:
+                reasons["ema_pullback"] = f"too_far_from_ema({prox:.1f}%>{adaptive:.1f}%)"
+            elif not is_bullish:
+                reasons["ema_pullback"] = "bearish_bar"
+            elif price < ema:
+                reasons["ema_pullback"] = "price_below_ema"
+            elif not vol_ok:
+                reasons["ema_pullback"] = "no_volume_confirmation"
+            else:
+                reasons["ema_pullback"] = "build_signal_failed"
+
+        # --- ORB ---
+        reasons["orb"] = "orb_conditions_not_met"
+        if not is_bullish:
+            reasons["orb"] = "bearish_bar"
+        elif not vol_ok:
+            reasons["orb"] = "no_volume_confirmation"
+
+        # --- Red to Green ---
+        if candidate.prev_close <= 0:
+            reasons["red_to_green"] = "no_prev_close"
+        elif price <= candidate.prev_close:
+            reasons["red_to_green"] = "price_below_prev_close"
+        elif not is_bullish:
+            reasons["red_to_green"] = "bearish_bar"
+        elif not vol_ok:
+            reasons["red_to_green"] = "no_volume_confirmation"
+        else:
+            reasons["red_to_green"] = "first_bar_not_red"
+
+        # --- Breakout ---
+        lookback = self._entry_cfg.breakout_lookback_bars
+        if len(df) < lookback + 1:
+            reasons["breakout"] = "insufficient_bars"
+        elif not vol_ok:
+            reasons["breakout"] = "no_volume_confirmation"
+        else:
+            recent = df.iloc[-(lookback + 1):-1]
+            recent_high = recent["high"].max()
+            if price <= recent_high:
+                reasons["breakout"] = f"no_breakout(price={price:.2f}<=high={recent_high:.2f})"
+            else:
+                high_range = recent["high"].max() - recent["low"].min()
+                latest_atr = df.iloc[-1].get("atr_14", atr)
+                if not pd.isna(latest_atr) and latest_atr > 0 and high_range > 2.0 * latest_atr:
+                    reasons["breakout"] = "not_consolidated"
+                else:
+                    reasons["breakout"] = "build_signal_failed"
+
+        return reasons
 
     def _check_vwap_pullback(
         self,

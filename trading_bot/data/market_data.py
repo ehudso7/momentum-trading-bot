@@ -211,19 +211,43 @@ class LiveMarketData(MarketDataProvider):
             limit=days,
         )
 
-        if df.empty:
-            df = self._yf_daily(symbol, days)
+        # If Polygon returned too few bars, try yfinance as supplement
+        if df.empty or len(df) < days * 0.5:
+            if not df.empty:
+                log.info(
+                    "market_data.daily_bars_insufficient_polygon",
+                    symbol=symbol,
+                    bars=len(df),
+                    requested=days,
+                )
+            df_yf = self._yf_daily(symbol, days)
+            if len(df_yf) > len(df):
+                df = df_yf
 
+        log.debug(
+            "market_data.daily_bars_result",
+            symbol=symbol,
+            bars=len(df),
+            requested=days,
+        )
         return df
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def _yf_daily(self, symbol: str, days: int) -> pd.DataFrame:
         try:
             ticker = yf.Ticker(symbol)
-            hist = ticker.history(period=f"{days}d")
+            # Use period names for reliability — yfinance sometimes
+            # mishandles numeric day periods for larger lookbacks.
+            if days <= 30:
+                period = "1mo"
+            elif days <= 90:
+                period = "3mo"
+            else:
+                period = "6mo"
+            hist = ticker.history(period=period)
             if not hist.empty:
                 hist.columns = [c.lower() for c in hist.columns]
-                return hist
+                return hist.tail(days)
         except Exception as e:
             log.error(
                 "market_data.daily_fallback_error", symbol=symbol, error=str(e)

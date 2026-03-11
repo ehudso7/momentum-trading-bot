@@ -187,30 +187,30 @@ def detector() -> RegimeDetector:
 # ---------------------------------------------------------------------------
 
 class TestDetectInsufficientData:
-    """detect() with insufficient data should return LOW_VOLATILITY."""
+    """detect() with insufficient data should return RANGE_BOUND (safe default)."""
 
     def test_none_input(self, detector: RegimeDetector):
         result = detector.detect(None)
-        assert result == MarketRegime.LOW_VOLATILITY
+        assert result == MarketRegime.RANGE_BOUND
 
     def test_empty_dataframe(self, detector: RegimeDetector):
         empty_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         result = detector.detect(empty_df)
-        assert result == MarketRegime.LOW_VOLATILITY
+        assert result == MarketRegime.RANGE_BOUND
 
     def test_too_few_bars(self, detector: RegimeDetector):
-        """Fewer than MIN_BARS (60) rows should return LOW_VOLATILITY."""
-        close = np.linspace(100, 110, 30)
+        """Fewer than MIN_BARS rows should return RANGE_BOUND."""
+        close = np.linspace(100, 110, RegimeDetector.MIN_BARS - 1)
         df = _make_ohlcv(close)
         result = detector.detect(df)
-        assert result == MarketRegime.LOW_VOLATILITY
+        assert result == MarketRegime.RANGE_BOUND
 
     def test_exactly_min_bars_minus_one(self, detector: RegimeDetector):
         """Exactly MIN_BARS - 1 rows is still insufficient."""
         close = np.linspace(100, 110, RegimeDetector.MIN_BARS - 1)
         df = _make_ohlcv(close)
         result = detector.detect(df)
-        assert result == MarketRegime.LOW_VOLATILITY
+        assert result == MarketRegime.RANGE_BOUND
 
     def test_exactly_min_bars_is_sufficient(self, detector: RegimeDetector):
         """Exactly MIN_BARS rows should NOT return LOW_VOLATILITY by default."""
