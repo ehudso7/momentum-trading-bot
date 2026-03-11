@@ -48,14 +48,21 @@ class RegimeDetector:
     """
 
     # Minimum bars required for reliable regime detection.
-    # 50-day EMA needs ~50 bars, plus lookback for ATR percentile.
-    MIN_BARS = 60
+    # 20-day EMA needs ~20 bars; 50-day EMA will be approximate with
+    # fewer bars but still directionally useful.  The previous threshold
+    # of 60 caused the detector to default on insufficient data too often
+    # (e.g. when Polygon free-tier returns limited history and yfinance
+    # is slow).  30 bars gives usable EMA-20/50 crossover signals.
+    MIN_BARS = 30
 
     # ADX-like threshold: above this value the market is considered trending.
     ADX_TRENDING_THRESHOLD = 25.0
 
     # ATR percentile threshold: above this the market is high volatility.
     ATR_HIGH_VOL_PERCENTILE = 80.0
+
+    # ATR percentile threshold: below this the market is low volatility.
+    ATR_LOW_VOL_PERCENTILE = 20.0
 
     # Lookback window for ATR percentile calculation.
     ATR_PERCENTILE_WINDOW = 50
@@ -79,8 +86,12 @@ class RegimeDetector:
                 "regime.insufficient_data",
                 bars=0 if spy_bars is None or spy_bars.empty else len(spy_bars),
                 required=self.MIN_BARS,
+                fallback="range_bound",
             )
-            return MarketRegime.LOW_VOLATILITY
+            # RANGE_BOUND is the correct default when we can't determine the
+            # regime — it applies moderate parameters without the stricter
+            # volume confirmation multiplier that LOW_VOLATILITY imposes.
+            return MarketRegime.RANGE_BOUND
 
         # --- Trend direction via EMA crossover ---
         ema_20 = compute_ema(spy_bars, length=20)
@@ -94,13 +105,14 @@ class RegimeDetector:
         # --- Volatility classification via ATR percentile ---
         atr_series = compute_atr(spy_bars, length=14)
         is_high_vol = self._is_high_volatility(atr_series)
+        is_low_vol = self._is_low_volatility(atr_series)
 
         # --- Trending vs ranging via ADX-like metric ---
         adx_value = self._compute_adx(spy_bars)
         is_trending = adx_value >= self.ADX_TRENDING_THRESHOLD
 
         # --- Classify regime ---
-        regime = self._classify(bullish_cross, is_trending, is_high_vol)
+        regime = self._classify(bullish_cross, is_trending, is_high_vol, is_low_vol)
 
         log.info(
             "regime.detected",
@@ -110,6 +122,8 @@ class RegimeDetector:
             adx=round(float(adx_value), 2),
             is_trending=is_trending,
             is_high_vol=is_high_vol,
+            is_low_vol=is_low_vol,
+            bars_received=len(spy_bars),
         )
 
         return regime
@@ -175,6 +189,27 @@ class RegimeDetector:
         )
 
         return bool(current_atr > percentile_threshold)
+
+    def _is_low_volatility(self, atr_series: pd.Series) -> bool:
+        """
+        Determine if current ATR is below the 20th percentile of the
+        recent ATR window.
+        """
+        if atr_series.empty or atr_series.isna().all():
+            return False
+
+        window = atr_series.iloc[-self.ATR_PERCENTILE_WINDOW:]
+        window = window.dropna()
+
+        if len(window) < 2:
+            return False
+
+        current_atr = window.iloc[-1]
+        percentile_threshold = np.percentile(
+            window.values, self.ATR_LOW_VOL_PERCENTILE
+        )
+
+        return bool(current_atr < percentile_threshold)
 
     def _compute_adx(self, df: pd.DataFrame) -> float:
         """
@@ -255,17 +290,18 @@ class RegimeDetector:
 
     @staticmethod
     def _classify(
-        bullish_cross: bool, is_trending: bool, is_high_vol: bool
+        bullish_cross: bool, is_trending: bool, is_high_vol: bool,
+        is_low_vol: bool = False,
     ) -> MarketRegime:
         """
-        Map the three signals to a single regime classification.
+        Map the signals to a single regime classification.
 
         Decision tree:
         1. If high volatility -> HIGH_VOLATILITY (takes priority)
         2. If trending and bullish cross -> TRENDING_BULLISH
         3. If trending and bearish cross -> TRENDING_BEARISH
-        4. If not trending and not high vol -> RANGE_BOUND
-        5. Otherwise -> LOW_VOLATILITY
+        4. If not trending and low volatility -> LOW_VOLATILITY
+        5. Otherwise -> RANGE_BOUND
         """
         if is_high_vol:
             return MarketRegime.HIGH_VOLATILITY
@@ -275,8 +311,10 @@ class RegimeDetector:
                 return MarketRegime.TRENDING_BULLISH
             return MarketRegime.TRENDING_BEARISH
 
-        # Not trending, not high vol -> range-bound or low vol
-        # Range-bound is the primary non-trending classification
+        # Not trending — distinguish low vol from range-bound
+        if is_low_vol:
+            return MarketRegime.LOW_VOLATILITY
+
         return MarketRegime.RANGE_BOUND
 
 

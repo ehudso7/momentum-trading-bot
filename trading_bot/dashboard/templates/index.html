@@ -446,6 +446,28 @@
     </table>
   </div>
 
+  <!-- Signal Rejections -->
+  <div class="card">
+    <h2>Signal Rejections (Today)</h2>
+    <div id="rejections-content">
+    {% if snap.rejected_signals_count > 0 %}
+    <div class="big-number" style="font-size: 22px; margin-bottom: 8px;">
+      <span id="rejection-total">{{ snap.rejected_signals_count }}</span> rejected
+    </div>
+    <table>
+      {% for stage, count in snap.rejected_by_stage.items() %}
+      <tr>
+        <td>{{ stage | capitalize }}</td>
+        <td id="rej-{{ stage }}">{{ count }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty" id="rejection-empty">No rejections yet</div>
+    {% endif %}
+    </div>
+  </div>
+
   <!-- Connection Status -->
   <div class="card">
     <h2>Connection</h2>
@@ -698,6 +720,23 @@
         $('bot-status').innerHTML = s.bot_running
           ? '<span class="status-dot status-normal"></span> Running'
           : '<span class="status-dot status-halted"></span> Stopped';
+
+        // Signal rejections
+        const rejCount = s.rejected_signals_count || 0;
+        const rejByStage = s.rejected_by_stage || {};
+        const rejContent = $('rejections-content');
+        if (rejContent) {
+          if (rejCount > 0) {
+            let rows = '';
+            for (const [stage, count] of Object.entries(rejByStage)) {
+              rows += `<tr><td>${stage.charAt(0).toUpperCase() + stage.slice(1)}</td><td>${count}</td></tr>`;
+            }
+            rejContent.innerHTML = `<div class="big-number" style="font-size: 22px; margin-bottom: 8px;">
+              <span>${rejCount}</span> rejected</div><table>${rows}</table>`;
+          } else {
+            rejContent.innerHTML = '<div class="empty">No rejections yet</div>';
+          }
+        }
       }
 
       // Positions table

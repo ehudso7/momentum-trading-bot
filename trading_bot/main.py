@@ -42,7 +42,7 @@ from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner
 from trading_bot.strategies.advisor import TradingAdvisor
 from trading_bot.strategies.pullback_vwap import PullbackVWAPStrategy
-from trading_bot.strategies.regime import RegimeDetector
+from trading_bot.strategies.regime import MarketRegime, RegimeDetector
 from trading_bot.utils.health import HealthMonitor
 from trading_bot.utils.helpers import (
     format_currency,
@@ -418,19 +418,18 @@ class TradingBot:
             regime_adjustments = self._regime_detector.get_regime_adjustments(regime)
         except Exception as e:
             log.warning("bot.regime_detection_error", error=str(e))
-            self._current_regime = None
-            regime_adjustments = {
-                "position_size_multiplier": 1.0,
-                "stop_multiplier": 1.0,
-                "max_positions_override": None,
-                "volume_confirmation_multiplier": 1.0,
-            }
+            # Default to range_bound — the safest "we don't know" regime.
+            # LOW_VOLATILITY imposes a stricter volume confirmation
+            # multiplier (1.5x) which can inadvertently filter out
+            # valid candidates.
+            self._current_regime = "range_bound"
+            regime_adjustments = self._regime_detector.get_regime_adjustments(
+                MarketRegime.RANGE_BOUND
+            )
             self._health.record_error("regime_detection")
 
         # Push regime to strategy for adaptive entry parameters
-        self._strategy.set_regime(
-            self._current_regime or "low_volatility", regime_adjustments
-        )
+        self._strategy.set_regime(self._current_regime, regime_adjustments)
 
         # 4. Generate daily plan on first tick of the day (via advisor)
         if not self._daily_plan_generated:
@@ -441,7 +440,7 @@ class TradingBot:
 
             daily_plan = self._advisor.recommend_daily_plan(
                 equity=equity,
-                regime=self._current_regime or "low_volatility",
+                regime=self._current_regime or "range_bound",
                 recent_journal_entries=self._portfolio.get_daily_journal_entries(),
             )
             log.info(
@@ -528,11 +527,21 @@ class TradingBot:
             # Evaluate strategy
             signal = self._strategy.evaluate(candidate, bars)
             if signal is None:
+                # Build a concise reason from the strategy's per-setup
+                # rejection diagnostics so the CSV and dashboard show
+                # exactly which checks failed.
+                details = getattr(self._strategy, "last_rejection_details", {})
+                if details:
+                    reason = "; ".join(
+                        f"{k}:{v}" for k, v in details.items()
+                    )
+                else:
+                    reason = "no_valid_setup"
                 self._record_rejection(RejectedSignal(
                     timestamp=now_et(),
                     symbol=candidate.symbol,
                     stage="strategy",
-                    reason="no_valid_setup",
+                    reason=reason,
                     entry_price=candidate.price,
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
@@ -637,7 +646,7 @@ class TradingBot:
             advisor_rec = self._advisor.recommend_entry(
                 signal=signal,
                 scan_result=candidate,
-                regime=self._current_regime or "low_volatility",
+                regime=self._current_regime or "range_bound",
                 positions=self._portfolio.get_open_positions(),
                 equity=equity,
             )

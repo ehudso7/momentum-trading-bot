@@ -157,6 +157,8 @@ def create_app(state: DashboardState) -> FastAPI:
             "last_updated": snap.last_updated,
             "bot_running": snap.bot_running,
             "last_error": snap.last_error,
+            "rejected_signals_count": snap.rejected_signals_count,
+            "rejected_by_stage": snap.rejected_by_stage,
         }
 
     @app.get("/api/positions")
