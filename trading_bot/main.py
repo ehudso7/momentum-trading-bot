@@ -1022,6 +1022,11 @@ class TradingBot:
         for r in self._rejected_signals:
             rejected_by_stage[r.stage] = rejected_by_stage.get(r.stage, 0) + 1
 
+        # Send the last 200 detailed rejections (most recent first)
+        recent_rejections = [
+            r.to_dict() for r in reversed(self._rejected_signals)
+        ][:200]
+
         self._dashboard_state.update(
             equity=equity,
             starting_equity=self._starting_equity,
@@ -1038,6 +1043,7 @@ class TradingBot:
             last_error=last_error,
             rejected_signals_count=len(self._rejected_signals),
             rejected_by_stage=rejected_by_stage,
+            rejected_signals=recent_rejections,
         )
 
     def stop(self) -> None:

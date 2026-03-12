@@ -191,6 +191,47 @@ def create_app(state: DashboardState) -> FastAPI:
         snap = state.get_snapshot()
         return snap.circuit_breaker
 
+    @app.get("/api/rejections")
+    async def api_rejections() -> dict[str, Any]:
+        """Rejected signals summary and recent details."""
+        snap = state.get_snapshot()
+        return {
+            "total": snap.rejected_signals_count,
+            "by_stage": snap.rejected_by_stage,
+            "recent": snap.rejected_signals,
+        }
+
+    @app.get("/api/rejections/summary")
+    async def api_rejections_summary() -> dict[str, Any]:
+        """Aggregate rejection reasons across all signals today."""
+        snap = state.get_snapshot()
+
+        # Group by stage, then count unique reasons within each stage
+        stage_reasons: dict[str, dict[str, int]] = {}
+        for r in snap.rejected_signals:
+            stage = r.get("stage", "unknown")
+            reason = r.get("reason", "unknown")
+            if stage not in stage_reasons:
+                stage_reasons[stage] = {}
+            stage_reasons[stage][reason] = stage_reasons[stage].get(reason, 0) + 1
+
+        # Also extract the top rejected symbols
+        symbol_counts: dict[str, int] = {}
+        for r in snap.rejected_signals:
+            sym = r.get("symbol", "?")
+            symbol_counts[sym] = symbol_counts.get(sym, 0) + 1
+
+        top_symbols = sorted(symbol_counts.items(), key=lambda x: -x[1])[:15]
+
+        return {
+            "total": snap.rejected_signals_count,
+            "by_stage": snap.rejected_by_stage,
+            "stage_reasons": stage_reasons,
+            "top_rejected_symbols": [
+                {"symbol": s, "count": c} for s, c in top_symbols
+            ],
+        }
+
     return app
 
 
