@@ -521,8 +521,8 @@ class TestRecommendExit:
         assert any("trending_bearish" in r for r in rec.reasons)
 
     @patch("trading_bot.strategies.advisor.now_et", return_value=_morning_time())
-    def test_high_volatility_regime_tightens_stop(self, mock_now):
-        """high_volatility regime => same tighten logic."""
+    def test_high_volatility_regime_holds_with_note(self, mock_now):
+        """high_volatility regime => hold with wider stops note (not tighten)."""
         pos = _make_position(
             entry_price=10.0,
             stop_price=9.50,
@@ -530,7 +530,7 @@ class TestRecommendExit:
             entry_time=datetime(2024, 6, 12, 9, 45),
         )
         rec = self.advisor.recommend_exit(pos, bars=None, market_regime="high_volatility")
-        assert rec.action == "tighten_stop"
+        assert rec.action == "hold"
         assert any("high_volatility" in r for r in rec.reasons)
 
     @patch("trading_bot.strategies.advisor.now_et", return_value=_morning_time())

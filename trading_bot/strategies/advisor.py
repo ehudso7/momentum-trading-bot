@@ -184,9 +184,8 @@ class TradingAdvisor:
                 )
                 adjustments["risk_pct_multiplier"] = 0.5
 
-        # --- Edge case: Bearish or high-volatility regime ---
-        bearish_regimes = {"trending_bearish", "high_volatility"}
-        if regime in bearish_regimes:
+        # --- Edge case: Bearish regime ---
+        if regime == "trending_bearish":
             if action == "enter":
                 action = "reduce_size"
             reasons.append(
@@ -196,6 +195,19 @@ class TradingAdvisor:
                 "risk_pct_multiplier", 1.0
             ) * 0.6
             adjusted_confidence *= 0.8
+
+        # --- Edge case: High volatility regime (less aggressive than bearish) ---
+        if regime == "high_volatility":
+            if action == "enter":
+                action = "reduce_size"
+            reasons.append(
+                "Market regime is 'high_volatility' -- recommend moderately "
+                "reduced position size with wider stops"
+            )
+            adjustments["risk_pct_multiplier"] = adjustments.get(
+                "risk_pct_multiplier", 1.0
+            ) * 0.8
+            adjusted_confidence *= 0.9
 
         # --- Edge case: Late in the day (after 2:30 PM ET) ---
         current_time = now_et()
@@ -332,13 +344,16 @@ class TradingAdvisor:
             )
 
         # --- Edge case: Market regime changed to bearish ---
-        bearish_regimes = {"trending_bearish", "high_volatility"}
-        if market_regime in bearish_regimes:
+        if market_regime == "trending_bearish":
             if action == "hold":
                 action = "tighten_stop"
                 urgency = "medium"
             reasons.append(
                 f"Market regime is '{market_regime}' -- recommend tighter stops"
+            )
+        elif market_regime == "high_volatility":
+            reasons.append(
+                "Market regime is 'high_volatility' -- wider stops already applied via regime adjustments"
             )
 
         # --- Edge case: Already scaled out 2x ---

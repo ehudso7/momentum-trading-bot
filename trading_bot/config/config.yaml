@@ -68,7 +68,7 @@ risk:
 entry:
   vwap_proximity_pct: 1.5       # Within 1.5% of VWAP for pullback
   ema_period: 9                  # EMA period for pullback
-  volume_confirmation_multiplier: 2.0  # Volume must be 2x recent avg (stricter)
+  volume_confirmation_multiplier: 1.5  # Volume must be 1.5x recent avg
   min_atr_distance: 0.5         # Min stop distance in ATR units
   breakout_lookback_bars: 5     # Bars to check for breakout
   min_consolidation_bars: 3     # Min bars of consolidation
