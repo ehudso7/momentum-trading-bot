@@ -65,6 +65,36 @@ class CircuitBreaker:
         return self._state
 
     @property
+    def consecutive_losses(self) -> int:
+        """Current consecutive loss count for graduated sizing."""
+        return self._consecutive_losses
+
+    def get_loss_streak_multiplier(self) -> float:
+        """
+        Graduated risk reduction based on consecutive losses.
+
+        Instead of binary halt at max_consecutive_losses, gradually
+        reduce position size as losses accumulate:
+          0 losses: 1.0x (full size)
+          1 loss:   0.75x
+          2 losses: 0.50x
+          3 losses: 0.25x
+          4+ losses: halt (handled by circuit breaker check)
+
+        Returns multiplier in (0.0, 1.0].
+        """
+        if self._consecutive_losses <= 0:
+            return 1.0
+        elif self._consecutive_losses == 1:
+            return 0.75
+        elif self._consecutive_losses == 2:
+            return 0.50
+        elif self._consecutive_losses == 3:
+            return 0.25
+        else:
+            return 0.0  # Should be halted by circuit breaker
+
+    @property
     def is_trading_allowed(self) -> bool:
         """
         Trading is allowed in NORMAL, WARNING, and COOLDOWN states,

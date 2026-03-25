@@ -629,6 +629,49 @@ class TradingBot:
                 )
                 risk_result.shares = adjusted_shares
 
+            # Tiered position sizing by setup quality
+            # A+ setups (confidence >= 0.80): full size
+            # B setups (confidence 0.65-0.80): 65% size
+            # C setups (confidence 0.55-0.65): 40% size
+            confidence = signal.confidence
+            if confidence < 0.65 and risk_result.shares > 0:
+                tier_mult = 0.40 if confidence < 0.65 else 0.65
+                tier_shares = max(1, int(risk_result.shares * tier_mult))
+                log.info(
+                    "bot.tiered_sizing",
+                    symbol=candidate.symbol,
+                    confidence=round(confidence, 3),
+                    tier="C",
+                    original=risk_result.shares,
+                    adjusted=tier_shares,
+                )
+                risk_result.shares = tier_shares
+            elif confidence < 0.80 and risk_result.shares > 0:
+                tier_shares = max(1, int(risk_result.shares * 0.65))
+                log.info(
+                    "bot.tiered_sizing",
+                    symbol=candidate.symbol,
+                    confidence=round(confidence, 3),
+                    tier="B",
+                    original=risk_result.shares,
+                    adjusted=tier_shares,
+                )
+                risk_result.shares = tier_shares
+
+            # Graduated loss streak cooldown — reduce size after consecutive losses
+            streak_mult = self._circuit_breaker.get_loss_streak_multiplier()
+            if streak_mult < 1.0 and risk_result.shares > 0:
+                streak_shares = max(1, int(risk_result.shares * streak_mult))
+                log.info(
+                    "bot.loss_streak_reduction",
+                    symbol=candidate.symbol,
+                    consecutive_losses=self._circuit_breaker.consecutive_losses,
+                    multiplier=streak_mult,
+                    original=risk_result.shares,
+                    adjusted=streak_shares,
+                )
+                risk_result.shares = streak_shares
+
             # Correlation check with existing positions
             existing_symbols = list(open_symbols)
             if existing_symbols:
