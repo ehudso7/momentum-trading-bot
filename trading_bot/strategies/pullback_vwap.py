@@ -133,7 +133,7 @@ class PullbackVWAPStrategy(Strategy):
             "trending_bullish": 1.5,   # Bullish trend = wider for momentum
             "trending_bearish": 0.8,   # Bearish = selective
             "range_bound": 2.0,        # Range = wider to catch pullbacks
-            "high_volatility": 1.0,    # High vol = standard, conviction
+            "high_volatility": 1.5,    # High vol = wider, gappers pull back further
             "low_volatility": 2.5,     # Low vol = widest, catch shallow pullbacks
         }
         self._proximity_multiplier = _PROXIMITY_MAP.get(regime, 1.0)

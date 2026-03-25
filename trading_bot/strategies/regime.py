@@ -345,11 +345,11 @@ _REGIME_ADJUSTMENTS: dict[MarketRegime, dict] = {
         "proximity_multiplier": 2.0,  # Wide — catch range pullbacks
     },
     MarketRegime.HIGH_VOLATILITY: {
-        "position_size_multiplier": 0.6,
+        "position_size_multiplier": 0.75,
         "stop_multiplier": 1.3,
-        "max_positions_override": 2,
+        "max_positions_override": None,
         "volume_confirmation_multiplier": 1.0,
-        "proximity_multiplier": 1.0,  # Standard — conviction needed in chaos
+        "proximity_multiplier": 1.5,  # Wider — gappers pull back further in high vol
     },
     MarketRegime.LOW_VOLATILITY: {
         "position_size_multiplier": 1.0,
