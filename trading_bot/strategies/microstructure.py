@@ -17,7 +17,7 @@ class MicrostructureScorer:
     Returns a multiplier [0.5, 1.1] for confidence scoring.
     """
     
-    WIDE_SPREAD_THRESHOLD = 0.005  # >0.5% high-low/price = wide spread
+    WIDE_SPREAD_THRESHOLD = 0.01  # >1.0% high-low/price = wide spread
     THIN_VOLUME_THRESHOLD = 50000  # <50K avg volume per bar = thin
     
     def score(self, bars: pd.DataFrame, entry_price: float) -> float:
