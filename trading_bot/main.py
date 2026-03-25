@@ -572,11 +572,28 @@ class TradingBot:
                 )
                 break
 
+            # Apply regime-based max positions override before risk check
+            open_positions = self._portfolio.get_open_positions()
+            max_pos_override = regime_adjustments.get("max_positions_override")
+            if max_pos_override is not None and len(open_positions) >= max_pos_override:
+                self._record_rejection(RejectedSignal(
+                    timestamp=now_et(),
+                    symbol=candidate.symbol,
+                    stage="risk",
+                    reason=f"regime_max_positions: {len(open_positions)}/{max_pos_override} ({self._current_regime})",
+                    entry_price=signal.entry_price,
+                    stop_price=signal.stop_price,
+                    signal_type=signal.signal_type.value,
+                    gap_pct=candidate.gap_pct,
+                    score=candidate.score,
+                ))
+                continue
+
             risk_result = self._sizer.calculate(
                 equity=equity,
                 entry_price=signal.entry_price,
                 stop_price=signal.stop_price,
-                current_positions=self._portfolio.get_open_positions(),
+                current_positions=open_positions,
                 buying_power=buying_power,
             )
 

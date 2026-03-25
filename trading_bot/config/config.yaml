@@ -80,8 +80,8 @@ exit:
     - 0.33                       # 33% at second target
     - 0.33                       # remainder trailed
   scale_out_rr_targets:          # R:R targets for scale-outs
-    - 1.0                        # First exit at 1:1 risk/reward
-    - 2.0                        # Second exit at 2:1 risk/reward
+    - 0.75                       # First exit at 0.75R (bank profit quickly)
+    - 1.5                        # Second exit at 1.5R (before momentum fades)
   trailing_stop_atr_multiplier: 1.2
   trailing_stop_breakeven_buffer_pct: 0.3
   hard_time_exit: "15:50"       # Flat by 3:50 PM ET

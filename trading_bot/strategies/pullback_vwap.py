@@ -180,6 +180,25 @@ class PullbackVWAPStrategy(Strategy):
             log.debug("strategy.no_atr", symbol=candidate.symbol)
             return None
 
+        # Dead zone hard filter: 11:30 AM - 1:00 PM ET
+        # Research shows this window has lowest institutional participation,
+        # wider spreads, and highest false signal rate. Block all but
+        # exceptional setups (high RVOL) to avoid midday chop losses.
+        try:
+            current = now_et()
+            is_dead_zone = (
+                (current.hour == 11 and current.minute >= 30) or current.hour == 12
+            )
+            if is_dead_zone and candidate.relative_volume < 5.0:
+                log.info(
+                    "strategy.dead_zone_filtered",
+                    symbol=candidate.symbol,
+                    rvol=candidate.relative_volume,
+                )
+                return None
+        except Exception:
+            pass
+
         # Volume exhaustion filter
         if self._volume_exhaust.is_exhausted(bars):
             log.info("strategy.volume_exhausted", symbol=candidate.symbol)
@@ -212,7 +231,7 @@ class PullbackVWAPStrategy(Strategy):
         for lookback_offset in [2, 3]:
             if len(df) < lookback_offset + 20:
                 continue
-            lb_df = df.iloc[:-lookback_offset + 1]
+            lb_df = df.iloc[:-lookback_offset]
             lb_latest = lb_df.iloc[-1]
             lb_price = lb_latest["close"]
             lb_vwap = lb_latest.get("vwap", lb_price)
@@ -235,7 +254,11 @@ class PullbackVWAPStrategy(Strategy):
 
                 if signal:
                     # Use current price for entry, not the lookback bar's price
+                    price_move = price - lb_price
                     signal.entry_price = round(price, 4)
+                    # Scale stop proportionally so R:R stays valid
+                    if price_move > 0:
+                        signal.stop_price = round(signal.stop_price + price_move * 0.8, 4)
                     # Revalidate stop distance with current price
                     if signal.stop_price >= price:
                         signal.stop_price = round(price - (atr * self._entry_cfg.min_atr_distance), 4)
@@ -306,6 +329,19 @@ class PullbackVWAPStrategy(Strategy):
                 if latest["close"] < latest["open"]:
                     return True, "momentum_exhaustion"
 
+            # 4b. MACD histogram flipping negative on runners (earlier exit than RSI)
+            macd_hist = latest.get("macd_histogram")
+            if macd_hist is not None and not pd.isna(macd_hist) and len(df) >= 2:
+                prev_hist = df.iloc[-2].get("macd_histogram")
+                if (
+                    prev_hist is not None
+                    and not pd.isna(prev_hist)
+                    and prev_hist > 0
+                    and macd_hist < 0
+                    and position.r_multiple >= 1.5
+                ):
+                    return True, "macd_momentum_shift"
+
             # 5. Parabolic SAR flip
             if self._exit_cfg.use_parabolic_sar:
                 psar_short = latest.get("psar_short")
@@ -353,14 +389,16 @@ class PullbackVWAPStrategy(Strategy):
         """
         Compute trailing stop level.
 
-        Activated once position reaches 0.5R profit (breakeven protection)
+        Activated once position reaches 0.3R profit (breakeven protection)
         or after first scale-out. Uses ATR-based trailing.
         Only ratchets UP, never down.
         """
-        # Activate breakeven protection early: once position is at +0.5R,
+        # Activate breakeven protection early: once position is at +0.3R,
         # start trailing to lock in gains and prevent winners turning to losers.
+        # 0.3R is aggressive but critical for momentum trades — protects capital
+        # on moves that stall after initial push.
         r_multiple = position.r_multiple
-        if position.scale_outs_completed < 1 and r_multiple < 0.5:
+        if position.scale_outs_completed < 1 and r_multiple < 0.3:
             return None
 
         if bars.empty or len(bars) < 20:
@@ -373,10 +411,18 @@ class PullbackVWAPStrategy(Strategy):
         if pd.isna(atr) or atr <= 0:
             return None
 
-        # ATR-based trailing stop
-        new_stop = position.current_price - (
-            atr * self._exit_cfg.trailing_stop_atr_multiplier
-        )
+        # Chandelier Exit: trail from high-water mark (peak price),
+        # not current price, to protect gains from pullbacks.
+        # Adaptive multiplier: tighten as profit grows to lock in more.
+        reference_price = position.high_water_mark or position.current_price
+        base_mult = self._exit_cfg.trailing_stop_atr_multiplier
+        if r_multiple >= 3.0:
+            atr_mult = base_mult * 0.7   # Tight at +3R
+        elif r_multiple >= 2.0:
+            atr_mult = base_mult * 0.85  # Moderately tight at +2R
+        else:
+            atr_mult = base_mult
+        new_stop = reference_price - (atr * atr_mult)
 
         # Minimum: breakeven + buffer
         buffer = position.entry_price * (
@@ -634,9 +680,14 @@ class PullbackVWAPStrategy(Strategy):
         if len(df) <= len(orb_bars):
             return None
 
-        # Price must break above ORB high
+        # ORB range must be reasonable (not already extended)
+        orb_range = orb_high - orb_low
+        if orb_range > 2.5 * atr:
+            return None
+
+        # Price must break above ORB high with confirmation margin
         latest = df.iloc[-1]
-        if price <= orb_high:
+        if price <= orb_high + (atr * 0.25):
             return None
 
         # Must be a bullish bar
@@ -647,8 +698,17 @@ class PullbackVWAPStrategy(Strategy):
         if not self._volume_confirms(df):
             return None
 
+        # ORB requires stricter RVOL (2.0x minimum)
+        if candidate.relative_volume < 2.0:
+            return None
+
         # Price above VWAP
         if not pd.isna(vwap) and price < vwap:
+            return None
+
+        # EMA alignment filter: EMA9 > EMA20 confirms uptrend
+        ema20_val = df.iloc[-1].get("ema_20", price)
+        if not pd.isna(ema) and not pd.isna(ema20_val) and ema < ema20_val:
             return None
 
         # Stop below ORB low or VWAP, whichever is higher (tighter risk)
@@ -795,9 +855,9 @@ class PullbackVWAPStrategy(Strategy):
         """
         Check if any of the last 3 bars had confirming volume.
 
-        Elite traders don't need the exact current candle to spike —
-        they look for a recent volume surge in the area. Checking
-        the last 3 bars catches volume spikes between scan ticks.
+        Uses time-of-day normalization: midday requires higher volume
+        threshold since baseline volume is naturally lower, making
+        average-looking volume potentially just noise.
         """
         if len(df) < 10:
             return False
@@ -807,7 +867,23 @@ class PullbackVWAPStrategy(Strategy):
         if avg_vol <= 0:
             return False
 
-        threshold = avg_vol * self._entry_cfg.volume_confirmation_multiplier
+        # Time-of-day volume normalization
+        base_mult = self._entry_cfg.volume_confirmation_multiplier
+        try:
+            current = now_et()
+            if (current.hour == 11 and current.minute >= 30) or current.hour == 12:
+                # Dead zone: require 1.7x normal threshold (~2.5x)
+                threshold_mult = base_mult * 1.7
+            elif 13 <= current.hour < 15:
+                # Afternoon: slightly higher (~1.8x)
+                threshold_mult = base_mult * 1.2
+            else:
+                # Morning power zone & power hour: normal
+                threshold_mult = base_mult
+        except Exception:
+            threshold_mult = base_mult
+
+        threshold = avg_vol * threshold_mult
 
         # Check if ANY of the last 3 bars had confirming volume
         for i in range(-3, 0):
@@ -973,6 +1049,27 @@ class PullbackVWAPStrategy(Strategy):
 
         # --- 9. Microstructure quality ---
         score *= self._microstructure.score(df, signal.entry_price)
+
+        # --- 9b. ADX trend strength ---
+        adx = df.iloc[-1].get("adx_14", 0.0) if "adx_14" in df.columns else 0.0
+        if not pd.isna(adx):
+            if adx < 20:
+                score *= 0.80  # Choppy/no trend — penalize heavily
+            elif adx > 30:
+                score *= 1.08  # Strong trend — boost
+
+        # --- 10. Multi-timeframe confirmation (5-min resampled from 1-min bars) ---
+        try:
+            if len(df) >= 30:
+                bars_5min = df.resample("5min").agg(
+                    {"open": "first", "high": "max", "low": "min",
+                     "close": "last", "volume": "sum"}
+                ).dropna()
+                if len(bars_5min) >= 25:
+                    mtf_mult = self._mtf.confirm(bars_5min, None)
+                    score *= mtf_mult
+        except Exception:
+            pass
 
         # Clamp to [0, 1]
         return round(max(0.0, min(1.0, score)), 4)

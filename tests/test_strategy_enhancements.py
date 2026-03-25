@@ -86,7 +86,7 @@ class TestVolumeExhaustionDetector:
 
     def test_exhausted_when_volume_drops(self):
         detector = VolumeExhaustionDetector()
-        bars = self._make_bars(1000000, 50000)
+        bars = self._make_bars(1000000, 40000)  # 4% < 5% threshold
         assert detector.is_exhausted(bars) is True
 
     def test_not_exhausted_when_volume_steady(self):
