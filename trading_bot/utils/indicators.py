@@ -243,6 +243,40 @@ def compute_relative_volume(current_volume: float, avg_volume: float) -> float:
     return current_volume / avg_volume
 
 
+def compute_macd(
+    df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.DataFrame:
+    """
+    Compute MACD line, signal line, and histogram.
+
+    MACD detects momentum shifts 2-3 bars before RSI — critical for
+    early exits on fading runners.
+
+    Args:
+        df: OHLCV DataFrame.
+        fast: Fast EMA period (default 12).
+        slow: Slow EMA period (default 26).
+        signal: Signal line EMA period (default 9).
+
+    Returns:
+        DataFrame with columns: macd, macd_signal, macd_histogram.
+    """
+    df = _normalize_columns(df)
+    try:
+        ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
+        ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        result = pd.DataFrame(index=df.index)
+        result["macd"] = macd_line
+        result["macd_signal"] = signal_line
+        result["macd_histogram"] = histogram
+        return result
+    except Exception:
+        return pd.DataFrame(index=df.index)
+
+
 def enrich_dataframe(
     df: pd.DataFrame,
     ema_length: int = 9,
@@ -251,6 +285,7 @@ def enrich_dataframe(
     include_psar: bool = True,
     include_rsi: bool = True,
     include_volume_ma: bool = True,
+    include_macd: bool = True,
 ) -> pd.DataFrame:
     """
     Add all technical indicators to a DataFrame.
@@ -308,5 +343,13 @@ def enrich_dataframe(
                 result["psar_long"] = psar["psar_long"]
             if "psar_short" in psar.columns:
                 result["psar_short"] = psar["psar_short"]
+
+    # MACD
+    if include_macd:
+        macd = compute_macd(result)
+        if not macd.empty:
+            for col in ("macd", "macd_signal", "macd_histogram"):
+                if col in macd.columns:
+                    result[col] = macd[col]
 
     return result

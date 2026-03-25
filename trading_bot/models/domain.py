@@ -104,6 +104,7 @@ class PositionInfo:
     signal_type: SignalType = SignalType.VWAP_PULLBACK
     trailing_stop_active: bool = False
     trailing_stop_price: Optional[float] = None
+    high_water_mark: Optional[float] = None
     broker_order_ids: list[str] = field(default_factory=list)
     broker_stop_order_id: Optional[str] = None
     broker_tp_order_id: Optional[str] = None

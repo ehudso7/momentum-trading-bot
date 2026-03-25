@@ -435,6 +435,10 @@ class PortfolioManager:
 
             position.current_price = price
 
+            # Track high-water mark for smarter trailing stops
+            if position.high_water_mark is None or price > position.high_water_mark:
+                position.high_water_mark = price
+
             # Feed price to paper broker so bracket stops/TPs trigger
             if hasattr(self._broker, "update_price"):
                 self._broker.update_price(symbol, price)

@@ -212,7 +212,7 @@ class PullbackVWAPStrategy(Strategy):
         for lookback_offset in [2, 3]:
             if len(df) < lookback_offset + 20:
                 continue
-            lb_df = df.iloc[:-lookback_offset + 1]
+            lb_df = df.iloc[:-lookback_offset]
             lb_latest = lb_df.iloc[-1]
             lb_price = lb_latest["close"]
             lb_vwap = lb_latest.get("vwap", lb_price)
@@ -235,7 +235,11 @@ class PullbackVWAPStrategy(Strategy):
 
                 if signal:
                     # Use current price for entry, not the lookback bar's price
+                    price_move = price - lb_price
                     signal.entry_price = round(price, 4)
+                    # Scale stop proportionally so R:R stays valid
+                    if price_move > 0:
+                        signal.stop_price = round(signal.stop_price + price_move * 0.8, 4)
                     # Revalidate stop distance with current price
                     if signal.stop_price >= price:
                         signal.stop_price = round(price - (atr * self._entry_cfg.min_atr_distance), 4)
@@ -306,6 +310,19 @@ class PullbackVWAPStrategy(Strategy):
                 if latest["close"] < latest["open"]:
                     return True, "momentum_exhaustion"
 
+            # 4b. MACD histogram flipping negative on runners (earlier exit than RSI)
+            macd_hist = latest.get("macd_histogram")
+            if macd_hist is not None and not pd.isna(macd_hist) and len(df) >= 2:
+                prev_hist = df.iloc[-2].get("macd_histogram")
+                if (
+                    prev_hist is not None
+                    and not pd.isna(prev_hist)
+                    and prev_hist > 0
+                    and macd_hist < 0
+                    and position.r_multiple >= 1.5
+                ):
+                    return True, "macd_momentum_shift"
+
             # 5. Parabolic SAR flip
             if self._exit_cfg.use_parabolic_sar:
                 psar_short = latest.get("psar_short")
@@ -353,14 +370,16 @@ class PullbackVWAPStrategy(Strategy):
         """
         Compute trailing stop level.
 
-        Activated once position reaches 0.5R profit (breakeven protection)
+        Activated once position reaches 0.3R profit (breakeven protection)
         or after first scale-out. Uses ATR-based trailing.
         Only ratchets UP, never down.
         """
-        # Activate breakeven protection early: once position is at +0.5R,
+        # Activate breakeven protection early: once position is at +0.3R,
         # start trailing to lock in gains and prevent winners turning to losers.
+        # 0.3R is aggressive but critical for momentum trades — protects capital
+        # on moves that stall after initial push.
         r_multiple = position.r_multiple
-        if position.scale_outs_completed < 1 and r_multiple < 0.5:
+        if position.scale_outs_completed < 1 and r_multiple < 0.3:
             return None
 
         if bars.empty or len(bars) < 20:
@@ -373,8 +392,10 @@ class PullbackVWAPStrategy(Strategy):
         if pd.isna(atr) or atr <= 0:
             return None
 
-        # ATR-based trailing stop
-        new_stop = position.current_price - (
+        # ATR-based trailing stop — trail from high-water mark (peak price),
+        # not just current price, to protect gains from pullbacks
+        reference_price = position.high_water_mark or position.current_price
+        new_stop = reference_price - (
             atr * self._exit_cfg.trailing_stop_atr_multiplier
         )
 
@@ -973,6 +994,19 @@ class PullbackVWAPStrategy(Strategy):
 
         # --- 9. Microstructure quality ---
         score *= self._microstructure.score(df, signal.entry_price)
+
+        # --- 10. Multi-timeframe confirmation (5-min resampled from 1-min bars) ---
+        try:
+            if len(df) >= 30:
+                bars_5min = df.resample("5min").agg(
+                    {"open": "first", "high": "max", "low": "min",
+                     "close": "last", "volume": "sum"}
+                ).dropna()
+                if len(bars_5min) >= 25:
+                    mtf_mult = self._mtf.confirm(bars_5min, None)
+                    score *= mtf_mult
+        except Exception:
+            pass
 
         # Clamp to [0, 1]
         return round(max(0.0, min(1.0, score)), 4)

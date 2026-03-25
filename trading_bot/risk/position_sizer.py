@@ -142,15 +142,18 @@ class PositionSizer:
                 positions_count=len(current_positions),
             )
 
-        # 4. Daily risk budget check
-        total_daily_risk = self._daily_risk_used + risk_dollars
+        # 4. Daily risk budget check (includes unrealized losses from open positions)
+        unrealized_loss = sum(
+            min(0.0, p.pnl_unrealized) for p in current_positions
+        )
+        total_daily_risk = self._daily_risk_used + risk_dollars + abs(unrealized_loss)
         max_daily_risk = equity * (self._config.max_daily_risk_pct / 100.0)
         if total_daily_risk > max_daily_risk:
             return RiskCheckResult(
                 approved=False,
                 shares=0,
                 risk_dollars=risk_dollars,
-                reason=f"daily_risk_exceeded: ${total_daily_risk:.2f} > ${max_daily_risk:.2f}",
+                reason=f"daily_risk_exceeded: ${total_daily_risk:.2f} > ${max_daily_risk:.2f} (unrealized: ${abs(unrealized_loss):.2f})",
                 leverage_used=0.0,
                 positions_count=len(current_positions),
             )
