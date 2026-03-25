@@ -659,13 +659,13 @@ class TradingBot:
                 risk_result.shares = tier_shares
 
             # Graduated loss streak cooldown — reduce size after consecutive losses
-            streak_mult = self._circuit_breaker.get_loss_streak_multiplier()
+            streak_mult = self._circuit.get_loss_streak_multiplier()
             if streak_mult < 1.0 and risk_result.shares > 0:
                 streak_shares = max(1, int(risk_result.shares * streak_mult))
                 log.info(
                     "bot.loss_streak_reduction",
                     symbol=candidate.symbol,
-                    consecutive_losses=self._circuit_breaker.consecutive_losses,
+                    consecutive_losses=self._circuit.consecutive_losses,
                     multiplier=streak_mult,
                     original=risk_result.shares,
                     adjusted=streak_shares,
