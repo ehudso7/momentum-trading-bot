@@ -243,6 +243,49 @@ def compute_relative_volume(current_volume: float, avg_volume: float) -> float:
     return current_volume / avg_volume
 
 
+def compute_adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """
+    Compute Average Directional Index for trend strength filtering.
+
+    ADX > 25 = trending, ADX < 20 = choppy. Used to filter out
+    momentum entries in non-trending conditions.
+
+    Args:
+        df: OHLCV DataFrame.
+        length: ADX period (default 14).
+
+    Returns:
+        pd.Series with ADX values (0-100).
+    """
+    df = _normalize_columns(df)
+    try:
+        high, low, close = df["high"], df["low"], df["close"]
+        up_move = high.diff()
+        down_move = -low.diff()
+
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+
+        alpha = 1.0 / length
+        smoothed_plus = plus_dm.ewm(alpha=alpha, adjust=False).mean()
+        smoothed_minus = minus_dm.ewm(alpha=alpha, adjust=False).mean()
+        smoothed_tr = tr.ewm(alpha=alpha, adjust=False).mean()
+
+        plus_di = 100 * smoothed_plus / smoothed_tr.replace(0, np.nan)
+        minus_di = 100 * smoothed_minus / smoothed_tr.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.ewm(alpha=alpha, adjust=False).mean()
+        return adx.fillna(0.0)
+    except Exception:
+        return pd.Series(0.0, index=df.index)
+
+
 def compute_macd(
     df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9
 ) -> pd.DataFrame:
@@ -286,6 +329,7 @@ def enrich_dataframe(
     include_rsi: bool = True,
     include_volume_ma: bool = True,
     include_macd: bool = True,
+    include_adx: bool = True,
 ) -> pd.DataFrame:
     """
     Add all technical indicators to a DataFrame.
@@ -343,6 +387,11 @@ def enrich_dataframe(
                 result["psar_long"] = psar["psar_long"]
             if "psar_short" in psar.columns:
                 result["psar_short"] = psar["psar_short"]
+
+    # ADX
+    if include_adx:
+        adx = compute_adx(result, length=14)
+        result["adx_14"] = adx
 
     # MACD
     if include_macd:

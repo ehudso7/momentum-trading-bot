@@ -180,6 +180,25 @@ class PullbackVWAPStrategy(Strategy):
             log.debug("strategy.no_atr", symbol=candidate.symbol)
             return None
 
+        # Dead zone hard filter: 11:30 AM - 1:00 PM ET
+        # Research shows this window has lowest institutional participation,
+        # wider spreads, and highest false signal rate. Block all but
+        # exceptional setups (high RVOL) to avoid midday chop losses.
+        try:
+            current = now_et()
+            is_dead_zone = (
+                (current.hour == 11 and current.minute >= 30) or current.hour == 12
+            )
+            if is_dead_zone and candidate.relative_volume < 5.0:
+                log.info(
+                    "strategy.dead_zone_filtered",
+                    symbol=candidate.symbol,
+                    rvol=candidate.relative_volume,
+                )
+                return None
+        except Exception:
+            pass
+
         # Volume exhaustion filter
         if self._volume_exhaust.is_exhausted(bars):
             log.info("strategy.volume_exhausted", symbol=candidate.symbol)
@@ -392,12 +411,18 @@ class PullbackVWAPStrategy(Strategy):
         if pd.isna(atr) or atr <= 0:
             return None
 
-        # ATR-based trailing stop — trail from high-water mark (peak price),
-        # not just current price, to protect gains from pullbacks
+        # Chandelier Exit: trail from high-water mark (peak price),
+        # not current price, to protect gains from pullbacks.
+        # Adaptive multiplier: tighten as profit grows to lock in more.
         reference_price = position.high_water_mark or position.current_price
-        new_stop = reference_price - (
-            atr * self._exit_cfg.trailing_stop_atr_multiplier
-        )
+        base_mult = self._exit_cfg.trailing_stop_atr_multiplier
+        if r_multiple >= 3.0:
+            atr_mult = base_mult * 0.7   # Tight at +3R
+        elif r_multiple >= 2.0:
+            atr_mult = base_mult * 0.85  # Moderately tight at +2R
+        else:
+            atr_mult = base_mult
+        new_stop = reference_price - (atr * atr_mult)
 
         # Minimum: breakeven + buffer
         buffer = position.entry_price * (
@@ -655,9 +680,14 @@ class PullbackVWAPStrategy(Strategy):
         if len(df) <= len(orb_bars):
             return None
 
-        # Price must break above ORB high
+        # ORB range must be reasonable (not already extended)
+        orb_range = orb_high - orb_low
+        if orb_range > 2.5 * atr:
+            return None
+
+        # Price must break above ORB high with confirmation margin
         latest = df.iloc[-1]
-        if price <= orb_high:
+        if price <= orb_high + (atr * 0.25):
             return None
 
         # Must be a bullish bar
@@ -668,8 +698,17 @@ class PullbackVWAPStrategy(Strategy):
         if not self._volume_confirms(df):
             return None
 
+        # ORB requires stricter RVOL (2.0x minimum)
+        if candidate.relative_volume < 2.0:
+            return None
+
         # Price above VWAP
         if not pd.isna(vwap) and price < vwap:
+            return None
+
+        # EMA alignment filter: EMA9 > EMA20 confirms uptrend
+        ema20_val = df.iloc[-1].get("ema_20", price)
+        if not pd.isna(ema) and not pd.isna(ema20_val) and ema < ema20_val:
             return None
 
         # Stop below ORB low or VWAP, whichever is higher (tighter risk)
@@ -816,9 +855,9 @@ class PullbackVWAPStrategy(Strategy):
         """
         Check if any of the last 3 bars had confirming volume.
 
-        Elite traders don't need the exact current candle to spike —
-        they look for a recent volume surge in the area. Checking
-        the last 3 bars catches volume spikes between scan ticks.
+        Uses time-of-day normalization: midday requires higher volume
+        threshold since baseline volume is naturally lower, making
+        average-looking volume potentially just noise.
         """
         if len(df) < 10:
             return False
@@ -828,7 +867,23 @@ class PullbackVWAPStrategy(Strategy):
         if avg_vol <= 0:
             return False
 
-        threshold = avg_vol * self._entry_cfg.volume_confirmation_multiplier
+        # Time-of-day volume normalization
+        base_mult = self._entry_cfg.volume_confirmation_multiplier
+        try:
+            current = now_et()
+            if (current.hour == 11 and current.minute >= 30) or current.hour == 12:
+                # Dead zone: require 1.7x normal threshold (~2.5x)
+                threshold_mult = base_mult * 1.7
+            elif 13 <= current.hour < 15:
+                # Afternoon: slightly higher (~1.8x)
+                threshold_mult = base_mult * 1.2
+            else:
+                # Morning power zone & power hour: normal
+                threshold_mult = base_mult
+        except Exception:
+            threshold_mult = base_mult
+
+        threshold = avg_vol * threshold_mult
 
         # Check if ANY of the last 3 bars had confirming volume
         for i in range(-3, 0):
@@ -994,6 +1049,14 @@ class PullbackVWAPStrategy(Strategy):
 
         # --- 9. Microstructure quality ---
         score *= self._microstructure.score(df, signal.entry_price)
+
+        # --- 9b. ADX trend strength ---
+        adx = df.iloc[-1].get("adx_14", 0.0) if "adx_14" in df.columns else 0.0
+        if not pd.isna(adx):
+            if adx < 20:
+                score *= 0.80  # Choppy/no trend — penalize heavily
+            elif adx > 30:
+                score *= 1.08  # Strong trend — boost
 
         # --- 10. Multi-timeframe confirmation (5-min resampled from 1-min bars) ---
         try:

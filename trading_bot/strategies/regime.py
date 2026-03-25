@@ -333,21 +333,21 @@ _REGIME_ADJUSTMENTS: dict[MarketRegime, dict] = {
     MarketRegime.TRENDING_BEARISH: {
         "position_size_multiplier": 0.5,
         "stop_multiplier": 0.8,
-        "max_positions_override": None,
+        "max_positions_override": 2,  # Limit exposure against trend
         "volume_confirmation_multiplier": 1.0,
         "proximity_multiplier": 0.8,  # Selective against trend
     },
     MarketRegime.RANGE_BOUND: {
         "position_size_multiplier": 0.75,
         "stop_multiplier": 1.0,
-        "max_positions_override": None,
+        "max_positions_override": 3,  # Slightly reduced in choppy markets
         "volume_confirmation_multiplier": 1.0,
         "proximity_multiplier": 2.0,  # Wide — catch range pullbacks
     },
     MarketRegime.HIGH_VOLATILITY: {
         "position_size_multiplier": 0.75,
         "stop_multiplier": 1.3,
-        "max_positions_override": None,
+        "max_positions_override": 2,  # Reduce exposure in high vol
         "volume_confirmation_multiplier": 1.0,
         "proximity_multiplier": 1.5,  # Wider — gappers pull back further in high vol
     },
