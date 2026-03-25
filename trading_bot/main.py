@@ -436,7 +436,7 @@ class TradingBot:
             try:
                 equity = self._broker.get_account_equity()
             except Exception:
-                equity = self._config.starting_capital
+                equity = self._starting_equity  # Use last known, not config default
 
             daily_plan = self._advisor.recommend_daily_plan(
                 equity=equity,

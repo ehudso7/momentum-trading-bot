@@ -14,7 +14,7 @@ class VolumeExhaustionDetector:
     the move is likely exhausted.
     """
     
-    EXHAUSTION_RATIO = 0.10  # Current rate < 10% of initial = exhausted
+    EXHAUSTION_RATIO = 0.05  # Current rate < 5% of initial = exhausted
     INITIAL_BARS = 15  # First 15 bars define "initial burst"
     
     def is_exhausted(self, bars: pd.DataFrame) -> bool:
