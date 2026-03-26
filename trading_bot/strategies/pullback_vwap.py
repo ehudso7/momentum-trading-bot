@@ -206,13 +206,22 @@ class PullbackVWAPStrategy(Strategy):
 
         # Check each setup in priority order, with multi-bar lookback
         # Try current bar first, then check recent bars for missed signals
-        setups = [
+        #
+        # Regime-restricted setups: in bearish or high-vol, only allow
+        # VWAP pullback (highest conviction). Secondary setups (EMA, ORB,
+        # red-to-green, breakout) have lower win rates in hostile regimes.
+        all_setups = [
             ("vwap_pullback", self._check_vwap_pullback),
             ("ema_pullback", self._check_ema_pullback),
             ("orb", self._check_opening_range_breakout),
             ("red_to_green", self._check_red_to_green),
             ("breakout", self._check_breakout),
         ]
+        if self._current_regime in ("trending_bearish", "high_volatility"):
+            # Bearish/high-vol: VWAP pullback only
+            setups = [s for s in all_setups if s[0] == "vwap_pullback"]
+        else:
+            setups = all_setups
 
         for setup_name, check_fn in setups:
             if setup_name == "vwap_pullback":
@@ -225,6 +234,16 @@ class PullbackVWAPStrategy(Strategy):
                 signal = check_fn(candidate, df, price, vwap, ema, atr, rsi)
 
             if signal:
+                # Minimum R:R gate: reject signals where first target
+                # doesn't offer at least 1.5:1 reward-to-risk
+                if signal.reward_risk_ratio < 1.5:
+                    log.info(
+                        "strategy.rr_too_low",
+                        symbol=candidate.symbol,
+                        rr=round(signal.reward_risk_ratio, 2),
+                        setup=setup_name,
+                    )
+                    continue
                 return signal
 
         # If no signal on current bar, check last 2 bars for missed entries
@@ -262,6 +281,9 @@ class PullbackVWAPStrategy(Strategy):
                     # Revalidate stop distance with current price
                     if signal.stop_price >= price:
                         signal.stop_price = round(price - (atr * self._entry_cfg.min_atr_distance), 4)
+                    # R:R gate for lookback signals too
+                    if signal.reward_risk_ratio < 1.5:
+                        continue
                     log.info(
                         "strategy.lookback_signal",
                         symbol=candidate.symbol,
