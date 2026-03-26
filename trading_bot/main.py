@@ -658,6 +658,24 @@ class TradingBot:
                 )
                 risk_result.shares = tier_shares
 
+            # Volatility-scaled sizing: reduce shares for high-ATR stocks.
+            # ATR/price > 5% = very volatile, scale down proportionally.
+            # This prevents outsized dollar losses on erratic movers.
+            if signal.atr > 0 and signal.entry_price > 0 and risk_result.shares > 0:
+                atr_pct = (signal.atr / signal.entry_price) * 100
+                if atr_pct > 5.0:
+                    vol_mult = min(1.0, 5.0 / atr_pct)  # Scale down proportionally
+                    vol_shares = max(1, int(risk_result.shares * vol_mult))
+                    log.info(
+                        "bot.volatility_scaling",
+                        symbol=candidate.symbol,
+                        atr_pct=round(atr_pct, 2),
+                        multiplier=round(vol_mult, 2),
+                        original=risk_result.shares,
+                        adjusted=vol_shares,
+                    )
+                    risk_result.shares = vol_shares
+
             # Graduated loss streak cooldown — reduce size after consecutive losses
             streak_mult = self._circuit.get_loss_streak_multiplier()
             if streak_mult < 1.0 and risk_result.shares > 0:

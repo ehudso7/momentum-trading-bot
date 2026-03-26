@@ -206,13 +206,22 @@ class PullbackVWAPStrategy(Strategy):
 
         # Check each setup in priority order, with multi-bar lookback
         # Try current bar first, then check recent bars for missed signals
-        setups = [
+        #
+        # Regime-restricted setups: in bearish or high-vol, only allow
+        # VWAP pullback (highest conviction). Secondary setups (EMA, ORB,
+        # red-to-green, breakout) have lower win rates in hostile regimes.
+        all_setups = [
             ("vwap_pullback", self._check_vwap_pullback),
             ("ema_pullback", self._check_ema_pullback),
             ("orb", self._check_opening_range_breakout),
             ("red_to_green", self._check_red_to_green),
             ("breakout", self._check_breakout),
         ]
+        if self._current_regime in ("trending_bearish", "high_volatility"):
+            # Bearish/high-vol: VWAP pullback only
+            setups = [s for s in all_setups if s[0] == "vwap_pullback"]
+        else:
+            setups = all_setups
 
         for setup_name, check_fn in setups:
             if setup_name == "vwap_pullback":
@@ -225,6 +234,16 @@ class PullbackVWAPStrategy(Strategy):
                 signal = check_fn(candidate, df, price, vwap, ema, atr, rsi)
 
             if signal:
+                # Minimum R:R gate: reject signals where first target
+                # doesn't offer at least 1.5:1 reward-to-risk
+                if signal.reward_risk_ratio < 1.5:
+                    log.info(
+                        "strategy.rr_too_low",
+                        symbol=candidate.symbol,
+                        rr=round(signal.reward_risk_ratio, 2),
+                        setup=setup_name,
+                    )
+                    continue
                 return signal
 
         # If no signal on current bar, check last 2 bars for missed entries
@@ -262,6 +281,9 @@ class PullbackVWAPStrategy(Strategy):
                     # Revalidate stop distance with current price
                     if signal.stop_price >= price:
                         signal.stop_price = round(price - (atr * self._entry_cfg.min_atr_distance), 4)
+                    # R:R gate for lookback signals too
+                    if signal.reward_risk_ratio < 1.5:
+                        continue
                     log.info(
                         "strategy.lookback_signal",
                         symbol=candidate.symbol,
@@ -423,6 +445,21 @@ class PullbackVWAPStrategy(Strategy):
         else:
             atr_mult = base_mult
         new_stop = reference_price - (atr * atr_mult)
+
+        # VWAP-aware trailing: if VWAP is above the ATR-based stop and
+        # price is above VWAP, use VWAP minus a small buffer as the stop.
+        # VWAP acts as dynamic support — stocks bouncing off VWAP are strong,
+        # and breaking below VWAP signals weakness.
+        vwap = latest.get("vwap")
+        if (
+            vwap is not None
+            and not pd.isna(vwap)
+            and vwap > 0
+            and position.current_price > vwap
+        ):
+            vwap_stop = vwap - (atr * 0.25)  # Small buffer below VWAP
+            if vwap_stop > new_stop:
+                new_stop = vwap_stop
 
         # Minimum: breakeven + buffer
         buffer = position.entry_price * (
@@ -908,11 +945,14 @@ class PullbackVWAPStrategy(Strategy):
         But ensures minimum distance of min_atr_distance * ATR.
         """
         entry_bar_low = df.iloc[-1]["low"]
-        swing_low = df.iloc[-10:]["low"].min()
+        # Use 5-bar swing low (tighter than 10-bar = less risk per trade)
+        swing_low_5 = df.iloc[-5:]["low"].min()
+        # Place stop slightly below swing low (buffer prevents exact-level whipsaws)
+        structure_stop = swing_low_5 - (atr * 0.15)
         atr_stop = entry_price - (atr * self._risk_cfg.stop_loss_atr_multiplier)
 
-        # Use highest (tightest) stop
-        stop = max(entry_bar_low, swing_low, atr_stop)
+        # Use highest (tightest) valid stop
+        stop = max(entry_bar_low, structure_stop, atr_stop)
 
         # For VWAP setups, also consider just below VWAP as stop
         if vwap is not None and not pd.isna(vwap):
