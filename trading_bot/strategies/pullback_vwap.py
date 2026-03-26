@@ -446,6 +446,21 @@ class PullbackVWAPStrategy(Strategy):
             atr_mult = base_mult
         new_stop = reference_price - (atr * atr_mult)
 
+        # VWAP-aware trailing: if VWAP is above the ATR-based stop and
+        # price is above VWAP, use VWAP minus a small buffer as the stop.
+        # VWAP acts as dynamic support — stocks bouncing off VWAP are strong,
+        # and breaking below VWAP signals weakness.
+        vwap = latest.get("vwap")
+        if (
+            vwap is not None
+            and not pd.isna(vwap)
+            and vwap > 0
+            and position.current_price > vwap
+        ):
+            vwap_stop = vwap - (atr * 0.25)  # Small buffer below VWAP
+            if vwap_stop > new_stop:
+                new_stop = vwap_stop
+
         # Minimum: breakeven + buffer
         buffer = position.entry_price * (
             self._exit_cfg.trailing_stop_breakeven_buffer_pct / 100
@@ -930,11 +945,14 @@ class PullbackVWAPStrategy(Strategy):
         But ensures minimum distance of min_atr_distance * ATR.
         """
         entry_bar_low = df.iloc[-1]["low"]
-        swing_low = df.iloc[-10:]["low"].min()
+        # Use 5-bar swing low (tighter than 10-bar = less risk per trade)
+        swing_low_5 = df.iloc[-5:]["low"].min()
+        # Place stop slightly below swing low (buffer prevents exact-level whipsaws)
+        structure_stop = swing_low_5 - (atr * 0.15)
         atr_stop = entry_price - (atr * self._risk_cfg.stop_loss_atr_multiplier)
 
-        # Use highest (tightest) stop
-        stop = max(entry_bar_low, swing_low, atr_stop)
+        # Use highest (tightest) valid stop
+        stop = max(entry_bar_low, structure_stop, atr_stop)
 
         # For VWAP setups, also consider just below VWAP as stop
         if vwap is not None and not pd.isna(vwap):
