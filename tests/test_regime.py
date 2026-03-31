@@ -339,7 +339,7 @@ class TestGetRegimeAdjustments:
         adj = detector.get_regime_adjustments(MarketRegime.HIGH_VOLATILITY)
         assert adj["position_size_multiplier"] == 0.75
         assert adj["stop_multiplier"] == 1.3
-        assert adj["max_positions_override"] == 2
+        assert adj["max_positions_override"] == 3
         assert adj["volume_confirmation_multiplier"] == 1.0
 
     def test_low_volatility_adjustments(self, detector: RegimeDetector):
@@ -375,9 +375,9 @@ class TestGetRegimeAdjustments:
         assert adj["stop_multiplier"] > 1.0
 
     def test_high_vol_limits_positions(self, detector: RegimeDetector):
-        """High volatility regime limits max positions to 2."""
+        """High volatility regime limits max positions to 3."""
         adj = detector.get_regime_adjustments(MarketRegime.HIGH_VOLATILITY)
-        assert adj["max_positions_override"] == 2
+        assert adj["max_positions_override"] == 3
 
     def test_low_vol_requires_more_volume(self, detector: RegimeDetector):
         """Low volatility regime requires higher volume confirmation."""

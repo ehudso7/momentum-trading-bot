@@ -100,7 +100,7 @@ class TradingAdvisor:
     """
 
     # Thresholds for decision-making
-    LOW_CONFIDENCE_THRESHOLD = 0.60
+    LOW_CONFIDENCE_THRESHOLD = 0.55
     HIGH_CONFIDENCE_THRESHOLD = 0.80
     LATE_DAY_HOUR = 14  # 2:30 PM ET boundary
     LATE_DAY_MINUTE = 30
