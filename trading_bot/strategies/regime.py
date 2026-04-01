@@ -347,9 +347,9 @@ _REGIME_ADJUSTMENTS: dict[MarketRegime, dict] = {
     MarketRegime.HIGH_VOLATILITY: {
         "position_size_multiplier": 0.75,
         "stop_multiplier": 1.3,
-        "max_positions_override": 2,  # Reduce exposure in high vol
+        "max_positions_override": 3,  # Allow 3 positions (was 2 — too restrictive)
         "volume_confirmation_multiplier": 1.0,
-        "proximity_multiplier": 1.5,  # Wider — gappers pull back further in high vol
+        "proximity_multiplier": 2.0,  # Wider — gappers pull back further in high vol
     },
     MarketRegime.LOW_VOLATILITY: {
         "position_size_multiplier": 1.0,
