@@ -201,3 +201,58 @@ class RejectedSignal:
             "gap_pct": round(self.gap_pct, 1),
             "score": round(self.score, 3),
         }
+
+
+@dataclass
+class FeatureSnapshot:
+    """
+    Structured feature record captured for every candidate evaluated.
+
+    Phase 1.5 Core conversion instrumentation. Used to build a training
+    dataset of the market state presented to the strategy at each
+    decision point — completely independent of the trading journal.
+    """
+
+    symbol: str
+    timestamp: datetime
+    price: float
+    gap_pct: float
+    relative_volume: float
+    volatility: float  # ATR as percentage of price (0.0 if unavailable)
+    regime: str
+
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "price": round(self.price, 4),
+            "gap_pct": round(self.gap_pct, 3),
+            "relative_volume": round(self.relative_volume, 3),
+            "volatility": round(self.volatility, 4),
+            "regime": self.regime,
+        }
+
+
+@dataclass
+class SignalDecision:
+    """
+    Structured decision record captured for every candidate evaluated.
+
+    Paired with a FeatureSnapshot to form a supervised-learning row:
+    features + label (action) + confidence + reason.
+    """
+
+    timestamp: datetime
+    symbol: str
+    action: str  # "buy" or "skip"
+    confidence: float  # 0.0 - 1.0 (defaults to 0.5 if strategy didn't score)
+    reason: str  # rejection stage/reason, or "executed" on buy
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": self.symbol,
+            "action": self.action,
+            "confidence": round(self.confidence, 4),
+            "reason": self.reason,
+        }

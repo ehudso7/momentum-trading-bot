@@ -55,7 +55,9 @@ from trading_bot.utils.helpers import (
 )
 from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager
-from trading_bot.models.domain import RejectedSignal
+from trading_bot.models.domain import FeatureSnapshot, RejectedSignal, SignalDecision
+from trading_bot.persistence.decision_log import DecisionLogger
+from trading_bot.utils.indicators import compute_atr
 from trading_bot.utils.reports import DailySummaryReport
 
 log = structlog.get_logger(__name__)
@@ -161,6 +163,12 @@ class TradingBot:
         self._rejected_signals: collections.deque[RejectedSignal] = collections.deque(maxlen=5000)
         self._rejected_csv = Path(config.journal_csv_path).parent / "rejected_signals.csv"
         self._ensure_rejected_csv()
+
+        # Phase 1.5 Core conversion: structured feature + decision capture.
+        # This is a separate dataset from the trade journal and rejected
+        # shadow log — one row per candidate evaluation, always.
+        decision_log_path = Path(config.journal_csv_path).parent / "decision_log.csv"
+        self._decision_logger = DecisionLogger(decision_log_path)
 
         # Daily auto-reset tracking
         self._last_trading_date: str | None = None
@@ -503,6 +511,9 @@ class TradingBot:
         for candidate in candidates:
             # Skip symbols already held
             if candidate.symbol in open_symbols:
+                # Still capture a snapshot so the dataset records EVERY candidate.
+                snapshot = self._build_feature_snapshot(candidate, None)
+                self._log_decision(snapshot, action="skip", reason="already_held")
                 continue
 
             # Fetch intraday bars
@@ -513,7 +524,13 @@ class TradingBot:
                     symbol=candidate.symbol,
                     detail="No intraday bars from Polygon or yfinance",
                 )
+                snapshot = self._build_feature_snapshot(candidate, None)
+                self._log_decision(snapshot, action="skip", reason="empty_bars")
                 continue
+
+            # Build the feature snapshot once per candidate — reused across
+            # every decision branch below. Pure observation, no side effects.
+            snapshot = self._build_feature_snapshot(candidate, bars)
 
             log.info(
                 "bot.evaluating_candidate",
@@ -546,6 +563,11 @@ class TradingBot:
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"strategy:{reason}",
+                )
                 continue
 
             # Risk check — equity is critical for position sizing.
@@ -561,6 +583,12 @@ class TradingBot:
                     error=str(e),
                 )
                 self._health.record_error("equity_api")
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason="equity_api_failed",
+                    confidence=signal.confidence,
+                )
                 continue  # Skip this candidate — can't size without equity
 
             # Guard against zero/negative equity (API returned garbage)
@@ -570,23 +598,39 @@ class TradingBot:
                     equity=equity,
                     detail="Broker returned zero equity — skipping all entries",
                 )
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason="zero_equity",
+                    confidence=signal.confidence,
+                )
                 break
 
             # Apply regime-based max positions override before risk check
             open_positions = self._portfolio.get_open_positions()
             max_pos_override = regime_adjustments.get("max_positions_override")
             if max_pos_override is not None and len(open_positions) >= max_pos_override:
+                reason_text = (
+                    f"regime_max_positions: {len(open_positions)}/"
+                    f"{max_pos_override} ({self._current_regime})"
+                )
                 self._record_rejection(RejectedSignal(
                     timestamp=now_et(),
                     symbol=candidate.symbol,
                     stage="risk",
-                    reason=f"regime_max_positions: {len(open_positions)}/{max_pos_override} ({self._current_regime})",
+                    reason=reason_text,
                     entry_price=signal.entry_price,
                     stop_price=signal.stop_price,
                     signal_type=signal.signal_type.value,
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"risk:{reason_text}",
+                    confidence=signal.confidence,
+                )
                 continue
 
             risk_result = self._sizer.calculate(
@@ -609,6 +653,12 @@ class TradingBot:
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"risk:{risk_result.reason}",
+                    confidence=signal.confidence,
+                )
                 continue
 
             # Log warnings
@@ -700,17 +750,24 @@ class TradingBot:
                         market_data=self._market_data,
                     )
                     if is_correlated:
+                        corr_reason = f"correlated_with_{existing_symbols}"
                         self._record_rejection(RejectedSignal(
                             timestamp=now_et(),
                             symbol=candidate.symbol,
                             stage="correlation",
-                            reason=f"correlated_with_{existing_symbols}",
+                            reason=corr_reason,
                             entry_price=signal.entry_price,
                             stop_price=signal.stop_price,
                             signal_type=signal.signal_type.value,
                             gap_pct=candidate.gap_pct,
                             score=candidate.score,
                         ))
+                        self._log_decision(
+                            snapshot,
+                            action="skip",
+                            reason=f"correlation:{corr_reason}",
+                            confidence=signal.confidence,
+                        )
                         continue
                 except Exception as e:
                     log.warning(
@@ -736,17 +793,24 @@ class TradingBot:
                 reasons=advisor_rec.reasons,
             )
             if advisor_rec.action == "skip":
+                advisor_reason = "; ".join(advisor_rec.reasons)
                 self._record_rejection(RejectedSignal(
                     timestamp=now_et(),
                     symbol=candidate.symbol,
                     stage="advisor",
-                    reason="; ".join(advisor_rec.reasons),
+                    reason=advisor_reason,
                     entry_price=signal.entry_price,
                     stop_price=signal.stop_price,
                     signal_type=signal.signal_type.value,
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"advisor:{advisor_reason}",
+                    confidence=advisor_rec.confidence,
+                )
                 continue
 
             # Execute trade
@@ -758,7 +822,21 @@ class TradingBot:
                     "bot.entry_rejected_by_broker",
                     symbol=candidate.symbol,
                 )
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason="broker_rejected",
+                    confidence=advisor_rec.confidence,
+                )
                 continue
+
+            # Record executed-buy decision (paired with same snapshot).
+            self._log_decision(
+                snapshot,
+                action="buy",
+                reason="executed",
+                confidence=advisor_rec.confidence,
+            )
 
             self._sizer.record_trade_risk(risk_result.risk_dollars)
             open_symbols.add(position.symbol)
@@ -786,6 +864,66 @@ class TradingBot:
                 risk=format_currency(risk_result.risk_dollars),
                 regime=self._current_regime,
             )
+
+    def _compute_volatility(self, bars, price: float) -> float:
+        """
+        Derive a unit-less volatility figure from ATR(14) as a percentage
+        of current price. Returns 0.0 when bars are missing, too short,
+        or price is non-positive. Best-effort — never raises.
+        """
+        try:
+            if bars is None or price <= 0:
+                return 0.0
+            if hasattr(bars, "empty") and bars.empty:
+                return 0.0
+            if len(bars) < 2:
+                return 0.0
+            atr = compute_atr(bars, length=14)
+            if atr is None or len(atr) == 0:
+                return 0.0
+            last_atr = float(atr.iloc[-1])
+            if last_atr != last_atr:  # NaN check
+                return 0.0
+            return (last_atr / price) * 100.0
+        except Exception:
+            return 0.0
+
+    def _build_feature_snapshot(self, candidate, bars) -> FeatureSnapshot:
+        """
+        Build a FeatureSnapshot for a single scan candidate.
+
+        Phase 1.5 Core conversion instrumentation. Pure observation —
+        does not change any trading behavior.
+        """
+        return FeatureSnapshot(
+            symbol=candidate.symbol,
+            timestamp=now_et(),
+            price=float(candidate.price),
+            gap_pct=float(candidate.gap_pct),
+            relative_volume=float(candidate.relative_volume),
+            volatility=self._compute_volatility(bars, float(candidate.price)),
+            regime=self._current_regime or "unknown",
+        )
+
+    def _log_decision(
+        self,
+        snapshot: FeatureSnapshot,
+        action: str,
+        reason: str,
+        confidence: float = 0.5,
+    ) -> None:
+        """Emit one row to the decision log. Safe — never raises."""
+        decision = SignalDecision(
+            timestamp=now_et(),
+            symbol=snapshot.symbol,
+            action=action,
+            confidence=float(confidence),
+            reason=reason,
+        )
+        try:
+            self._decision_logger.log(snapshot, decision)
+        except Exception as e:
+            log.debug("bot.decision_log_error", error=str(e))
 
     def _ensure_rejected_csv(self) -> None:
         """Create the rejected signals CSV if it doesn't exist."""
