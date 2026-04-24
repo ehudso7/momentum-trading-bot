@@ -20,11 +20,12 @@ Modules:
 from __future__ import annotations
 
 import csv
+import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol, Union
+from typing import Optional, Protocol, Union
 
 import structlog
 
@@ -33,6 +34,28 @@ from trading_bot.models.domain import FeatureSnapshot, SignalDecision
 log = structlog.get_logger(__name__)
 
 _DEFAULT_CSV_PATH = "data/alpha_scores.csv"
+
+# Phase 2.7 — daily-rotation controls. Kept in sync with
+# trading_bot.persistence.decision_log so an operator can flip a single
+# env var and rotate both Core datasets at once.
+ROTATION_ENV_VAR = "TRADING_DATA_ROTATION"
+ROTATION_NONE = "none"
+ROTATION_DAILY = "daily"
+_VALID_ROTATIONS = (ROTATION_NONE, ROTATION_DAILY)
+
+
+def _today_str() -> str:
+    """Return today's date as YYYY-MM-DD. Patchable from tests."""
+    return date.today().strftime("%Y-%m-%d")
+
+
+def _resolve_rotation(rotation: Optional[str]) -> str:
+    """Resolve rotation mode; explicit arg wins, unknown values fall back to none."""
+    raw = rotation if rotation is not None else os.getenv(ROTATION_ENV_VAR, ROTATION_NONE)
+    mode = (raw or ROTATION_NONE).strip().lower()
+    if mode not in _VALID_ROTATIONS:
+        return ROTATION_NONE
+    return mode
 
 CSV_HEADERS: list[str] = [
     "timestamp",
@@ -306,31 +329,54 @@ class RuleBasedAlphaScorer:
 class AlphaLogger:
     """Thread-safe append-only writer for AlphaScore rows."""
 
-    def __init__(self, csv_path: Union[str, Path] = _DEFAULT_CSV_PATH):
-        self._path = Path(csv_path)
+    def __init__(
+        self,
+        csv_path: Union[str, Path] = _DEFAULT_CSV_PATH,
+        rotation: Optional[str] = None,
+    ):
+        self._base_path = Path(csv_path)
+        self._rotation = _resolve_rotation(rotation)
         self._lock = threading.Lock()
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._base_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             log.error(
                 "alpha_log.mkdir_error",
-                path=str(self._path.parent),
+                path=str(self._base_path.parent),
                 error=str(e),
             )
-        self._ensure_header()
+        self._ensure_header(self._current_path())
 
     @property
     def path(self) -> Path:
-        return self._path
+        """Active destination path — dated when rotation is daily."""
+        return self._current_path()
 
-    def _ensure_header(self) -> None:
-        if self._path.exists():
+    @property
+    def base_path(self) -> Path:
+        return self._base_path
+
+    @property
+    def rotation(self) -> str:
+        return self._rotation
+
+    def _current_path(self) -> Path:
+        if self._rotation == ROTATION_DAILY:
+            today = _today_str()
+            return self._base_path.with_name(
+                f"{self._base_path.stem}_{today}{self._base_path.suffix}"
+            )
+        return self._base_path
+
+    def _ensure_header(self, path: Path) -> None:
+        if path.exists():
             return
         try:
-            with open(self._path, "w", newline="") as f:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", newline="") as f:
                 csv.DictWriter(f, fieldnames=CSV_HEADERS).writeheader()
         except Exception as e:
-            log.error("alpha_log.header_error", path=str(self._path), error=str(e))
+            log.error("alpha_log.header_error", path=str(path), error=str(e))
 
     def log(
         self,
@@ -352,13 +398,14 @@ class AlphaLogger:
             "volatility": round(float(snapshot.volatility), 4),
             "reasons": "|".join(alpha.reasons),
         }
+        current = self._current_path()
         with self._lock:
             try:
-                if not self._path.exists():
-                    self._ensure_header()
-                with open(self._path, "a", newline="") as f:
+                if not current.exists():
+                    self._ensure_header(current)
+                with open(current, "a", newline="") as f:
                     csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
             except Exception as e:
                 log.debug(
-                    "alpha_log.write_error", path=str(self._path), error=str(e)
+                    "alpha_log.write_error", path=str(current), error=str(e)
                 )
