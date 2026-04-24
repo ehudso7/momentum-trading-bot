@@ -398,6 +398,100 @@ you should expect:
   promotion-readiness signal.
 
 
+## Phase 3.6 — alpha experiment manifest
+
+Every daily report now appends one JSONL record to
+`data/alpha_experiments.jsonl` describing the exact state under
+which that report was produced: scorer fingerprint, full scorer
+config, env vars in play, guardrail outcome, A+B shadow-filter
+summary, git commit, and the paths of the report files.
+
+This is **append-only audit metadata**. Nothing in the trading
+loop reads the manifest back. No secret is ever persisted: the
+webhook URL is stored only as a boolean
+`TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL_present`.
+
+### Contents of a record
+
+```json
+{
+  "timestamp": "2026-04-24T21:03:15",
+  "report_date": "2026-04-24",
+  "git_commit": "8c61963d3becf76c218724c49340221d1a378611",
+  "scorer_fingerprint": "8c61963d3becf76c218724c49340221d1a3786110cf15a610fe5549a41b77a8b",
+  "scorer_config": {
+    "scorer": "RuleBasedAlphaScorer",
+    "weights": {"gap": 0.2, "rvol": 0.25, "vol": 0.15,
+                "regime": 0.1, "confidence": 0.25, "reason": 0.05},
+    "tier_thresholds": {"A": 0.8, "B": 0.65, "C": 0.5, "D": 0.35},
+    "regime_scores": {"trending_bullish": 1.0, "range_bound": 0.6,
+                      "low_volatility": 0.5, "high_volatility": 0.4,
+                      "trending_bearish": 0.2}
+  },
+  "env": {
+    "TRADING_ALPHA_FILTER_ENABLED": "true",
+    "TRADING_ALPHA_FILTER_MIN_TIER": "B",
+    "TRADING_DATA_ROTATION": "daily",
+    "TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL_present": true
+  },
+  "report_paths": {
+    "text": "data/alpha_reports/alpha_report_2026-04-24.txt",
+    "json": "data/alpha_reports/alpha_report_2026-04-24.json"
+  },
+  "totals": {"alpha_rows": 120, "buy_rows": 25, "skip_rows": 95,
+             "matched_trades": 24, "journal_trades": 24},
+  "promotion_readiness": {"status": "promising", "outcome_count": 24, "...": "..."},
+  "guardrails": {"status": "ok", "reasons": ["..."],
+                 "recommended_action": "no action — continue to monitor"},
+  "shadow_filter_ab_summary": {
+    "threshold": "A+B",
+    "allowed_buy_count": 18, "blocked_buy_count": 7,
+    "allowed_outcome_count": 16, "blocked_outcome_count": 7,
+    "allowed_win_rate": 0.6875, "blocked_win_rate": 0.2857,
+    "allowed_avg_pnl": 48.75, "blocked_avg_pnl": -22.14,
+    "allowed_avg_r_multiple": 0.81, "blocked_avg_r_multiple": -0.43
+  }
+}
+```
+
+### Safety
+
+- **Never stores secrets.** The webhook URL is listed only as a
+  boolean suffixed `_present`. A substring check in the Phase 3.6
+  tests asserts no raw URL ends up in the serialized record.
+- **Never fails the report.** Every I/O path (git rev-parse,
+  JSON serialization, file open/write) is wrapped; a failure sets
+  `DailyReportResult.manifest_error` and leaves
+  `DailyReportResult.success` unchanged so the operator still
+  gets the text / JSON report.
+- **Thread-safe.** Writes are serialized through a module-level
+  `threading.Lock` so concurrent in-process callers cannot
+  interleave JSONL rows. A separate test (`test_thread_safe_
+  concurrent_writes`) verifies 50 threads produce exactly 50
+  valid lines.
+
+### Inspection CLI
+
+```bash
+# Last 10 records (pretty-printed)
+python -m trading_bot.reporting.experiment_manifest --tail 10
+
+# All records as one JSON object per line
+python -m trading_bot.reporting.experiment_manifest --tail 0 --json-lines
+
+# Alternate manifest path (useful in test / staging)
+python -m trading_bot.reporting.experiment_manifest \
+    --manifest path/to/alpha_experiments.jsonl --tail 5
+```
+
+### Programmatic access
+
+`from trading_bot.reporting.experiment_manifest import read_manifest`
+returns a list of record dicts with the same `tail` semantics,
+skipping malformed lines so a partial write can never make
+history unreadable.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 See [`docs/DATASETS.md`](DATASETS.md) for the full spec. Short

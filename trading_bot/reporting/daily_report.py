@@ -48,7 +48,12 @@ from trading_bot.analysis.alpha_report import (
     format_text,
     load_alpha_scores,
 )
-from trading_bot.core.alpha import get_alpha_scorer_fingerprint
+from trading_bot.core.alpha import get_alpha_scorer_config, get_alpha_scorer_fingerprint
+from trading_bot.reporting.experiment_manifest import (
+    DEFAULT_MANIFEST_PATH as _MANIFEST_DEFAULT,
+    append_manifest_record,
+    build_manifest_record,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -90,6 +95,9 @@ class DailyReportResult:
     guardrail_status: Optional[str] = None
     alert_sent: bool = False
     alert_error: Optional[str] = None
+    manifest_path: Optional[Path] = None
+    manifest_appended: bool = False
+    manifest_error: Optional[str] = None
 
 
 def _today_str() -> str:
@@ -628,6 +636,43 @@ def generate_daily_report(
                 "daily_report.alert_error",
                 date=report_date,
                 error=result.alert_error,
+            )
+
+        # Phase 3.6 — append an experiment-manifest record. Best-
+        # effort: never fails the report. Writes next to the data
+        # directory the operator already passed in.
+        manifest_path = Path(data_dir) / "alpha_experiments.jsonl"
+        result.manifest_path = manifest_path
+        try:
+            scorer_config = get_alpha_scorer_config()
+        except Exception:
+            scorer_config = {}
+        try:
+            record = build_manifest_record(
+                report_date=report_date,
+                scorer_fingerprint=current_fingerprint,
+                scorer_config=scorer_config,
+                guardrails=guardrails,
+                totals=report.get("totals", {}),
+                promotion_readiness=report.get("promotion_readiness", {}),
+                shadow_filter_simulation=report.get(
+                    "shadow_filter_simulation", []
+                ),
+                txt_path=txt_out,
+                json_path=json_out,
+            )
+            ok, merr = append_manifest_record(record, manifest_path)
+            result.manifest_appended = ok
+            result.manifest_error = merr
+        except Exception as mexc:
+            # Final safety net — even a bug in build_manifest_record
+            # must not bubble up.
+            result.manifest_appended = False
+            result.manifest_error = f"{type(mexc).__name__}: {mexc}"
+            log.warning(
+                "daily_report.manifest_error",
+                date=report_date,
+                error=result.manifest_error,
             )
     except Exception as exc:
         # Swallow — this report is best-effort and must never block shutdown.
