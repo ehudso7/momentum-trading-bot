@@ -1539,6 +1539,88 @@ Sample JSON output:
   no third-party analytics.
 
 
+### Phase 5.2 — landing-page conversion optimisation
+
+`GET /` is still fully public and unauthenticated, but the page is
+now optimised to convert visitors into API-key holders instead of
+just describing the product. All prior Phase 4.3 invariants hold:
+no forms, no JavaScript, no disk reads, no env-var lookups, no
+leaking of reports / manifest data. The only runtime input is the
+optional `?ref=<code>` query parameter.
+
+Page structure (five `<section>` blocks):
+
+1. **Hero** — tagline _"See which trades your system should have
+   taken — before risking money."_, the existing "Read-only SaaS
+   layer. No trading. No execution." sub-line, and (when a ref
+   query param was supplied) a one-line `Invited by: <code>…</code>`
+   banner.
+2. **How it works** — three-step ordered list: scoring →
+   publishing daily validation reports → guardrail + audit trail.
+3. **Example output** — a small illustrative table showing a
+   report date, a `status-ok` guardrail badge, a Tier × Rows ×
+   Allowed × Blocked table, and a two-row shadow-threshold table.
+   The section header explicitly labels the content as
+   _"Illustrative snapshot — not live data."_ so a visitor cannot
+   confuse it with a live feed.
+4. **Upgrade** — a three-row Free vs Premium comparison table
+   (daily validation reports, experiment audit trail, protected
+   dashboard) that mirrors the Phase 4.5 access-tier caps (free =
+   last 3 days, premium = full history). Followed by two hardcoded
+   soft-conversion cues: _"Most users upgrade after ~7 days"_ and
+   _"Premium users run 3–5x more requests than free users"_. Both
+   cues are compile-time constants — they are not derived from the
+   live usage / conversion logs, so the public page carries zero
+   data leak risk.
+5. **Get started** — CTA copy pointing at operator-issued Bearer
+   API keys.
+
+**Ref query param.** The handler reads `request.query_params.get("ref")`
+and sanitises it with the same helper the growth middleware uses
+(`trading_bot.api.growth._sanitize_ref_code`). That helper strips
+every character outside `[A-Za-z0-9\-_:.]` and caps the result at
+64 characters. The sanitised value is HTML-escaped as defence in
+depth before being echoed inside a single `<code>` element in the
+hero banner. Concretely, this means:
+
+- `?ref=twitter-launch_2026` → banner reads
+  `Invited by: twitter-launch_2026`.
+- `?ref=<script>alert(1)</script>` → banner reads
+  `Invited by: scriptalert1script` — the payload is neutralised.
+- `?ref=` (empty) → no banner rendered.
+- `?ref=<500 chars>` → echoed value is capped at 64 chars.
+
+Because the sanitiser is the same one the growth logger uses, the
+page has a _what-you-see-is-what-gets-logged_ property: if the
+banner shows a character, so does the audit record, and vice
+versa.
+
+**Determinism.** `render_landing_page_html(ref_code: str = "")` is
+a pure function of its sanitised argument. Called with the same
+ref code twice it returns byte-identical HTML; called with no ref
+(or empty string) it returns byte-identical HTML to the legacy
+handler shape. The body builder `_landing_page_body(ref_code)` has
+the same contract.
+
+**Safety invariants (unchanged + re-tested in Phase 5.2):**
+
+- No `<form>`, `<input>`, `<button>`, `onclick`, `onsubmit`, or
+  `method="POST|PUT|PATCH|DELETE"` anywhere on the page.
+- No `<script>` tag, no `javascript:` URI.
+- No execution-adjacent terms (`place trade`, `submit order`,
+  `start bot`, `run simulation`, …) in the rendered copy.
+- No leaking of `scorer_config`, `TRADING_API_KEY`, env-var names,
+  or file paths — even when a ref param is supplied and reports /
+  manifest are populated with unique-marker fixtures.
+- The only non-read HTTP verb on the entire SaaS API is still
+  `POST /webhook/stripe` (Phase 4.7).
+
+**No new env vars.** Phase 5.2 is a pure presentation change;
+operators tune it by changing the source. The legacy env vars
+(`TRADING_API_REPORTS_DIR`, `TRADING_API_MANIFEST_PATH`, etc.) are
+not read by the landing handler.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

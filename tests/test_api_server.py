@@ -3730,3 +3730,346 @@ class TestPhase47Boundary:
         )
         assert resp.status_code == 200
         assert _read_usage(usage_path) == []
+
+
+# ===========================================================================
+# Phase 5.2 — landing-page conversion optimisation
+# ===========================================================================
+
+
+from trading_bot.api.server import _landing_page_body as _phase52_body  # noqa: E402
+
+
+class TestPhase52HasConversionSections:
+    """The landing page must expose all five conversion sections."""
+
+    def test_hero_tagline_present(self, client: TestClient):
+        body = client.get("/").text
+        assert (
+            "See which trades your system should have taken — "
+            "before risking money."
+        ) in body
+
+    def test_has_how_it_works_section(self, client: TestClient):
+        body = client.get("/").text
+        assert "<h2>How it works</h2>" in body
+        # The three-step list is an <ol> with 3 <li> children.
+        ol_start = body.find("<ol>")
+        ol_end = body.find("</ol>", ol_start)
+        assert ol_start != -1 and ol_end != -1
+        assert body.count("<li>", ol_start, ol_end) == 3
+
+    def test_has_example_output_section(self, client: TestClient):
+        body = client.get("/").text
+        assert "<h2>Example output</h2>" in body
+        low = body.lower()
+        # Three markers from the sample: a guardrail row, tier rows,
+        # and shadow-threshold rows.
+        assert "guardrail status" in low
+        assert ">tier<" in low
+        assert "shadow threshold" in low
+
+    def test_example_output_is_illustrative_not_real(self, client: TestClient):
+        body = client.get("/").text
+        # The sample must be clearly flagged as illustrative — not
+        # real data — so visitors don't confuse it with a live feed.
+        assert "Illustrative snapshot" in body or "not live data" in body
+
+    def test_has_upgrade_trigger_section(self, client: TestClient):
+        body = client.get("/").text
+        low = body.lower()
+        assert "<h2>upgrade</h2>" in low
+        # Free-vs-premium comparison table.
+        assert "<th>free</th>" in low
+        assert "<th>premium</th>" in low
+        # The free tier ships a 3-day history window (matches the
+        # Phase 4.5 free-tier cap).
+        assert "last 3 days" in low
+
+    def test_has_cta_section(self, client: TestClient):
+        body = client.get("/").text
+        assert "<h2>Get started</h2>" in body
+        # The CTA text must describe obtaining a Bearer key.
+        assert "Bearer API key" in body
+
+    def test_has_five_section_elements(self, client: TestClient):
+        body = client.get("/").text
+        # The spec calls for five conversion sections: Hero, How it
+        # works, Example output, Upgrade, Get started.
+        assert body.count("<section") == 5
+        assert body.count("</section>") == 5
+
+    def test_all_legacy_positioning_phrases_still_present(
+        self, client: TestClient,
+    ):
+        """Re-assert Phase 4.3 invariants after the Phase 5.2 rewrite."""
+        low = client.get("/").text.lower()
+        for phrase in (
+            "read-only", "guardrail", "daily validation",
+            "audit trail", "protected dashboard",
+        ):
+            assert phrase in low, (
+                f"Phase 4.3 positioning phrase lost: {phrase!r}"
+            )
+
+
+class TestPhase52SoftConversionCues:
+    """Hardcoded copy; no data lookup, no personalisation."""
+
+    def test_contains_upgrade_after_seven_days_cue(self, client: TestClient):
+        body = client.get("/").text
+        assert "Most users upgrade after ~7 days" in body
+
+    def test_contains_premium_usage_intensity_cue(self, client: TestClient):
+        body = client.get("/").text
+        # "3–5x" uses an en dash; the body must contain the phrase
+        # verbatim so the cue survives copy/paste and localisation.
+        assert "Premium users run 3–5x more requests" in body
+
+    def test_cues_do_not_depend_on_env_or_disk(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        """Cue text is a compile-time constant — setting env vars,
+        populating reports, or toggling premium keys must not change
+        either cue."""
+        baseline = render_landing_page_html()
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(tmp_path / "reports"))
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "whatever")
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({"report_date": "2026-04-24"})
+        )
+        populated = render_landing_page_html()
+        assert baseline == populated
+
+
+class TestPhase52RefQueryParam:
+    """`?ref=` is echoed back, sanitised identically to growth.py."""
+
+    def test_no_ref_hides_invited_banner(self, client: TestClient):
+        body = client.get("/").text
+        assert "Invited by" not in body
+
+    def test_valid_ref_is_echoed(self, client: TestClient):
+        body = client.get("/?ref=twitter-launch_2026").text
+        assert "Invited by" in body
+        assert "twitter-launch_2026" in body
+
+    def test_ref_matches_growth_sanitiser(self, client: TestClient):
+        """The value displayed on the page must match exactly what
+        the growth logger would record — "what you see is what gets
+        logged". Any character outside [A-Za-z0-9\\-_:.] is stripped."""
+        from trading_bot.api.growth import _sanitize_ref_code
+        raw = "twitter-launch_2026!!@#$"
+        expected = _sanitize_ref_code(raw)
+        body = client.get(f"/?ref={raw}").text
+        assert expected in body
+        # The stripped characters must not survive into the HTML.
+        for bad in ("!", "@", "#", "$"):
+            # The sanitised token is present but individual bad chars
+            # appear nowhere outside the CSS / inline markup — check
+            # the echoed <code> block specifically.
+            code_start = body.find("<code>")
+            code_end = body.find("</code>", code_start)
+            assert code_start != -1 and code_end != -1
+            assert bad not in body[code_start:code_end]
+
+    def test_empty_ref_param_hides_banner(self, client: TestClient):
+        body = client.get("/?ref=").text
+        assert "Invited by" not in body
+
+    def test_ref_is_capped_at_64_chars(self, client: TestClient):
+        body = client.get("/?ref=" + ("a" * 500)).text
+        # Find the echoed code block and verify the length.
+        start = body.find("<code>")
+        end = body.find("</code>", start)
+        assert start != -1 and end != -1
+        echoed = body[start + len("<code>"):end]
+        assert len(echoed) == 64
+        assert echoed == "a" * 64
+
+    def test_ref_html_injection_blocked(self, client: TestClient):
+        """Ref is sanitised before render AND escaped on output. A
+        <script> payload must not appear as a live tag."""
+        body = client.get("/?ref=<script>alert(1)</script>").text
+        # The raw attacker string must not appear.
+        assert "<script>alert(1)</script>" not in body
+        # No <script tag of ANY kind is allowed on the landing page.
+        assert "<script" not in body.lower()
+        # No javascript: URIs either.
+        assert "javascript:" not in body.lower()
+
+    def test_ref_does_not_affect_status_or_content_type(
+        self, client: TestClient,
+    ):
+        resp = client.get("/?ref=abc")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+
+    def test_ref_value_appears_inside_code_tag_only(
+        self, client: TestClient,
+    ):
+        """The echoed ref lives inside a single <code>…</code> element
+        inside a <p class="ref"> — so the value can't end up in a
+        surprising attribute context."""
+        body = client.get("/?ref=xyz-promo").text
+        assert "<p class=\"ref\">Invited by: <code>xyz-promo</code></p>" in body
+
+
+class TestPhase52Determinism:
+    """Render is a pure function of the sanitised ref code."""
+
+    def test_no_ref_is_deterministic(self):
+        a = render_landing_page_html()
+        b = render_landing_page_html()
+        assert a == b
+
+    def test_same_ref_is_deterministic(self):
+        a = render_landing_page_html("partner-a")
+        b = render_landing_page_html("partner-a")
+        assert a == b
+
+    def test_different_refs_produce_different_html(self):
+        a = render_landing_page_html("partner-a")
+        b = render_landing_page_html("partner-b")
+        assert a != b
+
+    def test_empty_ref_matches_no_ref(self):
+        assert render_landing_page_html("") == render_landing_page_html()
+
+    def test_body_builder_is_pure(self):
+        """Internal body builder: same input → byte-identical output."""
+        assert _phase52_body("") == _phase52_body("")
+        assert _phase52_body("abc") == _phase52_body("abc")
+
+
+class TestPhase52NoNewMutatingControls:
+    """The Phase 4.3 no-forms / no-JS invariants still hold after 5.2."""
+
+    def test_still_no_form_or_inputs_or_buttons(self, client: TestClient):
+        body = client.get("/?ref=abc").text.lower()
+        for token in (
+            "<form", "<input", "<button",
+            "onclick", "onsubmit", "onchange",
+            "method=\"post\"", "method=\"put\"",
+            "method=\"patch\"", "method=\"delete\"",
+            "method='post'", "method='put'",
+            "method='patch'", "method='delete'",
+        ):
+            assert token not in body, (
+                f"Phase 5.2 body still contains mutating marker: {token}"
+            )
+
+    def test_still_no_execution_control_terms(self, client: TestClient):
+        body = client.get("/?ref=abc").text.lower()
+        for term in (
+            "place trade", "execute trade", "submit order",
+            "start bot", "stop bot", "enable filter", "disable filter",
+            "toggle filter", "run simulation", "backtest now",
+            "place order", "make trade",
+        ):
+            assert term not in body, (
+                f"Phase 5.2 body leaks execution-adjacent term: {term}"
+            )
+
+    def test_still_no_script_or_js(self, client: TestClient):
+        body = client.get("/?ref=abc").text.lower()
+        assert "<script" not in body
+        assert "javascript:" not in body
+
+
+class TestPhase52DoesNotAddNewMutatingRoute:
+    """The only non-read verb anywhere is POST /webhook/stripe."""
+
+    def test_verbs_unchanged_after_phase_52(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"Phase 5.2 introduced a non-read verb: {m} {path}"
+                )
+
+    def test_root_accepts_only_get_head_options(self):
+        for route in app.routes:
+            if getattr(route, "path", "") == "/":
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"})
+                break
+        else:
+            raise AssertionError("/ route not registered")
+
+
+class TestPhase52DoesNotLeakProtectedDataWithRef:
+    """Planting planet-sized markers everywhere still can't leak
+    when a ref query param is present — the page is still static."""
+
+    def test_ref_variant_ignores_reports_and_manifest(
+        self, client: TestClient, authed_env,
+    ):
+        reports_dir: Path = authed_env["reports_dir"]
+        manifest: Path = authed_env["manifest"]
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({
+                "report_date": "2026-04-24",
+                "scorer_config": {"weights": {"gap": 0.7},
+                                  "PHASE52_LEAK_MARKER_A": True},
+            })
+        )
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"PHASE52_LEAK_MARKER_B": "keep-out"}) + "\n"
+        )
+        body = client.get("/?ref=some-partner").text
+        assert "PHASE52_LEAK_MARKER_A" not in body
+        assert "PHASE52_LEAK_MARKER_B" not in body
+        assert "scorer_config" not in body
+
+    def test_ref_does_not_leak_env_var_names(self, client: TestClient):
+        body = client.get("/?ref=some-partner").text
+        assert "TRADING_API_KEY" not in body
+        assert "TRADING_API_GROWTH_LOG_PATH" not in body
+        assert "STRIPE" not in body
+
+
+class TestPhase52BoundaryUnchanged:
+    """The SaaS boundary must still hold after the landing-page rewrite."""
+
+    def test_server_still_does_not_import_core(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for pat in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert pat not in src, (
+                f"Phase 5.2 broke SaaS boundary: {pat!r}"
+            )
+
+    def test_landing_handler_only_reads_ref_query_param(self):
+        """The landing handler must not touch reports, manifest, or
+        any other env-driven path."""
+        import inspect
+        from trading_bot.api import server as srv_mod
+        src = inspect.getsource(srv_mod.landing_page)
+        # The handler reads exactly one piece of runtime state.
+        assert "request.query_params.get(\"ref\")" in src
+        # It must NOT read any protected disk source.
+        for forbidden in (
+            "load_latest_report", "read_manifest",
+            "REPORTS_DIR_ENV_VAR", "MANIFEST_PATH_ENV_VAR",
+            "os.getenv", "Path(",
+        ):
+            assert forbidden not in src, (
+                f"landing handler unexpectedly references: {forbidden}"
+            )

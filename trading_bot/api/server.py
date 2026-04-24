@@ -925,95 +925,148 @@ def health() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4.3 — public product/status landing page
+# Phase 4.3 + 5.2 — public landing page (now conversion-focused)
 #
-# Fully static HTML. The route handler returns the page verbatim — it
-# reads no report, opens no manifest, issues no subprocess, and calls
-# no helper that performs I/O. Because nothing dynamic is injected,
-# the page cannot by construction expose scorer_config, paths, secrets,
-# report/experiment data, or anything else protected.
+# The page is fully static HTML with exactly one optional piece of
+# dynamic content: the sanitised ``?ref=<code>`` query parameter is
+# echoed into a small "Invited by" banner so a referrer can confirm
+# their link resolved correctly. The sanitisation set is identical
+# to the growth-log sanitiser (Phase 5.1), which already strips any
+# character outside ``[A-Za-z0-9\-_:.]`` and caps at 64 chars — so
+# HTML, javascript: URIs, angle brackets, and control characters
+# cannot survive. The ref value is also HTML-escaped at render time
+# as defence in depth.
+#
+# Everything else on the page is a compile-time constant. The
+# handler performs no disk reads, no env lookup, no subprocess, and
+# no helper that performs I/O — which is how we guarantee that
+# report data, scorer_config, paths, or secrets cannot leak.
 # ---------------------------------------------------------------------------
 
 
-# Static body of the product / status page. Contains no dynamic
-# data, no I/O, no secrets — by construction the handler cannot
-# leak anything protected. The CSS block is supplied by
-# `_DASHBOARD_CSS` (defined further down); referenced at request
-# time via `render_landing_page_html()` to avoid module-ordering
-# issues.
-_LANDING_PAGE_BODY = (
-    "<body>"
-    "<h1>Momentum Trading Bot — Analytics</h1>"
-    "<p class=\"meta\">Read-only SaaS layer. No trading. No execution.</p>"
-    "<section>"
-    "<h2>What this is</h2>"
-    "<p>A strictly read-only analytics surface over a momentum "
-    "day-trading bot. The service publishes daily validation "
-    "reports, tracks alpha performance over time, and surfaces "
-    "guardrails when the system detects drift — without exposing "
-    "any execution path, scoring internals, or account state.</p>"
-    "</section>"
-    "<section>"
-    "<h2>Read-only alpha analytics</h2>"
-    "<p>Every candidate the bot evaluates is scored into a tier "
-    "(A / B / C / D / F). This service publishes aggregated "
-    "tier statistics, decile calibration, and shadow-filter "
-    "simulation rows so you can see how the scorer would have "
-    "performed — without it ever gating a live trade.</p>"
-    "</section>"
-    "<section>"
-    "<h2>Guardrail monitoring</h2>"
-    "<p>Each trading day is classified as "
-    "<strong>ok</strong>, <strong>warning</strong>, "
-    "<strong>critical</strong>, or "
-    "<strong>insufficient_data</strong> based on whether the "
-    "filter would have kept trades that did better than the ones "
-    "it would have rejected. The status and the reasons behind it "
-    "are surfaced via the API and the operator dashboard.</p>"
-    "</section>"
-    "<section>"
-    "<h2>Daily validation reports</h2>"
-    "<p>One plain-text + JSON validation report per trading day, "
-    "with tier stats, promotion-readiness, shadow-filter "
-    "simulation, and the day's guardrail outcome. Generated "
-    "automatically at session end — no manual rebuild step.</p>"
-    "</section>"
-    "<section>"
-    "<h2>Experiment audit trail</h2>"
-    "<p>Every daily report appends one record to an append-only "
-    "manifest so the exact configuration behind every guardrail "
-    "outcome is reproducible. No secrets are stored: webhook URLs "
-    "are recorded only as a presence boolean.</p>"
-    "</section>"
-    "<section>"
-    "<h2>Protected dashboard</h2>"
-    "<p>Operators with a valid API key can access a read-only HTML "
-    "dashboard that combines the latest validation report and the "
-    "most recent experiment records. The dashboard ships no "
-    "execution controls, no scoring weights, and no account data.</p>"
-    "</section>"
-    "<section>"
-    "<h2>Safety invariants</h2>"
-    "<ul>"
-    "<li>No endpoint executes, simulates, or automates a trade.</li>"
-    "<li>No endpoint writes to disk.</li>"
-    "<li>The service imports nothing from the live trading pipeline.</li>"
-    "<li>The only mutating action anywhere in this service is an "
-    "operator toggling an environment variable.</li>"
-    "</ul>"
-    "</section>"
-    "<footer>"
-    "This landing page is public. All analytics endpoints require "
-    "a Bearer API key."
-    "</footer>"
-    "</body></html>"
-)
+# Use the exact same ref-code sanitiser the growth middleware uses
+# when it writes the event record. This guarantees "what you see is
+# what gets logged" — the display never reveals a character that
+# the audit log would have silently stripped.
+from trading_bot.api.growth import _sanitize_ref_code as _sanitize_landing_ref_code  # noqa: E402
 
 
-def render_landing_page_html() -> str:
+def _landing_page_body(ref_code: str) -> str:
     """
-    Build the public landing page. Pure function — no I/O, no env
-    reads, no config lookup. Tests can call this directly.
+    Build the <body>…</body> of the landing page. Pure — takes
+    ``ref_code`` (already sanitised; may be empty) and returns a
+    deterministic string.
+    """
+    if ref_code:
+        ref_banner = (
+            "<p class=\"ref\">Invited by: "
+            f"<code>{_esc(ref_code)}</code></p>"
+        )
+    else:
+        ref_banner = ""
+    return (
+        "<body>"
+        # --- Section 1: Hero ---
+        "<section class=\"hero\">"
+        "<h1>Momentum Trading Bot — Analytics</h1>"
+        "<p class=\"tagline\">"
+        "See which trades your system should have taken — "
+        "before risking money."
+        "</p>"
+        "<p class=\"meta\">Read-only SaaS layer. No trading. "
+        "No execution.</p>"
+        f"{ref_banner}"
+        "</section>"
+        # --- Section 2: How it works ---
+        "<section>"
+        "<h2>How it works</h2>"
+        "<ol>"
+        "<li>Every candidate the trading bot evaluates is scored "
+        "into an A / B / C / D / F tier — offline, without ever "
+        "gating a live trade.</li>"
+        "<li>This service publishes daily validation reports with "
+        "tier stats, decile calibration, and shadow-filter "
+        "simulation rows so you can see how the scorer would have "
+        "performed.</li>"
+        "<li>When the filter would have kept trades that did "
+        "worse than the ones it would have rejected, the guardrail "
+        "flips to warning or critical and the experiment audit "
+        "trail records exactly which configuration produced the "
+        "outcome.</li>"
+        "</ol>"
+        "</section>"
+        # --- Section 3: Example output ---
+        "<section>"
+        "<h2>Example output</h2>"
+        "<p class=\"meta\">Illustrative snapshot — not live data.</p>"
+        "<table class=\"kv\">"
+        "<tr><td>Report date</td><td>2026-04-22</td></tr>"
+        "<tr><td>Guardrail status</td>"
+        "<td><span class=\"status-ok\">ok</span></td></tr>"
+        "<tr><td>Matched trades</td><td>103</td></tr>"
+        "</table>"
+        "<table>"
+        "<tr><th>Tier</th><th>Rows</th>"
+        "<th>Allowed outcome</th><th>Blocked outcome</th></tr>"
+        "<tr><td>A</td><td>14</td><td>+0.64%</td><td>+0.12%</td></tr>"
+        "<tr><td>B</td><td>31</td><td>+0.31%</td><td>+0.05%</td></tr>"
+        "<tr><td>C</td><td>58</td><td>+0.14%</td><td>+0.02%</td></tr>"
+        "</table>"
+        "<table>"
+        "<tr><th>Shadow threshold</th>"
+        "<th>Allowed</th><th>Blocked</th></tr>"
+        "<tr><td>0.55</td><td>45</td><td>58</td></tr>"
+        "<tr><td>0.60</td><td>32</td><td>71</td></tr>"
+        "</table>"
+        "</section>"
+        # --- Section 4: Upgrade trigger ---
+        "<section>"
+        "<h2>Upgrade</h2>"
+        "<table>"
+        "<tr><th>Capability</th><th>Free</th><th>Premium</th></tr>"
+        "<tr><td>Daily validation reports</td>"
+        "<td>last 3 days</td><td>full history</td></tr>"
+        "<tr><td>Experiment audit trail</td>"
+        "<td>3 most recent</td><td>full history</td></tr>"
+        "<tr><td>Protected dashboard</td>"
+        "<td>—</td><td>included</td></tr>"
+        "</table>"
+        "<p class=\"meta\">"
+        "Most users upgrade after ~7 days. "
+        "Premium users run 3–5x more requests than free users."
+        "</p>"
+        "</section>"
+        # --- Section 5: CTA ---
+        "<section>"
+        "<h2>Get started</h2>"
+        "<p>Request a Bearer API key from your operator to unlock "
+        "the full analytics surface — daily validation reports, "
+        "the audit trail, and the protected dashboard.</p>"
+        "<p class=\"meta\">"
+        "No sign-up fields on this page. No JavaScript. No trading "
+        "endpoints. Every data endpoint requires a key."
+        "</p>"
+        "</section>"
+        "<footer>"
+        "This landing page is public. All analytics endpoints "
+        "require a Bearer API key."
+        "</footer>"
+        "</body></html>"
+    )
+
+
+def render_landing_page_html(ref_code: str = "") -> str:
+    """
+    Build the public landing page.
+
+    Pure function: given the same ``ref_code`` it returns the same
+    HTML. No I/O, no env reads, no config lookup.
+
+    The caller is responsible for passing an already-sanitised
+    ``ref_code`` (the route handler does this via
+    ``_sanitize_landing_ref_code``). An unsanitised value is
+    defended-against by ``_esc`` at render time, but the public
+    contract is: only the sanitised charset.
     """
     return (
         "<!DOCTYPE html>"
@@ -1023,26 +1076,33 @@ def render_landing_page_html() -> str:
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<meta name=\"description\" content=\""
         "Read-only analytics, guardrail monitoring, and audit-trail API "
-        "for the Momentum Trading Bot. No trading endpoints, no execution "
-        "controls, no account data."
+        "for the Momentum Trading Bot. See which trades your system "
+        "should have taken — before risking money."
         "\">"
         + _DASHBOARD_CSS +
         "</head>"
-        + _LANDING_PAGE_BODY
+        + _landing_page_body(ref_code)
     )
 
 
 @app.get("/", response_class=HTMLResponse, tags=["public"])
-def landing_page() -> HTMLResponse:
+def landing_page(request: Request) -> HTMLResponse:
     """
     Public product/status page. Intentionally unauthenticated.
 
-    Fully static — the handler returns the output of a pure
-    function with no access to reports, manifest, environment
-    secrets, or any other dynamic input. This is the only way to
-    guarantee the page cannot leak protected content.
+    The handler reads exactly one piece of runtime state: the
+    ``?ref=<code>`` query parameter, which is sanitised to the
+    growth-log charset before being echoed back. Every other byte
+    on the page is a compile-time constant, so the handler cannot
+    leak reports, manifest data, env secrets, or any other
+    protected content.
     """
-    return HTMLResponse(content=render_landing_page_html(), status_code=200)
+    raw_ref = request.query_params.get("ref")
+    ref_code = _sanitize_landing_ref_code(raw_ref) if raw_ref else ""
+    return HTMLResponse(
+        content=render_landing_page_html(ref_code),
+        status_code=200,
+    )
 
 
 # ---------------------------------------------------------------------------
