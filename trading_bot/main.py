@@ -21,7 +21,6 @@ import csv
 import signal
 import sys
 import threading
-import time
 from pathlib import Path
 
 import structlog
@@ -51,11 +50,14 @@ from trading_bot.utils.helpers import (
     is_near_close,
     is_premarket,
     now_et,
-    time_until_market_open,
 )
 from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager
-from trading_bot.models.domain import RejectedSignal
+from trading_bot.models.domain import FeatureSnapshot, RejectedSignal, SignalDecision
+from trading_bot.persistence.decision_log import DecisionLogger
+from trading_bot.core.alpha import AlphaFilter, AlphaLogger, RuleBasedAlphaScorer
+from trading_bot.reporting.daily_report import generate_daily_report
+from trading_bot.utils.indicators import compute_atr
 from trading_bot.utils.reports import DailySummaryReport
 
 log = structlog.get_logger(__name__)
@@ -161,6 +163,35 @@ class TradingBot:
         self._rejected_signals: collections.deque[RejectedSignal] = collections.deque(maxlen=5000)
         self._rejected_csv = Path(config.journal_csv_path).parent / "rejected_signals.csv"
         self._ensure_rejected_csv()
+
+        # Phase 1.5 Core conversion: structured feature + decision capture.
+        # This is a separate dataset from the trade journal and rejected
+        # shadow log — one row per candidate evaluation, always.
+        decision_log_path = Path(config.journal_csv_path).parent / "decision_log.csv"
+        self._decision_logger = DecisionLogger(decision_log_path)
+
+        # Phase 2 Core conversion: alpha scoring layer (SHADOW MODE ONLY).
+        # Scores every decision for offline analysis — does NOT block or
+        # approve trades. Trading behavior is identical with or without it.
+        alpha_log_path = Path(config.journal_csv_path).parent / "alpha_scores.csv"
+        self._alpha_scorer = RuleBasedAlphaScorer()
+        self._alpha_logger = AlphaLogger(alpha_log_path)
+
+        # Phase 3 Core conversion: opt-in paper-only alpha filter gate.
+        # OFF by default — when the env var TRADING_ALPHA_FILTER_ENABLED=true
+        # and the bot is in paper mode, weak-tier trades (below
+        # TRADING_ALPHA_FILTER_MIN_TIER, default B) are rejected AFTER the
+        # risk engine approves them. LIVE mode always ignores the filter.
+        self._alpha_filter = AlphaFilter(
+            scorer=self._alpha_scorer,
+            run_mode=config.run_mode.value,
+        )
+        if self._alpha_filter.active:
+            log.info(
+                "bot.alpha_filter_active",
+                min_tier=self._alpha_filter.min_tier,
+                run_mode=self._alpha_filter.run_mode,
+            )
 
         # Daily auto-reset tracking
         self._last_trading_date: str | None = None
@@ -325,6 +356,11 @@ class TradingBot:
 
         # Generate and log daily summary report
         self._generate_daily_summary()
+
+        # Phase 3.2 — post-run alpha validation report. Best-effort
+        # only: any failure here is logged and swallowed so shutdown
+        # can never be delayed or blocked by post-run analytics.
+        self._generate_daily_alpha_report()
 
         log.info(
             "bot.shutdown",
@@ -503,6 +539,9 @@ class TradingBot:
         for candidate in candidates:
             # Skip symbols already held
             if candidate.symbol in open_symbols:
+                # Still capture a snapshot so the dataset records EVERY candidate.
+                snapshot = self._build_feature_snapshot(candidate, None)
+                self._log_decision(snapshot, action="skip", reason="already_held")
                 continue
 
             # Fetch intraday bars
@@ -513,7 +552,13 @@ class TradingBot:
                     symbol=candidate.symbol,
                     detail="No intraday bars from Polygon or yfinance",
                 )
+                snapshot = self._build_feature_snapshot(candidate, None)
+                self._log_decision(snapshot, action="skip", reason="empty_bars")
                 continue
+
+            # Build the feature snapshot once per candidate — reused across
+            # every decision branch below. Pure observation, no side effects.
+            snapshot = self._build_feature_snapshot(candidate, bars)
 
             log.info(
                 "bot.evaluating_candidate",
@@ -546,6 +591,11 @@ class TradingBot:
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"strategy:{reason}",
+                )
                 continue
 
             # Risk check — equity is critical for position sizing.
@@ -561,6 +611,12 @@ class TradingBot:
                     error=str(e),
                 )
                 self._health.record_error("equity_api")
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason="equity_api_failed",
+                    confidence=signal.confidence,
+                )
                 continue  # Skip this candidate — can't size without equity
 
             # Guard against zero/negative equity (API returned garbage)
@@ -570,23 +626,39 @@ class TradingBot:
                     equity=equity,
                     detail="Broker returned zero equity — skipping all entries",
                 )
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason="zero_equity",
+                    confidence=signal.confidence,
+                )
                 break
 
             # Apply regime-based max positions override before risk check
             open_positions = self._portfolio.get_open_positions()
             max_pos_override = regime_adjustments.get("max_positions_override")
             if max_pos_override is not None and len(open_positions) >= max_pos_override:
+                reason_text = (
+                    f"regime_max_positions: {len(open_positions)}/"
+                    f"{max_pos_override} ({self._current_regime})"
+                )
                 self._record_rejection(RejectedSignal(
                     timestamp=now_et(),
                     symbol=candidate.symbol,
                     stage="risk",
-                    reason=f"regime_max_positions: {len(open_positions)}/{max_pos_override} ({self._current_regime})",
+                    reason=reason_text,
                     entry_price=signal.entry_price,
                     stop_price=signal.stop_price,
                     signal_type=signal.signal_type.value,
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"risk:{reason_text}",
+                    confidence=signal.confidence,
+                )
                 continue
 
             risk_result = self._sizer.calculate(
@@ -609,6 +681,12 @@ class TradingBot:
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"risk:{risk_result.reason}",
+                    confidence=signal.confidence,
+                )
                 continue
 
             # Log warnings
@@ -658,6 +736,24 @@ class TradingBot:
                 )
                 risk_result.shares = tier_shares
 
+            # Volatility-scaled sizing: reduce shares for high-ATR stocks.
+            # ATR/price > 5% = very volatile, scale down proportionally.
+            # This prevents outsized dollar losses on erratic movers.
+            if signal.atr > 0 and signal.entry_price > 0 and risk_result.shares > 0:
+                atr_pct = (signal.atr / signal.entry_price) * 100
+                if atr_pct > 5.0:
+                    vol_mult = min(1.0, 5.0 / atr_pct)  # Scale down proportionally
+                    vol_shares = max(1, int(risk_result.shares * vol_mult))
+                    log.info(
+                        "bot.volatility_scaling",
+                        symbol=candidate.symbol,
+                        atr_pct=round(atr_pct, 2),
+                        multiplier=round(vol_mult, 2),
+                        original=risk_result.shares,
+                        adjusted=vol_shares,
+                    )
+                    risk_result.shares = vol_shares
+
             # Graduated loss streak cooldown — reduce size after consecutive losses
             streak_mult = self._circuit.get_loss_streak_multiplier()
             if streak_mult < 1.0 and risk_result.shares > 0:
@@ -682,17 +778,24 @@ class TradingBot:
                         market_data=self._market_data,
                     )
                     if is_correlated:
+                        corr_reason = f"correlated_with_{existing_symbols}"
                         self._record_rejection(RejectedSignal(
                             timestamp=now_et(),
                             symbol=candidate.symbol,
                             stage="correlation",
-                            reason=f"correlated_with_{existing_symbols}",
+                            reason=corr_reason,
                             entry_price=signal.entry_price,
                             stop_price=signal.stop_price,
                             signal_type=signal.signal_type.value,
                             gap_pct=candidate.gap_pct,
                             score=candidate.score,
                         ))
+                        self._log_decision(
+                            snapshot,
+                            action="skip",
+                            reason=f"correlation:{corr_reason}",
+                            confidence=signal.confidence,
+                        )
                         continue
                 except Exception as e:
                     log.warning(
@@ -718,17 +821,47 @@ class TradingBot:
                 reasons=advisor_rec.reasons,
             )
             if advisor_rec.action == "skip":
+                advisor_reason = "; ".join(advisor_rec.reasons)
                 self._record_rejection(RejectedSignal(
                     timestamp=now_et(),
                     symbol=candidate.symbol,
                     stage="advisor",
-                    reason="; ".join(advisor_rec.reasons),
+                    reason=advisor_reason,
                     entry_price=signal.entry_price,
                     stop_price=signal.stop_price,
                     signal_type=signal.signal_type.value,
                     gap_pct=candidate.gap_pct,
                     score=candidate.score,
                 ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"advisor:{advisor_reason}",
+                    confidence=advisor_rec.confidence,
+                )
+                continue
+
+            # Phase 3: paper-only alpha filter gate. Runs AFTER every
+            # risk / correlation / advisor check so it can ONLY block
+            # an already-approved trade — never approve one risk
+            # rejected, never upsize, never bypass any safety rail.
+            # Live mode always returns blocked=False.
+            filter_decision = self._alpha_filter.check(
+                snapshot, confidence=advisor_rec.confidence
+            )
+            if filter_decision.blocked:
+                log.info(
+                    "bot.alpha_filter_blocked",
+                    symbol=candidate.symbol,
+                    tier=filter_decision.tier,
+                    min_tier=filter_decision.min_tier,
+                )
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=filter_decision.reason,
+                    confidence=advisor_rec.confidence,
+                )
                 continue
 
             # Execute trade
@@ -740,7 +873,21 @@ class TradingBot:
                     "bot.entry_rejected_by_broker",
                     symbol=candidate.symbol,
                 )
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason="broker_rejected",
+                    confidence=advisor_rec.confidence,
+                )
                 continue
+
+            # Record executed-buy decision (paired with same snapshot).
+            self._log_decision(
+                snapshot,
+                action="buy",
+                reason="executed",
+                confidence=advisor_rec.confidence,
+            )
 
             self._sizer.record_trade_risk(risk_result.risk_dollars)
             open_symbols.add(position.symbol)
@@ -768,6 +915,80 @@ class TradingBot:
                 risk=format_currency(risk_result.risk_dollars),
                 regime=self._current_regime,
             )
+
+    def _compute_volatility(self, bars, price: float) -> float:
+        """
+        Derive a unit-less volatility figure from ATR(14) as a percentage
+        of current price. Returns 0.0 when bars are missing, too short,
+        or price is non-positive. Best-effort — never raises.
+        """
+        try:
+            if bars is None or price <= 0:
+                return 0.0
+            if hasattr(bars, "empty") and bars.empty:
+                return 0.0
+            if len(bars) < 2:
+                return 0.0
+            atr = compute_atr(bars, length=14)
+            if atr is None or len(atr) == 0:
+                return 0.0
+            last_atr = float(atr.iloc[-1])
+            if last_atr != last_atr:  # NaN check
+                return 0.0
+            return (last_atr / price) * 100.0
+        except Exception:
+            return 0.0
+
+    def _build_feature_snapshot(self, candidate, bars) -> FeatureSnapshot:
+        """
+        Build a FeatureSnapshot for a single scan candidate.
+
+        Phase 1.5 Core conversion instrumentation. Pure observation —
+        does not change any trading behavior.
+        """
+        return FeatureSnapshot(
+            symbol=candidate.symbol,
+            timestamp=now_et(),
+            price=float(candidate.price),
+            gap_pct=float(candidate.gap_pct),
+            relative_volume=float(candidate.relative_volume),
+            volatility=self._compute_volatility(bars, float(candidate.price)),
+            regime=self._current_regime or "unknown",
+        )
+
+    def _log_decision(
+        self,
+        snapshot: FeatureSnapshot,
+        action: str,
+        reason: str,
+        confidence: float = 0.5,
+    ) -> None:
+        """
+        Emit one row to the decision log and one shadow-mode alpha score.
+
+        Safe — never raises. Alpha scoring is pure observation and cannot
+        block or approve trades (Phase 2 shadow mode).
+        """
+        decision = SignalDecision(
+            timestamp=now_et(),
+            symbol=snapshot.symbol,
+            action=action,
+            confidence=float(confidence),
+            reason=reason,
+        )
+        try:
+            self._decision_logger.log(snapshot, decision)
+        except Exception as e:
+            log.debug("bot.decision_log_error", error=str(e))
+
+        # Shadow-mode alpha score. Any failure here is silent — the
+        # trading loop never sees an exception from this path and the
+        # score is never consulted for an accept/reject decision.
+        try:
+            alpha = self._alpha_scorer.score(snapshot, decision)
+            self._alpha_logger.log(alpha, snapshot, decision)
+        except Exception as e:
+            log.debug("bot.alpha_score_error", error=str(e))
 
     def _ensure_rejected_csv(self) -> None:
         """Create the rejected signals CSV if it doesn't exist."""
@@ -821,6 +1042,11 @@ class TradingBot:
 
             # Generate end-of-day report for previous day
             self._generate_daily_summary()
+
+            # Phase 3.2: alpha validation report for the day that just
+            # ended. Uses the PREVIOUS date explicitly so the dated CSVs
+            # picked up by the rotation scheme are the correct ones.
+            self._generate_daily_alpha_report(date=self._last_trading_date)
 
             # Reset all daily counters
             try:
@@ -929,6 +1155,38 @@ class TradingBot:
             largest_loss=report_data.get("largest_loser", 0.0),
             ending_equity=ending_equity,
         )
+
+    def _generate_daily_alpha_report(self, date: str | None = None) -> None:
+        """
+        Write the Phase 3.2 post-run alpha validation report.
+
+        Best-effort: every failure is logged and swallowed so shutdown
+        (or the midnight-rollover reset) can never be delayed or
+        blocked by post-run analytics. No shared state is mutated.
+        """
+        data_dir = Path(self._config.journal_csv_path).parent
+        reports_dir = data_dir / "alpha_reports"
+        try:
+            result = generate_daily_report(
+                date=date,
+                data_dir=data_dir,
+                reports_dir=reports_dir,
+            )
+            if result.success:
+                log.info(
+                    "bot.daily_alpha_report_written",
+                    date=result.date,
+                    txt=str(result.txt_path),
+                    json=str(result.json_path),
+                )
+            else:
+                log.info(
+                    "bot.daily_alpha_report_skipped",
+                    date=result.date,
+                    error=result.error,
+                )
+        except Exception as exc:  # pragma: no cover — defense in depth
+            log.warning("bot.daily_alpha_report_error", error=str(exc))
 
     def _log_status(self) -> None:
         """Log periodic status update with health and regime info."""

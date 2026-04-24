@@ -217,9 +217,13 @@ class PullbackVWAPStrategy(Strategy):
             ("red_to_green", self._check_red_to_green),
             ("breakout", self._check_breakout),
         ]
-        if self._current_regime in ("trending_bearish", "high_volatility"):
-            # Bearish/high-vol: VWAP pullback only
+        if self._current_regime == "trending_bearish":
+            # Bearish: VWAP pullback only — safest setup against trend
             setups = [s for s in all_setups if s[0] == "vwap_pullback"]
+        elif self._current_regime == "high_volatility":
+            # High-vol: allow VWAP + EMA pullbacks (both are pullback setups
+            # with defined risk via stop placement, unlike breakouts/ORB)
+            setups = [s for s in all_setups if s[0] in ("vwap_pullback", "ema_pullback")]
         else:
             setups = all_setups
 
@@ -445,6 +449,21 @@ class PullbackVWAPStrategy(Strategy):
         else:
             atr_mult = base_mult
         new_stop = reference_price - (atr * atr_mult)
+
+        # VWAP-aware trailing: if VWAP is above the ATR-based stop and
+        # price is above VWAP, use VWAP minus a small buffer as the stop.
+        # VWAP acts as dynamic support — stocks bouncing off VWAP are strong,
+        # and breaking below VWAP signals weakness.
+        vwap = latest.get("vwap")
+        if (
+            vwap is not None
+            and not pd.isna(vwap)
+            and vwap > 0
+            and position.current_price > vwap
+        ):
+            vwap_stop = vwap - (atr * 0.25)  # Small buffer below VWAP
+            if vwap_stop > new_stop:
+                new_stop = vwap_stop
 
         # Minimum: breakeven + buffer
         buffer = position.entry_price * (
@@ -894,8 +913,8 @@ class PullbackVWAPStrategy(Strategy):
         try:
             current = now_et()
             if (current.hour == 11 and current.minute >= 30) or current.hour == 12:
-                # Dead zone: require 1.7x normal threshold (~2.5x)
-                threshold_mult = base_mult * 1.7
+                # Dead zone: require 1.3x normal threshold (~2.0x)
+                threshold_mult = base_mult * 1.3
             elif 13 <= current.hour < 15:
                 # Afternoon: slightly higher (~1.8x)
                 threshold_mult = base_mult * 1.2
@@ -930,11 +949,14 @@ class PullbackVWAPStrategy(Strategy):
         But ensures minimum distance of min_atr_distance * ATR.
         """
         entry_bar_low = df.iloc[-1]["low"]
-        swing_low = df.iloc[-10:]["low"].min()
+        # Use 5-bar swing low (tighter than 10-bar = less risk per trade)
+        swing_low_5 = df.iloc[-5:]["low"].min()
+        # Place stop slightly below swing low (buffer prevents exact-level whipsaws)
+        structure_stop = swing_low_5 - (atr * 0.15)
         atr_stop = entry_price - (atr * self._risk_cfg.stop_loss_atr_multiplier)
 
-        # Use highest (tightest) stop
-        stop = max(entry_bar_low, swing_low, atr_stop)
+        # Use highest (tightest) valid stop
+        stop = max(entry_bar_low, structure_stop, atr_stop)
 
         # For VWAP setups, also consider just below VWAP as stop
         if vwap is not None and not pd.isna(vwap):
@@ -1003,8 +1025,8 @@ class PullbackVWAPStrategy(Strategy):
             if gap_size > 0:
                 current_gap = signal.entry_price - candidate.prev_close
                 gap_filled_pct = (1.0 - current_gap / gap_size) * 100
-                if gap_filled_pct > 50:
-                    score *= max(0.6, 1.0 - (gap_filled_pct - 50) / 100)
+                if gap_filled_pct > 60:
+                    score *= max(0.75, 1.0 - (gap_filled_pct - 60) / 150)
 
         # --- 3. Multi-candle momentum ---
         if len(df) >= 5:
@@ -1076,7 +1098,7 @@ class PullbackVWAPStrategy(Strategy):
         adx = df.iloc[-1].get("adx_14", 0.0) if "adx_14" in df.columns else 0.0
         if not pd.isna(adx):
             if adx < 20:
-                score *= 0.80  # Choppy/no trend — penalize heavily
+                score *= 0.90  # Choppy/no trend — mild penalty
             elif adx > 30:
                 score *= 1.08  # Strong trend — boost
 
