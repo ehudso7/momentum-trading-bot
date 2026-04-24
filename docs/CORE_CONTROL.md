@@ -147,6 +147,73 @@ disabling the filter.
   fresh trades before trusting the filter again.
 
 
+## Phase 3.3 — alpha performance guardrails
+
+The automated daily report (Phase 3.2) now emits a top-level
+`guardrails` block inside `alpha_report_<DATE>.json` and an
+`Alpha guardrails:` section inside `alpha_report_<DATE>.txt`. It is
+pure post-run classification — no trading-loop behaviour depends on
+it, nothing in the filter or scorer is changed.
+
+### Output fields
+
+| Field                | Type        | Description |
+| ---                  | ---         | --- |
+| `status`             | str         | One of `ok`, `warning`, `critical`, `insufficient_data`. |
+| `reasons`            | list[str]   | Human-readable bullets explaining the status. |
+| `recommended_action` | str         | Operator instruction matching the status. |
+
+The CLI prints the `status` alongside the file paths, e.g.
+`guardrail status: ok`. The bot's shutdown log line
+`bot.daily_alpha_report_written` also carries the status via
+`daily_report.generated`.
+
+### Classification rules
+
+Evaluated in this order; the first rule that fires wins.
+
+1. **`insufficient_data`** — fewer than
+   `GUARDRAIL_MIN_MATCHED_TRADES` (20) matched trades in the joined
+   dataset. No further classification is attempted; the recommended
+   action is "collect more data".
+2. **`critical`** — the A+B row of the shadow-filter simulation
+   shows that the trades the filter would KEEP did WORSE than the
+   ones it would REJECT, by either of:
+   - `allowed_avg_r_multiple < blocked_avg_r_multiple`, or
+   - `allowed_win_rate      < blocked_win_rate`.
+   Recommended action: disable `TRADING_ALPHA_FILTER_ENABLED` and
+   re-run the analysis.
+3. **`warning`** — either of:
+   - `promotion_readiness.status == "weak"`, or
+   - A/B tier `outcome_count` is below
+     `min_required_outcomes`.
+   Recommended action: review the filter before promotion; keep
+   `TRADING_ALPHA_FILTER_ENABLED=false` in any environment that
+   matters until warnings clear.
+4. **`ok`** — default. Allowed side matches or outperforms blocked
+   on both win rate and avg R at the A+B threshold, readiness is
+   not weak, and A/B outcome count meets the configured minimum.
+
+The comparison in rule 2 only fires when BOTH sides have realized
+outcomes. A threshold where only one side has trades leaves the
+critical rule silent — you cannot declare the filter harmful from
+a side-less comparison.
+
+### Operational interpretation
+
+- `insufficient_data` is **normal** in the first days of a paper
+  run. Do not act on it.
+- A sustained `warning` state across multiple days suggests the
+  scoring weights or threshold need tuning before promotion.
+- A `critical` state is the only signal that demands operator
+  action: disable the filter until the next analysis shows a clear
+  A+B advantage again.
+
+Guardrails are a diagnostic layer. They can neither enable nor
+disable the filter themselves — that is still an explicit operator
+decision via the `TRADING_ALPHA_FILTER_ENABLED` env var.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 See [`docs/DATASETS.md`](DATASETS.md) for the full spec. Short

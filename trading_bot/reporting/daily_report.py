@@ -53,6 +53,16 @@ DAILY_HEADER = "DAILY ALPHA VALIDATION REPORT"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_REPORTS_DIR = "reports"
 
+# Phase 3.3 — guardrail thresholds. All three are documented in
+# docs/CORE_CONTROL.md so operators can reason about them without
+# reading source.
+GUARDRAIL_MIN_MATCHED_TRADES = 20  # below this → insufficient_data
+
+GUARDRAIL_STATUS_OK = "ok"
+GUARDRAIL_STATUS_WARNING = "warning"
+GUARDRAIL_STATUS_CRITICAL = "critical"
+GUARDRAIL_STATUS_INSUFFICIENT = "insufficient_data"
+
 
 @dataclass
 class DailyReportResult:
@@ -63,6 +73,7 @@ class DailyReportResult:
     json_path: Path
     success: bool
     error: Optional[str] = None
+    guardrail_status: Optional[str] = None
 
 
 def _today_str() -> str:
@@ -116,6 +127,175 @@ def _compose_json_payload(report: dict, report_date: str) -> dict:
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.3 — alpha performance guardrails
+# ---------------------------------------------------------------------------
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    """Coerce an arbitrary value to int, returning `default` on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+
+def _coerce_float(value) -> Optional[float]:
+    """Coerce an arbitrary value to float, returning None on failure."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result != result:  # NaN
+        return None
+    return result
+
+
+def evaluate_guardrails(report: dict) -> dict:
+    """
+    Classify the day's alpha-filter performance as one of
+    ``ok`` / ``warning`` / ``critical`` / ``insufficient_data``.
+
+    Pure function: takes the dict produced by
+    ``trading_bot.analysis.alpha_report.build_report`` and returns a
+    decorator dict. Never mutates its input, never raises — a missing
+    or malformed field degrades gracefully to insufficient_data.
+
+    Logic (see docs/CORE_CONTROL.md):
+
+    - insufficient_data if fewer than GUARDRAIL_MIN_MATCHED_TRADES (20)
+      matched trades were observed.
+    - critical if the A+B shadow-filter row shows
+      `allowed_avg_r_multiple < blocked_avg_r_multiple`, i.e. the
+      trades the filter would KEEP did WORSE than the ones it would
+      REJECT.
+    - critical if the same row shows
+      `allowed_win_rate < blocked_win_rate`.
+    - warning if `promotion_readiness.status == "weak"`.
+    - warning if A/B tier outcome_count is below min_required_outcomes.
+    - ok otherwise.
+    """
+    totals = (report or {}).get("totals") or {}
+    readiness = (report or {}).get("promotion_readiness") or {}
+    sim_rows = (report or {}).get("shadow_filter_simulation") or []
+
+    matched_trades = _coerce_int(totals.get("matched_trades", 0))
+
+    # --- insufficient_data short-circuit ---
+    if matched_trades < GUARDRAIL_MIN_MATCHED_TRADES:
+        return {
+            "status": GUARDRAIL_STATUS_INSUFFICIENT,
+            "reasons": [
+                f"only {matched_trades} matched trades "
+                f"(need >= {GUARDRAIL_MIN_MATCHED_TRADES})"
+            ],
+            "recommended_action": (
+                "keep the paper alpha filter disabled and let more trades "
+                "accumulate before judging performance"
+            ),
+        }
+
+    # --- look up the A+B shadow-filter simulation row ---
+    ab_row = next(
+        (r for r in sim_rows if r.get("threshold") == "A+B"), None
+    )
+
+    critical_reasons: list[str] = []
+    if ab_row:
+        a_r = _coerce_float(ab_row.get("allowed_avg_r_multiple"))
+        b_r = _coerce_float(ab_row.get("blocked_avg_r_multiple"))
+        a_wr = _coerce_float(ab_row.get("allowed_win_rate"))
+        b_wr = _coerce_float(ab_row.get("blocked_win_rate"))
+
+        # Only compare when BOTH sides have realized outcomes.
+        if a_r is not None and b_r is not None and a_r < b_r:
+            critical_reasons.append(
+                f"allowed avg R {a_r:.3f} < blocked avg R {b_r:.3f} "
+                f"at the A+B threshold"
+            )
+        if a_wr is not None and b_wr is not None and a_wr < b_wr:
+            critical_reasons.append(
+                f"allowed win rate {a_wr:.2%} < blocked win rate "
+                f"{b_wr:.2%} at the A+B threshold"
+            )
+
+    if critical_reasons:
+        return {
+            "status": GUARDRAIL_STATUS_CRITICAL,
+            "reasons": critical_reasons,
+            "recommended_action": (
+                "disable TRADING_ALPHA_FILTER_ENABLED and re-run the "
+                "analysis before re-enabling — the filter is rejecting "
+                "better trades than it keeps"
+            ),
+        }
+
+    # --- warning conditions ---
+    warning_reasons: list[str] = []
+    if str(readiness.get("status", "")).lower() == "weak":
+        warning_reasons.append(
+            "promotion_readiness.status is 'weak' — A/B tiers "
+            "fail to outperform C/D/F on the current sample"
+        )
+
+    ab_block = readiness.get("ab") or {}
+    ab_outcome = _coerce_int(ab_block.get("outcome_count", 0))
+    min_req = _coerce_int(readiness.get("min_required_outcomes", 0))
+    if min_req > 0 and ab_outcome < min_req:
+        warning_reasons.append(
+            f"A/B outcome_count={ab_outcome} is below "
+            f"min_required_outcomes={min_req}"
+        )
+
+    if warning_reasons:
+        return {
+            "status": GUARDRAIL_STATUS_WARNING,
+            "reasons": warning_reasons,
+            "recommended_action": (
+                "review the filter before promotion — keep "
+                "TRADING_ALPHA_FILTER_ENABLED=false in any environment "
+                "that matters until warnings clear"
+            ),
+        }
+
+    # --- ok ---
+    return {
+        "status": GUARDRAIL_STATUS_OK,
+        "reasons": [
+            "allowed side matches or outperforms blocked on both "
+            "win rate and avg R at the A+B threshold"
+        ],
+        "recommended_action": (
+            "no action — continue to monitor; promotion to live still "
+            "requires an explicit ticket per docs/CORE_CONTROL.md"
+        ),
+    }
+
+
+def _format_guardrails_section(guardrails: dict) -> str:
+    """Render the guardrails dict as a self-contained text block."""
+    lines = ["", "Alpha guardrails:"]
+    lines.append(f"  status             = {guardrails.get('status', '')}")
+    lines.append(
+        f"  recommended_action = {guardrails.get('recommended_action', '')}"
+    )
+    reasons = guardrails.get("reasons") or []
+    lines.append("  reasons:")
+    if not reasons:
+        lines.append("    - (none)")
+    else:
+        for reason in reasons:
+            lines.append(f"    - {reason}")
+    return "\n".join(lines)
+
+
 def generate_daily_report(
     date: Optional[str] = None,
     data_dir: Union[str, Path] = DEFAULT_DATA_DIR,
@@ -153,10 +333,26 @@ def generate_daily_report(
             min_required_outcomes=min_required_outcomes,
         )
 
+        # Phase 3.3 — classify the day's alpha-filter performance.
+        guardrails = evaluate_guardrails(report)
+        report_with_guardrails = dict(report)
+        report_with_guardrails["guardrails"] = guardrails
+
         txt_body = format_text(report)
-        txt_payload = _wrap_text_with_daily_header(report_date, txt_body)
-        json_payload = _compose_json_payload(report, report_date)
-        json_text = json.dumps(json_payload, indent=2, sort_keys=False, default=str)
+        txt_body_with_guardrails = (
+            txt_body.rstrip("\n")
+            + "\n"
+            + _format_guardrails_section(guardrails)
+        )
+        txt_payload = _wrap_text_with_daily_header(
+            report_date, txt_body_with_guardrails
+        )
+        json_payload = _compose_json_payload(
+            report_with_guardrails, report_date
+        )
+        json_text = json.dumps(
+            json_payload, indent=2, sort_keys=False, default=str
+        )
 
         # Ensure the output dir exists before writing either file.
         Path(reports_dir).mkdir(parents=True, exist_ok=True)
@@ -164,6 +360,7 @@ def generate_daily_report(
         json_out.write_text(json_text + "\n")
 
         result.success = True
+        result.guardrail_status = guardrails.get("status")
         log.info(
             "daily_report.generated",
             date=report_date,
@@ -171,6 +368,7 @@ def generate_daily_report(
             json=str(json_out),
             alpha_rows=report.get("totals", {}).get("alpha_rows", 0),
             matched_trades=report.get("totals", {}).get("matched_trades", 0),
+            guardrail_status=result.guardrail_status,
         )
     except Exception as exc:
         # Swallow — this report is best-effort and must never block shutdown.
@@ -241,6 +439,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Daily alpha validation report written for {result.date}:")
         print(f"  text: {result.txt_path}")
         print(f"  json: {result.json_path}")
+        print(f"  guardrail status: {result.guardrail_status}")
         return 0
 
     print(
