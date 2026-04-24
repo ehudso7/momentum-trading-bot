@@ -1172,6 +1172,134 @@ going through the billing flow.
   verbs anywhere". Existing integrations keep working because
   nothing in the trading loop depends on billing state.
 
+### Phase 4.8 — operator-only Stripe Checkout link generator
+
+An operator CLI that mints a Stripe Checkout URL the operator can
+email / message to a customer so the customer can self-serve
+upgrade to premium. **No public endpoint is added** — checkout
+generation is deliberately not exposed via the dashboard or any
+FastAPI route, and the test suite explicitly asserts no
+`/checkout`, `/subscribe`, `/upgrade`, or `/billing/checkout`
+route was introduced. Existing "POST only on /webhook/stripe"
+boundary tests continue to pass.
+
+#### Function: `create_checkout_session(api_key, success_url, cancel_url)`
+
+Lives in `trading_bot.api.billing`. Reads:
+
+- `STRIPE_API_KEY` — Stripe secret key. Required.
+- `STRIPE_PRICE_ID_PREMIUM` — premium price id. Required.
+- (Does NOT read `STRIPE_WEBHOOK_SECRET` — webhooks and checkout
+  are independent concerns.)
+
+Builds a Stripe Checkout Session payload with:
+
+- `mode=subscription`
+- `line_items[0][price]=<STRIPE_PRICE_ID_PREMIUM>`, `quantity=1`
+- `success_url`, `cancel_url` (operator-supplied, HTTP header
+  injection characters are rejected)
+- `customer_creation=always`
+- `metadata[api_key]=<api_key>` AND
+  `subscription_data[metadata][api_key]=<api_key>` — so the
+  Phase 4.7 webhook handler can promote this api_key to premium
+  regardless of whether Stripe expands the customer in the
+  delivered event.
+
+Return value (caller-safe — raw `api_key` is **never** included):
+
+```python
+{
+    "checkout_session_id": "cs_test_abcdef…",
+    "checkout_url":        "https://checkout.stripe.com/c/pay/cs_test_…",
+    "api_key_hash":        "<32 hex chars of SHA-256>",
+}
+```
+
+Fail-closed exceptions:
+
+- `BillingConfigError` — `STRIPE_API_KEY` or
+  `STRIPE_PRICE_ID_PREMIUM` is unset.
+- `BillingAPIError` — Stripe returned non-2xx, bad JSON, or
+  the network failed. The error message never includes the raw
+  `api_key`.
+- `ValueError` — missing / whitespace-only `api_key`,
+  `success_url`, or `cancel_url`; newline / control characters
+  in either URL.
+
+HTTP transport:
+
+- Uses `requests.post` with HTTP Basic auth `(STRIPE_API_KEY, "")`
+  against `https://api.stripe.com/v1/checkout/sessions` — matches
+  the Stripe SDK's wire protocol.
+- No Stripe SDK dependency is added.
+- `http_post` is an injectable keyword argument for tests so
+  the entire function can be exercised offline.
+
+#### CLI
+
+```bash
+python -m trading_bot.api.billing checkout \
+    --api-key <user-api-key> \
+    --success-url https://app.example.com/billing/success \
+    --cancel-url https://app.example.com/billing/cancel
+```
+
+Sample output (success):
+
+```
+checkout_url:         https://checkout.stripe.com/c/pay/cs_test_a1b2c3…
+checkout_session_id:  cs_test_a1b2c3d4e5f6
+api_key_hash:         223e7ccef94c4d39c9c54bbc61d3b051
+```
+
+Sample output (missing env):
+
+```
+error: STRIPE_API_KEY is not configured
+```
+
+Exit codes:
+
+| Code | Meaning |
+| ---  | --- |
+| `0`  | Checkout URL created. |
+| `2`  | Configuration error (missing env var, bad URL). |
+| `3`  | Stripe API error (non-2xx, bad JSON, network failure). |
+
+The raw `--api-key` value is **never** printed to stdout or
+stderr — the CLI prints only the `checkout_url`, session id,
+and hashed `api_key_hash`. A dedicated test runs the CLI as a
+subprocess with a uniquely-marked api key and asserts the marker
+is absent from both streams.
+
+#### Safety invariants (enforced by tests)
+
+- **No new FastAPI route.** `TestPhase48NoNewApiRoute` iterates
+  `app.routes` and fails if any path contains `/checkout`,
+  `/subscribe`, `/upgrade`, or `/billing/checkout`.
+- **Mutating verbs still limited to `POST /webhook/stripe`.** The
+  Phase 4.0 – 4.7 boundary is re-asserted.
+- **Raw API key never persisted.** `create_checkout_session`
+  returns only the hashed form. The only on-the-wire usage of
+  the raw key is sent directly to Stripe via HTTPS; it never
+  enters a log, a report, or the Phase 4.6 usage file.
+- **URL injection rejected.** Success / cancel URLs containing
+  `\r`, `\n`, `\t`, or `\x00` are rejected with `ValueError`
+  before any network call is made.
+- **No Core imports.** Billing module grep — still zero matches
+  for `trading_bot.core`, `trading_bot.main`, etc.
+
+#### When to use
+
+- Manual concierge upgrades: customer reaches out to support,
+  operator runs the CLI, emails the checkout URL back.
+- Internal staging or demo environments where operators want to
+  invite specific testers to premium without building a public
+  flow.
+- As a stopgap before Phase 4.9 (which may expose a public,
+  authenticated checkout endpoint guarded by rate-limiting and
+  per-user quotas).
+
 
 ## Phase 2.7 — dataset rotation (reference)
 

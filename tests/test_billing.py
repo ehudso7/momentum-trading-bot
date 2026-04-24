@@ -533,3 +533,476 @@ class TestBillingBoundary:
 
     def test_default_tolerance_is_300_seconds(self):
         assert DEFAULT_SIGNATURE_TOLERANCE_SECONDS == 300
+
+
+# ===========================================================================
+# Phase 4.8 — operator-only Stripe Checkout CLI / helper
+# ===========================================================================
+
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+from trading_bot.api.billing import (  # noqa: E402
+    STRIPE_API_BASE_URL,
+    BillingAPIError,
+    BillingConfigError,
+    _hash_api_key,
+    _validate_checkout_inputs,
+    create_checkout_session,
+    main as billing_main,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+SAFE_API_KEY_FOR_CHECKOUT = "operator-granted-user-key-ABC123"
+SAFE_SUCCESS_URL = "https://app.example.com/billing/success"
+SAFE_CANCEL_URL = "https://app.example.com/billing/cancel"
+
+
+@pytest.fixture
+def stripe_checkout_env(monkeypatch):
+    """Configure both env vars create_checkout_session needs."""
+    monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_checkout_xyz")
+    monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_test_premium_monthly")
+
+
+@pytest.fixture
+def stub_http_post():
+    """
+    Return a stub HTTP poster that records its kwargs and returns a
+    realistic Stripe Checkout Session JSON body.
+    """
+    calls: list[dict] = []
+
+    def stub(**kwargs):
+        calls.append(kwargs)
+        return {
+            "id": "cs_test_session_abcdef123",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_session_abcdef123",
+            "object": "checkout.session",
+            "mode": "subscription",
+        }
+
+    stub.calls = calls  # type: ignore[attr-defined]
+    return stub
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+
+class TestValidateCheckoutInputs:
+    def test_valid_inputs_pass(self):
+        _validate_checkout_inputs(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+        )
+
+    @pytest.mark.parametrize(
+        "api_key", [None, "", "   "],
+    )
+    def test_missing_api_key_raises(self, api_key):
+        with pytest.raises(ValueError, match="api_key"):
+            _validate_checkout_inputs(
+                api_key, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            )
+
+    @pytest.mark.parametrize("success_url", [None, "", "   "])
+    def test_missing_success_url_raises(self, success_url):
+        with pytest.raises(ValueError, match="success_url"):
+            _validate_checkout_inputs(
+                SAFE_API_KEY_FOR_CHECKOUT, success_url, SAFE_CANCEL_URL,
+            )
+
+    @pytest.mark.parametrize("cancel_url", [None, "", "   "])
+    def test_missing_cancel_url_raises(self, cancel_url):
+        with pytest.raises(ValueError, match="cancel_url"):
+            _validate_checkout_inputs(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, cancel_url,
+            )
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "https://evil.example.com\r\nX-Injected: 1",
+            "https://evil.example.com\nHeader: 1",
+            "https://example.com/\x00",
+            "https://example.com/\tpath",
+        ],
+    )
+    def test_newline_or_control_chars_in_urls_rejected(self, bad):
+        with pytest.raises(ValueError, match="forbidden"):
+            _validate_checkout_inputs(
+                SAFE_API_KEY_FOR_CHECKOUT, bad, SAFE_CANCEL_URL,
+            )
+        with pytest.raises(ValueError, match="forbidden"):
+            _validate_checkout_inputs(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, bad,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Config errors
+# ---------------------------------------------------------------------------
+
+
+class TestCreateCheckoutSessionConfigErrors:
+    def test_missing_api_key_raises_config_error(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_test")
+        with pytest.raises(BillingConfigError) as excinfo:
+            create_checkout_session(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+                http_post=lambda **kw: {"id": "x", "url": "y"},
+            )
+        assert "STRIPE_API_KEY" in str(excinfo.value)
+        # Never echoes the api_key.
+        assert SAFE_API_KEY_FOR_CHECKOUT not in str(excinfo.value)
+
+    def test_missing_price_id_raises_config_error(self, monkeypatch):
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_x")
+        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
+        with pytest.raises(BillingConfigError) as excinfo:
+            create_checkout_session(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+                http_post=lambda **kw: {"id": "x", "url": "y"},
+            )
+        assert "STRIPE_PRICE_ID_PREMIUM" in str(excinfo.value)
+        assert SAFE_API_KEY_FOR_CHECKOUT not in str(excinfo.value)
+
+    def test_webhook_secret_not_needed(self, monkeypatch, stub_http_post):
+        """Checkout generation must NOT require STRIPE_WEBHOOK_SECRET."""
+        monkeypatch.delenv(STRIPE_WEBHOOK_SECRET_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_x")
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_x")
+        result = create_checkout_session(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            http_post=stub_http_post,
+        )
+        assert result["checkout_url"].startswith("https://checkout.stripe.com/")
+
+
+# ---------------------------------------------------------------------------
+# Payload correctness
+# ---------------------------------------------------------------------------
+
+
+class TestCreateCheckoutSessionPayload:
+    def test_returns_only_safe_fields(
+        self, stripe_checkout_env, stub_http_post
+    ):
+        result = create_checkout_session(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            http_post=stub_http_post,
+        )
+        assert set(result.keys()) == {
+            "checkout_session_id", "checkout_url", "api_key_hash",
+        }
+        assert result["checkout_session_id"] == "cs_test_session_abcdef123"
+        assert result["checkout_url"].startswith("https://checkout.stripe.com/")
+        assert result["api_key_hash"] == _hash_api_key(SAFE_API_KEY_FOR_CHECKOUT)
+        assert len(result["api_key_hash"]) == 32
+
+    def test_raw_api_key_never_in_return_value(
+        self, stripe_checkout_env, stub_http_post
+    ):
+        result = create_checkout_session(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            http_post=stub_http_post,
+        )
+        dumped = json.dumps(result)
+        assert SAFE_API_KEY_FOR_CHECKOUT not in dumped
+
+    def test_payload_uses_stripe_price_id_from_env(
+        self, monkeypatch, stub_http_post
+    ):
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_live_1")
+        monkeypatch.setenv(
+            STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_super_premium_xyz",
+        )
+        create_checkout_session(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            http_post=stub_http_post,
+        )
+        call = stub_http_post.calls[-1]
+        assert call["data"]["line_items[0][price]"] == "price_super_premium_xyz"
+
+    def test_payload_has_all_required_stripe_fields(
+        self, stripe_checkout_env, stub_http_post
+    ):
+        create_checkout_session(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            http_post=stub_http_post,
+        )
+        data = stub_http_post.calls[-1]["data"]
+        assert data["mode"] == "subscription"
+        assert data["line_items[0][price]"] == "price_test_premium_monthly"
+        assert data["line_items[0][quantity]"] == "1"
+        assert data["success_url"] == SAFE_SUCCESS_URL
+        assert data["cancel_url"] == SAFE_CANCEL_URL
+        assert data["customer_creation"] == "always"
+        # Api key on BOTH session metadata AND subscription metadata —
+        # so the webhook handler gets it regardless of expansion.
+        assert data["metadata[api_key]"] == SAFE_API_KEY_FOR_CHECKOUT
+        assert (
+            data["subscription_data[metadata][api_key]"]
+            == SAFE_API_KEY_FOR_CHECKOUT
+        )
+
+    def test_payload_posts_to_correct_stripe_url(
+        self, stripe_checkout_env, stub_http_post
+    ):
+        create_checkout_session(
+            SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+            http_post=stub_http_post,
+        )
+        call = stub_http_post.calls[-1]
+        assert call["url"] == f"{STRIPE_API_BASE_URL}/checkout/sessions"
+        assert call["auth"] == ("sk_test_checkout_xyz", "")
+        assert call["timeout"] > 0
+
+    def test_non_2xx_from_stripe_raises_api_error(
+        self, stripe_checkout_env
+    ):
+        def failing_post(**kwargs):
+            raise BillingAPIError("stripe returned HTTP 400")
+
+        with pytest.raises(BillingAPIError):
+            create_checkout_session(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+                http_post=failing_post,
+            )
+
+    def test_missing_id_in_response_raises(
+        self, stripe_checkout_env
+    ):
+        with pytest.raises(BillingAPIError, match="missing 'id' or 'url'"):
+            create_checkout_session(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+                http_post=lambda **kw: {"url": "https://checkout.stripe.com/x"},
+            )
+
+    def test_missing_url_in_response_raises(
+        self, stripe_checkout_env
+    ):
+        with pytest.raises(BillingAPIError, match="missing 'id' or 'url'"):
+            create_checkout_session(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+                http_post=lambda **kw: {"id": "cs_abc"},
+            )
+
+    def test_non_dict_response_raises(
+        self, stripe_checkout_env
+    ):
+        with pytest.raises(BillingAPIError, match="non-object"):
+            create_checkout_session(
+                SAFE_API_KEY_FOR_CHECKOUT, SAFE_SUCCESS_URL, SAFE_CANCEL_URL,
+                http_post=lambda **kw: ["not", "a", "dict"],
+            )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+class TestCliCheckout:
+    def test_cli_happy_path_prints_safe_fields_only(
+        self, stripe_checkout_env, stub_http_post, monkeypatch, capsys
+    ):
+        # Inject the stub into the billing module so main() picks it up.
+        import trading_bot.api.billing as billing_mod
+        monkeypatch.setattr(
+            billing_mod, "_post_to_stripe", stub_http_post,
+        )
+        rc = billing_main([
+            "checkout",
+            "--api-key", SAFE_API_KEY_FOR_CHECKOUT,
+            "--success-url", SAFE_SUCCESS_URL,
+            "--cancel-url", SAFE_CANCEL_URL,
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        out = captured.out
+        # Safe fields are printed.
+        assert "checkout_url:" in out
+        assert "https://checkout.stripe.com/" in out
+        assert "checkout_session_id:" in out
+        assert "cs_test_session_abcdef123" in out
+        assert "api_key_hash:" in out
+        # CRITICAL: raw api key MUST NOT appear anywhere in the output.
+        assert SAFE_API_KEY_FOR_CHECKOUT not in out
+        assert SAFE_API_KEY_FOR_CHECKOUT not in captured.err
+
+    def test_cli_missing_stripe_api_key_returns_2(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_x")
+        rc = billing_main([
+            "checkout",
+            "--api-key", SAFE_API_KEY_FOR_CHECKOUT,
+            "--success-url", SAFE_SUCCESS_URL,
+            "--cancel-url", SAFE_CANCEL_URL,
+        ])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "STRIPE_API_KEY" in err
+        # Still never echoes the api_key.
+        assert SAFE_API_KEY_FOR_CHECKOUT not in err
+
+    def test_cli_missing_price_id_returns_2(self, monkeypatch, capsys):
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_x")
+        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
+        rc = billing_main([
+            "checkout",
+            "--api-key", SAFE_API_KEY_FOR_CHECKOUT,
+            "--success-url", SAFE_SUCCESS_URL,
+            "--cancel-url", SAFE_CANCEL_URL,
+        ])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "STRIPE_PRICE_ID_PREMIUM" in err
+        assert SAFE_API_KEY_FOR_CHECKOUT not in err
+
+    def test_cli_stripe_api_error_returns_3(
+        self, stripe_checkout_env, monkeypatch, capsys
+    ):
+        def failing_post(**kwargs):
+            raise BillingAPIError("stripe returned HTTP 402")
+
+        import trading_bot.api.billing as billing_mod
+        monkeypatch.setattr(billing_mod, "_post_to_stripe", failing_post)
+
+        rc = billing_main([
+            "checkout",
+            "--api-key", SAFE_API_KEY_FOR_CHECKOUT,
+            "--success-url", SAFE_SUCCESS_URL,
+            "--cancel-url", SAFE_CANCEL_URL,
+        ])
+        assert rc == 3
+        err = capsys.readouterr().err
+        assert "stripe" in err.lower()
+        assert SAFE_API_KEY_FOR_CHECKOUT not in err
+
+    def test_cli_invalid_url_returns_2(
+        self, stripe_checkout_env, capsys
+    ):
+        rc = billing_main([
+            "checkout",
+            "--api-key", SAFE_API_KEY_FOR_CHECKOUT,
+            "--success-url", "https://example.com/\r\nHeader: inject",
+            "--cancel-url", SAFE_CANCEL_URL,
+        ])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "forbidden" in err.lower()
+
+    def test_cli_missing_command_returns_2(self, capsys):
+        rc = billing_main([])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "usage" in err.lower() or "checkout" in err.lower()
+
+    def test_cli_unknown_command_returns_2(self, capsys):
+        rc = billing_main(["nonsense"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "unknown" in err.lower()
+
+    def test_cli_help_returns_0(self, capsys):
+        rc = billing_main(["--help"])
+        assert rc == 0
+
+    def test_cli_subprocess_smoke(
+        self, stripe_checkout_env, monkeypatch, tmp_path
+    ):
+        """Run `python -m trading_bot.api.billing checkout ...` in a
+        subprocess with a controlled env, stubbing the HTTP poster
+        via a tiny helper script that monkey-patches before dispatch."""
+        helper = tmp_path / "run.py"
+        helper.write_text(
+            "import sys\n"
+            "from trading_bot.api import billing\n"
+            "def _stub(**kw):\n"
+            "    return {'id': 'cs_subprocess_OK', "
+            "'url': 'https://checkout.stripe.com/c/pay/cs_subprocess_OK'}\n"
+            "billing._post_to_stripe = _stub\n"
+            "raise SystemExit(billing.main(sys.argv[1:]))\n"
+        )
+        env = dict(__import__("os").environ)
+        env[STRIPE_API_KEY_ENV_VAR] = "sk_test_subprocess"
+        env[STRIPE_PRICE_ID_PREMIUM_ENV_VAR] = "price_subprocess"
+        result = subprocess.run(
+            [
+                sys.executable, str(helper),
+                "checkout",
+                "--api-key", SAFE_API_KEY_FOR_CHECKOUT,
+                "--success-url", SAFE_SUCCESS_URL,
+                "--cancel-url", SAFE_CANCEL_URL,
+            ],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "cs_subprocess_OK" in result.stdout
+        assert "https://checkout.stripe.com/c/pay/cs_subprocess_OK" in result.stdout
+        # Subprocess never prints the raw api key.
+        assert SAFE_API_KEY_FOR_CHECKOUT not in result.stdout
+        assert SAFE_API_KEY_FOR_CHECKOUT not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# No new FastAPI route added by Phase 4.8
+# ---------------------------------------------------------------------------
+
+
+class TestPhase48NoNewApiRoute:
+    def test_no_checkout_route_on_server(self):
+        """Phase 4.8 must NOT add a /checkout endpoint to the FastAPI app."""
+        from trading_bot.api.server import app
+        forbidden_fragments = (
+            "/checkout",
+            "/subscribe",
+            "/upgrade",
+            "/billing/checkout",
+        )
+        for route in app.routes:
+            path = getattr(route, "path", "") or ""
+            for frag in forbidden_fragments:
+                assert frag not in path, (
+                    f"Phase 4.8 introduced a public billing route: {path}"
+                )
+
+    def test_only_non_read_verb_is_still_webhook_stripe(self):
+        """The only mutating route must still be POST /webhook/stripe."""
+        from trading_bot.api.server import app
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"Phase 4.8 leaked a mutating route: {m} {path}"
+                )
+
+    def test_billing_module_still_does_not_import_core(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "billing.py"
+        ).read_text()
+        for pat in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert pat not in src

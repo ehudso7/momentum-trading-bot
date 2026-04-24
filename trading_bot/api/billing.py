@@ -26,14 +26,16 @@ Env vars consumed:
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import hmac
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import structlog
 
@@ -168,6 +170,19 @@ def is_stripe_configured() -> bool:
     it we fall back to the Phase 4.5 env-var premium-keys list.
     """
     return bool((os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip())
+
+
+def _hash_api_key(api_key: Optional[str]) -> str:
+    """
+    Anonymize an API key — first 32 hex chars of SHA-256(api_key).
+
+    Duplicated (with the same implementation) in
+    ``trading_bot.api.server`` so the billing module can stay free
+    of any import from the server module. Empty / None → "".
+    """
+    if not api_key:
+        return ""
+    return hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()[:32]
 
 
 def is_premium_via_stripe(api_key: Optional[str]) -> bool:
@@ -354,3 +369,252 @@ def handle_webhook_event(event) -> dict:
         "action": "ignored",
         "reason": "unhandled_type",
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.8 — operator-only Stripe Checkout link generation
+# ---------------------------------------------------------------------------
+
+
+STRIPE_API_BASE_URL = "https://api.stripe.com/v1"
+STRIPE_API_TIMEOUT_SECONDS = 10.0
+
+# HTTP post signature for dependency injection. Takes (url, data,
+# auth, timeout) kwargs and returns the parsed JSON response dict.
+# Real implementation uses ``requests.post``; tests inject a stub.
+HttpPoster = Callable[..., dict]
+
+
+class BillingConfigError(RuntimeError):
+    """
+    Raised when an operation that requires Stripe configuration is
+    attempted while the relevant env vars are missing. Message is
+    operator-safe — never echoes the caller-supplied API key back.
+    """
+
+
+class BillingAPIError(RuntimeError):
+    """Raised when Stripe's REST API returns a non-2xx response."""
+
+
+def _post_to_stripe(
+    *, url: str, data: dict, auth: tuple[str, str], timeout: float,
+) -> dict:
+    """
+    Default HTTP poster. Uses ``requests`` (already a transitive
+    dependency via the broader project) rather than adding the
+    full Stripe SDK. Returns the parsed JSON body on 2xx, raises
+    ``BillingAPIError`` otherwise. Exposed as a module-level
+    function so tests can monkey-patch it.
+    """
+    import requests
+
+    try:
+        response = requests.post(
+            url, data=data, auth=auth, timeout=timeout,
+        )
+    except Exception as exc:
+        raise BillingAPIError(
+            f"stripe request failed: {type(exc).__name__}"
+        ) from exc
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if not (200 <= status_code < 300):
+        # Stripe's error body may contain caller-supplied data; log
+        # a short prefix at DEBUG and surface only the status code.
+        try:
+            body_preview = getattr(response, "text", "")[:200]
+        except Exception:
+            body_preview = ""
+        log.debug(
+            "billing.stripe_non_2xx",
+            status_code=status_code,
+            body_preview=body_preview,
+        )
+        raise BillingAPIError(f"stripe returned HTTP {status_code}")
+    try:
+        return response.json()
+    except Exception as exc:
+        raise BillingAPIError(
+            f"stripe response not valid JSON: {type(exc).__name__}"
+        ) from exc
+
+
+def _validate_checkout_inputs(
+    api_key: str, success_url: str, cancel_url: str,
+) -> None:
+    if not api_key or not str(api_key).strip():
+        raise ValueError("api_key is required")
+    if not success_url or not str(success_url).strip():
+        raise ValueError("success_url is required")
+    if not cancel_url or not str(cancel_url).strip():
+        raise ValueError("cancel_url is required")
+    # Prevent obvious header-injection / newline shenanigans in the
+    # URLs we forward to Stripe's API.
+    for name, value in (("success_url", success_url), ("cancel_url", cancel_url)):
+        if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
+            raise ValueError(
+                f"{name} contains forbidden whitespace / control characters"
+            )
+
+
+def create_checkout_session(
+    api_key: str,
+    success_url: str,
+    cancel_url: str,
+    *,
+    http_post: Optional[HttpPoster] = None,
+) -> dict:
+    """
+    Create a Stripe Checkout session that upgrades ``api_key`` to
+    the premium subscription and returns a URL the operator can
+    forward to the customer.
+
+    Returns a small, caller-safe dict::
+
+        {
+            "checkout_session_id": "cs_...",
+            "checkout_url":        "https://checkout.stripe.com/...",
+            "api_key_hash":        "<32-hex SHA-256 prefix>",
+        }
+
+    The raw ``api_key`` is **never** returned, printed, or logged by
+    this function — only the hashed form. Callers (CLI, scripts)
+    must continue that hygiene.
+
+    Fail-closed: raises ``BillingConfigError`` when
+    ``STRIPE_API_KEY`` or ``STRIPE_PRICE_ID_PREMIUM`` are missing.
+    The webhook secret is NOT required for this operation.
+    """
+    _validate_checkout_inputs(api_key, success_url, cancel_url)
+
+    stripe_secret = (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
+    price_id = (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
+    if not stripe_secret:
+        raise BillingConfigError(
+            f"{STRIPE_API_KEY_ENV_VAR} is not configured"
+        )
+    if not price_id:
+        raise BillingConfigError(
+            f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR} is not configured"
+        )
+
+    # Stripe accepts application/x-www-form-urlencoded with bracketed
+    # field names for nested structures.
+    data = {
+        "mode": "subscription",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        # Mirror the api_key onto BOTH session-level and
+        # subscription-level metadata so the webhook handler can pick
+        # it up even when the customer isn't expanded by Stripe.
+        "metadata[api_key]": api_key,
+        "subscription_data[metadata][api_key]": api_key,
+        "customer_creation": "always",
+    }
+
+    poster = http_post if http_post is not None else _post_to_stripe
+    payload = poster(
+        url=f"{STRIPE_API_BASE_URL}/checkout/sessions",
+        data=data,
+        auth=(stripe_secret, ""),
+        timeout=STRIPE_API_TIMEOUT_SECONDS,
+    )
+    if not isinstance(payload, dict):
+        raise BillingAPIError("stripe returned non-object JSON")
+
+    session_id = str(payload.get("id") or "")
+    checkout_url = str(payload.get("url") or "")
+    if not session_id or not checkout_url:
+        raise BillingAPIError(
+            "stripe response missing 'id' or 'url' field"
+        )
+
+    return {
+        "checkout_session_id": session_id,
+        "checkout_url": checkout_url,
+        "api_key_hash": _hash_api_key(api_key),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI — operator-only invocation. Never prints the raw API key.
+# ---------------------------------------------------------------------------
+
+
+def _checkout_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.billing checkout",
+        description=(
+            "Generate a Stripe Checkout URL for upgrading an API key "
+            "to the premium tier. Operator-only — the raw API key is "
+            "never printed to stdout."
+        ),
+    )
+    parser.add_argument("--api-key", required=True,
+                        help="API key to promote on successful checkout")
+    parser.add_argument("--success-url", required=True,
+                        help="Absolute URL for Stripe to redirect to on success")
+    parser.add_argument("--cancel-url", required=True,
+                        help="Absolute URL for Stripe to redirect to on cancel")
+    args = parser.parse_args(argv)
+
+    try:
+        result = create_checkout_session(
+            args.api_key, args.success_url, args.cancel_url,
+        )
+    except BillingConfigError as exc:
+        # Operator-facing message; never echo the api key back.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except BillingAPIError as exc:
+        print(f"error: stripe: {exc}", file=sys.stderr)
+        return 3
+
+    # Print only caller-safe fields. The raw api_key is NOT in
+    # `result`; it's impossible to leak it via this code path.
+    print(f"checkout_url:         {result['checkout_url']}")
+    print(f"checkout_session_id:  {result['checkout_session_id']}")
+    print(f"api_key_hash:         {result['api_key_hash']}")
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.billing",
+        description="Operator-only billing helpers.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    # `checkout` is parsed by its own sub-handler; list it here so
+    # `--help` at top level documents it.
+    subparsers.add_parser(
+        "checkout",
+        help="Generate a Stripe Checkout URL for an API key",
+        add_help=False,
+    )
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        _build_parser().print_help(sys.stderr)
+        return 2
+    command, rest = argv[0], argv[1:]
+    if command == "checkout":
+        return _checkout_cli(rest)
+    if command in ("-h", "--help"):
+        _build_parser().print_help()
+        return 0
+    print(f"error: unknown command '{command}'", file=sys.stderr)
+    print("available commands: checkout", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
