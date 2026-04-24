@@ -1873,6 +1873,112 @@ default messages immediately on the next request — no restart
 needed; the resolver runs per-request.
 
 
+### Phase 5.8 — nudge copy performance report
+
+Two changes in one phase, both additive and reversible:
+
+1. The Phase 5.5 upgrade-events log gains an optional
+   `copy_variant_hash` field. The three "carries-copy" events
+   record the hash of whichever Phase 5.7 nudge string was
+   actually rendered to the user.
+2. A new offline analysis module groups the events log by that
+   hash to measure which copy variants drive paid conversions.
+
+**`copy_variant_hash` field (writer side)**
+
+Computed as `SHA-256(resolved_copy)[:32]`. The raw copy is
+**never** persisted — `_hash_copy_variant` is called inside
+`record_upgrade_event`, the hash lands on the row, and the
+input string is dropped at function exit. Pinned by
+`test_raw_copy_is_never_persisted`.
+
+The field is set on:
+
+* `dashboard_banner_seen` — hash of `_upgrade_banner_copy()`
+* `daily_request_limit_hit` — hash of `_limit_hit_copy()`
+* `report_limit_hit` — hash of `_report_limit_copy()`
+
+Other events (`old_report_blocked`, `experiment_limit_blocked`)
+have no operator-tunable copy and record `copy_variant_hash:
+null`. Pinned by `TestPhase58OtherEventsHaveNullHash`.
+
+`record_upgrade_event` accepts an optional `copy_variant=None`
+kwarg. Calls that pre-date Phase 5.8 still work — the row simply
+records `copy_variant_hash: null` (backward compat is pinned by
+`test_backward_compat_call_without_copy_variant`).
+
+**Same-string contract.** The 429 and 403 paths resolve the
+copy ONCE per request and pass the same string to both the
+JSON response body and the telemetry hasher. So
+`SHA-256(response.body.detail)[:32] == row.copy_variant_hash`
+on every recorded rejection — pinned by
+`test_429_event_carries_copy_hash_matching_response_body` and
+its 403 counterpart.
+
+**Analysis module — `trading_bot.analysis.nudge_report`**
+
+Inputs (paths overridable on the CLI):
+
+    data/api_upgrade_events.jsonl   (Phase 5.5/5.8)
+    data/api_conversions.jsonl      (Phase 4.9)
+
+Per `copy_variant_hash` row:
+
+    {
+      "copy_variant_hash":            "<32-hex>",
+      "event_count":                  12,
+      "unique_users":                 8,
+      "converted_users":              3,
+      "conversion_rate":              0.375,
+      "delta_samples":                3,
+      "median_time_to_convert_seconds": 432000.0,
+      "p90_time_to_convert_seconds":   518400.0,
+      "median_time_to_convert_days":   5.0,
+      "p90_time_to_convert_days":      6.0,
+      "events":                       ["dashboard_banner_seen"]
+    }
+
+Time delta = `(earliest conversion ts) − (earliest event ts for
+THIS variant_hash)`, per converted user. Negative deltas are
+dropped.
+
+Headline pick: `strongest_variant` returns the variant with the
+highest `conversion_rate`, gated by
+`MIN_SUPPORT_FOR_RANKING = 2` distinct users (override via
+`--min-users-for-ranking`). Ties break by hash alphabetically
+for byte-determinism.
+
+**Privacy invariants (tested):**
+
+* No raw API key on disk — both inputs already hash.
+* No raw copy text on disk — Phase 5.8 hashes at write time.
+* The per-variant report row deliberately **omits**
+  `api_key_hash` so BI pipelines can't derive which users saw
+  which variant from the report alone
+  (`test_per_variant_row_does_not_include_api_key_hash`).
+* Boundary: `nudge_report.py` imports nothing from Core or
+  `trading_bot.api.*`. Pinned by source-grep test.
+
+**CLI**
+
+    python -m trading_bot.analysis.nudge_report
+    python -m trading_bot.analysis.nudge_report --json-only
+    python -m trading_bot.analysis.nudge_report --text-only
+    python -m trading_bot.analysis.nudge_report \
+        --events data/api_upgrade_events.jsonl \
+        --conversions data/api_conversions.jsonl \
+        --reports-dir reports \
+        --date 2026-04-24 \
+        --min-users-for-ranking 5
+
+Writes `reports/nudge_report_<DATE>.{txt,json}`.
+
+**Operator workflow.** Operators correlate the hash back to the
+copy variant via their own deployment notes (e.g. the env-var
+value at the time of rollout). They never need access to the
+raw copy through this pipeline — and cannot get it from disk.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

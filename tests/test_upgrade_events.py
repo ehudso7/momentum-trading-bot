@@ -528,3 +528,88 @@ class TestNoPiiLeak:
         assert hashlib.sha256(
             b"MARKER_RAW_API_KEY",
         ).hexdigest()[:32] in body
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.8 — copy_variant_hash field
+# ---------------------------------------------------------------------------
+
+
+from trading_bot.api.upgrade_events import _hash_copy_variant  # noqa: E402
+
+
+class TestPhase58CopyVariantHash:
+    def _hex(self, s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:32]
+
+    def test_resolved_copy_is_hashed_and_persisted(self, events_path: Path):
+        record_upgrade_event(
+            "k", EVENT_DASHBOARD_BANNER_SEEN,
+            copy_variant="Upgrade now to unlock everything!",
+        )
+        (row,) = _read_records(events_path)
+        assert row["copy_variant_hash"] == self._hex(
+            "Upgrade now to unlock everything!",
+        )
+
+    def test_raw_copy_is_never_persisted(self, events_path: Path):
+        secret_copy = "TOP_SECRET_COPY_THAT_MUST_NEVER_LAND_ON_DISK"
+        record_upgrade_event(
+            "k", EVENT_DASHBOARD_BANNER_SEEN, copy_variant=secret_copy,
+        )
+        body = events_path.read_text(encoding="utf-8")
+        assert secret_copy not in body
+        # The hash IS persisted so operators can group on it.
+        assert self._hex(secret_copy) in body
+
+    def test_same_copy_hashes_to_same_value(self, events_path: Path):
+        record_upgrade_event(
+            "k", EVENT_DASHBOARD_BANNER_SEEN, copy_variant="ABC",
+        )
+        record_upgrade_event(
+            "k", EVENT_DAILY_REQUEST_LIMIT_HIT, copy_variant="ABC",
+        )
+        rows = _read_records(events_path)
+        assert len({r["copy_variant_hash"] for r in rows}) == 1
+
+    def test_different_copy_hashes_to_different_values(
+        self, events_path: Path,
+    ):
+        record_upgrade_event(
+            "k", EVENT_DASHBOARD_BANNER_SEEN, copy_variant="ABC",
+        )
+        record_upgrade_event(
+            "k", EVENT_DASHBOARD_BANNER_SEEN, copy_variant="DEF",
+        )
+        rows = _read_records(events_path)
+        assert len({r["copy_variant_hash"] for r in rows}) == 2
+
+    def test_no_copy_variant_serialises_as_null(self, events_path: Path):
+        record_upgrade_event("k", EVENT_OLD_REPORT_BLOCKED)
+        (row,) = _read_records(events_path)
+        assert row["copy_variant_hash"] is None
+
+    def test_empty_copy_variant_serialises_as_null(self, events_path: Path):
+        record_upgrade_event(
+            "k", EVENT_REPORT_LIMIT_HIT, copy_variant="",
+        )
+        (row,) = _read_records(events_path)
+        assert row["copy_variant_hash"] is None
+
+    def test_hash_is_32_hex_chars(self):
+        h = _hash_copy_variant("any copy value")
+        assert isinstance(h, str)
+        assert len(h) == 32
+        int(h, 16)  # raises if non-hex
+
+    def test_hash_helper_handles_none(self):
+        assert _hash_copy_variant(None) is None
+        assert _hash_copy_variant("") is None
+
+    def test_backward_compat_call_without_copy_variant(self, events_path: Path):
+        """Calls that pre-date Phase 5.8 (no copy_variant kwarg)
+        still work and produce a copy_variant_hash of null."""
+        record_upgrade_event("k", EVENT_DASHBOARD_BANNER_SEEN)
+        (row,) = _read_records(events_path)
+        assert "copy_variant_hash" in row
+        assert row["copy_variant_hash"] is None

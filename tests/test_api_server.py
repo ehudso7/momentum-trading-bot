@@ -5425,3 +5425,180 @@ class TestPhase57BoundaryUnchanged:
             "TRADING_REPORT_LIMIT_COPY",
         ):
             assert name not in body
+
+
+# ===========================================================================
+# Phase 5.8 — server-side telemetry of copy_variant_hash
+# ===========================================================================
+
+
+import hashlib as _hashlib_phase58  # noqa: E402
+
+
+def _hex_copy(copy: str) -> str:
+    return _hashlib_phase58.sha256(
+        copy.encode("utf-8"),
+    ).hexdigest()[:32]
+
+
+class TestPhase58DashboardBannerHash:
+    def test_default_banner_copy_is_hashed_into_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "dashboard_banner_seen"
+        assert row["copy_variant_hash"] == _hex_copy(
+            DEFAULT_UPGRADE_BANNER_COPY,
+        )
+
+    def test_custom_banner_copy_changes_hash(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv(
+            UPGRADE_BANNER_COPY_ENV_VAR, "Variant B copy here",
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["copy_variant_hash"] == _hex_copy("Variant B copy here")
+        assert row["copy_variant_hash"] != _hex_copy(
+            DEFAULT_UPGRADE_BANNER_COPY,
+        )
+
+    def test_raw_banner_copy_never_appears_on_disk(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
+    ):
+        secret = "DO_NOT_LEAK_BANNER_COPY_PHASE58"
+        monkeypatch.setenv(UPGRADE_BANNER_COPY_ENV_VAR, secret)
+        client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = upgrade_events_path.read_text(encoding="utf-8")
+        assert secret not in body
+        # But the hash IS persisted.
+        assert _hex_copy(secret) in body
+
+    def test_premium_user_dashboard_does_not_persist_copy_hash(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv(
+            UPGRADE_BANNER_COPY_ENV_VAR, "PREMIUM_DASHBOARD_BANNER",
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        # Premium users emit no upgrade event at all.
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+
+class TestPhase58LimitHitHash:
+    def test_429_event_carries_copy_hash_matching_response_body(
+        self, client: TestClient, free_env, usage_path: Path,
+        upgrade_events_path: Path, monkeypatch,
+    ):
+        custom = "Custom 429 copy — upgrade for more!"
+        monkeypatch.setenv(LIMIT_HIT_COPY_ENV_VAR, custom)
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        # The response body carries the raw copy …
+        assert resp.json() == {"detail": custom}
+        # … and the telemetry row carries its hash.
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "daily_request_limit_hit"
+        assert row["copy_variant_hash"] == _hex_copy(custom)
+
+    def test_429_default_copy_is_hashed(
+        self, client: TestClient, free_env, usage_path: Path,
+        upgrade_events_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["copy_variant_hash"] == _hex_copy(
+            DEFAULT_LIMIT_HIT_COPY,
+        )
+
+
+class TestPhase58ReportLimitHash:
+    def test_403_event_carries_copy_hash_matching_response_body(
+        self, client: TestClient, free_env, usage_path: Path,
+        upgrade_events_path: Path, monkeypatch,
+    ):
+        custom = "Custom 403 — premium unlocks reports."
+        monkeypatch.setenv(REPORT_LIMIT_COPY_ENV_VAR, custom)
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "500")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/reports/latest",
+        )
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": custom}
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "report_limit_hit"
+        assert row["copy_variant_hash"] == _hex_copy(custom)
+
+
+class TestPhase58OtherEventsHaveNullHash:
+    """``old_report_blocked`` and ``experiment_limit_blocked`` aren't
+    operator-tunable copy. Their telemetry row must record a null
+    hash, never the legacy literal."""
+
+    def test_old_report_blocked_has_null_hash(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        free_env["reports_dir"].mkdir(parents=True, exist_ok=True)
+        resp = client.get(
+            "/reports/2020-01-01",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "old_report_blocked"
+        assert row["copy_variant_hash"] is None
+
+    def test_experiment_limit_blocked_has_null_hash(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/experiments/4",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "experiment_limit_blocked"
+        assert row["copy_variant_hash"] is None

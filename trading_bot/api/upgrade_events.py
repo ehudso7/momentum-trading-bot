@@ -118,6 +118,24 @@ def _hash_api_key(api_key: Optional[str]) -> str:
     return hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()[:32]
 
 
+def _hash_copy_variant(copy_variant: Optional[str]) -> Optional[str]:
+    """
+    Phase 5.8 — derive ``SHA-256(copy)[:32]`` from a resolved nudge
+    copy string so the upgrade-events log can group rows by which
+    variant the operator was running, without ever persisting the
+    raw copy text.
+
+    ``None`` / empty input → ``None`` (the field is optional and
+    is recorded as ``null`` in the JSONL row).
+    """
+    if copy_variant is None:
+        return None
+    s = str(copy_variant)
+    if not s:
+        return None
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:32]
+
+
 def _log_path() -> Path:
     return Path(
         os.getenv(UPGRADE_EVENTS_LOG_ENV_VAR, DEFAULT_UPGRADE_EVENTS_LOG_PATH)
@@ -177,10 +195,18 @@ def record_upgrade_event(
     path: Optional[str] = None,
     request_id: Optional[str] = None,
     ref_code: Optional[str] = None,
+    copy_variant: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> dict:
     """
     Append one upgrade-telemetry record. Best-effort.
+
+    Phase 5.8: callers of the three "carries-copy" events
+    (``dashboard_banner_seen``, ``daily_request_limit_hit``,
+    ``report_limit_hit``) may pass the **resolved** Phase 5.7
+    nudge copy as ``copy_variant``. The function hashes it to
+    ``SHA-256(copy)[:32]`` and stores the hash on the record.
+    The raw copy text is **never** persisted.
 
     Returns a small status dict for tests:
 
@@ -201,6 +227,7 @@ def record_upgrade_event(
         return {"action": "skipped", "reason": "no_api_key"}
 
     cleaned_ref = _sanitize_ref_code(ref_code)
+    variant_hash = _hash_copy_variant(copy_variant)
     record = {
         "timestamp": _now_iso_utc(now),
         "api_key_hash": hashed,
@@ -209,6 +236,7 @@ def record_upgrade_event(
         "request_id": str(request_id) if request_id else None,
         "tier": TIER_FREE,
         "ref_code": cleaned_ref or None,
+        "copy_variant_hash": variant_hash,
     }
     _append_record(record)
     return {"action": "recorded", "event": event, "api_key_hash": hashed}

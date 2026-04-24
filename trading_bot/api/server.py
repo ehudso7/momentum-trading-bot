@@ -512,13 +512,21 @@ def _emit_upgrade_event(
     request: Optional[Request],
     api_key: Optional[str],
     event: str,
+    *,
+    copy_variant: Optional[str] = None,
 ) -> None:
     """
-    Phase 5.5 — best-effort upgrade-telemetry emission.
+    Phase 5.5 + 5.8 — best-effort upgrade-telemetry emission.
 
     Extracts the request_id (set by audit_middleware) and the
     ``?ref=`` query parameter from ``request`` and forwards them to
     ``trading_bot.api.upgrade_events.record_upgrade_event``.
+
+    Phase 5.8: if ``copy_variant`` is supplied (the resolved Phase
+    5.7 nudge copy that was actually rendered to the user), it is
+    hashed inside the events module and stored as
+    ``copy_variant_hash`` on the row. The raw copy is never
+    persisted.
 
     Every failure path is caught and logged at DEBUG. Telemetry
     must NEVER affect the outgoing response or the caller's latency.
@@ -552,6 +560,7 @@ def _emit_upgrade_event(
             path=path_value,
             request_id=request_id,
             ref_code=ref_code,
+            copy_variant=copy_variant,
         )
     except Exception as exc:
         log.debug("upgrade_events.emit_error", event=event, error=str(exc))
@@ -973,23 +982,33 @@ async def free_tier_middleware(request: Request, call_next):
     remaining = max(0, max_total - total_today)
 
     if total_today >= max_total:
-        # Phase 5.5 — telemetry is best-effort; never affects the response.
-        _emit_upgrade_event(request, api_key, "daily_request_limit_hit")
-        # Phase 5.7 — operator-overridable copy.
+        # Phase 5.7 — operator-overridable copy. Resolve once so the
+        # exact same string flows into the response body AND the
+        # Phase 5.8 telemetry hash.
+        copy = _limit_hit_copy()
+        # Phase 5.5 + 5.8 — telemetry is best-effort; never affects
+        # the response.
+        _emit_upgrade_event(
+            request, api_key, "daily_request_limit_hit",
+            copy_variant=copy,
+        )
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": _limit_hit_copy()},
+            content={"detail": copy},
             headers={
                 FREE_TIER_USAGE_HEADER: usage_header,
                 FREE_TIER_REMAINING_HEADER: "0",
             },
         )
     if is_report and reports_today >= max_reports:
-        _emit_upgrade_event(request, api_key, "report_limit_hit")
-        # Phase 5.7 — operator-overridable copy.
+        copy = _report_limit_copy()
+        _emit_upgrade_event(
+            request, api_key, "report_limit_hit",
+            copy_variant=copy,
+        )
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
-            content={"detail": _report_limit_copy()},
+            content={"detail": copy},
             headers={
                 FREE_TIER_USAGE_HEADER: usage_header,
                 FREE_TIER_REMAINING_HEADER: str(remaining),
@@ -2071,13 +2090,24 @@ def dashboard(
     experiments = [_sanitize_manifest(r) for r in records[-10:]] if records else []
 
     tier = TIER_PREMIUM if _is_premium(api_key) else TIER_FREE
-    html = render_dashboard_html(report, experiments, tier=tier)
+    # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
+    # string rendered to the user is also the one we hash into the
+    # telemetry row. Premium users skip the resolver entirely (no
+    # banner, no event emission).
+    banner_copy = _upgrade_banner_copy() if tier == TIER_FREE else None
+    html = render_dashboard_html(
+        report, experiments, tier=tier, banner_copy=banner_copy,
+    )
     if tier == TIER_FREE:
-        # Phase 5.5 — the banner is rendered in the HTML above; emit
-        # one telemetry row per dashboard load so we can measure how
-        # often free users actually see the upgrade prompt. Emission
-        # is best-effort and never affects the response.
-        _emit_upgrade_event(request, api_key, "dashboard_banner_seen")
+        # Phase 5.5 + 5.8 — the banner is rendered in the HTML
+        # above; emit one telemetry row per dashboard load so we
+        # can measure how often free users actually see the
+        # upgrade prompt. The resolved copy is hashed into the
+        # row's ``copy_variant_hash`` field.
+        _emit_upgrade_event(
+            request, api_key, "dashboard_banner_seen",
+            copy_variant=banner_copy,
+        )
     return HTMLResponse(content=html, status_code=200)
 
 
