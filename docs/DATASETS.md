@@ -157,6 +157,40 @@ existing deployment and any existing analysis script continues to
 work without change. `journal.csv` is not rotated — it is owned by
 the existing portfolio manager code and is unchanged.
 
+### Multi-day analysis (Phase 2.8)
+
+`alpha_report` can consume a whole run of rotated daily files in a
+single invocation. The `--alpha`, `--decision`, and `--journal` CLI
+flags each accept three input forms:
+
+1. A single explicit CSV path (original behaviour).
+2. A shell glob, e.g. `"data/alpha_scores_*.csv"`. Quote it so the
+   shell does not expand before argparse sees it.
+3. A comma-separated list of paths and/or globs, e.g.
+   `"data/alpha_scores_2026-04-*.csv,data/alpha_scores_2026-05-01.csv"`.
+
+Behaviour:
+
+- All matching files are loaded and concatenated.
+- Missing explicit paths and empty glob matches are silently skipped
+  (the loaders are always best-effort).
+- Rows whose first column literally equals the header name are
+  dropped, so manually merging files with
+  `cat a.csv b.csv > merged.csv` does not corrupt the dataset.
+- The per-source block of the report gains `resolved_files`
+  (count) and `resolved_paths` (list of strings) so you can see
+  exactly which CSVs were consumed.
+
+Example:
+
+```bash
+python -m trading_bot.analysis.alpha_report \
+    --alpha    "data/alpha_scores_*.csv" \
+    --decision "data/decision_log_*.csv" \
+    --journal  "data/journal.csv" \
+    --min-outcomes 100
+```
+
 
 ## Known limitations
 

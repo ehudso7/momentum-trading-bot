@@ -26,12 +26,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import sys
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import pandas as pd
+
+PathSpec = Union[str, Path, None]
 
 DEFAULT_ALPHA_CSV = "data/alpha_scores.csv"
 DEFAULT_DECISION_CSV = "data/decision_log.csv"
@@ -61,21 +64,114 @@ def _empty(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame({c: [] for c in columns})
 
 
-def load_alpha_scores(path: Union[str, Path]) -> pd.DataFrame:
-    """Load Phase 2 alpha scores. Empty DataFrame if missing or unreadable."""
+def _looks_like_glob(text: str) -> bool:
+    """True if `text` contains any shell-glob meta character."""
+    return any(ch in text for ch in "*?[")
+
+
+def _resolve_paths(spec: PathSpec) -> list[Path]:
+    """
+    Resolve an input spec into a deduplicated list of existing CSV paths.
+
+    Accepted forms (Phase 2.8):
+      - None                                → []
+      - Path                                → [path] if it exists, else []
+      - "path/to/file.csv"                  → single explicit path
+      - "data/alpha_scores_*.csv"           → glob pattern (sorted)
+      - "a.csv,b.csv"                       → comma-separated list
+      - "data/a_*.csv,data/b.csv"           → mixed globs and explicit paths
+
+    Missing explicit paths and empty glob matches are silently skipped
+    — `build_report` is always best-effort and never raises on I/O.
+    Order: comma-separated segments are processed left-to-right; glob
+    matches within a segment are sorted lexicographically so a run
+    across rotated daily files is chronologically stable.
+    """
+    if spec is None:
+        return []
+    if isinstance(spec, Path):
+        return [spec] if spec.is_file() else []
+    s = str(spec).strip()
+    if not s:
+        return []
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for part in (segment.strip() for segment in s.split(",")):
+        if not part:
+            continue
+        if _looks_like_glob(part):
+            matches = sorted(glob.glob(part))
+        else:
+            matches = [part]
+        for match in matches:
+            p = Path(match)
+            if p in seen:
+                continue
+            if not p.is_file():
+                continue
+            seen.add(p)
+            resolved.append(p)
+    return resolved
+
+
+def _read_and_concat(
+    paths: Iterable[Path],
+    all_columns: list[str],
+    timestamp_col: str = "timestamp",
+) -> pd.DataFrame:
+    """
+    Read every CSV in `paths`, concatenate them, and drop any rows that
+    look like a duplicated header (common when files were appended
+    together by hand).
+
+    Returns an empty DataFrame with `all_columns` when there is nothing
+    to load.
+    """
+    frames: list[pd.DataFrame] = []
+    for p in paths:
+        try:
+            frame = pd.read_csv(p)
+        except Exception:
+            continue
+        if frame is None or frame.empty:
+            continue
+        frames.append(frame)
+    if not frames:
+        return _empty(all_columns)
+
+    df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+    if df.empty:
+        return _empty(all_columns)
+
+    # Drop rows whose first column literally equals the header name —
+    # catches `cat a.csv b.csv > merged.csv` style concatenation.
+    if timestamp_col in df.columns:
+        header_mask = df[timestamp_col].astype(str).str.strip() == timestamp_col
+        if header_mask.any():
+            df = df[~header_mask].reset_index(drop=True)
+
+    return df
+
+
+def load_alpha_scores(path: PathSpec) -> pd.DataFrame:
+    """
+    Load Phase 2 alpha scores.
+
+    Accepts a single CSV path, a glob pattern, or a comma-separated
+    list of paths/globs. Empty DataFrame if nothing resolves or every
+    matched file is unreadable.
+    """
     cols = [
         "timestamp", "symbol", "score", "tier", "action", "confidence",
         "regime", "gap_pct", "relative_volume", "volatility", "reasons",
     ]
-    p = Path(path)
-    if not p.exists():
+    paths = _resolve_paths(path)
+    if not paths:
         return _empty(cols)
-    try:
-        df = pd.read_csv(p)
-    except Exception:
-        return _empty(cols)
+    df = _read_and_concat(paths, cols)
     if df.empty:
-        return _empty(cols)
+        return df
     for c in cols:
         if c not in df.columns:
             df[c] = pd.NA
@@ -85,21 +181,18 @@ def load_alpha_scores(path: Union[str, Path]) -> pd.DataFrame:
     return df
 
 
-def load_decision_log(path: Union[str, Path]) -> pd.DataFrame:
-    """Load Phase 1.5 decision log. Empty DataFrame if missing or unreadable."""
+def load_decision_log(path: PathSpec) -> pd.DataFrame:
+    """Load Phase 1.5 decision log. Accepts path / glob / comma-separated spec."""
     cols = [
         "timestamp", "symbol", "price", "gap_pct", "relative_volume",
         "volatility", "regime", "action", "confidence", "reason",
     ]
-    p = Path(path)
-    if not p.exists():
+    paths = _resolve_paths(path)
+    if not paths:
         return _empty(cols)
-    try:
-        df = pd.read_csv(p)
-    except Exception:
-        return _empty(cols)
+    df = _read_and_concat(paths, cols)
     if df.empty:
-        return _empty(cols)
+        return df
     for c in cols:
         if c not in df.columns:
             df[c] = pd.NA
@@ -109,9 +202,9 @@ def load_decision_log(path: Union[str, Path]) -> pd.DataFrame:
     return df
 
 
-def load_journal(path: Union[str, Path]) -> pd.DataFrame:
+def load_journal(path: PathSpec) -> pd.DataFrame:
     """
-    Load the trade journal.
+    Load the trade journal. Accepts path / glob / comma-separated spec.
 
     Journal stores `date` as YYYY-MM-DD and `entry_time`/`exit_time` as
     HH:MM:SS — reconstruct a full entry_dt by concatenating them so we
@@ -122,13 +215,10 @@ def load_journal(path: Union[str, Path]) -> pd.DataFrame:
         "shares", "pnl", "rr_ratio", "hold_time_minutes", "entry_time",
         "exit_time", "exit_reason", "notes",
     ]
-    p = Path(path)
-    if not p.exists():
+    paths = _resolve_paths(path)
+    if not paths:
         return _empty(cols + ["entry_dt", "exit_dt"])
-    try:
-        df = pd.read_csv(p)
-    except Exception:
-        return _empty(cols + ["entry_dt", "exit_dt"])
+    df = _read_and_concat(paths, cols, timestamp_col="date")
     if df.empty:
         return _empty(cols + ["entry_dt", "exit_dt"])
     for c in cols:
@@ -519,10 +609,28 @@ def promotion_readiness(
 # ---------------------------------------------------------------------------
 
 
+def _source_meta(spec: PathSpec, rows: int) -> dict[str, Any]:
+    """
+    Build the per-source metadata dict.
+
+    Phase 2.8: `spec` can be a single path, a glob, or a comma-separated
+    list. Resolved files are listed so an operator can see exactly
+    which CSVs were consumed.
+    """
+    paths = _resolve_paths(spec)
+    return {
+        "path": "" if spec is None else str(spec),
+        "exists": len(paths) > 0,
+        "resolved_files": len(paths),
+        "resolved_paths": [str(p) for p in paths],
+        "rows": int(rows),
+    }
+
+
 def build_report(
-    alpha_path: Union[str, Path] = DEFAULT_ALPHA_CSV,
-    decision_path: Union[str, Path] = DEFAULT_DECISION_CSV,
-    journal_path: Union[str, Path] = DEFAULT_JOURNAL_CSV,
+    alpha_path: PathSpec = DEFAULT_ALPHA_CSV,
+    decision_path: PathSpec = DEFAULT_DECISION_CSV,
+    journal_path: PathSpec = DEFAULT_JOURNAL_CSV,
     tolerance_minutes: int = DEFAULT_MATCH_TOLERANCE_MINUTES,
     min_required_outcomes: int = DEFAULT_MIN_REQUIRED_OUTCOMES,
 ) -> dict[str, Any]:
@@ -532,21 +640,9 @@ def build_report(
     journal_df = load_journal(journal_path)
 
     sources = {
-        "alpha_scores": {
-            "path": str(alpha_path),
-            "exists": Path(alpha_path).exists(),
-            "rows": int(len(alpha_df)),
-        },
-        "decision_log": {
-            "path": str(decision_path),
-            "exists": Path(decision_path).exists(),
-            "rows": int(len(decision_df)),
-        },
-        "journal": {
-            "path": str(journal_path),
-            "exists": Path(journal_path).exists(),
-            "rows": int(len(journal_df)),
-        },
+        "alpha_scores": _source_meta(alpha_path, len(alpha_df)),
+        "decision_log": _source_meta(decision_path, len(decision_df)),
+        "journal": _source_meta(journal_path, len(journal_df)),
     }
 
     notes: list[str] = []
@@ -617,10 +713,16 @@ def format_text(report: dict[str, Any]) -> str:
     sources = report["sources"]
     lines.append("Sources:")
     for name, meta in sources.items():
+        files = meta.get("resolved_files", 1 if meta.get("exists") else 0)
         lines.append(
             f"  {name:<14} exists={meta['exists']!s:<5} "
-            f"rows={meta['rows']:<6} path={meta['path']}"
+            f"files={files:<3} rows={meta['rows']:<6} "
+            f"requested={meta['path']}"
         )
+        resolved_paths = meta.get("resolved_paths", [])
+        if files > 1:
+            for rp in resolved_paths:
+                lines.append(f"    - {rp}")
     lines.append(f"Join tolerance: {report['tolerance_minutes']} minutes")
 
     totals = report["totals"]
@@ -716,12 +818,28 @@ def _build_parser() -> argparse.ArgumentParser:
             "then prints tier / reason / regime statistics."
         ),
     )
-    parser.add_argument("--alpha", default=DEFAULT_ALPHA_CSV,
-                        help=f"Path to alpha_scores.csv (default: {DEFAULT_ALPHA_CSV})")
-    parser.add_argument("--decision", default=DEFAULT_DECISION_CSV,
-                        help=f"Path to decision_log.csv (default: {DEFAULT_DECISION_CSV})")
-    parser.add_argument("--journal", default=DEFAULT_JOURNAL_CSV,
-                        help=f"Path to journal.csv (default: {DEFAULT_JOURNAL_CSV})")
+    parser.add_argument(
+        "--alpha", default=DEFAULT_ALPHA_CSV,
+        help=(
+            f"Path, glob, or comma-separated list of alpha_scores CSVs "
+            f"(default: {DEFAULT_ALPHA_CSV}). "
+            'Example: --alpha "data/alpha_scores_*.csv"'
+        ),
+    )
+    parser.add_argument(
+        "--decision", default=DEFAULT_DECISION_CSV,
+        help=(
+            f"Path, glob, or comma-separated list of decision_log CSVs "
+            f"(default: {DEFAULT_DECISION_CSV})"
+        ),
+    )
+    parser.add_argument(
+        "--journal", default=DEFAULT_JOURNAL_CSV,
+        help=(
+            f"Path, glob, or comma-separated list of journal CSVs "
+            f"(default: {DEFAULT_JOURNAL_CSV})"
+        ),
+    )
     parser.add_argument("--tolerance", type=int,
                         default=DEFAULT_MATCH_TOLERANCE_MINUTES,
                         help="Minutes of slack when joining alpha rows to trades")

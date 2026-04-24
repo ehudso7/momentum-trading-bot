@@ -812,3 +812,335 @@ def test_cli_min_outcomes_subprocess_smoke(
     assert result.returncode == 0, result.stderr
     assert "Promotion readiness:" in result.stdout
     assert "By score decile" in result.stdout
+
+
+# ===========================================================================
+# Phase 2.8 — multi-day / multi-file input support.
+# ===========================================================================
+
+
+from trading_bot.analysis.alpha_report import _resolve_paths  # noqa: E402
+
+
+def _write_alpha(path: Path, rows: list[dict]) -> Path:
+    return _write_csv(path, ALPHA_HEADERS, rows)
+
+
+def _alpha_row(symbol: str, ts: str, tier: str = "A", score: float = 0.9,
+               action: str = "buy") -> dict:
+    return dict(
+        timestamp=ts, symbol=symbol, score=score, tier=tier,
+        action=action, confidence=0.8, regime="trending_bullish",
+        gap_pct=10.0, relative_volume=10.0, volatility=3.0,
+        reasons=f"gap_sweet_spot|action_{action}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# _resolve_paths helper
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_paths_none_returns_empty():
+    assert _resolve_paths(None) == []
+    assert _resolve_paths("") == []
+    assert _resolve_paths("   ") == []
+
+
+def test_resolve_paths_single_existing_file(tmp_path: Path):
+    p = _write_alpha(tmp_path / "alpha.csv", [_alpha_row("A", "2026-04-24 09:45:00")])
+    assert _resolve_paths(str(p)) == [p]
+    assert _resolve_paths(p) == [p]  # Path object also accepted
+
+
+def test_resolve_paths_missing_explicit_path_returns_empty(tmp_path: Path):
+    assert _resolve_paths(tmp_path / "absent.csv") == []
+    assert _resolve_paths(str(tmp_path / "absent.csv")) == []
+
+
+def test_resolve_paths_glob_returns_sorted_matches(tmp_path: Path):
+    p1 = _write_alpha(tmp_path / "alpha_2026-04-24.csv", [_alpha_row("A", "2026-04-24 09:45:00")])
+    p2 = _write_alpha(tmp_path / "alpha_2026-04-25.csv", [_alpha_row("B", "2026-04-25 09:45:00")])
+    p3 = _write_alpha(tmp_path / "alpha_2026-04-23.csv", [_alpha_row("C", "2026-04-23 09:45:00")])
+    got = _resolve_paths(str(tmp_path / "alpha_*.csv"))
+    assert got == [p3, p1, p2]  # lexicographic → chronological
+
+
+def test_resolve_paths_comma_separated(tmp_path: Path):
+    p1 = _write_alpha(tmp_path / "a.csv", [_alpha_row("A", "2026-04-24 09:45:00")])
+    p2 = _write_alpha(tmp_path / "b.csv", [_alpha_row("B", "2026-04-25 09:45:00")])
+    spec = f"{p1},{p2}"
+    assert _resolve_paths(spec) == [p1, p2]
+
+
+def test_resolve_paths_mixed_glob_and_explicit(tmp_path: Path):
+    p1 = _write_alpha(tmp_path / "alpha_2026-04-24.csv", [_alpha_row("A", "2026-04-24 09:45:00")])
+    p2 = _write_alpha(tmp_path / "alpha_2026-04-25.csv", [_alpha_row("B", "2026-04-25 09:45:00")])
+    explicit = _write_alpha(tmp_path / "extra.csv", [_alpha_row("C", "2026-04-26 09:45:00")])
+    spec = f"{tmp_path}/alpha_*.csv,{explicit}"
+    got = _resolve_paths(spec)
+    assert got == [p1, p2, explicit]
+
+
+def test_resolve_paths_deduplicates(tmp_path: Path):
+    p = _write_alpha(tmp_path / "alpha.csv", [_alpha_row("A", "2026-04-24 09:45:00")])
+    spec = f"{p},{p},{p}"
+    assert _resolve_paths(spec) == [p]
+
+
+# ---------------------------------------------------------------------------
+# Single-file behaviour still works.
+# ---------------------------------------------------------------------------
+
+
+def test_single_file_still_works_end_to_end(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    report = build_report(
+        alpha_path=alpha_csv,
+        decision_path=decision_csv,
+        journal_path=journal_csv,
+    )
+    assert report["totals"]["alpha_rows"] == 5
+    alpha_src = report["sources"]["alpha_scores"]
+    assert alpha_src["exists"] is True
+    assert alpha_src["resolved_files"] == 1
+    assert alpha_src["resolved_paths"] == [str(alpha_csv)]
+    assert alpha_src["path"] == str(alpha_csv)
+
+
+# ---------------------------------------------------------------------------
+# Glob loads multiple rotated files.
+# ---------------------------------------------------------------------------
+
+
+def test_glob_loads_multiple_rotated_alpha_files(tmp_path: Path):
+    _write_alpha(tmp_path / "alpha_scores_2026-04-24.csv", [
+        _alpha_row("AAA", "2026-04-24 09:45:00"),
+        _alpha_row("BBB", "2026-04-24 10:00:00", tier="B", score=0.7),
+    ])
+    _write_alpha(tmp_path / "alpha_scores_2026-04-25.csv", [
+        _alpha_row("CCC", "2026-04-25 09:45:00"),
+        _alpha_row("DDD", "2026-04-25 10:00:00", tier="F", score=0.2, action="skip"),
+    ])
+
+    df = load_alpha_scores(str(tmp_path / "alpha_scores_*.csv"))
+    assert len(df) == 4
+    symbols = sorted(df["symbol"].tolist())
+    assert symbols == ["AAA", "BBB", "CCC", "DDD"]
+
+
+def test_glob_loads_multiple_days_into_report(tmp_path: Path):
+    _write_alpha(tmp_path / "alpha_scores_2026-04-24.csv", [
+        _alpha_row("AAA", "2026-04-24 09:45:00"),
+    ])
+    _write_alpha(tmp_path / "alpha_scores_2026-04-25.csv", [
+        _alpha_row("BBB", "2026-04-25 09:45:00"),
+    ])
+    _write_alpha(tmp_path / "alpha_scores_2026-04-26.csv", [
+        _alpha_row("CCC", "2026-04-26 09:45:00"),
+    ])
+
+    report = build_report(
+        alpha_path=str(tmp_path / "alpha_scores_*.csv"),
+        decision_path=tmp_path / "absent_decision.csv",
+        journal_path=tmp_path / "absent_journal.csv",
+    )
+    src = report["sources"]["alpha_scores"]
+    assert src["resolved_files"] == 3
+    assert len(src["resolved_paths"]) == 3
+    assert src["rows"] == 3
+    assert src["exists"] is True
+    assert report["totals"]["alpha_rows"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Comma-separated inputs.
+# ---------------------------------------------------------------------------
+
+
+def test_comma_separated_inputs_concatenate(tmp_path: Path):
+    p1 = _write_alpha(tmp_path / "day1.csv", [_alpha_row("AAA", "2026-04-24 09:45:00")])
+    p2 = _write_alpha(tmp_path / "day2.csv", [_alpha_row("BBB", "2026-04-25 09:45:00")])
+    df = load_alpha_scores(f"{p1},{p2}")
+    assert len(df) == 2
+    assert set(df["symbol"]) == {"AAA", "BBB"}
+
+
+def test_comma_separated_mix_of_existing_and_missing(tmp_path: Path):
+    p1 = _write_alpha(tmp_path / "day1.csv", [_alpha_row("AAA", "2026-04-24 09:45:00")])
+    # Missing file in the middle must not crash; surviving files still load.
+    spec = f"{p1},{tmp_path / 'ghost.csv'},{tmp_path / 'also_missing.csv'}"
+    df = load_alpha_scores(spec)
+    assert len(df) == 1
+    assert df["symbol"].iloc[0] == "AAA"
+
+
+# ---------------------------------------------------------------------------
+# Missing paths / empty globs don't crash.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_glob_does_not_crash(tmp_path: Path):
+    df = load_alpha_scores(str(tmp_path / "no_match_*.csv"))
+    assert len(df) == 0
+    # build_report with a fully-missing glob behaves like the
+    # missing-file case from Phase 2.5.
+    report = build_report(
+        alpha_path=str(tmp_path / "no_match_*.csv"),
+        decision_path=str(tmp_path / "no_match_dec_*.csv"),
+        journal_path=str(tmp_path / "no_match_j_*.csv"),
+    )
+    assert report["sources"]["alpha_scores"]["exists"] is False
+    assert report["sources"]["alpha_scores"]["resolved_files"] == 0
+    assert report["totals"]["alpha_rows"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Duplicate header rows inside a concatenated file are dropped.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_header_rows_are_dropped(tmp_path: Path):
+    """
+    Simulate `cat day1.csv day2.csv > merged.csv` — the second file's
+    header ends up as a data row. The loader must filter it out.
+    """
+    target = tmp_path / "merged.csv"
+    header = ",".join(ALPHA_HEADERS)
+    row1 = f"2026-04-24 09:45:00,AAA,0.9,A,buy,0.8,trending_bullish,10,10,3,gap"
+    row2 = f"2026-04-25 09:45:00,BBB,0.7,B,buy,0.7,range_bound,8,5,2,gap"
+    # Header appears TWICE — once at the top, and once again before row2
+    content = "\n".join([header, row1, header, row2]) + "\n"
+    target.write_text(content)
+
+    df = load_alpha_scores(target)
+    assert len(df) == 2
+    assert set(df["symbol"]) == {"AAA", "BBB"}
+
+
+def test_journal_duplicate_header_rows_dropped(tmp_path: Path):
+    target = tmp_path / "merged_journal.csv"
+    header = ",".join(JOURNAL_HEADERS)
+    row1 = "2026-04-24,AAA,buy,vwap_pullback,10,12,100,200,2.0,30,09:45:00,10:15:00,target_2r,"
+    row2 = "2026-04-25,BBB,buy,ema_pullback,12,11,100,-50,-0.5,20,10:00:00,10:20:00,stop_loss,"
+    content = "\n".join([header, row1, header, row2]) + "\n"
+    target.write_text(content)
+
+    df = load_journal(target)
+    assert len(df) == 2
+    assert set(df["symbol"]) == {"AAA", "BBB"}
+    assert df["entry_dt"].notna().all()
+
+
+# ---------------------------------------------------------------------------
+# JSON includes resolved file counts.
+# ---------------------------------------------------------------------------
+
+
+def test_json_includes_resolved_file_counts(tmp_path: Path):
+    _write_alpha(tmp_path / "alpha_2026-04-24.csv", [_alpha_row("AAA", "2026-04-24 09:45:00")])
+    _write_alpha(tmp_path / "alpha_2026-04-25.csv", [_alpha_row("BBB", "2026-04-25 09:45:00")])
+
+    report = build_report(
+        alpha_path=str(tmp_path / "alpha_*.csv"),
+        decision_path=tmp_path / "absent.csv",
+        journal_path=tmp_path / "absent_j.csv",
+    )
+    parsed = json.loads(format_json(report))
+    src = parsed["sources"]["alpha_scores"]
+    assert src["resolved_files"] == 2
+    assert len(src["resolved_paths"]) == 2
+    assert src["rows"] == 2
+    # All source blocks have the new fields
+    for name in ("alpha_scores", "decision_log", "journal"):
+        s = parsed["sources"][name]
+        assert "resolved_files" in s
+        assert "resolved_paths" in s
+
+
+def test_text_report_lists_individual_files_when_multiple(tmp_path: Path):
+    _write_alpha(tmp_path / "alpha_2026-04-24.csv", [_alpha_row("A", "2026-04-24 09:45:00")])
+    _write_alpha(tmp_path / "alpha_2026-04-25.csv", [_alpha_row("B", "2026-04-25 09:45:00")])
+    report = build_report(
+        alpha_path=str(tmp_path / "alpha_*.csv"),
+        decision_path=tmp_path / "absent.csv",
+        journal_path=tmp_path / "absent_j.csv",
+    )
+    txt = format_text(report)
+    assert "files=2" in txt
+    assert "alpha_2026-04-24.csv" in txt
+    assert "alpha_2026-04-25.csv" in txt
+
+
+# ---------------------------------------------------------------------------
+# CLI smoke test with glob input.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_glob_smoke(tmp_path: Path):
+    # Build two rotated alpha files + two decision files + one journal
+    _write_alpha(tmp_path / "alpha_scores_2026-04-24.csv", [
+        _alpha_row("AAA", "2026-04-24 09:45:00"),
+        _alpha_row("BBB", "2026-04-24 10:00:00"),
+    ])
+    _write_alpha(tmp_path / "alpha_scores_2026-04-25.csv", [
+        _alpha_row("CCC", "2026-04-25 09:45:00"),
+    ])
+    _write_csv(tmp_path / "decision_log_2026-04-24.csv", DECISION_HEADERS, [
+        dict(timestamp="2026-04-24 09:45:00", symbol="AAA", price=10.0,
+             gap_pct=10.0, relative_volume=10.0, volatility=3.0,
+             regime="trending_bullish", action="buy", confidence=0.8,
+             reason="executed"),
+        dict(timestamp="2026-04-24 10:00:00", symbol="BBB", price=11.0,
+             gap_pct=10.0, relative_volume=10.0, volatility=3.0,
+             regime="trending_bullish", action="buy", confidence=0.7,
+             reason="executed"),
+    ])
+    _write_csv(tmp_path / "decision_log_2026-04-25.csv", DECISION_HEADERS, [
+        dict(timestamp="2026-04-25 09:45:00", symbol="CCC", price=12.0,
+             gap_pct=10.0, relative_volume=10.0, volatility=3.0,
+             regime="trending_bullish", action="buy", confidence=0.8,
+             reason="executed"),
+    ])
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "trading_bot.analysis.alpha_report",
+            "--alpha", str(tmp_path / "alpha_scores_*.csv"),
+            "--decision", str(tmp_path / "decision_log_*.csv"),
+            "--journal", str(tmp_path / "no_journal_*.csv"),  # empty glob
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed["sources"]["alpha_scores"]["resolved_files"] == 2
+    assert parsed["sources"]["decision_log"]["resolved_files"] == 2
+    assert parsed["sources"]["journal"]["resolved_files"] == 0
+    assert parsed["totals"]["alpha_rows"] == 3
+
+
+def test_cli_comma_separated_smoke(tmp_path: Path):
+    a1 = _write_alpha(tmp_path / "a1.csv", [_alpha_row("AAA", "2026-04-24 09:45:00")])
+    a2 = _write_alpha(tmp_path / "a2.csv", [_alpha_row("BBB", "2026-04-25 09:45:00")])
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "trading_bot.analysis.alpha_report",
+            "--alpha", f"{a1},{a2}",
+            "--decision", str(tmp_path / "absent.csv"),
+            "--journal", str(tmp_path / "absent_j.csv"),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed["sources"]["alpha_scores"]["resolved_files"] == 2
+    assert parsed["totals"]["alpha_rows"] == 2
