@@ -58,6 +58,7 @@ from trading_bot.utils.notifications import NotificationManager
 from trading_bot.models.domain import FeatureSnapshot, RejectedSignal, SignalDecision
 from trading_bot.persistence.decision_log import DecisionLogger
 from trading_bot.core.alpha import AlphaFilter, AlphaLogger, RuleBasedAlphaScorer
+from trading_bot.reporting.daily_report import generate_daily_report
 from trading_bot.utils.indicators import compute_atr
 from trading_bot.utils.reports import DailySummaryReport
 
@@ -357,6 +358,11 @@ class TradingBot:
 
         # Generate and log daily summary report
         self._generate_daily_summary()
+
+        # Phase 3.2 — post-run alpha validation report. Best-effort
+        # only: any failure here is logged and swallowed so shutdown
+        # can never be delayed or blocked by post-run analytics.
+        self._generate_daily_alpha_report()
 
         log.info(
             "bot.shutdown",
@@ -1039,6 +1045,11 @@ class TradingBot:
             # Generate end-of-day report for previous day
             self._generate_daily_summary()
 
+            # Phase 3.2: alpha validation report for the day that just
+            # ended. Uses the PREVIOUS date explicitly so the dated CSVs
+            # picked up by the rotation scheme are the correct ones.
+            self._generate_daily_alpha_report(date=self._last_trading_date)
+
             # Reset all daily counters
             try:
                 equity = self._broker.get_account_equity()
@@ -1146,6 +1157,38 @@ class TradingBot:
             largest_loss=report_data.get("largest_loser", 0.0),
             ending_equity=ending_equity,
         )
+
+    def _generate_daily_alpha_report(self, date: str | None = None) -> None:
+        """
+        Write the Phase 3.2 post-run alpha validation report.
+
+        Best-effort: every failure is logged and swallowed so shutdown
+        (or the midnight-rollover reset) can never be delayed or
+        blocked by post-run analytics. No shared state is mutated.
+        """
+        data_dir = Path(self._config.journal_csv_path).parent
+        reports_dir = data_dir / "alpha_reports"
+        try:
+            result = generate_daily_report(
+                date=date,
+                data_dir=data_dir,
+                reports_dir=reports_dir,
+            )
+            if result.success:
+                log.info(
+                    "bot.daily_alpha_report_written",
+                    date=result.date,
+                    txt=str(result.txt_path),
+                    json=str(result.json_path),
+                )
+            else:
+                log.info(
+                    "bot.daily_alpha_report_skipped",
+                    date=result.date,
+                    error=result.error,
+                )
+        except Exception as exc:  # pragma: no cover — defense in depth
+            log.warning("bot.daily_alpha_report_error", error=str(exc))
 
     def _log_status(self) -> None:
         """Log periodic status update with health and regime info."""
