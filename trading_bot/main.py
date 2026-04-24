@@ -57,6 +57,7 @@ from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager
 from trading_bot.models.domain import FeatureSnapshot, RejectedSignal, SignalDecision
 from trading_bot.persistence.decision_log import DecisionLogger
+from trading_bot.core.alpha import AlphaLogger, RuleBasedAlphaScorer
 from trading_bot.utils.indicators import compute_atr
 from trading_bot.utils.reports import DailySummaryReport
 
@@ -169,6 +170,13 @@ class TradingBot:
         # shadow log — one row per candidate evaluation, always.
         decision_log_path = Path(config.journal_csv_path).parent / "decision_log.csv"
         self._decision_logger = DecisionLogger(decision_log_path)
+
+        # Phase 2 Core conversion: alpha scoring layer (SHADOW MODE ONLY).
+        # Scores every decision for offline analysis — does NOT block or
+        # approve trades. Trading behavior is identical with or without it.
+        alpha_log_path = Path(config.journal_csv_path).parent / "alpha_scores.csv"
+        self._alpha_scorer = RuleBasedAlphaScorer()
+        self._alpha_logger = AlphaLogger(alpha_log_path)
 
         # Daily auto-reset tracking
         self._last_trading_date: str | None = None
@@ -912,7 +920,12 @@ class TradingBot:
         reason: str,
         confidence: float = 0.5,
     ) -> None:
-        """Emit one row to the decision log. Safe — never raises."""
+        """
+        Emit one row to the decision log and one shadow-mode alpha score.
+
+        Safe — never raises. Alpha scoring is pure observation and cannot
+        block or approve trades (Phase 2 shadow mode).
+        """
         decision = SignalDecision(
             timestamp=now_et(),
             symbol=snapshot.symbol,
@@ -924,6 +937,15 @@ class TradingBot:
             self._decision_logger.log(snapshot, decision)
         except Exception as e:
             log.debug("bot.decision_log_error", error=str(e))
+
+        # Shadow-mode alpha score. Any failure here is silent — the
+        # trading loop never sees an exception from this path and the
+        # score is never consulted for an accept/reject decision.
+        try:
+            alpha = self._alpha_scorer.score(snapshot, decision)
+            self._alpha_logger.log(alpha, snapshot, decision)
+        except Exception as e:
+            log.debug("bot.alpha_score_error", error=str(e))
 
     def _ensure_rejected_csv(self) -> None:
         """Create the rejected signals CSV if it doesn't exist."""
