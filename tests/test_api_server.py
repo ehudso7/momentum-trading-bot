@@ -1464,3 +1464,283 @@ class TestPhase42BoundaryUnchanged:
                 assert word not in path.lower(), (
                     f"suspicious route introduced: {path}"
                 )
+
+
+# ===========================================================================
+# Phase 4.3 — public product/status landing page
+# ===========================================================================
+
+
+from trading_bot.api.server import render_landing_page_html  # noqa: E402
+
+
+class TestLandingPageIsPublic:
+    def test_root_returns_200_without_auth(self, client: TestClient):
+        resp = client.get("/")
+        assert resp.status_code == 200
+
+    def test_root_works_when_api_key_unconfigured(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        """The landing page must remain visible even before a key is
+        set — it's how a new operator discovers what to configure."""
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        resp = client.get("/")
+        assert resp.status_code == 200
+
+    def test_root_ignores_auth_header_entirely(self, client: TestClient, authed_env):
+        """Sending a wrong token must not downgrade the public page."""
+        resp = client.get(
+            "/", headers={"Authorization": "Bearer something-wrong"}
+        )
+        assert resp.status_code == 200
+
+    def test_protected_endpoints_still_require_auth_after_root_exists(
+        self, client: TestClient, authed_env
+    ):
+        """Re-assert Phase 4.0 invariant — adding / must not weaken
+        auth on any protected endpoint."""
+        for path in (
+            "/reports/latest",
+            "/reports/2026-04-24",
+            "/experiments/recent",
+            "/experiments/1",
+            "/dashboard",
+        ):
+            resp = client.get(path)
+            assert resp.status_code == 401, (
+                f"{path} must still require auth, got {resp.status_code}"
+            )
+
+
+class TestLandingPageHtml:
+    def test_returns_html_content_type(self, client: TestClient):
+        resp = client.get("/")
+        assert resp.headers["content-type"].startswith("text/html")
+
+    def test_body_is_well_formed_html(self, client: TestClient):
+        body = client.get("/").text
+        assert body.startswith("<!DOCTYPE html>")
+        assert "<html" in body and "</html>" in body
+        assert "<body>" in body and "</body>" in body
+
+    def test_includes_product_positioning(self, client: TestClient):
+        body = client.get("/").text.lower()
+        assert "read-only" in body
+        assert "guardrail" in body
+        assert "daily validation" in body
+        assert "audit trail" in body
+        assert "protected dashboard" in body
+
+    def test_mentions_tier_system_but_not_weights(self, client: TestClient):
+        body = client.get("/").text
+        # Positioning: mentions A/B/C/D/F tiers.
+        assert "A / B / C / D / F" in body or "tier" in body.lower()
+        # Must NOT name any individual scoring weight.
+        for forbidden in (
+            "gap weight", "rvol weight", "vol weight",
+            "confidence weight", "regime weight", "reason weight",
+            "GAP_WEIGHT", "TIER_A_MIN", "TIER_B_MIN",
+        ):
+            assert forbidden not in body, (
+                f"landing page mentions weight internal: {forbidden}"
+            )
+
+
+class TestLandingPageDoesNotLeakProtectedData:
+    """
+    Populate the reports dir + manifest with KNOWN markers, then hit
+    the public root endpoint and assert none of them leak into the
+    response. The landing page is fully static so this should hold
+    even when the disk is full of sensitive fixtures.
+    """
+
+    def _populate_all_markers(self, reports_dir: Path, manifest: Path) -> None:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "alpha_report_2026-04-24.json").write_text(json.dumps({
+            "report_type": "daily_alpha_validation",
+            "report_date": "2026-04-24",
+            "scorer_fingerprint": "f" * 64,
+            "scorer_config": {"weights": {"gap": 0.2},
+                              "unique_marker_scorer_LEAK_1": True},
+            "sources": {
+                "alpha_scores": {"path": "/srv/private/UNIQUE_PATH_LEAK_2",
+                                 "exists": True, "rows": 1,
+                                 "resolved_files": 1,
+                                 "resolved_paths": ["/srv/private/x.csv"]},
+                "decision_log": {"exists": True, "rows": 1,
+                                 "resolved_files": 1},
+                "journal": {"exists": True, "rows": 1, "resolved_files": 1},
+            },
+            "totals": {"alpha_rows": 1, "buy_rows": 1, "skip_rows": 0,
+                       "matched_trades": 1, "journal_trades": 1},
+            "guardrails": {"status": "ok",
+                           "reasons": ["UNIQUE_REASON_LEAK_3"],
+                           "recommended_action": "no action"},
+        }))
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps({
+            "timestamp": "2026-04-24T00:00:00",
+            "report_date": "2026-04-24",
+            "scorer_fingerprint": "f" * 64,
+            "scorer_config": {"weights": {"gap": 0.2}},
+            "env": {"TRADING_ALPHA_FILTER_ENABLED": "true"},
+            "report_paths": {"text": "/srv/private/UNIQUE_PATH_LEAK_4.txt",
+                             "json": "/srv/private/UNIQUE_PATH_LEAK_4.json"},
+            "totals": {"matched_trades": 1},
+            "promotion_readiness": {"status": "promising"},
+            "guardrails": {"status": "warning",
+                           "reasons": ["UNIQUE_MANIFEST_LEAK_5"]},
+        }) + "\n")
+
+    def test_root_does_not_leak_report_data(
+        self, client: TestClient, authed_env
+    ):
+        self._populate_all_markers(
+            authed_env["reports_dir"], authed_env["manifest"],
+        )
+        body = client.get("/").text
+        # Unique markers planted in the fixtures MUST NOT appear.
+        assert "UNIQUE_PATH_LEAK_2" not in body
+        assert "UNIQUE_PATH_LEAK_4" not in body
+        assert "UNIQUE_REASON_LEAK_3" not in body
+        assert "UNIQUE_MANIFEST_LEAK_5" not in body
+        assert "unique_marker_scorer_LEAK_1" not in body
+        # And the raw fingerprint hash of the planted fixture.
+        assert "f" * 64 not in body
+
+    def test_root_does_not_include_scorer_config(self, client: TestClient):
+        body = client.get("/").text
+        assert "scorer_config" not in body
+        # The words "weight" / "0.2" might exist in prose; the specific
+        # field name "scorer_config" must not.
+
+    def test_root_does_not_expose_raw_paths(self, client: TestClient):
+        body = client.get("/").text
+        for bad in ("/srv/", "/var/lib/", "/tmp/",
+                    "/home/", "/data/alpha_experiments.jsonl"):
+            assert bad not in body, f"path leaked: {bad}"
+
+    def test_root_does_not_reveal_api_key_env_name(
+        self, client: TestClient
+    ):
+        """Per spec: no API key hints beyond 'protected dashboard'."""
+        body = client.get("/").text
+        # The specific env var name must not appear — that would be
+        # a hint useful only to an attacker, not to operators (who
+        # find it via docs, not via the landing page).
+        assert "TRADING_API_KEY" not in body
+
+
+class TestLandingPageNoMutatingControls:
+    def test_no_form_or_inputs_or_buttons(self, client: TestClient):
+        body = client.get("/").text.lower()
+        for token in (
+            "<form", "<input", "<button",
+            "onclick", "onsubmit", "onchange",
+            "method=\"post\"", "method=\"put\"",
+            "method=\"patch\"", "method=\"delete\"",
+            "method='post'", "method='put'",
+            "method='patch'", "method='delete'",
+        ):
+            assert token not in body, (
+                f"landing page includes mutating marker: {token}"
+            )
+
+    def test_no_execution_control_terms(self, client: TestClient):
+        body = client.get("/").text.lower()
+        for term in (
+            "place trade", "execute trade", "submit order",
+            "start bot", "stop bot", "enable filter", "disable filter",
+            "toggle filter", "run simulation", "backtest now",
+            "place order", "make trade",
+        ):
+            assert term not in body, (
+                f"landing page surfaces an execution-adjacent term: {term}"
+            )
+
+    def test_no_script_or_js_loaders(self, client: TestClient):
+        body = client.get("/").text.lower()
+        # No JS at all — matches the CSP script-src 'none' directive.
+        assert "<script" not in body
+        assert "javascript:" not in body
+
+
+class TestLandingPageBoundaryUnchanged:
+    def test_forbidden_imports_still_enforced(self):
+        """Re-assert Phase 4.0 invariant after Phase 4.3."""
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for forbidden in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert forbidden not in src, (
+                f"SaaS boundary broken by Phase 4.3: {forbidden!r}"
+            )
+
+    def test_still_only_read_verbs_after_phase_4_3(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            for m in methods:
+                assert m in {"GET", "HEAD", "OPTIONS"}, (
+                    f"non-read-only method introduced: {m} {route.path}"
+                )
+
+    def test_landing_route_accepts_only_get_head_options(self):
+        for route in app.routes:
+            if getattr(route, "path", "") == "/":
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"})
+                break
+        else:
+            raise AssertionError("/ route not registered")
+
+    def test_landing_path_not_banned_substring(self):
+        banned = [
+            "/trade", "/order", "/execute", "/run",
+            "/simulate", "/backtest", "/live", "/paper",
+            "/scorer", "/filter",
+        ]
+        for word in banned:
+            assert word not in "/", (
+                f"/ (root) should not contain banned word: {word}"
+            )
+
+
+class TestRenderLandingPageHtmlPure:
+    def test_is_pure_no_io(self):
+        """Calling the renderer with no env / no disk setup still works."""
+        html1 = render_landing_page_html()
+        html2 = render_landing_page_html()
+        # Deterministic — no timestamps, no dynamic content.
+        assert html1 == html2
+        assert html1.startswith("<!DOCTYPE html>")
+
+    def test_does_not_depend_on_env_or_disk(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """Even with the reports / manifest env vars pointing at
+        populated files, the landing page output is unchanged."""
+        # No env set
+        baseline = render_landing_page_html()
+        # Populate disk + env
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(tmp_path / "reports"))
+        monkeypatch.setenv(
+            MANIFEST_PATH_ENV_VAR, str(tmp_path / "manifest.jsonl")
+        )
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({"report_date": "2026-04-24",
+                        "leak_marker": "ABSOLUTELY_MUST_NOT_APPEAR"})
+        )
+        populated = render_landing_page_html()
+        assert baseline == populated
+        assert "ABSOLUTELY_MUST_NOT_APPEAR" not in populated

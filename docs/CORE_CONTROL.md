@@ -539,6 +539,7 @@ trading decision or scoring internal.
 
 | Method | Path                       | Auth | Description |
 | ---    | ---                        | ---  | --- |
+| GET    | `/`                        | No   | Public product / status page (Phase 4.3). |
 | GET    | `/health`                  | No   | Liveness probe. |
 | GET    | `/reports/latest`          | Yes  | Most recent daily report (sanitized). |
 | GET    | `/reports/{date}`          | Yes  | Report for `YYYY-MM-DD` (sanitized). |
@@ -741,6 +742,62 @@ uvicorn trading_bot.api.server:app \
 - It does not expose `scorer_config`, raw paths, or secrets.
 - It does not automate or enable TLS — a reverse proxy (Caddy,
   nginx, Cloudflare) must terminate TLS in front of the app.
+
+### Phase 4.3 — public product / status landing page
+
+`GET /` now serves a publicly-accessible HTML page that explains the
+analytics product without exposing a single byte of protected
+content. Intended as both a marketing-style product page and a
+"healthy deployment" confirmation for operators.
+
+**Fully static by construction.** The handler returns the output of
+`render_landing_page_html()`, a pure function with no I/O:
+
+- Does not read any report file.
+- Does not read the experiment manifest.
+- Does not inspect env vars.
+- Does not call a database or subprocess.
+
+Because there is no dynamic substitution, the page cannot leak
+scorer_config, filesystem paths, bearer tokens, report data,
+experiment data, or anything else live. The Phase 4.3 tests plant
+unique-marker strings into the reports directory and manifest,
+request `/`, and assert none of the markers appear in the body.
+
+**Content (read-only positioning, no operational data):**
+
+1. "What this is" — the analytics-layer elevator pitch.
+2. "Read-only alpha analytics" — A/B/C/D/F tiers, aggregated stats,
+   shadow-filter simulation — WITHOUT ever gating a live trade.
+3. "Guardrail monitoring" — names the four statuses
+   (`ok` / `warning` / `critical` / `insufficient_data`) and explains
+   what they classify.
+4. "Daily validation reports" — one text + JSON pair per day.
+5. "Experiment audit trail" — the Phase 3.6 append-only manifest.
+6. "Protected dashboard" — operators with an API key can visit
+   `/dashboard`; no login UI, no API-key hint beyond that sentence.
+7. "Safety invariants" — bulleted summary of what the service will
+   never do (execute, simulate, write to disk, import Core).
+8. Footer — one-liner "all analytics endpoints require a Bearer API key".
+
+**What the landing page MUST NOT contain** (enforced by tests):
+
+- Live report or experiment data (any field value pulled from disk).
+- Strings like `scorer_config`, `GAP_WEIGHT`, `TIER_A_MIN`.
+- Filesystem paths (`/srv/`, `/var/lib/`, `/tmp/`, `/data/...`).
+- The env-var name `TRADING_API_KEY`.
+- Any `<form>`, `<input>`, `<button>`, `onclick`, `onsubmit`,
+  `onchange`, or `method=POST|PUT|PATCH|DELETE`.
+- Any `<script>` or `javascript:` URL — consistent with the CSP
+  `script-src 'none'` directive.
+- Phrases that imply operator controls: "place trade", "execute
+  trade", "submit order", "enable/disable filter", "run simulation",
+  "start bot", etc.
+
+**Protected endpoints are unchanged.** `TestLandingPageIsPublic::
+test_protected_endpoints_still_require_auth_after_root_exists`
+explicitly re-asserts that every `/reports/*`, `/experiments/*`,
+and `/dashboard` request without a Bearer token still returns 401.
 
 
 ## Phase 2.7 — dataset rotation (reference)

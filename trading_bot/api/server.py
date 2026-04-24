@@ -470,6 +470,127 @@ def health() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.3 — public product/status landing page
+#
+# Fully static HTML. The route handler returns the page verbatim — it
+# reads no report, opens no manifest, issues no subprocess, and calls
+# no helper that performs I/O. Because nothing dynamic is injected,
+# the page cannot by construction expose scorer_config, paths, secrets,
+# report/experiment data, or anything else protected.
+# ---------------------------------------------------------------------------
+
+
+# Static body of the product / status page. Contains no dynamic
+# data, no I/O, no secrets — by construction the handler cannot
+# leak anything protected. The CSS block is supplied by
+# `_DASHBOARD_CSS` (defined further down); referenced at request
+# time via `render_landing_page_html()` to avoid module-ordering
+# issues.
+_LANDING_PAGE_BODY = (
+    "<body>"
+    "<h1>Momentum Trading Bot — Analytics</h1>"
+    "<p class=\"meta\">Read-only SaaS layer. No trading. No execution.</p>"
+    "<section>"
+    "<h2>What this is</h2>"
+    "<p>A strictly read-only analytics surface over a momentum "
+    "day-trading bot. The service publishes daily validation "
+    "reports, tracks alpha performance over time, and surfaces "
+    "guardrails when the system detects drift — without exposing "
+    "any execution path, scoring internals, or account state.</p>"
+    "</section>"
+    "<section>"
+    "<h2>Read-only alpha analytics</h2>"
+    "<p>Every candidate the bot evaluates is scored into a tier "
+    "(A / B / C / D / F). This service publishes aggregated "
+    "tier statistics, decile calibration, and shadow-filter "
+    "simulation rows so you can see how the scorer would have "
+    "performed — without it ever gating a live trade.</p>"
+    "</section>"
+    "<section>"
+    "<h2>Guardrail monitoring</h2>"
+    "<p>Each trading day is classified as "
+    "<strong>ok</strong>, <strong>warning</strong>, "
+    "<strong>critical</strong>, or "
+    "<strong>insufficient_data</strong> based on whether the "
+    "filter would have kept trades that did better than the ones "
+    "it would have rejected. The status and the reasons behind it "
+    "are surfaced via the API and the operator dashboard.</p>"
+    "</section>"
+    "<section>"
+    "<h2>Daily validation reports</h2>"
+    "<p>One plain-text + JSON validation report per trading day, "
+    "with tier stats, promotion-readiness, shadow-filter "
+    "simulation, and the day's guardrail outcome. Generated "
+    "automatically at session end — no manual rebuild step.</p>"
+    "</section>"
+    "<section>"
+    "<h2>Experiment audit trail</h2>"
+    "<p>Every daily report appends one record to an append-only "
+    "manifest so the exact configuration behind every guardrail "
+    "outcome is reproducible. No secrets are stored: webhook URLs "
+    "are recorded only as a presence boolean.</p>"
+    "</section>"
+    "<section>"
+    "<h2>Protected dashboard</h2>"
+    "<p>Operators with a valid API key can access a read-only HTML "
+    "dashboard that combines the latest validation report and the "
+    "most recent experiment records. The dashboard ships no "
+    "execution controls, no scoring weights, and no account data.</p>"
+    "</section>"
+    "<section>"
+    "<h2>Safety invariants</h2>"
+    "<ul>"
+    "<li>No endpoint executes, simulates, or automates a trade.</li>"
+    "<li>No endpoint writes to disk.</li>"
+    "<li>The service imports nothing from the live trading pipeline.</li>"
+    "<li>The only mutating action anywhere in this service is an "
+    "operator toggling an environment variable.</li>"
+    "</ul>"
+    "</section>"
+    "<footer>"
+    "This landing page is public. All analytics endpoints require "
+    "a Bearer API key."
+    "</footer>"
+    "</body></html>"
+)
+
+
+def render_landing_page_html() -> str:
+    """
+    Build the public landing page. Pure function — no I/O, no env
+    reads, no config lookup. Tests can call this directly.
+    """
+    return (
+        "<!DOCTYPE html>"
+        "<html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<title>Momentum Trading Bot — Analytics</title>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<meta name=\"description\" content=\""
+        "Read-only analytics, guardrail monitoring, and audit-trail API "
+        "for the Momentum Trading Bot. No trading endpoints, no execution "
+        "controls, no account data."
+        "\">"
+        + _DASHBOARD_CSS +
+        "</head>"
+        + _LANDING_PAGE_BODY
+    )
+
+
+@app.get("/", response_class=HTMLResponse, tags=["public"])
+def landing_page() -> HTMLResponse:
+    """
+    Public product/status page. Intentionally unauthenticated.
+
+    Fully static — the handler returns the output of a pure
+    function with no access to reports, manifest, environment
+    secrets, or any other dynamic input. This is the only way to
+    guarantee the page cannot leak protected content.
+    """
+    return HTMLResponse(content=render_landing_page_html(), status_code=200)
+
+
 @app.get(
     "/reports/latest",
     tags=["reports"],
