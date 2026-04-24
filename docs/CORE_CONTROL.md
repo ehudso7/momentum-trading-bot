@@ -34,6 +34,7 @@ See also:
 | `STRIPE_PRICE_ID_PREMIUM`              | `price_...`      | *(unset)* | SaaS API only | Informational — operator-facing reference to the premium product. Not read by this codebase. (Phase 4.7) |
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH`    | path             | `data/stripe_premium_keys.json` | SaaS API only | Persistent JSON list of opaque API-key strings with active subscriptions. Survives restarts. (Phase 4.7) |
 | `TRADING_API_CONVERSION_LOG_PATH`      | path             | `data/api_conversions.jsonl` | SaaS API only | Append-only JSONL of free → paid conversion events. Hashed keys only — no PII, no card data. (Phase 4.9) |
+| `TRADING_API_GROWTH_LOG_PATH`          | path             | `data/api_growth.jsonl`      | SaaS API only | Append-only JSONL of `?ref=<code>` referral events. Dedup'd per (hash, ref) within 24h. Hashed keys only. (Phase 5.1) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -1402,6 +1403,140 @@ conversions by price_id   = count(*) group by conversion.price_id
 
 All of it is plain SQL / pandas on two JSONL files — no database,
 no PII, no card data.
+
+### Phase 5.1 — growth loop tracking
+
+Records one JSONL event to `TRADING_API_GROWTH_LOG_PATH` whenever
+an **authenticated** caller hits any endpoint with a `?ref=<code>`
+query parameter. Pair this with the Phase 5.0 pricing report to
+identify which referral / distribution sources drive actual usage
+and conversion — instead of just "pageviews" from marketing tools.
+
+No new env var required for the feature to work; it's always on.
+Events are append-only JSONL with the same schema discipline as
+every other Core-conversion log (hashed keys only, no PII).
+
+#### Record shape
+
+| Field          | Description |
+| ---            | --- |
+| `timestamp`    | UTC `YYYY-MM-DDTHH:MM:SS.ffffffZ` |
+| `api_key_hash` | `SHA-256(api_key)[:32]` — identical scheme to server / billing / conversion / usage logs, so this file JOINs with all of them on one column |
+| `ref_code`     | Sanitized `?ref=` value — only `[A-Za-z0-9\-_:.]` survives, capped at 64 chars |
+| `path`         | `request.url.path` (HTTP route, not any query-string content) |
+| `request_id`   | Matches the `X-Request-ID` returned on the response, so a single request can be traced across audit + usage + growth |
+
+Example record:
+
+```json
+{
+  "timestamp": "2026-04-18T10:00:00.000000Z",
+  "api_key_hash": "0f0dc1c3ff361d4e3948d6fa7752e7f6",
+  "ref_code": "hn_launch",
+  "path": "/reports/latest",
+  "request_id": "a18664d06c464ccab2eca45706f2aff3"
+}
+```
+
+#### Dedup policy
+
+The same `(api_key_hash, ref_code)` pair is recorded at most ONCE
+per sliding 24-hour window. A user who reloads the same
+`?ref=hn_launch` URL a hundred times counts as one. A user who
+clicks two distinct ref codes (`hn_launch` then `twitter_q2`)
+produces two rows.
+
+Dedup survives process restarts: on first call the in-memory
+cache rehydrates from recent rows in the file.
+
+Constants:
+
+- `DEDUP_WINDOW_HOURS = 24`
+- `DEDUP_WINDOW_SECONDS = 86_400`
+
+#### Integration point
+
+`trading_bot.api.server.growth_middleware` runs after
+`usage_middleware` (so it sees the validated
+`request.state.api_key`) but before `cors_middleware`. If
+`?ref=` is present AND the caller is authenticated, it calls
+`trading_bot.api.growth.record_growth_event(...)` inside a
+try/except so any write failure is logged at DEBUG and
+swallowed. `test_does_not_break_request_if_growth_write_fails`
+stubs the writer to raise and asserts the response is still 200.
+
+#### Safety / privacy invariants (enforced by tests)
+
+- **No raw API key on disk.** Planted unique-marker token in the
+  API key → absent from the growth file.
+- **ref_code sanitized before persistence.** `<script>`-shaped
+  input is stripped of `<`, `>`, and any other non-safe char
+  before anything is written. Tests:
+  `test_bogus_ref_chars_sanitized_in_file`.
+- **No `Authorization`, `Bearer`, `email`, `password`, `pan`,
+  `cvv`, or `card` words in the file.** Not added by this module,
+  and the autouse test sweeps the file for all of them.
+- **Public endpoints don't record.** `/health?ref=...` never
+  creates a row because `require_api_key` never runs for
+  public paths, so `request.state.api_key` stays unset.
+- **Unauthenticated requests don't record.** 401 responses on
+  protected endpoints produce no growth rows either.
+- **No Core imports.** Boundary test re-greps `growth.py` for
+  `trading_bot.core.*`, `execution`, `portfolio`, `risk`,
+  `scanners`, `strategies`, `main` — zero matches.
+
+#### CLI
+
+```
+python -m trading_bot.api.growth --summary
+python -m trading_bot.api.growth --summary --json
+python -m trading_bot.api.growth --summary --top 5
+python -m trading_bot.api.growth --summary --path path/to/file.jsonl
+```
+
+Sample text output:
+
+```
+Total growth events    = 10
+Distinct ref codes     = 3
+Distinct unique users  = 9
+
+  ref_code                           events  unique_users   paths
+  ---------------------------------------------------------------
+  hn_launch                               5             5       1
+  twitter_q2                              3             3       1
+  newsletter_apr                          2             2       1
+```
+
+Sample JSON output:
+
+```json
+{
+  "total_events": 10,
+  "distinct_refs": 3,
+  "distinct_users": 9,
+  "refs": [
+    {"ref_code": "hn_launch",      "events": 5, "unique_users": 5, "paths": 1},
+    {"ref_code": "twitter_q2",     "events": 3, "unique_users": 3, "paths": 1},
+    {"ref_code": "newsletter_apr", "events": 2, "unique_users": 2, "paths": 1}
+  ]
+}
+```
+
+#### What you can compute with this
+
+- **Unique users per ref code** — drives "which distribution channel
+  actually brings new active users" (vs. just bot / click traffic).
+- **Paths per ref code** — how many different endpoints a source's
+  users end up touching. Deep engagement signal.
+- **Overlap between refs** — join the growth log with itself on
+  `api_key_hash` to see users who arrived via both `hn_launch` and
+  `twitter_q2`.
+- **Conversion per ref** — join the growth log with the Phase 4.9
+  conversion log on `api_key_hash`; count how many users in each
+  ref bucket also appear as `event == "converted"`. Now you have
+  a per-channel conversion rate with no PII, no tracking pixel,
+  no third-party analytics.
 
 
 ## Phase 2.7 — dataset rotation (reference)

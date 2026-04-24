@@ -822,6 +822,52 @@ async def usage_middleware(request: Request, call_next):
 
 
 @app.middleware("http")
+async def growth_middleware(request: Request, call_next):
+    """
+    Phase 5.1 — record a growth event iff the authenticated caller
+    supplied a ``?ref=<code>`` query parameter.
+
+    Skipped for:
+      - unauthenticated requests (``request.state.api_key`` unset).
+      - requests without a ``ref`` query param or with an empty /
+        invalid one (the growth module sanitizes to a safe charset).
+
+    Best-effort: every exception from the growth writer is caught
+    and logged at DEBUG so the trading-bot's read-only API remains
+    unaffected by a disk-full / permissions failure here.
+
+    Registered AFTER ``usage_middleware`` but BEFORE ``cors`` — the
+    order is immaterial for correctness since both read
+    ``request.state.api_key`` in their POST phase, but this keeps
+    the three "per-request record" middlewares adjacent.
+    """
+    response: Response = await call_next(request)
+    try:
+        api_key = getattr(
+            getattr(request, "state", None), "api_key", None,
+        )
+        if not api_key:
+            return response
+        raw_ref = request.query_params.get("ref")
+        if not raw_ref:
+            return response
+        # Lazy-import to keep the SaaS boundary unambiguously clean:
+        # growth is an API-layer sibling, not Core.
+        from trading_bot.api.growth import record_growth_event
+        record_growth_event(
+            api_key=api_key,
+            ref_code=raw_ref,
+            path=request.url.path,
+            request_id=getattr(
+                getattr(request, "state", None), "request_id", None,
+            ),
+        )
+    except Exception as exc:
+        log.debug("growth.middleware_error", error=str(exc))
+    return response
+
+
+@app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     """
     Tiny read-only CORS implementation driven by
