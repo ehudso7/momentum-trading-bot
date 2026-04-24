@@ -37,8 +37,19 @@ DEFAULT_ALPHA_CSV = "data/alpha_scores.csv"
 DEFAULT_DECISION_CSV = "data/decision_log.csv"
 DEFAULT_JOURNAL_CSV = "data/journal.csv"
 DEFAULT_MATCH_TOLERANCE_MINUTES = 5
+DEFAULT_MIN_REQUIRED_OUTCOMES = 100
 
 TIER_ORDER: list[str] = ["A", "B", "C", "D", "F"]
+HIGH_TIERS: list[str] = ["A", "B"]
+LOW_TIERS: list[str] = ["C", "D", "F"]
+
+# Ten decile buckets [0.0, 0.1), [0.1, 0.2), …, [0.9, 1.0] — the last
+# bucket is extended by an epsilon so a score of exactly 1.0 is captured.
+DECILE_BINS: list[float] = [i / 10.0 for i in range(11)]
+DECILE_BINS[-1] = 1.0 + 1e-9  # include 1.0 in the last bucket
+DECILE_LABELS: list[str] = [
+    f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10)
+]
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +340,181 @@ def regime_stats(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.6 — score-decile calibration.
+# ---------------------------------------------------------------------------
+
+
+def decile_stats(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """
+    Bin alpha scores into 10 deciles of width 0.1 and compute per-bucket
+    stats. Bucketing is left-closed / right-open except the last bucket,
+    which includes a score of exactly 1.0.
+
+    Always returns all 10 rows, in ascending order, so a consumer can
+    render a clean calibration curve even when some bins are empty.
+    """
+    out: list[dict[str, Any]] = []
+    if df.empty or "score" not in df.columns:
+        for lbl in DECILE_LABELS:
+            row = {"decile": lbl}
+            row.update(_group_row(df.head(0)))
+            out.append(row)
+        return out
+
+    scores = pd.to_numeric(df["score"], errors="coerce").clip(
+        lower=0.0, upper=1.0
+    )
+    df2 = df.copy()
+    df2["_decile"] = pd.cut(
+        scores,
+        bins=DECILE_BINS,
+        labels=DECILE_LABELS,
+        include_lowest=True,
+        right=False,
+    )
+
+    for lbl in DECILE_LABELS:
+        g = df2[df2["_decile"] == lbl]
+        row = {"decile": lbl}
+        row.update(_group_row(g))
+        out.append(row)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.6 — promotion readiness.
+# ---------------------------------------------------------------------------
+
+
+def _ab_outperforms(
+    ab_wr: Optional[float],
+    cdf_wr: Optional[float],
+    ab_r: Optional[float],
+    cdf_r: Optional[float],
+    ab_n: int,
+    cdf_n: int,
+) -> bool:
+    """
+    Has the A/B tier cohort demonstrably beaten the C/D/F tier cohort?
+
+    - No outcomes on A/B → cannot outperform.
+    - Only A/B has outcomes (C/D/F all skipped → no realized trades):
+      fall back to an absolute positive-expectancy heuristic.
+    - Both sides have outcomes: require A/B to beat C/D/F on both
+      win rate AND avg R-multiple, to avoid declaring victory from a
+      single flaky metric.
+    """
+    if ab_n == 0:
+        return False
+    if cdf_n == 0:
+        if ab_wr is not None and ab_wr >= 0.5:
+            return True
+        if ab_r is not None and ab_r > 0.5:
+            return True
+        return False
+    wr_ok = ab_wr is not None and cdf_wr is not None and ab_wr > cdf_wr
+    r_ok = ab_r is not None and cdf_r is not None and ab_r > cdf_r
+    return wr_ok and r_ok
+
+
+def promotion_readiness(
+    joined: pd.DataFrame,
+    min_required_outcomes: int = DEFAULT_MIN_REQUIRED_OUTCOMES,
+) -> dict[str, Any]:
+    """
+    Assess whether the alpha scores are predictive enough to graduate
+    out of shadow mode. Returns a status string plus the underlying
+    numbers the decision was based on.
+
+    Status transitions:
+      - "not_ready"                    : fewer than min_required_outcomes and
+                                         no clear A/B edge visible.
+      - "weak"                         : enough outcomes but A/B fails to
+                                         outperform C/D/F.
+      - "promising"                    : A/B outperforms but sample is small.
+      - "ready_for_shadow_filter_test" : A/B outperforms AND we have at
+                                         least min_required_outcomes total.
+    """
+    ab_pnl = pd.Series([], dtype=float)
+    cdf_pnl = pd.Series([], dtype=float)
+    ab_rr = pd.Series([], dtype=float)
+    cdf_rr = pd.Series([], dtype=float)
+
+    if not joined.empty and "tier" in joined.columns:
+        tier_col = joined["tier"].astype(str)
+        ab_df = joined[tier_col.isin(HIGH_TIERS)]
+        cdf_df = joined[tier_col.isin(LOW_TIERS)]
+        ab_pnl = _numeric_series(ab_df, "pnl")
+        cdf_pnl = _numeric_series(cdf_df, "pnl")
+        ab_rr = _numeric_series(ab_df, "rr_ratio")
+        cdf_rr = _numeric_series(cdf_df, "rr_ratio")
+
+    ab_n = int(len(ab_pnl))
+    cdf_n = int(len(cdf_pnl))
+    total_outcomes = ab_n + cdf_n
+
+    ab_wr: Optional[float] = (
+        float((ab_pnl > 0).sum()) / ab_n if ab_n > 0 else None
+    )
+    cdf_wr: Optional[float] = (
+        float((cdf_pnl > 0).sum()) / cdf_n if cdf_n > 0 else None
+    )
+    ab_r: Optional[float] = float(ab_rr.mean()) if not ab_rr.empty else None
+    cdf_r: Optional[float] = (
+        float(cdf_rr.mean()) if not cdf_rr.empty else None
+    )
+
+    outperforms = _ab_outperforms(ab_wr, cdf_wr, ab_r, cdf_r, ab_n, cdf_n)
+    enough = total_outcomes >= max(1, int(min_required_outcomes))
+
+    if outperforms and enough:
+        status = "ready_for_shadow_filter_test"
+        explanation = (
+            f"A/B tiers outperform C/D/F and sample size "
+            f"{total_outcomes} >= {min_required_outcomes} outcomes."
+        )
+    elif outperforms:
+        status = "promising"
+        explanation = (
+            f"A/B tiers outperform but sample is small "
+            f"({total_outcomes}/{min_required_outcomes} outcomes)."
+        )
+    elif enough:
+        status = "weak"
+        explanation = (
+            f"A/B tiers fail to outperform C/D/F over "
+            f"{total_outcomes} outcomes."
+        )
+    else:
+        status = "not_ready"
+        explanation = (
+            f"Insufficient outcomes ({total_outcomes}/"
+            f"{min_required_outcomes}) to assess."
+        )
+
+    def _round(v: Optional[float], nd: int = 4) -> Optional[float]:
+        return round(v, nd) if v is not None else None
+
+    return {
+        "status": status,
+        "explanation": explanation,
+        "min_required_outcomes": int(min_required_outcomes),
+        "outcome_count": total_outcomes,
+        "ab_outperforms": outperforms,
+        "ab": {
+            "outcome_count": ab_n,
+            "win_rate": _round(ab_wr),
+            "avg_r_multiple": _round(ab_r),
+        },
+        "cdf": {
+            "outcome_count": cdf_n,
+            "win_rate": _round(cdf_wr),
+            "avg_r_multiple": _round(cdf_r),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Report builder.
 # ---------------------------------------------------------------------------
 
@@ -338,6 +524,7 @@ def build_report(
     decision_path: Union[str, Path] = DEFAULT_DECISION_CSV,
     journal_path: Union[str, Path] = DEFAULT_JOURNAL_CSV,
     tolerance_minutes: int = DEFAULT_MATCH_TOLERANCE_MINUTES,
+    min_required_outcomes: int = DEFAULT_MIN_REQUIRED_OUTCOMES,
 ) -> dict[str, Any]:
     """Assemble the full analysis report as a plain dict."""
     alpha_df = load_alpha_scores(alpha_path)
@@ -395,6 +582,10 @@ def build_report(
         "tier_stats": tier_stats(joined),
         "reason_stats": reason_stats(joined),
         "regime_stats": regime_stats(joined),
+        "decile_stats": decile_stats(joined),
+        "promotion_readiness": promotion_readiness(
+            joined, min_required_outcomes=min_required_outcomes
+        ),
         "notes": notes,
     }
 
@@ -470,6 +661,32 @@ def format_text(report: dict[str, Any]) -> str:
     _section("By tier", "tier", report["tier_stats"])
     _section("By reason (top first)", "reason", report["reason_stats"])
     _section("By regime", "regime", report["regime_stats"])
+    _section("By score decile", "decile", report.get("decile_stats", []))
+
+    readiness = report.get("promotion_readiness")
+    if readiness:
+        lines.append("")
+        lines.append("Promotion readiness:")
+        lines.append(f"  status      = {readiness['status']}")
+        lines.append(
+            f"  outcomes    = {readiness['outcome_count']}/"
+            f"{readiness['min_required_outcomes']} required"
+        )
+        lines.append(
+            f"  explanation = {readiness.get('explanation', '')}"
+        )
+        ab = readiness.get("ab", {})
+        cdf = readiness.get("cdf", {})
+        lines.append(
+            f"  A/B tiers   : outcomes={ab.get('outcome_count', 0):<4} "
+            f"win_rate={_fmt(ab.get('win_rate'), '.2%')} "
+            f"avg_R={_fmt(ab.get('avg_r_multiple'), '.2f')}"
+        )
+        lines.append(
+            f"  C/D/F tiers : outcomes={cdf.get('outcome_count', 0):<4} "
+            f"win_rate={_fmt(cdf.get('win_rate'), '.2%')} "
+            f"avg_R={_fmt(cdf.get('avg_r_multiple'), '.2f')}"
+        )
 
     if report.get("notes"):
         lines.append("")
@@ -508,6 +725,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tolerance", type=int,
                         default=DEFAULT_MATCH_TOLERANCE_MINUTES,
                         help="Minutes of slack when joining alpha rows to trades")
+    parser.add_argument("--min-outcomes", dest="min_outcomes", type=int,
+                        default=DEFAULT_MIN_REQUIRED_OUTCOMES,
+                        help=(
+                            "Minimum realized-outcome count required for "
+                            "promotion readiness to leave the 'not_ready' "
+                            f"state (default: {DEFAULT_MIN_REQUIRED_OUTCOMES})"
+                        ))
     parser.add_argument("--json", action="store_true",
                         help="Emit JSON instead of plain text")
     parser.add_argument("--output", default=None,
@@ -524,6 +748,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         decision_path=args.decision,
         journal_path=args.journal,
         tolerance_minutes=args.tolerance,
+        min_required_outcomes=args.min_outcomes,
     )
 
     payload = format_json(report) if args.json else format_text(report)

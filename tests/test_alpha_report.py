@@ -23,8 +23,11 @@ import pytest
 
 from trading_bot.analysis import alpha_report
 from trading_bot.analysis.alpha_report import (
+    DECILE_LABELS,
+    DEFAULT_MIN_REQUIRED_OUTCOMES,
     TIER_ORDER,
     build_report,
+    decile_stats,
     format_json,
     format_text,
     join_outcomes,
@@ -32,6 +35,7 @@ from trading_bot.analysis.alpha_report import (
     load_decision_log,
     load_journal,
     main,
+    promotion_readiness,
     reason_stats,
     regime_stats,
     tier_stats,
@@ -515,3 +519,296 @@ def test_loaders_return_empty_dataframes_when_missing(tmp_path: Path):
 
 # Also import pandas for a test above
 import pandas as pd  # noqa: E402
+
+
+# ===========================================================================
+# Phase 2.6 — decile calibration + promotion readiness.
+# ===========================================================================
+
+
+def _make_joined_frame(
+    tier_outcomes: dict[str, list[float]],
+    rr_map: dict[str, list[float]] | None = None,
+) -> pd.DataFrame:
+    """
+    Build a joined DataFrame from {tier: [pnl, pnl, ...]} fixtures.
+
+    One row per pnl entry; tier rows without an rr entry default to
+    pnl/100 so avg_r_multiple tracks sign/magnitude intuitively.
+    """
+    rows: list[dict] = []
+    for tier, pnl_list in tier_outcomes.items():
+        rr_list = (rr_map or {}).get(tier) or [p / 100.0 for p in pnl_list]
+        for i, (pnl, rr) in enumerate(zip(pnl_list, rr_list)):
+            rows.append({
+                "symbol": f"{tier}{i}",
+                "tier": tier,
+                "score": {
+                    "A": 0.90, "B": 0.70, "C": 0.55,
+                    "D": 0.40, "F": 0.20,
+                }[tier],
+                "action": "buy",
+                "regime": "trending_bullish",
+                "confidence": 0.8,
+                "pnl": pnl,
+                "rr_ratio": rr,
+                "matched": True,
+            })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Decile binning.
+# ---------------------------------------------------------------------------
+
+
+def test_decile_stats_returns_all_ten_buckets_in_order():
+    stats = decile_stats(pd.DataFrame())
+    assert [r["decile"] for r in stats] == DECILE_LABELS
+    for row in stats:
+        assert row["count"] == 0
+        assert row["win_rate"] is None
+
+
+def test_decile_binning_assigns_scores_correctly():
+    # One row per representative score, confirm it lands in the intended bin.
+    df = pd.DataFrame(
+        {
+            "score": [0.00, 0.05, 0.10, 0.25, 0.49, 0.50, 0.75, 0.90, 0.95, 1.00],
+            "action": ["skip"] * 10,
+            "tier": ["F"] * 10,
+            "regime": ["range_bound"] * 10,
+        }
+    )
+    stats = {r["decile"]: r for r in decile_stats(df)}
+    assert stats["0.0-0.1"]["count"] == 2  # 0.00, 0.05
+    assert stats["0.1-0.2"]["count"] == 1  # 0.10
+    assert stats["0.2-0.3"]["count"] == 1  # 0.25
+    assert stats["0.4-0.5"]["count"] == 1  # 0.49
+    assert stats["0.5-0.6"]["count"] == 1  # 0.50
+    assert stats["0.7-0.8"]["count"] == 1  # 0.75
+    assert stats["0.9-1.0"]["count"] == 3  # 0.90, 0.95, 1.00 (last bucket includes 1.0)
+    assert stats["0.3-0.4"]["count"] == 0
+    assert stats["0.6-0.7"]["count"] == 0
+    assert stats["0.8-0.9"]["count"] == 0
+
+
+def test_decile_stats_include_outcome_fields_when_present():
+    df = pd.DataFrame({
+        "score": [0.92, 0.88, 0.55, 0.20],
+        "action": ["buy", "buy", "skip", "skip"],
+        "tier": ["A", "A", "C", "F"],
+        "regime": ["trending_bullish"] * 4,
+        "pnl": [200.0, -50.0, None, None],
+        "rr_ratio": [2.0, -0.5, None, None],
+    })
+    stats = {r["decile"]: r for r in decile_stats(df)}
+    top = stats["0.8-0.9"]
+    # 0.88 falls in 0.8-0.9
+    assert top["count"] == 1
+    assert top["outcome_count"] == 1
+    assert top["win_rate"] == 0.0  # single loser
+    very_top = stats["0.9-1.0"]
+    assert very_top["count"] == 1
+    assert very_top["win_rate"] == 1.0
+    assert very_top["avg_pnl"] == pytest.approx(200.0)
+
+
+# ---------------------------------------------------------------------------
+# Promotion readiness.
+# ---------------------------------------------------------------------------
+
+
+def test_promotion_readiness_empty_frame_returns_not_ready():
+    result = promotion_readiness(pd.DataFrame(), min_required_outcomes=10)
+    assert result["status"] == "not_ready"
+    assert result["outcome_count"] == 0
+    assert result["ab"]["outcome_count"] == 0
+    assert result["cdf"]["outcome_count"] == 0
+    assert result["ab_outperforms"] is False
+    assert "Insufficient outcomes" in result["explanation"]
+
+
+def test_ab_outperform_with_enough_outcomes_is_ready_for_shadow_filter_test():
+    # 60 A/B winners (+100 ea), 40 C/D/F losers (-100 ea) → AB clearly wins,
+    # total outcomes 100 >= default 100.
+    joined = _make_joined_frame({
+        "A": [100.0] * 30 + [-20.0] * 5,  # 30/35 = 85.7% win, total PnL +2900
+        "B": [100.0] * 20 + [-20.0] * 5,  # 20/25 = 80% win
+        "C": [-100.0] * 15,               # all losers
+        "D": [-100.0] * 15,
+        "F": [-100.0] * 10,
+    })
+    result = promotion_readiness(joined, min_required_outcomes=100)
+    assert result["status"] == "ready_for_shadow_filter_test"
+    assert result["ab_outperforms"] is True
+    assert result["outcome_count"] == 100
+    assert result["ab"]["win_rate"] > result["cdf"]["win_rate"]
+    assert result["ab"]["avg_r_multiple"] > result["cdf"]["avg_r_multiple"]
+
+
+def test_ab_outperform_but_small_sample_is_promising():
+    joined = _make_joined_frame({
+        "A": [100.0, 100.0, 100.0, -50.0],
+        "B": [100.0, -50.0],
+        "C": [-100.0, -100.0],
+        "D": [-100.0],
+        "F": [-100.0],
+    })
+    result = promotion_readiness(joined, min_required_outcomes=100)
+    assert result["status"] == "promising"
+    assert result["ab_outperforms"] is True
+    assert result["outcome_count"] < 100
+
+
+def test_lower_tiers_outperform_ab_is_weak_with_enough_outcomes():
+    # Flip the pattern: AB loses more often than CDF.
+    joined = _make_joined_frame({
+        "A": [-100.0] * 30,
+        "B": [-100.0] * 20,
+        "C": [100.0] * 20,
+        "D": [100.0] * 20,
+        "F": [100.0] * 10,
+    })
+    result = promotion_readiness(joined, min_required_outcomes=50)
+    assert result["status"] == "weak"
+    assert result["ab_outperforms"] is False
+    assert result["ab"]["win_rate"] < result["cdf"]["win_rate"]
+
+
+def test_lower_tiers_win_with_small_sample_is_not_ready():
+    joined = _make_joined_frame({
+        "A": [-100.0, -100.0],
+        "C": [100.0, 100.0],
+    })
+    result = promotion_readiness(joined, min_required_outcomes=100)
+    assert result["status"] == "not_ready"
+    assert result["ab_outperforms"] is False
+
+
+def test_insufficient_sample_small_fixture_is_not_ready():
+    joined = _make_joined_frame({"A": [100.0, -50.0]})
+    result = promotion_readiness(joined, min_required_outcomes=100)
+    assert result["status"] in {"promising", "not_ready"}
+    # With only AB and win_rate=50% via heuristic this can be 'promising';
+    # pin to 'not_ready' by lowering AB win rate
+    joined2 = _make_joined_frame({"A": [-100.0, -100.0]})
+    result2 = promotion_readiness(joined2, min_required_outcomes=100)
+    assert result2["status"] == "not_ready"
+
+
+def test_ab_only_outcomes_positive_expectancy_is_promising():
+    """Only A/B traded — CDF has no realized outcomes. Positive
+    expectancy on AB alone is enough to be 'promising' (small sample)."""
+    joined = _make_joined_frame({"A": [100.0, 100.0, 100.0, -50.0]})
+    result = promotion_readiness(joined, min_required_outcomes=100)
+    assert result["status"] == "promising"
+    assert result["cdf"]["outcome_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# build_report integration — JSON / text must include the new sections.
+# ---------------------------------------------------------------------------
+
+
+def test_json_includes_readiness_and_decile_stats(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    report = build_report(
+        alpha_path=alpha_csv,
+        decision_path=decision_csv,
+        journal_path=journal_csv,
+        min_required_outcomes=100,
+    )
+    parsed = json.loads(format_json(report))
+    assert "decile_stats" in parsed
+    assert len(parsed["decile_stats"]) == 10
+    assert {r["decile"] for r in parsed["decile_stats"]} == set(DECILE_LABELS)
+    assert "promotion_readiness" in parsed
+    pr = parsed["promotion_readiness"]
+    assert set(pr.keys()) >= {
+        "status", "explanation", "min_required_outcomes",
+        "outcome_count", "ab_outperforms", "ab", "cdf",
+    }
+    # With only 3 outcomes vs min 100, status must be not_ready or promising
+    assert pr["status"] in {"not_ready", "promising"}
+
+
+def test_text_report_includes_readiness_section(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    report = build_report(
+        alpha_path=alpha_csv,
+        decision_path=decision_csv,
+        journal_path=journal_csv,
+        min_required_outcomes=100,
+    )
+    txt = format_text(report)
+    assert "By score decile" in txt
+    assert "Promotion readiness:" in txt
+    assert "status" in txt
+    assert "A/B tiers" in txt
+    assert "C/D/F tiers" in txt
+
+
+def test_default_min_required_outcomes_is_100():
+    assert DEFAULT_MIN_REQUIRED_OUTCOMES == 100
+
+
+# ---------------------------------------------------------------------------
+# CLI --min-outcomes flag.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_min_outcomes_changes_readiness_threshold(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path, capsys
+):
+    # Default threshold (100) — 3 matched trades is nowhere near it.
+    rc = main([
+        "--alpha", str(alpha_csv),
+        "--decision", str(decision_csv),
+        "--journal", str(journal_csv),
+        "--json",
+    ])
+    assert rc == 0
+    default_parsed = json.loads(capsys.readouterr().out)
+    assert default_parsed["promotion_readiness"]["min_required_outcomes"] == 100
+
+    # Very low threshold (2) — 3 matched trades should now be "enough" and
+    # if A/B outperforms the status flips to ready_for_shadow_filter_test.
+    rc = main([
+        "--alpha", str(alpha_csv),
+        "--decision", str(decision_csv),
+        "--journal", str(journal_csv),
+        "--min-outcomes", "2",
+        "--json",
+    ])
+    assert rc == 0
+    low_parsed = json.loads(capsys.readouterr().out)
+    assert low_parsed["promotion_readiness"]["min_required_outcomes"] == 2
+    # With 3 outcomes >= 2 the status is either ready_for_shadow_filter_test
+    # (if AB outperforms) or weak (if it doesn't). Either way, never "not_ready"
+    # and never "promising" — those both require fewer than min outcomes.
+    assert low_parsed["promotion_readiness"]["status"] in {
+        "ready_for_shadow_filter_test", "weak",
+    }
+
+
+def test_cli_min_outcomes_subprocess_smoke(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "trading_bot.analysis.alpha_report",
+            "--alpha", str(alpha_csv),
+            "--decision", str(decision_csv),
+            "--journal", str(journal_csv),
+            "--min-outcomes", "2",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Promotion readiness:" in result.stdout
+    assert "By score decile" in result.stdout
