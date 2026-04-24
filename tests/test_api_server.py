@@ -63,12 +63,17 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         "TRADING_API_AUDIT_LOG_PATH",
         # Phase 4.5 — premium-keys list.
         "TRADING_API_PREMIUM_KEYS",
+        # Phase 4.6 — usage metrics path.
+        "TRADING_API_USAGE_LOG_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
     # location so tests don't write to the real data/ directory.
     audit_tmp = tmp_path_factory.mktemp("api_audit") / "audit.jsonl"
     monkeypatch.setenv("TRADING_API_AUDIT_LOG_PATH", str(audit_tmp))
+    # Likewise for the Phase 4.6 usage log.
+    usage_tmp = tmp_path_factory.mktemp("api_usage") / "usage.jsonl"
+    monkeypatch.setenv("TRADING_API_USAGE_LOG_PATH", str(usage_tmp))
 
 
 @pytest.fixture(autouse=True)
@@ -2833,3 +2838,384 @@ class TestPhase45BoundaryUnchanged:
             "from trading_bot.main",
         ):
             assert pat not in src
+
+
+# ===========================================================================
+# Phase 4.6 — per-key usage metrics
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    DEFAULT_USAGE_LOG_PATH,
+    USAGE_LOG_ENV_VAR,
+    _append_usage_record,
+    _hash_api_key,
+)
+
+
+@pytest.fixture
+def usage_path() -> Path:
+    """Return the path clean_api_env pointed the usage log at."""
+    return Path(_os_phase44.environ["TRADING_API_USAGE_LOG_PATH"])
+
+
+def _read_usage(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            out.append(json.loads(s))
+        except Exception:
+            continue
+    return out
+
+
+class TestHashApiKey:
+    def test_empty_or_none_returns_empty_string(self):
+        assert _hash_api_key(None) == ""
+        assert _hash_api_key("") == ""
+
+    def test_returns_32_hex_chars(self):
+        h = _hash_api_key("whatever-key-value")
+        assert isinstance(h, str)
+        assert len(h) == 32
+        int(h, 16)
+
+    def test_deterministic(self):
+        assert _hash_api_key("abc") == _hash_api_key("abc")
+
+    def test_different_inputs_different_hashes(self):
+        assert _hash_api_key("abc") != _hash_api_key("abd")
+
+    def test_is_not_the_raw_key(self):
+        key = "super-secret-KEY-12345"
+        h = _hash_api_key(key)
+        assert key not in h
+        assert h != key
+
+    def test_matches_sha256_prefix(self):
+        """Lock in the SHA-256 prefix: 32 hex chars of the digest."""
+        import hashlib as _hlib
+        key = "stable-key"
+        expected = _hlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        assert _hash_api_key(key) == expected
+
+
+class TestUsageEnvDefault:
+    def test_default_path_is_documented(self):
+        assert DEFAULT_USAGE_LOG_PATH == "data/api_usage.jsonl"
+
+    def test_env_var_name_is_documented(self):
+        assert USAGE_LOG_ENV_VAR == "TRADING_API_USAGE_LOG_PATH"
+
+
+class TestProtectedRequestsWriteUsage:
+    def test_reports_latest_writes_one_usage_record(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        records = _read_usage(usage_path)
+        assert len(records) == 1
+        rec = records[0]
+        required = {
+            "timestamp", "key_hash", "tier", "method", "path",
+            "status_code", "duration_ms", "request_id",
+        }
+        assert required.issubset(rec.keys())
+        assert rec["method"] == "GET"
+        assert rec["path"] == "/reports/latest"
+        assert rec["status_code"] == 200
+
+    def test_dashboard_writes_usage_record(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        records = _read_usage(usage_path)
+        assert len(records) == 1
+        assert records[0]["path"] == "/dashboard"
+
+    def test_experiments_recent_writes_usage_record(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert len(_read_usage(usage_path)) == 1
+
+    def test_multiple_protected_requests_write_one_record_each(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        for _ in range(4):
+            client.get(
+                "/reports/latest",
+                headers={"Authorization": f"Bearer {VALID_KEY}"},
+            )
+        assert len(_read_usage(usage_path)) == 4
+
+
+class TestPublicRequestsDoNotWriteUsage:
+    def test_health_does_not_write_usage(
+        self, client: TestClient, usage_path: Path
+    ):
+        client.get("/health")
+        assert _read_usage(usage_path) == []
+
+    def test_root_does_not_write_usage(
+        self, client: TestClient, usage_path: Path
+    ):
+        client.get("/")
+        assert _read_usage(usage_path) == []
+
+    def test_public_request_with_auth_header_still_no_usage(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        client.get(
+            "/health", headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        client.get(
+            "/", headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert _read_usage(usage_path) == []
+
+
+class TestAuthFailuresDoNotWriteUsage:
+    def test_missing_header_no_usage(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        client.get("/reports/latest")  # 401
+        assert _read_usage(usage_path) == []
+
+    def test_wrong_key_no_usage(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer wrong-key"},
+        )  # 403
+        assert _read_usage(usage_path) == []
+
+    def test_unconfigured_server_no_usage(
+        self, client: TestClient, monkeypatch, usage_path: Path
+    ):
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )  # 503
+        assert _read_usage(usage_path) == []
+
+
+class TestUsageTierRecorded:
+    def test_free_tier_recorded(
+        self, client: TestClient, free_env, usage_path: Path
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        rec = _read_usage(usage_path)[-1]
+        assert rec["tier"] == "free"
+        assert rec["key_hash"] == _hash_api_key(FREE_KEY)
+
+    def test_premium_tier_recorded(
+        self, client: TestClient, free_env, usage_path: Path
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        rec = _read_usage(usage_path)[-1]
+        assert rec["tier"] == "premium"
+        assert rec["key_hash"] == _hash_api_key(VALID_KEY)
+
+    def test_different_keys_produce_different_hashes(
+        self, client: TestClient, free_env, usage_path: Path
+    ):
+        client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        hashes = {r["key_hash"] for r in _read_usage(usage_path)}
+        assert len(hashes) == 2
+
+    def test_same_key_groups_under_same_hash(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        for _ in range(3):
+            client.get(
+                "/reports/latest",
+                headers={"Authorization": f"Bearer {VALID_KEY}"},
+            )
+        hashes = {r["key_hash"] for r in _read_usage(usage_path)}
+        assert len(hashes) == 1
+
+
+class TestUsageDoesNotLeakRawKey:
+    def test_valid_key_never_in_usage_file(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        raw = usage_path.read_text(encoding="utf-8")
+        assert VALID_KEY not in raw
+
+    def test_free_key_never_in_usage_file(
+        self, client: TestClient, free_env, usage_path: Path
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        raw = usage_path.read_text(encoding="utf-8")
+        assert FREE_KEY not in raw
+
+    def test_no_authorization_header_word_in_file(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        raw = usage_path.read_text(encoding="utf-8").lower()
+        assert "authorization" not in raw
+        assert "bearer " not in raw
+
+    def test_rejected_token_never_in_usage_file(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        attempt = "attempted-leak-marker-ABC_9f3e"
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {attempt}"},
+        )
+        assert _read_usage(usage_path) == []
+        if usage_path.exists():
+            raw = usage_path.read_text(encoding="utf-8")
+            assert attempt not in raw
+
+
+class TestUsageRequestIdMatchesResponseHeader:
+    def test_generated_request_id_matches(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        rid = resp.headers.get(REQUEST_ID_HEADER)
+        rec = _read_usage(usage_path)[-1]
+        assert rid is not None
+        assert rec["request_id"] == rid
+
+    def test_supplied_request_id_flows_through(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/latest",
+            headers={
+                "Authorization": f"Bearer {VALID_KEY}",
+                REQUEST_ID_HEADER: "trace-abc-123",
+            },
+        )
+        assert resp.headers[REQUEST_ID_HEADER] == "trace-abc-123"
+        rec = _read_usage(usage_path)[-1]
+        assert rec["request_id"] == "trace-abc-123"
+
+
+class TestUsageWriteFailureDoesNotFailRequest:
+    def test_writer_raises_does_not_break_request(
+        self, client: TestClient, authed_env, monkeypatch
+    ):
+        def raising(record, path=None):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(srv, "_append_usage_record", raising)
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert REQUEST_ID_HEADER in resp.headers
+
+    def test_missing_parent_dir_auto_created(
+        self, client: TestClient, authed_env, monkeypatch, tmp_path: Path
+    ):
+        nested = tmp_path / "a" / "b" / "c" / "usage.jsonl"
+        monkeypatch.setenv(USAGE_LOG_ENV_VAR, str(nested))
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert nested.exists()
+
+
+class TestPhase46BoundaryUnchanged:
+    def test_only_read_verbs_after_phase_4_6(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            for m in methods:
+                assert m in {"GET", "HEAD", "OPTIONS"}, (
+                    f"non-read-only method: {m} {route.path}"
+                )
+
+    def test_forbidden_imports_still_clean_after_phase_4_6(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for pat in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert pat not in src
+
+    def test_usage_record_never_carries_report_body(
+        self, client: TestClient, authed_env, usage_path: Path
+    ):
+        """Planted marker inside a report must never appear in the
+        usage log — usage records are METADATA only."""
+        unique = "USAGE_LEAK_MARKER_XYZ"
+        (authed_env["reports_dir"]).mkdir(parents=True, exist_ok=True)
+        (authed_env["reports_dir"] / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({"report_date": "2026-04-24", "leak": unique})
+        )
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert unique not in usage_path.read_text(encoding="utf-8")

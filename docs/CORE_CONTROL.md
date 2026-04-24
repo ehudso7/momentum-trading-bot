@@ -28,6 +28,7 @@ See also:
 | `TRADING_API_RATE_LIMIT_PER_MINUTE`    | positive int     | `60`      | SaaS API only | In-memory per-client-IP rate limit. Invalid values fall back to 60 fail-closed. (Phase 4.2) |
 | `TRADING_API_AUDIT_LOG_PATH`           | path             | `data/api_access_audit.jsonl` | SaaS API only | Append-only JSONL file recording one metadata-only record per request. (Phase 4.4) |
 | `TRADING_API_PREMIUM_KEYS`             | comma-sep tokens | *(unset)* | SaaS API only | Bearer tokens that grant premium-tier access. Any other accepted token is treated as free tier. (Phase 4.5) |
+| `TRADING_API_USAGE_LOG_PATH`           | path             | `data/api_usage.jsonl` | SaaS API only | Append-only JSONL file with one metadata-only record per successful protected request. Raw API keys never written. (Phase 4.6) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -946,10 +947,94 @@ export TRADING_API_PREMIUM_KEYS="ent-key-acme,ent-key-globex"
 
 - No payment processing. Tier promotion is operator-driven (edit
   the env var, rotate keys).
-- No per-user analytics beyond what the Phase 4.4 audit trail
-  already captures.
 - No mutating endpoints — the boundary tests still enforce
   GET/HEAD/OPTIONS only after Phase 4.5.
+
+### Phase 4.6 — per-key usage metrics
+
+Every **successful** protected request appends one JSONL record to
+`TRADING_API_USAGE_LOG_PATH` (default `data/api_usage.jsonl`).
+Public endpoints (`/`, `/health`) and requests that failed auth
+(401 / 403 / 503) are NOT recorded here — they remain visible in
+the Phase 4.4 audit trail.
+
+The raw API key is never written. It is anonymized by
+`_hash_api_key(api_key)` which returns the first 32 hex characters
+of `SHA-256(api_key)`. The same key always maps to the same hash,
+so records cluster by caller for adoption measurement, but the
+mapping is one-way and the raw token never leaves memory.
+
+#### Record shape
+
+| Field          | Source |
+| ---            | --- |
+| `timestamp`    | `datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')` |
+| `key_hash`     | `SHA-256(api_key)[:32]` |
+| `tier`         | `"free"` or `"premium"` — classification at request time |
+| `method`       | `request.method` |
+| `path`         | `request.url.path` |
+| `status_code`  | final response status |
+| `duration_ms`  | wall-clock handler time, rounded to 2 decimals |
+| `request_id`   | matches the `X-Request-ID` returned on the response |
+
+#### Example
+
+```json
+{
+  "timestamp": "2026-04-24T18:30:14.501824Z",
+  "key_hash": "4a55ea81e1313e68a8feea48e98110bc",
+  "tier": "free",
+  "method": "GET",
+  "path": "/reports/latest",
+  "status_code": 200,
+  "duration_ms": 4.23,
+  "request_id": "a18664d06c464ccab2eca45706f2aff3"
+}
+```
+
+#### Leakage guards (enforced by tests)
+
+- **Raw keys never in the file.** Tests issue authed requests with
+  unique-marker tokens (both free and premium) and assert the token
+  strings never appear in the usage log.
+- **Attempted tokens never in the file.** A 403 with a unique-marker
+  Bearer value produces **zero** usage records — only successful
+  auth counts — so rejected tokens can never be scraped from the
+  usage log.
+- **`Authorization` / `Bearer` header tokens never in the file.**
+  Tests scan the entire file for the header words.
+- **Report/experiment bodies never in the file.** A planted marker
+  inside a report JSON that a caller requests is confirmed absent
+  from the usage log — the writer records metadata only.
+
+#### Operational behaviour
+
+- **Best-effort write.** Every I/O path is caught — if the file
+  cannot be written, the request still returns normally.
+  `TestUsageWriteFailureDoesNotFailRequest` stubs the writer to
+  raise and confirms HTTP 200 is still returned.
+- **Thread-safe.** Writes are serialized through a module-level
+  `threading.Lock` (`_usage_write_lock`, separate from the audit
+  lock).
+- **Parent directory auto-created** on first append.
+- **Authenticated-only.** The usage middleware reads the validated
+  token from `request.state.api_key`, which is set by
+  `require_api_key` on success. Failed auth paths never set that
+  attribute, so they are guaranteed to produce no usage record.
+- **Does not double-count.** Each request produces at most one
+  record; public-path skipping is based on exact path match against
+  `_PUBLIC_PATHS_NO_USAGE = {"/", "/health"}`.
+
+#### Out of scope
+
+- No payment tracking, no billing, no per-user contact info.
+- No rate-limiting decisions made from usage data — the Phase 4.2
+  rate limiter is still purely per-IP.
+- No cross-record correlation beyond what `request_id` and
+  `key_hash` already enable for downstream pipelines.
+
+
+## Phase 2.7 — dataset rotation (reference)
 
 
 ## Phase 2.7 — dataset rotation (reference)

@@ -124,6 +124,15 @@ _UNAUTHENTICATED_STATUSES: frozenset[int] = frozenset({401, 403, 503})
 
 _audit_write_lock = threading.Lock()
 
+# Phase 4.6 — per-key usage metrics.
+USAGE_LOG_ENV_VAR = "TRADING_API_USAGE_LOG_PATH"
+DEFAULT_USAGE_LOG_PATH = "data/api_usage.jsonl"
+# Paths that are NEVER counted in the usage log. Everything else
+# is considered a "protected" request for billing/adoption purposes.
+_PUBLIC_PATHS_NO_USAGE: frozenset[str] = frozenset({"/", "/health"})
+
+_usage_write_lock = threading.Lock()
+
 
 def _reports_dir() -> Path:
     return Path(os.getenv(REPORTS_DIR_ENV_VAR, DEFAULT_REPORTS_DIR))
@@ -251,6 +260,54 @@ def _is_authenticated_status(status_code: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4.6 — per-key usage metrics
+# ---------------------------------------------------------------------------
+
+
+def _usage_log_path() -> Path:
+    return Path(os.getenv(USAGE_LOG_ENV_VAR, DEFAULT_USAGE_LOG_PATH))
+
+
+def _hash_api_key(api_key: Optional[str]) -> str:
+    """
+    Anonymize an API key for usage metrics. Returns the first 32
+    hex characters of ``SHA-256(api_key)``. Empty/None input → "".
+
+    Deterministic: the same key always maps to the same hash, so
+    usage records cluster by caller without ever storing the raw
+    token. Not reversible and deliberately not a full-length hash
+    — 128 bits of the SHA-256 digest is plenty for grouping.
+    """
+    if not api_key:
+        return ""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:32]
+
+
+def _append_usage_record(record: dict, path: Optional[Path] = None) -> None:
+    """
+    Thread-safely append a single JSONL usage record.
+
+    Best-effort: every failure path is caught + logged at DEBUG.
+    Never raises — a disk outage must not fail a live API request.
+    """
+    target = path if path is not None else _usage_log_path()
+    try:
+        line = json.dumps(record, sort_keys=False, default=str)
+    except Exception as exc:
+        log.debug("usage.serialize_error", error=str(exc))
+        return
+    with _usage_write_lock:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as exc:
+            log.debug(
+                "usage.write_error", path=str(target), error=str(exc)
+            )
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
@@ -273,6 +330,7 @@ def _is_premium(api_key: Optional[str]) -> bool:
 
 
 def require_api_key(
+    request: Request,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_security),
 ) -> str:
     """
@@ -288,6 +346,12 @@ def require_api_key(
       - 503 when neither env var is set — fail-closed.
       - 401 when the header is missing or non-Bearer.
       - 403 when the header's token matches neither set.
+
+    Side effect on success: the validated token is stashed on
+    ``request.state.api_key`` so the Phase 4.6 usage-metrics
+    middleware can read it without re-validating. The token NEVER
+    leaves the request's in-memory state — it is not logged and
+    not persisted.
     """
     configured = (os.getenv(API_KEY_ENV_VAR, "") or "").strip()
     premium_keys = _premium_keys_set()
@@ -315,6 +379,12 @@ def require_api_key(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",
         )
+    # Stash only after validation — failure paths raised above never
+    # reach this line, so `api_key` on request.state implies "auth OK".
+    try:
+        request.state.api_key = presented
+    except Exception:
+        pass
     return presented
 
 
@@ -666,6 +736,66 @@ async def audit_middleware(request: Request, call_next):
         })
     except Exception as exc:
         log.debug("audit.record_build_error", error=str(exc))
+
+    return response
+
+
+@app.middleware("http")
+async def usage_middleware(request: Request, call_next):
+    """
+    Phase 4.6 — append one per-key usage record for every SUCCESSFUL
+    protected request. Skipped for:
+      - public paths (/, /health).
+      - requests that never authenticated (request.state.api_key
+        was not set by `require_api_key`).
+
+    The raw API key never leaves memory: we hash it (SHA-256[:32])
+    before any I/O. Usage writes never fail the request — all
+    exceptions are caught and logged at DEBUG.
+
+    Registered AFTER `audit_middleware` so `request.state.request_id`
+    is already populated by the time the usage record is built.
+    """
+    start = time.perf_counter()
+    try:
+        response: Response = await call_next(request)
+    except Exception:
+        # We skip usage logging on handler exceptions — the audit
+        # trail covers them. Re-raise so outer middleware (logging,
+        # security headers) still runs.
+        raise
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    # Skip public paths.
+    if request.url.path in _PUBLIC_PATHS_NO_USAGE:
+        return response
+
+    # Skip requests that never authenticated (401/403/503, OPTIONS
+    # preflight handled by cors, etc. — in all such cases the
+    # auth dependency did not run to completion).
+    api_key = getattr(getattr(request, "state", None), "api_key", None)
+    if not api_key:
+        return response
+
+    try:
+        record = {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
+            "key_hash": _hash_api_key(api_key),
+            "tier": TIER_PREMIUM if _is_premium(api_key) else TIER_FREE,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": int(response.status_code),
+            "duration_ms": duration_ms,
+            "request_id": getattr(
+                getattr(request, "state", None), "request_id", None
+            ),
+        }
+        _append_usage_record(record)
+    except Exception as exc:
+        log.debug("usage.record_build_error", error=str(exc))
 
     return response
 
