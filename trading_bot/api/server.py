@@ -435,6 +435,55 @@ def _extract_bearer_token(request: Request) -> Optional[str]:
     return token or None
 
 
+def _emit_upgrade_event(
+    request: Optional[Request],
+    api_key: Optional[str],
+    event: str,
+) -> None:
+    """
+    Phase 5.5 — best-effort upgrade-telemetry emission.
+
+    Extracts the request_id (set by audit_middleware) and the
+    ``?ref=`` query parameter from ``request`` and forwards them to
+    ``trading_bot.api.upgrade_events.record_upgrade_event``.
+
+    Every failure path is caught and logged at DEBUG. Telemetry
+    must NEVER affect the outgoing response or the caller's latency.
+    """
+    try:
+        path_value: Optional[str] = None
+        request_id: Optional[str] = None
+        ref_code: Optional[str] = None
+        if request is not None:
+            try:
+                path_value = request.url.path
+            except Exception:
+                path_value = None
+            try:
+                request_id = getattr(
+                    getattr(request, "state", None), "request_id", None,
+                )
+            except Exception:
+                request_id = None
+            try:
+                raw_ref = request.query_params.get("ref")
+                if raw_ref:
+                    ref_code = raw_ref
+            except Exception:
+                ref_code = None
+        # Lazy import — keeps the SaaS boundary explicitly clean.
+        from trading_bot.api.upgrade_events import record_upgrade_event
+        record_upgrade_event(
+            api_key=api_key,
+            event=event,
+            path=path_value,
+            request_id=request_id,
+            ref_code=ref_code,
+        )
+    except Exception as exc:
+        log.debug("upgrade_events.emit_error", event=event, error=str(exc))
+
+
 def _count_free_tier_usage_today(
     key_hash: str,
     today: Optional[str] = None,
@@ -579,6 +628,8 @@ def _enforce_free_limits(
     date_requested: Optional[str] = None,
     n_experiments: Optional[int] = None,
     explicit_limit: Optional[int] = None,
+    request: Optional[Request] = None,
+    api_key: Optional[str] = None,
 ) -> None:
     """
     Raise HTTP 403 with the documented "upgrade required for full
@@ -589,20 +640,25 @@ def _enforce_free_limits(
       date_requested  : YYYY-MM-DD asked for; rejected if outside free window.
       n_experiments   : 1-indexed nth-most-recent experiment; rejected if > cap.
       explicit_limit  : caller-supplied `?limit=` value; rejected if > cap.
+      request         : (Phase 5.5) enables upgrade-event telemetry.
+      api_key         : (Phase 5.5) enables upgrade-event telemetry.
     """
     if is_premium:
         return
     if date_requested is not None and not _free_date_allowed(date_requested):
+        _emit_upgrade_event(request, api_key, "old_report_blocked")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=UPGRADE_REQUIRED_DETAIL,
         )
     if n_experiments is not None and n_experiments > MAX_FREE_TIER_EXPERIMENTS:
+        _emit_upgrade_event(request, api_key, "experiment_limit_blocked")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=UPGRADE_REQUIRED_DETAIL,
         )
     if explicit_limit is not None and explicit_limit > MAX_FREE_TIER_EXPERIMENTS:
+        _emit_upgrade_event(request, api_key, "experiment_limit_blocked")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=UPGRADE_REQUIRED_DETAIL,
@@ -844,6 +900,8 @@ async def free_tier_middleware(request: Request, call_next):
     remaining = max(0, max_total - total_today)
 
     if total_today >= max_total:
+        # Phase 5.5 — telemetry is best-effort; never affects the response.
+        _emit_upgrade_event(request, api_key, "daily_request_limit_hit")
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={"detail": FREE_TIER_LIMIT_DETAIL},
@@ -853,6 +911,7 @@ async def free_tier_middleware(request: Request, call_next):
             },
         )
     if is_report and reports_today >= max_reports:
+        _emit_upgrade_event(request, api_key, "report_limit_hit")
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content={"detail": UPGRADE_REQUIRED_DETAIL},
@@ -1446,6 +1505,7 @@ def latest_report() -> dict[str, Any]:
 @app.get("/reports/{date}", tags=["reports"])
 def report_for_date(
     date: str,
+    request: Request,
     api_key: str = Depends(require_api_key),
 ) -> dict[str, Any]:
     """
@@ -1457,7 +1517,10 @@ def report_for_date(
     """
     _validate_date(date)
     _enforce_free_limits(
-        is_premium=_is_premium(api_key), date_requested=date,
+        is_premium=_is_premium(api_key),
+        date_requested=date,
+        request=request,
+        api_key=api_key,
     )
     path = _reports_dir() / f"alpha_report_{date}.json"
     if not path.exists():
@@ -1492,7 +1555,10 @@ def recent_experiments(
     # equal to the default.
     explicit_limit = limit if "limit" in request.query_params else None
     _enforce_free_limits(
-        is_premium=is_premium, explicit_limit=explicit_limit,
+        is_premium=is_premium,
+        explicit_limit=explicit_limit,
+        request=request,
+        api_key=api_key,
     )
     effective_limit = (
         limit if is_premium else min(limit, MAX_FREE_TIER_EXPERIMENTS)
@@ -1506,6 +1572,7 @@ def recent_experiments(
 @app.get("/experiments/{n}", tags=["experiments"])
 def experiment_by_index(
     n: int,
+    request: Request,
     api_key: str = Depends(require_api_key),
 ) -> dict[str, Any]:
     """
@@ -1521,7 +1588,10 @@ def experiment_by_index(
             detail="n must be >= 1 (1 = most recent)",
         )
     _enforce_free_limits(
-        is_premium=_is_premium(api_key), n_experiments=n,
+        is_premium=_is_premium(api_key),
+        n_experiments=n,
+        request=request,
+        api_key=api_key,
     )
     records = _read_manifest_records(_manifest_path())
     if not records:
@@ -1870,6 +1940,7 @@ def render_dashboard_html(
     tags=["dashboard"],
 )
 def dashboard(
+    request: Request,
     api_key: str = Depends(require_api_key),
 ) -> HTMLResponse:
     """
@@ -1910,6 +1981,12 @@ def dashboard(
 
     tier = TIER_PREMIUM if _is_premium(api_key) else TIER_FREE
     html = render_dashboard_html(report, experiments, tier=tier)
+    if tier == TIER_FREE:
+        # Phase 5.5 — the banner is rendered in the HTML above; emit
+        # one telemetry row per dashboard load so we can measure how
+        # often free users actually see the upgrade prompt. Emission
+        # is best-effort and never affects the response.
+        _emit_upgrade_event(request, api_key, "dashboard_banner_seen")
     return HTMLResponse(content=html, status_code=200)
 
 

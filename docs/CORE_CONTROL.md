@@ -1700,6 +1700,105 @@ no form, no CTA link — so it adds zero attack surface and
 respects the "read-only" invariant from Phase 4.1.
 
 
+### Phase 5.5 — upgrade CTA telemetry
+
+Records one JSONL event every time a free-tier caller encounters
+a conversion-relevant friction point. Purely additive — no
+premium behaviour changes, no request ever blocks or slows down
+on a telemetry failure, and no raw API key ever lands on disk.
+
+**Event log**
+
+    data/api_upgrade_events.jsonl   (default path)
+
+Env var: `TRADING_API_UPGRADE_EVENTS_LOG_PATH`.
+
+**Event names (exact strings, emitted only when `tier == "free"`)**
+
+| Event | Fires when |
+|---|---|
+| `dashboard_banner_seen` | `/dashboard` renders for a free user |
+| `daily_request_limit_hit` | Phase 5.4 global 429 fires on any protected path |
+| `report_limit_hit` | Phase 5.4 403 fires on `/reports/*` |
+| `old_report_blocked` | Phase 4.5 rejects `/reports/{date}` outside the 3-day window |
+| `experiment_limit_blocked` | Phase 4.5 rejects `/experiments/{n}` or `/experiments/recent?limit=…` over `MAX_FREE_TIER_EXPERIMENTS` |
+
+**Record schema**
+
+    {
+      "timestamp":     "2026-04-24T14:23:11.500000Z",
+      "api_key_hash":  "3bcae9a335c1e77f182d8d02372f2f89",
+      "event":         "dashboard_banner_seen",
+      "path":          "/dashboard",
+      "request_id":    "3a2f8b0e1c2d4ef9",
+      "tier":          "free",
+      "ref_code":      "twitter-q2"
+    }
+
+* `api_key_hash` is `SHA-256(api_key)[:32]` — identical to the
+  hash used by server/billing/conversion/growth, so this file
+  joins cleanly against all four on a single column.
+* `ref_code` reuses the Phase 5.1 growth-log sanitiser
+  (`[A-Za-z0-9\-_:.]`, capped at 64 chars); missing or empty
+  becomes `null`.
+* `request_id` is the same id that appears on the response's
+  `X-Request-ID` header (Phase 4.4) — operators can correlate a
+  user report with the exact telemetry row.
+* `tier` is always the constant string `"free"` (premium callers
+  never reach an emission site; the middleware and gate both
+  short-circuit before that).
+
+**Safety invariants (tested)**
+
+* Raw API keys are **never** persisted; only the opaque hash.
+* Telemetry is best-effort: disk failure, serialisation error, or
+  a broken parent directory all return silently — the caller's
+  request still succeeds, and the failure surfaces via structlog
+  at DEBUG.
+* Thread-safe JSONL append via a module-level `threading.Lock`.
+* Unknown event names are dropped silently.
+* Unauthenticated requests, the Stripe webhook, and premium
+  callers never produce a row.
+* The upgrade_events module imports nothing from Core (verified
+  by source-grep test) and nothing from any other api module at
+  import time (server.py does the call via a lazy import so the
+  SaaS boundary stays unambiguous).
+
+**CLI**
+
+    python -m trading_bot.api.upgrade_events --summary
+    python -m trading_bot.api.upgrade_events --summary --json
+    python -m trading_bot.api.upgrade_events --summary \
+        --path data/api_upgrade_events.jsonl \
+        --top-paths 10 --top-refs 10
+
+Summary output (text or JSON) includes:
+
+* `total_events` — total rows read.
+* `events` — per-event count and unique users.
+* `top_paths` — the paths that fire events most often.
+* `ref_codes` — per-`ref_code` count, unique users, and number
+  of distinct events; present only when at least one row carried
+  a ref_code.
+
+**BI joins (reference)**
+
+Join `data/api_upgrade_events.jsonl` with:
+
+* `data/api_usage.jsonl` (Phase 4.6) on `(api_key_hash == key_hash)`
+  — measure how many free users hit each friction point relative
+  to request volume.
+* `data/api_conversions.jsonl` (Phase 4.9) on `api_key_hash`
+  — compute per-event conversion rate ("of users who saw the
+  banner, how many upgraded?").
+* `data/api_growth.jsonl` (Phase 5.1) on
+  `(api_key_hash, ref_code)` — attribute each friction hit back
+  to the channel the user arrived from.
+
+No PII. No paths leaking raw secrets. Reversible by simply
+ignoring the log file.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

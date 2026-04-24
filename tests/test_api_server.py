@@ -82,6 +82,9 @@ def clean_api_env(monkeypatch, tmp_path_factory):
     # And the Phase 4.7 Stripe premium-cache file.
     stripe_tmp = tmp_path_factory.mktemp("stripe_cache") / "keys.json"
     monkeypatch.setenv("TRADING_STRIPE_PREMIUM_CACHE_PATH", str(stripe_tmp))
+    # Phase 5.5 — upgrade events log path.
+    upgrade_tmp = tmp_path_factory.mktemp("upgrade_events") / "events.jsonl"
+    monkeypatch.setenv("TRADING_API_UPGRADE_EVENTS_LOG_PATH", str(upgrade_tmp))
     # Also wipe the billing module's in-memory cache between tests.
     from trading_bot.api import billing as _billing_mod
     _billing_mod.reset_cache_for_tests()
@@ -4633,3 +4636,351 @@ class TestPhase54HeaderShape:
         )
         assert resp.status_code == 429
         assert resp.headers.get(FREE_TIER_REMAINING_HEADER) == "0"
+
+
+# ===========================================================================
+# Phase 5.5 — upgrade CTA telemetry (server-side emission tests)
+# ===========================================================================
+
+
+from trading_bot.api.upgrade_events import (  # noqa: E402
+    UPGRADE_EVENTS_LOG_ENV_VAR,
+    _hash_api_key as _ue_hash,
+)
+
+
+@pytest.fixture
+def upgrade_events_path() -> Path:
+    """Return the per-test upgrade-events log path set by clean_api_env."""
+    return Path(_os_phase44.environ[UPGRADE_EVENTS_LOG_ENV_VAR])
+
+
+def _read_upgrade_events(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rows.append(json.loads(s))
+        except Exception:
+            continue
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# dashboard_banner_seen
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55DashboardBannerEvent:
+    def test_free_user_dashboard_logs_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        events = _read_upgrade_events(upgrade_events_path)
+        assert len(events) == 1
+        row = events[0]
+        assert row["event"] == "dashboard_banner_seen"
+        assert row["tier"] == "free"
+        assert row["path"] == "/dashboard"
+        assert row["api_key_hash"] == _ue_hash(FREE_KEY)
+
+    def test_premium_user_dashboard_does_not_log_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+    def test_dashboard_event_carries_ref_code_when_present(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/dashboard?ref=twitter-q2",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["ref_code"] == "twitter-q2"
+
+    def test_dashboard_event_ref_code_is_sanitised(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/dashboard?ref=<script>alert(1)</script>",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["ref_code"] == "scriptalert1script"
+
+
+# ---------------------------------------------------------------------------
+# daily_request_limit_hit
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55DailyRequestLimitEvent:
+    def test_429_logs_event(
+        self, client: TestClient, free_env, usage_path: Path,
+        upgrade_events_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "2")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=2,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "daily_request_limit_hit"
+        assert row["path"] == "/experiments/recent"
+        assert row["tier"] == "free"
+        assert row["api_key_hash"] == _ue_hash(FREE_KEY)
+
+    def test_429_event_request_id_matches_response_header(
+        self, client: TestClient, free_env, usage_path: Path,
+        upgrade_events_path: Path, monkeypatch,
+    ):
+        """The event's request_id must equal the X-Request-ID the
+        caller sees, so an operator can correlate a user's rejection
+        with the telemetry row."""
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        rid = resp.headers.get("X-Request-ID")
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert rid
+        assert row["request_id"] == rid
+
+    def test_successful_free_request_does_not_log(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "50")
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+
+# ---------------------------------------------------------------------------
+# report_limit_hit
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55ReportLimitEvent:
+    def test_403_on_reports_path_logs_event(
+        self, client: TestClient, free_env, usage_path: Path,
+        upgrade_events_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "500")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "2")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=2,
+            report_path_prefix="/reports/latest",
+        )
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "report_limit_hit"
+        assert row["path"] == "/reports/latest"
+        assert row["tier"] == "free"
+
+
+# ---------------------------------------------------------------------------
+# old_report_blocked
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55OldReportBlockedEvent:
+    def test_out_of_window_date_logs_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        """Request a report from 2020 — well outside the 3-day
+        Phase 4.5 free-tier window."""
+        free_env["reports_dir"].mkdir(parents=True, exist_ok=True)
+        resp = client.get(
+            "/reports/2020-01-01",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "old_report_blocked"
+        assert row["path"] == "/reports/2020-01-01"
+        assert row["tier"] == "free"
+
+    def test_premium_user_old_report_does_not_log(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        free_env["reports_dir"].mkdir(parents=True, exist_ok=True)
+        resp = client.get(
+            "/reports/2020-01-01",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        # Premium gets 404 (no such report exists) — NOT 403.
+        assert resp.status_code == 404
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+
+# ---------------------------------------------------------------------------
+# experiment_limit_blocked
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55ExperimentLimitBlockedEvent:
+    def test_out_of_range_n_logs_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        """Phase 4.5 free tier caps n at MAX_FREE_TIER_EXPERIMENTS=3."""
+        resp = client.get(
+            "/experiments/4",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "experiment_limit_blocked"
+        assert row["path"] == "/experiments/4"
+        assert row["tier"] == "free"
+
+    def test_explicit_limit_query_param_logs_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/experiments/recent?limit=50",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        (row,) = _read_upgrade_events(upgrade_events_path)
+        assert row["event"] == "experiment_limit_blocked"
+        assert row["path"] == "/experiments/recent"
+
+    def test_premium_user_does_not_log(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        resp = client.get(
+            "/experiments/4",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code in {200, 404}
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Negative guarantees
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55DoesNotBlockRequests:
+    def test_telemetry_write_failure_does_not_break_request(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch, tmp_path: Path,
+    ):
+        """Redirect the events log at a path whose parent is a
+        regular file so mkdir raises. The user-facing request must
+        still return 200 with no change to behaviour."""
+        bad_parent = tmp_path / "not-a-dir"
+        bad_parent.write_text("x")
+        monkeypatch.setenv(
+            UPGRADE_EVENTS_LOG_ENV_VAR,
+            str(bad_parent / "events.jsonl"),
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_no_raw_key_in_log_file(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+    ):
+        client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = upgrade_events_path.read_text(encoding="utf-8")
+        assert FREE_KEY not in body
+        # The hash IS recorded.
+        assert _ue_hash(FREE_KEY) in body
+
+    def test_webhook_does_not_emit_upgrade_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        resp = client.post(
+            "/webhook/stripe", content=b"{}",
+            headers={"stripe-signature": "badsig"},
+        )
+        assert resp.status_code != 429
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+    def test_unauthenticated_request_does_not_emit_event(
+        self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        resp = client.get("/experiments/recent")
+        assert resp.status_code == 401
+        assert _read_upgrade_events(upgrade_events_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Boundary
+# ---------------------------------------------------------------------------
+
+
+class TestPhase55Boundary:
+    def test_no_core_imports_from_upgrade_events(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "upgrade_events.py"
+        ).read_text()
+        for forbidden in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert forbidden not in src
+
+    def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST"
