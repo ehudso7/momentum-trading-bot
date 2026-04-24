@@ -57,6 +57,14 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from trading_bot.api.billing import (
+    STRIPE_WEBHOOK_SECRET_ENV_VAR,
+    handle_webhook_event,
+    is_premium_via_stripe,
+    is_stripe_configured,
+    verify_webhook_signature,
+)
+
 log = structlog.get_logger(__name__)
 
 
@@ -323,9 +331,22 @@ def _premium_keys_set() -> set[str]:
 
 
 def _is_premium(api_key: Optional[str]) -> bool:
-    """True iff the supplied key is in TRADING_API_PREMIUM_KEYS."""
+    """
+    True iff the supplied key is premium.
+
+    Phase 4.7 precedence:
+      1. If Stripe is configured (STRIPE_API_KEY set) AND the cache
+         shows this api_key as having an active subscription → True.
+      2. Otherwise, fall back to the Phase 4.5 env-var list —
+         this continues to work when Stripe is not configured AND
+         gives operators an override path when Stripe IS configured.
+
+    Empty / None input → False.
+    """
     if not api_key:
         return False
+    if is_stripe_configured() and is_premium_via_stripe(api_key):
+        return True
     return api_key in _premium_keys_set()
 
 
@@ -976,6 +997,82 @@ def landing_page() -> HTMLResponse:
     guarantee the page cannot leak protected content.
     """
     return HTMLResponse(content=render_landing_page_html(), status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.7 — Stripe billing webhook.
+#
+# This is the ONLY non-read-only endpoint exposed by the SaaS API.
+# It accepts server-to-server webhook deliveries from Stripe, and
+# its job is strictly to update the premium-key cache based on
+# subscription lifecycle events. It performs no trade action, does
+# not touch any Core module, and never echoes sensitive payment
+# metadata back to the caller. The boundary tests in
+# tests/test_api_server.py explicitly allow POST on this single path
+# and reject it everywhere else.
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/webhook/stripe",
+    tags=["billing"],
+    # Intentionally include_in_schema=True so the OpenAPI doc shows
+    # the integration surface; Stripe doesn't consume the schema.
+)
+async def stripe_webhook(request: Request) -> dict[str, Any]:
+    """
+    Accept Stripe webhook deliveries for subscription lifecycle events.
+
+    - Requires `STRIPE_WEBHOOK_SECRET` to be configured; returns 503
+      fail-closed otherwise, so a mis-deployed server cannot accept
+      arbitrary billing traffic.
+    - Signature is verified manually (no `stripe` pip dep required);
+      invalid signatures → 400.
+    - Updates the premium-key cache via
+      `trading_bot.api.billing.handle_webhook_event`, which itself
+      catches every failure and never raises into this handler.
+
+    Handled event types:
+      - customer.subscription.created (adds premium on active/trialing)
+      - customer.subscription.deleted (removes premium)
+      - invoice.payment_failed         (removes premium immediately)
+    """
+    secret = (os.getenv(STRIPE_WEBHOOK_SECRET_ENV_VAR, "") or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="billing webhook not configured",
+        )
+
+    raw_body = await request.body()
+    signature = request.headers.get("stripe-signature", "")
+    if not verify_webhook_signature(raw_body, signature, secret):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid webhook signature",
+        )
+
+    try:
+        event = json.loads(raw_body.decode("utf-8", errors="replace"))
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid webhook payload",
+        )
+
+    result = handle_webhook_event(event)
+    # Log a structured line — the billing module already logs on
+    # failures; this is a success breadcrumb tagged for ops.
+    log.info(
+        "billing.webhook_processed",
+        type=result.get("type"),
+        action=result.get("action"),
+    )
+    return {
+        "received": True,
+        "action": result.get("action", "ignored"),
+        "type": result.get("type", ""),
+    }
 
 
 @app.get(

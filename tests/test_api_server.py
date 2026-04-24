@@ -65,6 +65,11 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         "TRADING_API_PREMIUM_KEYS",
         # Phase 4.6 — usage metrics path.
         "TRADING_API_USAGE_LOG_PATH",
+        # Phase 4.7 — Stripe billing env.
+        "STRIPE_API_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "STRIPE_PRICE_ID_PREMIUM",
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
@@ -74,6 +79,12 @@ def clean_api_env(monkeypatch, tmp_path_factory):
     # Likewise for the Phase 4.6 usage log.
     usage_tmp = tmp_path_factory.mktemp("api_usage") / "usage.jsonl"
     monkeypatch.setenv("TRADING_API_USAGE_LOG_PATH", str(usage_tmp))
+    # And the Phase 4.7 Stripe premium-cache file.
+    stripe_tmp = tmp_path_factory.mktemp("stripe_cache") / "keys.json"
+    monkeypatch.setenv("TRADING_STRIPE_PREMIUM_CACHE_PATH", str(stripe_tmp))
+    # Also wipe the billing module's in-memory cache between tests.
+    from trading_bot.api import billing as _billing_mod
+    _billing_mod.reset_cache_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -658,13 +669,23 @@ class TestBoundaryEnforcement:
             )
 
     def test_no_mutating_http_verbs(self, client: TestClient):
-        """The API must not expose POST / PUT / DELETE / PATCH routes."""
+        """
+        The API must not expose POST / PUT / DELETE / PATCH routes,
+        with the documented Phase 4.7 exception of POST /webhook/stripe
+        — a server-to-server billing webhook that does not touch any
+        trading / Core path.
+        """
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
-            # HEAD and OPTIONS are auto-added and read-only — allow them.
+            path = getattr(route, "path", "") or ""
             for method in methods:
-                assert method in {"GET", "HEAD", "OPTIONS"}, (
-                    f"non-read-only route detected: {method} {route.path}"
+                if method in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe", (
+                    f"non-read-only route detected: {method} {path}"
+                )
+                assert method == "POST", (
+                    f"/webhook/stripe may only accept POST, got {method}"
                 )
 
     def test_no_trading_endpoint_paths(self):
@@ -1449,12 +1470,19 @@ class TestRequestLogging:
 
 class TestPhase42BoundaryUnchanged:
     def test_still_only_read_verbs_after_middleware(self):
-        """Re-assert Phase 4.0 invariant — no mutating verbs added."""
+        """
+        Re-assert Phase 4.0 invariant — no mutating verbs added.
+        Phase 4.7 exception: POST /webhook/stripe is allowed (and
+        nothing else is).
+        """
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
             for m in methods:
-                assert m in {"GET", "HEAD", "OPTIONS"}, (
-                    f"non-read-only method introduced: {m} {route.path}"
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only method introduced: {m} {path}"
                 )
 
     def test_forbidden_imports_still_enforced(self):
@@ -1714,9 +1742,12 @@ class TestLandingPageBoundaryUnchanged:
     def test_still_only_read_verbs_after_phase_4_3(self):
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
             for m in methods:
-                assert m in {"GET", "HEAD", "OPTIONS"}, (
-                    f"non-read-only method introduced: {m} {route.path}"
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only method introduced: {m} {path}"
                 )
 
     def test_landing_route_accepts_only_get_head_options(self):
@@ -2236,8 +2267,13 @@ class TestPhase44BoundaryUnchanged:
     def test_only_read_verbs_after_phase_4_4(self):
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
             for m in methods:
-                assert m in {"GET", "HEAD", "OPTIONS"}
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only method introduced: {m} {path}"
+                )
 
     def test_audit_never_writes_report_or_experiment_contents(
         self, client: TestClient, authed_env, audit_path: Path
@@ -2820,8 +2856,13 @@ class TestPhase45BoundaryUnchanged:
     def test_only_read_verbs_after_phase_4_5(self):
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
             for m in methods:
-                assert m in {"GET", "HEAD", "OPTIONS"}
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only method introduced: {m} {path}"
+                )
 
     def test_forbidden_imports_still_clean(self):
         src = (
@@ -3183,9 +3224,12 @@ class TestPhase46BoundaryUnchanged:
     def test_only_read_verbs_after_phase_4_6(self):
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
             for m in methods:
-                assert m in {"GET", "HEAD", "OPTIONS"}, (
-                    f"non-read-only method: {m} {route.path}"
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only method: {m} {path}"
                 )
 
     def test_forbidden_imports_still_clean_after_phase_4_6(self):
@@ -3219,3 +3263,470 @@ class TestPhase46BoundaryUnchanged:
             headers={"Authorization": f"Bearer {VALID_KEY}"},
         )
         assert unique not in usage_path.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# Phase 4.7 — Stripe billing integration
+# ===========================================================================
+
+
+import hashlib as _hashlib_phase47  # noqa: E402
+import hmac as _hmac_phase47  # noqa: E402
+import time as _time_phase47  # noqa: E402
+
+from trading_bot.api import billing as _billing  # noqa: E402
+
+
+STRIPE_TEST_SECRET = "whsec_test_secret_for_tests_only"
+STRIPE_API_TEST_KEY = "sk_test_abcdefghij"
+
+
+def _sign_stripe_webhook(body: bytes, secret: str, *, ts=None) -> str:
+    timestamp = int(ts if ts is not None else _time_phase47.time())
+    signed = f"{timestamp}.".encode("utf-8") + body
+    sig = _hmac_phase47.new(
+        secret.encode("utf-8"), signed, _hashlib_phase47.sha256,
+    ).hexdigest()
+    return f"t={timestamp},v1={sig}"
+
+
+@pytest.fixture
+def stripe_env(monkeypatch, tmp_path: Path):
+    """Configure the server for Stripe-primary mode."""
+    monkeypatch.setenv("STRIPE_API_KEY", STRIPE_API_TEST_KEY)
+    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", STRIPE_TEST_SECRET)
+    monkeypatch.setenv("STRIPE_PRICE_ID_PREMIUM", "price_test_premium")
+    cache_file = tmp_path / "stripe_premium.json"
+    monkeypatch.setenv("TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_file))
+    # Server still needs a valid Bearer somewhere — the Stripe-only
+    # customer will authenticate via TRADING_API_KEY for this fixture.
+    # Premium tier will be granted by the Stripe webhook.
+    monkeypatch.setenv(API_KEY_ENV_VAR, "stripe-customer-api-key")
+    # Clear the env-var premium-list so Stripe is the only source.
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    _billing.reset_cache_for_tests()
+    reports_dir = tmp_path / "reports"
+    manifest = tmp_path / "manifest.jsonl"
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
+    return {
+        "cache_file": cache_file,
+        "reports_dir": reports_dir,
+        "manifest": manifest,
+        "api_key": "stripe-customer-api-key",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Webhook endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookEndpointSignature:
+    def test_valid_signature_returns_200(
+        self, client: TestClient, stripe_env
+    ):
+        body = json.dumps({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": stripe_env["api_key"]},
+            }},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={
+                "stripe-signature": sig,
+                "content-type": "application/json",
+            },
+        )
+        assert resp.status_code == 200
+        body_json = resp.json()
+        assert body_json["received"] is True
+        assert body_json["action"] == "added"
+        assert body_json["type"] == "customer.subscription.created"
+
+    def test_invalid_signature_returns_400(
+        self, client: TestClient, stripe_env
+    ):
+        resp = client.post(
+            "/webhook/stripe",
+            content=b"{}",
+            headers={
+                "stripe-signature": "t=123,v1=deadbeef",
+                "content-type": "application/json",
+            },
+        )
+        assert resp.status_code == 400
+        assert "invalid" in resp.json()["detail"].lower()
+
+    def test_missing_signature_returns_400(
+        self, client: TestClient, stripe_env
+    ):
+        resp = client.post(
+            "/webhook/stripe",
+            content=b"{}",
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+    def test_tampered_body_returns_400(
+        self, client: TestClient, stripe_env
+    ):
+        body = b'{"type": "customer.subscription.created"}'
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe",
+            content=body + b" ",  # extra byte breaks HMAC
+            headers={
+                "stripe-signature": sig,
+                "content-type": "application/json",
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_webhook_not_configured_returns_503(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        """No STRIPE_WEBHOOK_SECRET → reject every call fail-closed."""
+        monkeypatch.delenv("STRIPE_WEBHOOK_SECRET", raising=False)
+        body = b'{"type": "customer.subscription.created"}'
+        sig = _sign_stripe_webhook(body, "anything")
+        resp = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert resp.status_code == 503
+
+    def test_invalid_json_body_with_good_signature_returns_400(
+        self, client: TestClient, stripe_env
+    ):
+        body = b"not valid json at all"
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert resp.status_code == 400
+
+    def test_webhook_does_not_require_auth_header(
+        self, client: TestClient, stripe_env
+    ):
+        """Webhook is authenticated by signature, NOT by Authorization."""
+        body = json.dumps({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {"metadata": {"api_key": "some-key"}}},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={"stripe-signature": sig},
+        )
+        # 200 even without any Authorization header.
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: webhook delivery → premium access
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookUpdatesAccess:
+    def test_subscription_created_grants_premium_access(
+        self, client: TestClient, stripe_env
+    ):
+        _write_report(stripe_env["reports_dir"], "2026-04-24")
+        api_key = stripe_env["api_key"]
+
+        # Before subscription: free tier — writes cannot reach old dates
+        # (here we need to mock _today_utc or just test with an OLD date).
+        from trading_bot.api import server as srv
+        srv._today_utc = lambda: _date_phase45(2026, 4, 24)
+        # Request old date as free → 403.
+        _write_report(stripe_env["reports_dir"], "2025-01-01")
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 403
+
+        # Now Stripe delivers the subscription.created webhook.
+        body = json.dumps({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": api_key},
+            }},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        hook = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert hook.status_code == 200
+        assert hook.json()["action"] == "added"
+
+        # Same request now succeeds (premium tier).
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+
+    def test_subscription_deleted_revokes_premium(
+        self, client: TestClient, stripe_env
+    ):
+        api_key = stripe_env["api_key"]
+        _write_report(stripe_env["reports_dir"], "2025-01-01")
+
+        # Become premium.
+        _billing.add_premium_key(api_key)
+
+        from trading_bot.api import server as srv
+        srv._today_utc = lambda: _date_phase45(2026, 4, 24)
+
+        # Works as premium first.
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+
+        # Stripe delivers subscription.deleted.
+        body = json.dumps({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {"metadata": {"api_key": api_key}}},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        hook = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert hook.status_code == 200
+        assert hook.json()["action"] == "removed"
+
+        # Now free-tier — old date blocked.
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 403
+
+    def test_payment_failed_revokes_premium(
+        self, client: TestClient, stripe_env
+    ):
+        api_key = stripe_env["api_key"]
+        _billing.add_premium_key(api_key)
+        assert _billing.is_premium_via_stripe(api_key) is True
+
+        body = json.dumps({
+            "type": "invoice.payment_failed",
+            "data": {"object": {"metadata": {"api_key": api_key}}},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe",
+            content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert resp.status_code == 200
+        assert _billing.is_premium_via_stripe(api_key) is False
+
+
+# ---------------------------------------------------------------------------
+# Fallback to env-var premium list when Stripe not configured
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackToEnvVar:
+    def test_env_var_premium_works_when_stripe_not_configured(
+        self, client: TestClient, free_env
+    ):
+        """free_env has TRADING_API_PREMIUM_KEYS=VALID_KEY and Stripe unset."""
+        _write_report(free_env["reports_dir"], "2025-01-01")
+        from trading_bot.api import server as srv
+        srv._today_utc = lambda: _date_phase45(2026, 4, 24)
+        # VALID_KEY is premium via env var.
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        # FREE_KEY is NOT premium.
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+
+    def test_env_var_premium_still_works_when_stripe_configured(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        """Operator override: env-var premium list is still honoured
+        even when Stripe is configured, so ops can grant access
+        independently of the billing flow."""
+        monkeypatch.setenv("STRIPE_API_KEY", STRIPE_API_TEST_KEY)
+        monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", STRIPE_TEST_SECRET)
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(tmp_path / "cache.json"),
+        )
+        monkeypatch.setenv(API_KEY_ENV_VAR, "shared-free")
+        monkeypatch.setenv("TRADING_API_PREMIUM_KEYS", "ops-override-key")
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(tmp_path / "reports"))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+        _billing.reset_cache_for_tests()
+
+        _write_report(tmp_path / "reports", "2025-01-01")
+        from trading_bot.api import server as srv
+        srv._today_utc = lambda: _date_phase45(2026, 4, 24)
+
+        # ops-override-key works via env var even though it's not
+        # in the Stripe cache.
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": "Bearer ops-override-key"},
+        )
+        assert resp.status_code == 200
+
+    def test_stripe_cache_wins_for_customers_not_in_env(
+        self, client: TestClient, stripe_env
+    ):
+        """Stripe cache grants premium to a key not in TRADING_API_PREMIUM_KEYS."""
+        api_key = stripe_env["api_key"]
+        _billing.add_premium_key(api_key)
+        _write_report(stripe_env["reports_dir"], "2025-01-01")
+        from trading_bot.api import server as srv
+        srv._today_utc = lambda: _date_phase45(2026, 4, 24)
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# No sensitive data stored / returned
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookNeverPersistsSensitiveData:
+    def test_card_data_in_webhook_payload_does_not_land_on_disk(
+        self, client: TestClient, stripe_env
+    ):
+        """A webhook event with card / email / PAN fields must result in
+        NONE of those values being written to the Stripe cache file."""
+        api_key = stripe_env["api_key"]
+        body = json.dumps({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": api_key},
+                "customer": {
+                    "email": "card_owner_LEAK@example.com",
+                    "name": "LEAKED_CARDHOLDER",
+                    "metadata": {"pan": "4242424242424242", "cvv": "999"},
+                },
+            }},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe", content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert resp.status_code == 200
+        raw = stripe_env["cache_file"].read_text(encoding="utf-8")
+        for leak in (
+            "card_owner_LEAK@example.com",
+            "LEAKED_CARDHOLDER",
+            "4242424242424242",
+            "999",
+        ):
+            assert leak not in raw, f"leaked {leak!r} to {stripe_env['cache_file']}"
+        # The opaque api_key is the ONLY thing persisted.
+        assert api_key in raw
+
+    def test_webhook_response_body_never_echoes_sensitive_fields(
+        self, client: TestClient, stripe_env
+    ):
+        api_key = stripe_env["api_key"]
+        body = json.dumps({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": api_key},
+                "customer": {
+                    "email": "RESP_LEAK@example.com",
+                },
+            }},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe", content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert resp.status_code == 200
+        assert "RESP_LEAK@example.com" not in resp.text
+        # Also the api_key must not be echoed back in the response body.
+        assert api_key not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Boundary re-assertion
+# ---------------------------------------------------------------------------
+
+
+class TestPhase47Boundary:
+    def test_only_non_read_verb_is_post_webhook_stripe(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only method {m} on {path}"
+                )
+
+    def test_webhook_stripe_does_not_import_core(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "billing.py"
+        ).read_text()
+        for pat in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert pat not in src
+
+    def test_webhook_does_not_write_usage_record(
+        self, client: TestClient, stripe_env, usage_path: Path
+    ):
+        """The Stripe webhook is a system-to-system call, not a user
+        request — it must NOT land in the per-key usage log."""
+        body = json.dumps({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": stripe_env["api_key"]},
+            }},
+        }).encode("utf-8")
+        sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
+        resp = client.post(
+            "/webhook/stripe", content=body,
+            headers={"stripe-signature": sig},
+        )
+        assert resp.status_code == 200
+        assert _read_usage(usage_path) == []

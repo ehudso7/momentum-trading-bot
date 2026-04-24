@@ -29,6 +29,10 @@ See also:
 | `TRADING_API_AUDIT_LOG_PATH`           | path             | `data/api_access_audit.jsonl` | SaaS API only | Append-only JSONL file recording one metadata-only record per request. (Phase 4.4) |
 | `TRADING_API_PREMIUM_KEYS`             | comma-sep tokens | *(unset)* | SaaS API only | Bearer tokens that grant premium-tier access. Any other accepted token is treated as free tier. (Phase 4.5) |
 | `TRADING_API_USAGE_LOG_PATH`           | path             | `data/api_usage.jsonl` | SaaS API only | Append-only JSONL file with one metadata-only record per successful protected request. Raw API keys never written. (Phase 4.6) |
+| `STRIPE_API_KEY`                       | `sk_...` secret  | *(unset)* | SaaS API only | Presence toggles Stripe-primary premium classification. Unset → Phase 4.5 env-var list is the only source. (Phase 4.7) |
+| `STRIPE_WEBHOOK_SECRET`                | `whsec_...`      | *(unset)* | SaaS API only | HMAC secret used to verify Stripe webhook signatures. Unset → `POST /webhook/stripe` fail-closed 503. (Phase 4.7) |
+| `STRIPE_PRICE_ID_PREMIUM`              | `price_...`      | *(unset)* | SaaS API only | Informational — operator-facing reference to the premium product. Not read by this codebase. (Phase 4.7) |
+| `TRADING_STRIPE_PREMIUM_CACHE_PATH`    | path             | `data/stripe_premium_keys.json` | SaaS API only | Persistent JSON list of opaque API-key strings with active subscriptions. Survives restarts. (Phase 4.7) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -1032,6 +1036,141 @@ mapping is one-way and the raw token never leaves memory.
   rate limiter is still purely per-IP.
 - No cross-record correlation beyond what `request_id` and
   `key_hash` already enable for downstream pipelines.
+
+### Phase 4.7 — Stripe billing integration (`POST /webhook/stripe`)
+
+Promotes users from **free → premium automatically** when they
+start an active Stripe subscription, and revokes premium the
+moment Stripe tells us the subscription ended or payment failed.
+
+**Never stores card data, PAN, CVV, emails, names, or any other
+sensitive payment field.** The only thing persisted locally is a
+JSON list of opaque API-key strings whose owners currently have an
+active subscription. A dedicated test plants PII fields into a
+webhook body and asserts none of them appear in the persisted
+cache file or the webhook response body.
+
+Implementation avoids adding a `stripe` pip dependency: signature
+verification is the documented Stripe v1 scheme
+(`HMAC-SHA256(secret, f"{t}.{body}")`) implemented with stdlib
+`hmac` + `hashlib`, so failure modes and replay protection are
+well-understood without a library surface.
+
+#### How API keys map to Stripe customers
+
+The Stripe customer metadata **must** include `api_key=<user_key>`.
+When issuing a subscription via Stripe Checkout or Billing Portal,
+also set `subscription_data.metadata.api_key = <user_key>` so the
+value is copied onto the subscription object — webhooks do not
+expand the customer by default, and we deliberately do not call
+Stripe's API on the critical webhook path.
+
+Without this metadata, the webhook silently ignores the event
+(`action: "ignored", reason: "no_api_key_on_event"`). The
+subscription is still valid at Stripe's end, but the SaaS API
+does not know which user it belongs to until the metadata is
+corrected and a subsequent event (e.g., `subscription.updated`)
+carries it.
+
+#### `POST /webhook/stripe`
+
+Request:
+- Headers: `Stripe-Signature: t=<ts>,v1=<hmac>` (required).
+- Body: raw JSON exactly as Stripe sends it (no client mutation).
+
+Responses:
+- `200 {"received": true, "action": "added|removed|ignored", "type": <event_type>}`
+- `400 {"detail": "invalid webhook signature"}` — bad HMAC or stale timestamp.
+- `400 {"detail": "invalid webhook payload"}` — body is not valid JSON.
+- `503 {"detail": "billing webhook not configured"}` — `STRIPE_WEBHOOK_SECRET` unset.
+
+Handled event types:
+
+| Event                              | Behaviour |
+| ---                                | --- |
+| `customer.subscription.created`    | Adds `api_key` to the premium cache iff `status in {active, trialing}`. |
+| `customer.subscription.deleted`    | Removes `api_key` from the premium cache (idempotent). |
+| `invoice.payment_failed`           | Removes `api_key` immediately (fail-closed on billing failure). |
+| *(anything else)*                  | `action: "ignored", reason: "unhandled_type"` — no side effects. |
+
+#### Precedence (when both are configured)
+
+```
+is_premium(api_key):
+    if Stripe configured AND api_key in Stripe cache  → True
+    if api_key in TRADING_API_PREMIUM_KEYS            → True   (operator override)
+    else                                              → False  (free tier)
+```
+
+The env-var list continues to work even when Stripe is configured,
+so operators / enterprise accounts can be granted access without
+going through the billing flow.
+
+#### Fallback when Stripe is not configured
+
+- `STRIPE_API_KEY` unset → Phase 4.5 semantics exactly: premium is
+  determined entirely by `TRADING_API_PREMIUM_KEYS`. The webhook
+  endpoint still exists but returns 503 if called (nothing to
+  verify against).
+
+#### Safety invariants (enforced by tests)
+
+- **Tamper rejection.** A single-byte change to the body makes the
+  HMAC fail and the webhook returns 400.
+- **Replay rejection.** Signed timestamps outside the 300-second
+  tolerance window are rejected.
+- **Secret rotation.** Changing `STRIPE_WEBHOOK_SECRET` invalidates
+  all in-flight deliveries — they all fail 400 immediately.
+- **No Core imports.** `tests/test_billing.py::TestBillingBoundary`
+  greps `trading_bot/api/billing.py` for forbidden imports.
+- **No mutating routes except this one.** Every boundary test
+  carves out exactly `POST /webhook/stripe` — any other mutating
+  verb on any route causes the test to fail.
+- **No sensitive data on disk.** The cache file contains only
+  opaque `api_key` strings; planted PII / card-number markers in
+  webhook bodies are asserted absent.
+- **Not recorded in the per-key usage log.** The Stripe webhook is
+  a system-to-system call — it carries no Authorization header
+  and no caller-owned API key, so the Phase 4.6 usage middleware
+  correctly skips it.
+
+#### Setup instructions for Stripe
+
+1. In the Stripe Dashboard → Developers → API keys, copy the
+   secret key (`sk_live_...` for production) and set it as
+   `STRIPE_API_KEY` on the server.
+2. In Developers → Webhooks, create a new endpoint pointing at
+   `https://your-host/webhook/stripe`. Select events:
+   `customer.subscription.created`,
+   `customer.subscription.deleted`,
+   `invoice.payment_failed`.
+   Copy the Signing secret (`whsec_...`) and set it as
+   `STRIPE_WEBHOOK_SECRET`.
+3. Create the premium product and copy the price ID to
+   `STRIPE_PRICE_ID_PREMIUM` (informational).
+4. When creating a Checkout Session, set
+   `customer_creation=always` plus
+   `subscription_data.metadata.api_key=<user_key>` so the
+   webhook event carries the user identity. Also set
+   `customer.metadata.api_key=<user_key>` as a defence-in-depth
+   fallback.
+5. Restart the server. `POST /webhook/stripe` now accepts
+   signed Stripe deliveries and routes subscription state
+   into the premium-key cache.
+
+#### Rollback
+
+- Unset `STRIPE_API_KEY` → server falls back to the env-var
+  premium list. The webhook starts returning 503 (no more
+  subscription events accepted). Existing Stripe-granted access
+  persists until the operator deletes the cache file.
+- Delete `data/stripe_premium_keys.json` → all Stripe-granted
+  premium access is revoked. A restart reloads the (now empty)
+  cache.
+- Revert the Phase 4.7 commit → the `/webhook/stripe` endpoint
+  disappears and the boundary tests revert to "no mutating
+  verbs anywhere". Existing integrations keep working because
+  nothing in the trading loop depends on billing state.
 
 
 ## Phase 2.7 — dataset rotation (reference)
