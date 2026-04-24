@@ -21,6 +21,9 @@ See also:
 | `TRADING_ALPHA_FILTER_ENABLED`         | `true` / `false` | `false`   | **Paper only**| Allow the alpha filter to block weak trades. (Phase 3) |
 | `TRADING_ALPHA_FILTER_MIN_TIER`        | `A` / `B` / `C`  | `B`       | Paper only    | Minimum alpha tier required to pass the filter. (Phase 3) |
 | `TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL`  | URL string       | *(unset)* | Any           | Optional Slack/Discord webhook for warning/critical guardrail alerts. (Phase 3.4) |
+| `TRADING_API_KEY`                      | opaque string    | *(unset)* | SaaS API only | Required bearer token for every protected `/reports` / `/experiments` endpoint. Unset → server refuses all protected traffic. (Phase 4.0) |
+| `TRADING_API_REPORTS_DIR`              | path             | `reports` | SaaS API only | Directory holding `alpha_report_<DATE>.json`. (Phase 4.0) |
+| `TRADING_API_MANIFEST_PATH`            | path             | `data/alpha_experiments.jsonl` | SaaS API only | Path to the append-only manifest. (Phase 4.0) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -490,6 +493,85 @@ python -m trading_bot.reporting.experiment_manifest \
 returns a list of record dicts with the same `tail` semantics,
 skipping malformed lines so a partial write can never make
 history unreadable.
+
+
+## Phase 4 — SaaS Boundary Rules
+
+The Core bot (scanner / strategy / risk / execution / portfolio / alpha
+scoring / filter) stays **private** on the trading host. A separate,
+strictly **read-only** analytics layer (`trading_bot.api.server`)
+can be exposed to an external SaaS surface without exposing any
+trading decision or scoring internal.
+
+### What the API MAY expose
+
+- Aggregated daily statistics: tier / reason / regime stats,
+  decile calibration, shadow-filter simulation rows, totals.
+- Guardrail classification and recommended action.
+- Promotion-readiness status.
+- The scorer **fingerprint** hash (a 64-char opaque string).
+- The append-only experiment manifest, minus server-side paths
+  and minus the scorer weight breakdown.
+
+### What the API MUST NOT expose
+
+- Trading execution. There is no POST / PUT / PATCH / DELETE
+  endpoint and no path that could be interpreted as an order or
+  trade hook — enforced by
+  `tests/test_api_server.py::TestBoundaryEnforcement`.
+- Alpha scoring weights, tier thresholds, regime-score maps —
+  i.e., the content of `get_alpha_scorer_config()`. The
+  sanitizer strips `scorer_config` from every response.
+- Filesystem paths embedded in report sources or manifest
+  `report_paths`. Stripped before serialization so the hosting
+  layout cannot be inferred.
+- Any live-decision state. The API never imports
+  `trading_bot.core.alpha`, `trading_bot.main`, or any module
+  under `execution/`, `portfolio/`, `risk/`, `scanners/`, or
+  `strategies/`. A structural test enforces this at source level.
+- Raw secrets. The upstream `snapshot_env()` already redacts the
+  webhook URL to a presence boolean; the API further scrubs
+  fields that shouldn't cross the boundary.
+
+### Endpoints
+
+| Method | Path                       | Auth | Description |
+| ---    | ---                        | ---  | --- |
+| GET    | `/health`                  | No   | Liveness probe. |
+| GET    | `/reports/latest`          | Yes  | Most recent daily report (sanitized). |
+| GET    | `/reports/{date}`          | Yes  | Report for `YYYY-MM-DD` (sanitized). |
+| GET    | `/experiments/recent?limit=N` | Yes | Last N manifest records (sanitized). |
+| GET    | `/experiments/{n}`         | Yes  | Nth-most-recent manifest record (1 = most recent). |
+
+All non-`/health` endpoints require
+`Authorization: Bearer <TRADING_API_KEY>`. Unset `TRADING_API_KEY`
+on the server → every protected endpoint returns 503; this is a
+deliberate fail-closed default.
+
+### Running
+
+```bash
+export TRADING_API_KEY=<random secret>
+# optional overrides
+export TRADING_API_REPORTS_DIR=reports
+export TRADING_API_MANIFEST_PATH=data/alpha_experiments.jsonl
+
+uvicorn trading_bot.api.server:app --reload --host 0.0.0.0 --port 8000
+```
+
+Interactive docs are available at `/docs` and `/redoc`; they do not
+bypass authentication.
+
+### Deployment posture
+
+- The API is designed to run on a separate host from the Core
+  trading bot, or at least as a separate process that only has
+  read access to the reports / manifest files.
+- Because the API never writes to disk and never imports Core,
+  compromising the API process cannot affect live trading.
+- Rate limiting / DDOS protection are expected to come from the
+  surrounding infrastructure (reverse proxy, API gateway). The
+  server itself caps `/experiments/recent?limit=` at 100.
 
 
 ## Phase 2.7 — dataset rotation (reference)
