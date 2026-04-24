@@ -89,6 +89,27 @@ MAX_FREE_TIER_DAYS = 3            # /reports/{date} window for free tier
 MAX_FREE_TIER_EXPERIMENTS = 3     # /experiments/* cap for free tier
 UPGRADE_REQUIRED_DETAIL = "upgrade required for full access"
 
+# Phase 5.4 — free-tier daily usage caps (reversible via env vars).
+# Both caps are hard ceilings on a per-key / per-UTC-day basis. They
+# apply ONLY to free-tier callers — premium users are exempt, as
+# are public paths (/ , /health) and the Stripe webhook.
+FREE_MAX_REQUESTS_ENV_VAR = "TRADING_FREE_MAX_REQUESTS_PER_DAY"
+FREE_MAX_REPORT_CALLS_ENV_VAR = "TRADING_FREE_MAX_REPORT_CALLS"
+DEFAULT_FREE_MAX_REQUESTS_PER_DAY = 50
+DEFAULT_FREE_MAX_REPORT_CALLS = 10
+FREE_TIER_USAGE_HEADER = "X-Free-Tier-Usage"
+FREE_TIER_REMAINING_HEADER = "X-Free-Tier-Remaining"
+FREE_TIER_LIMIT_DETAIL = (
+    "free tier limit reached — upgrade for continued access"
+)
+# Paths that count as "report calls" for the stricter cap.
+_FREE_TIER_REPORT_PATH_PREFIX = "/reports/"
+# Paths that Phase 5.4 does NOT count toward the daily cap and
+# must NEVER emit a 429/403 from this middleware.
+_FREE_TIER_EXEMPT_PATHS: frozenset[str] = frozenset(
+    {"/", "/health", "/webhook/stripe"}
+)
+
 DEFAULT_REPORTS_DIR = "reports"
 DEFAULT_MANIFEST_PATH = "data/alpha_experiments.jsonl"
 
@@ -179,6 +200,38 @@ def _allowed_origins() -> list[str]:
     if not raw or not raw.strip():
         return []
     return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _parse_positive_int_env(env_var: str, default: int) -> int:
+    """
+    Resolve a positive-integer env var fail-closed.
+
+    Any invalid value (non-int, zero, negative, empty, garbage)
+    falls back to ``default`` — a typo in a limit env var must
+    never disable the limit entirely.
+    """
+    raw = os.getenv(env_var)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if n <= 0:
+        return default
+    return n
+
+
+def _free_max_requests_per_day() -> int:
+    return _parse_positive_int_env(
+        FREE_MAX_REQUESTS_ENV_VAR, DEFAULT_FREE_MAX_REQUESTS_PER_DAY,
+    )
+
+
+def _free_max_report_calls() -> int:
+    return _parse_positive_int_env(
+        FREE_MAX_REPORT_CALLS_ENV_VAR, DEFAULT_FREE_MAX_REPORT_CALLS,
+    )
 
 
 def _client_ip(request: Request) -> str:
@@ -348,6 +401,91 @@ def _is_premium(api_key: Optional[str]) -> bool:
     if is_stripe_configured() and is_premium_via_stripe(api_key):
         return True
     return api_key in _premium_keys_set()
+
+
+def _is_known_key(api_key: Optional[str]) -> bool:
+    """
+    Phase 5.4 helper: True iff ``api_key`` would be accepted by
+    ``require_api_key`` (free or premium). Used by the free-tier
+    middleware to decide whether to enforce or fall through; the
+    actual authentication still happens at the route dependency.
+    """
+    if not api_key:
+        return False
+    configured = (os.getenv(API_KEY_ENV_VAR, "") or "").strip()
+    if configured and api_key == configured:
+        return True
+    return _is_premium(api_key) or api_key in _premium_keys_set()
+
+
+def _extract_bearer_token(request: Request) -> Optional[str]:
+    """
+    Pull the bearer token out of the ``Authorization`` header
+    without logging it and without touching the FastAPI dependency
+    system. Returns ``None`` if the header is absent or malformed.
+    """
+    auth = request.headers.get("authorization") or ""
+    parts = auth.strip().split(None, 1)
+    if len(parts) != 2:
+        return None
+    scheme, token = parts
+    if scheme.lower() != "bearer":
+        return None
+    token = token.strip()
+    return token or None
+
+
+def _count_free_tier_usage_today(
+    key_hash: str,
+    today: Optional[str] = None,
+) -> tuple[int, int]:
+    """
+    Return ``(total_requests, report_requests)`` for ``key_hash`` on
+    the current UTC date.
+
+    * ``total_requests`` — every usage-log row for this key whose
+      ``timestamp`` falls on ``today``.
+    * ``report_requests`` — the subset whose ``path`` starts with
+      ``/reports/``.
+
+    Best-effort: any I/O / decoding failure returns ``(0, 0)`` and
+    logs at DEBUG. The caller's request must never fail because
+    this counter hit disk trouble.
+    """
+    if not key_hash:
+        return (0, 0)
+    day = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = _usage_log_path()
+    if not path.exists():
+        return (0, 0)
+    total = 0
+    reports = 0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except Exception:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("key_hash") != key_hash:
+                    continue
+                ts = rec.get("timestamp")
+                if not isinstance(ts, str) or not ts.startswith(day):
+                    continue
+                total += 1
+                p = rec.get("path")
+                if isinstance(p, str) and p.startswith(
+                    _FREE_TIER_REPORT_PATH_PREFIX,
+                ):
+                    reports += 1
+    except Exception as exc:
+        log.debug("free_tier.count_error", error=str(exc))
+    return (total, reports)
 
 
 def require_api_key(
@@ -639,6 +777,107 @@ async def rate_limit_middleware(request: Request, call_next):
             headers={"Retry-After": str(retry_after)},
         )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def free_tier_middleware(request: Request, call_next):
+    """
+    Phase 5.4 — enforce per-UTC-day request caps on free-tier callers.
+
+    Two caps, both driven by env vars (reversible):
+
+      * ``TRADING_FREE_MAX_REQUESTS_PER_DAY`` (default 50)
+        — every protected request counts, regardless of path.
+      * ``TRADING_FREE_MAX_REPORT_CALLS`` (default 10)
+        — tighter cap on calls whose path starts with
+        ``/reports/``.
+
+    When a free-tier caller exceeds ``max_requests_per_day`` we
+    return ``429`` with
+    ``{"detail": "free tier limit reached — upgrade for continued access"}``.
+    When they exceed ``max_report_calls`` on a ``/reports/*`` path
+    we return ``403`` with
+    ``{"detail": "upgrade required for full access"}``.
+
+    Both rejection responses — and every successful response for a
+    free-tier caller — carry the headers
+    ``X-Free-Tier-Usage: <current>/<limit>`` and
+    ``X-Free-Tier-Remaining: <remaining>``.
+
+    Unaffected surfaces:
+
+      * premium users (``_is_premium`` returns True);
+      * the public landing / health paths and ``POST /webhook/stripe``;
+      * unauthenticated requests (they are rejected with 401/403
+        by ``require_api_key`` at dispatch time, NOT by this
+        middleware — so limits cannot be used as an auth oracle).
+
+    Best-effort: any failure reading the usage log degrades to
+    "no counts yet" — we prefer to let a request through than to
+    block a paying user because of a disk outage.
+    """
+    path = request.url.path
+    if path in _FREE_TIER_EXEMPT_PATHS:
+        return await call_next(request)
+
+    api_key = _extract_bearer_token(request)
+    if not api_key:
+        # Anonymous: let require_api_key reject with 401/403.
+        return await call_next(request)
+    if not _is_known_key(api_key):
+        # Unknown key: let require_api_key reject with 401/403.
+        return await call_next(request)
+    if _is_premium(api_key):
+        # Premium keys are entirely exempt — no enforcement, no
+        # headers. The premium surface must behave identically to
+        # the pre-Phase-5.4 server.
+        return await call_next(request)
+
+    # Free-tier authenticated caller. Enforce and annotate.
+    max_total = _free_max_requests_per_day()
+    max_reports = _free_max_report_calls()
+    key_hash = _hash_api_key(api_key)
+    total_today, reports_today = _count_free_tier_usage_today(key_hash)
+    is_report = path.startswith(_FREE_TIER_REPORT_PATH_PREFIX)
+
+    usage_header = f"{total_today}/{max_total}"
+    remaining = max(0, max_total - total_today)
+
+    if total_today >= max_total:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": FREE_TIER_LIMIT_DETAIL},
+            headers={
+                FREE_TIER_USAGE_HEADER: usage_header,
+                FREE_TIER_REMAINING_HEADER: "0",
+            },
+        )
+    if is_report and reports_today >= max_reports:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": UPGRADE_REQUIRED_DETAIL},
+            headers={
+                FREE_TIER_USAGE_HEADER: usage_header,
+                FREE_TIER_REMAINING_HEADER: str(remaining),
+            },
+        )
+
+    response: Response = await call_next(request)
+
+    # Annotate the response. We only set the headers on responses
+    # the auth layer accepted — a 401/403/503 means the caller never
+    # actually authenticated, so presenting a per-user counter there
+    # would be misleading AND could be used as an account-exists
+    # oracle.
+    if response.status_code not in {401, 403, 503}:
+        new_total = total_today + 1
+        response.headers[FREE_TIER_USAGE_HEADER] = (
+            f"{new_total}/{max_total}"
+        )
+        response.headers[FREE_TIER_REMAINING_HEADER] = str(
+            max(0, max_total - new_total),
+        )
+    return response
 
 
 @app.middleware("http")
@@ -1349,6 +1588,15 @@ _DASHBOARD_CSS = """
   .status-not_ready { color: #666; font-weight: 600; }
   .kv td:first-child { color: #555; font-weight: 600; }
   footer { margin-top: 3em; color: #999; font-size: 0.8em; }
+  .free-tier-banner {
+    background: #fff7e6;
+    border: 1px solid #f0c36d;
+    color: #7a4a00;
+    padding: 0.6em 0.9em;
+    margin: 1em 0;
+    border-radius: 4px;
+    font-weight: 600;
+  }
 </style>
 """.strip()
 
@@ -1585,6 +1833,16 @@ def render_dashboard_html(
         + "</section>"
     )
 
+    # Phase 5.4 — free-tier nudge banner. Rendered before the
+    # first report block so it's the first thing a free user sees
+    # when they load the dashboard.
+    free_tier_banner = (
+        '<p class="free-tier-banner">'
+        'You&#39;re using the free tier — upgrade for full access.'
+        "</p>"
+        if is_free else ""
+    )
+
     return (
         "<!DOCTYPE html>"
         "<html lang=\"en\"><head>"
@@ -1594,6 +1852,7 @@ def render_dashboard_html(
         "</head><body>"
         "<h1>Momentum Trading Bot — Analytics Dashboard</h1>"
         f'<p class="meta">Read-only view. Generated at {generated_at}.</p>'
+        f"{free_tier_banner}"
         f"{report_block}"
         f"{experiments_block}"
         "<footer>"

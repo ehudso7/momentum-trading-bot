@@ -4073,3 +4073,563 @@ class TestPhase52BoundaryUnchanged:
             assert forbidden not in src, (
                 f"landing handler unexpectedly references: {forbidden}"
             )
+
+
+# ===========================================================================
+# Phase 5.4 — free-tier daily usage caps
+# ===========================================================================
+
+
+from datetime import timezone as _tz_phase54  # noqa: E402
+
+from trading_bot.api.server import (  # noqa: E402
+    DEFAULT_FREE_MAX_REPORT_CALLS,
+    DEFAULT_FREE_MAX_REQUESTS_PER_DAY,
+    FREE_MAX_REPORT_CALLS_ENV_VAR,
+    FREE_MAX_REQUESTS_ENV_VAR,
+    FREE_TIER_LIMIT_DETAIL,
+    FREE_TIER_REMAINING_HEADER,
+    FREE_TIER_USAGE_HEADER,
+    _count_free_tier_usage_today,
+    _free_max_report_calls,
+    _free_max_requests_per_day,
+)
+
+
+def _today_utc_str_54() -> str:
+    from datetime import datetime as _dt
+    return _dt.now(_tz_phase54.utc).strftime("%Y-%m-%d")
+
+
+def _seed_usage_rows(
+    path: Path,
+    *,
+    key: str,
+    n: int,
+    report_path_prefix: str = "/experiments/recent",
+    date_str: Optional[str] = None,
+) -> None:
+    """
+    Write ``n`` usage-log rows for ``key`` directly to the usage
+    log. Saves us from having to issue ``n`` real HTTP requests
+    when we just want to seed a pre-existing count.
+    """
+    import hashlib
+    date_str = date_str or _today_utc_str_54()
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for i in range(n):
+            rec = {
+                "timestamp": f"{date_str}T00:00:{i % 60:02d}.000000Z",
+                "key_hash": key_hash,
+                "tier": "free",
+                "method": "GET",
+                "path": report_path_prefix,
+                "status_code": 200,
+                "duration_ms": 1.0,
+                "request_id": f"seed-{i}",
+            }
+            fh.write(json.dumps(rec) + "\n")
+
+
+# `Optional` used above — keep the import adjacent to where it's used
+# so the test block stays self-contained.
+from typing import Optional  # noqa: E402,F401
+
+
+# ---------------------------------------------------------------------------
+# Env resolver / fail-closed behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54EnvResolvers:
+    def test_defaults_when_unset(self, monkeypatch):
+        monkeypatch.delenv(FREE_MAX_REQUESTS_ENV_VAR, raising=False)
+        monkeypatch.delenv(FREE_MAX_REPORT_CALLS_ENV_VAR, raising=False)
+        assert _free_max_requests_per_day() == DEFAULT_FREE_MAX_REQUESTS_PER_DAY
+        assert _free_max_report_calls() == DEFAULT_FREE_MAX_REPORT_CALLS
+
+    def test_explicit_override(self, monkeypatch):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "7")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "3")
+        assert _free_max_requests_per_day() == 7
+        assert _free_max_report_calls() == 3
+
+    @pytest.mark.parametrize("bad", ["", "   ", "abc", "-1", "0", "1.5", "nan"])
+    def test_invalid_values_fail_closed_to_default(self, monkeypatch, bad):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, bad)
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, bad)
+        assert _free_max_requests_per_day() == DEFAULT_FREE_MAX_REQUESTS_PER_DAY
+        assert _free_max_report_calls() == DEFAULT_FREE_MAX_REPORT_CALLS
+
+
+# ---------------------------------------------------------------------------
+# Counter
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54CountHelper:
+    def test_missing_log_returns_zeros(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv(
+            USAGE_LOG_ENV_VAR, str(tmp_path / "absent.jsonl"),
+        )
+        assert _count_free_tier_usage_today("h" * 32) == (0, 0)
+
+    def test_counts_only_matching_hash_and_today(
+        self, usage_path: Path, monkeypatch,
+    ):
+        today = _today_utc_str_54()
+        # Seed 4 rows for our key today + 2 rows for another key +
+        # 3 rows for our key on a different date.
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=4,
+            report_path_prefix="/reports/latest",
+        )
+        _seed_usage_rows(
+            usage_path, key="other-key", n=2,
+            report_path_prefix="/reports/latest",
+        )
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=3,
+            report_path_prefix="/reports/latest",
+            date_str="1999-01-01",
+        )
+        import hashlib
+        kh = hashlib.sha256(FREE_KEY.encode()).hexdigest()[:32]
+        total, reports = _count_free_tier_usage_today(kh, today=today)
+        assert total == 4
+        assert reports == 4
+
+    def test_report_path_subset(self, usage_path: Path):
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=5,
+            report_path_prefix="/experiments/recent",
+        )
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=3,
+            report_path_prefix="/reports/2026-04-24",
+        )
+        import hashlib
+        kh = hashlib.sha256(FREE_KEY.encode()).hexdigest()[:32]
+        total, reports = _count_free_tier_usage_today(kh)
+        assert total == 8
+        assert reports == 3
+
+    def test_empty_key_hash_returns_zeros(self, usage_path: Path):
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=2,
+            report_path_prefix="/reports/latest",
+        )
+        assert _count_free_tier_usage_today("") == (0, 0)
+
+    def test_corrupt_lines_are_skipped(self, usage_path: Path):
+        usage_path.parent.mkdir(parents=True, exist_ok=True)
+        usage_path.write_text(
+            "not-json\n"
+            "\n"
+            "[\"not a dict\"]\n"
+            + json.dumps({
+                "timestamp": _today_utc_str_54() + "T00:00:00.000000Z",
+                "key_hash": "a" * 32,
+                "tier": "free",
+                "path": "/reports/latest",
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        total, reports = _count_free_tier_usage_today("a" * 32)
+        assert (total, reports) == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Free-tier limit: request cap (429)
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54RequestCap:
+    def test_free_user_429_after_limit_reached(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "3")
+        # Pre-seed exactly the limit (3) for today.
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=3,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        assert resp.json() == {"detail": FREE_TIER_LIMIT_DETAIL}
+        assert resp.headers.get(FREE_TIER_USAGE_HEADER) == "3/3"
+        assert resp.headers.get(FREE_TIER_REMAINING_HEADER) == "0"
+
+    def test_free_user_allowed_below_limit(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "50")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=10,
+            report_path_prefix="/experiments/recent",
+        )
+        # Write a manifest so /experiments/recent returns data.
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get(FREE_TIER_USAGE_HEADER) == "11/50"
+        assert resp.headers.get(FREE_TIER_REMAINING_HEADER) == "39"
+
+    def test_free_user_cannot_bypass_via_query_string(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "2")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=2,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent?limit=1",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+
+    def test_rejection_body_does_not_leak_key_or_hash(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        body = resp.text
+        assert FREE_KEY not in body
+        import hashlib
+        kh = hashlib.sha256(FREE_KEY.encode()).hexdigest()[:32]
+        assert kh not in body
+
+
+# ---------------------------------------------------------------------------
+# Free-tier limit: report-calls cap (403)
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54ReportCap:
+    def test_free_user_403_after_report_limit_reached(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "500")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "2")
+        # Seed 2 report calls — exactly at the cap.
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=2,
+            report_path_prefix="/reports/latest",
+        )
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "upgrade required for full access"}
+        assert resp.headers.get(FREE_TIER_USAGE_HEADER) == "2/500"
+        assert resp.headers.get(FREE_TIER_REMAINING_HEADER) == "498"
+
+    def test_non_report_paths_unaffected_by_report_cap(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        """The report cap must not block /experiments/* calls even
+        when the free user is over the report limit."""
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "500")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "2")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=5,
+            report_path_prefix="/reports/latest",
+        )
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_global_cap_wins_over_report_cap_when_both_exceeded(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        """If a free user exceeded BOTH caps we return the 429 — it's
+        the harsher signal and stops every subsequent call, not just
+        /reports/*."""
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "5")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "3")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=5,
+            report_path_prefix="/reports/latest",
+        )
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Premium-user exemption
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54PremiumIsExempt:
+    def test_premium_user_no_429_even_past_limit(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "2")
+        # Seed 100 usage rows attributed to the PREMIUM key — the
+        # middleware must ignore them entirely.
+        _seed_usage_rows(
+            usage_path, key=VALID_KEY, n=100,
+            report_path_prefix="/experiments/recent",
+        )
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_premium_response_has_no_free_tier_headers(
+        self, client: TestClient, free_env, usage_path: Path,
+    ):
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert FREE_TIER_USAGE_HEADER not in resp.headers
+        assert FREE_TIER_REMAINING_HEADER not in resp.headers
+
+    def test_premium_user_past_report_cap_still_allowed(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=VALID_KEY, n=50,
+            report_path_prefix="/reports/latest",
+        )
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Exempt paths: /, /health, /webhook/stripe
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54ExemptPaths:
+    def test_root_has_no_free_tier_headers(self, client: TestClient):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert FREE_TIER_USAGE_HEADER not in resp.headers
+        assert FREE_TIER_REMAINING_HEADER not in resp.headers
+
+    def test_health_has_no_free_tier_headers(self, client: TestClient):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert FREE_TIER_USAGE_HEADER not in resp.headers
+        assert FREE_TIER_REMAINING_HEADER not in resp.headers
+
+    def test_webhook_stripe_not_blocked_even_at_limit(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        """Even if we'd hit the free-tier cap, the webhook is
+        exempt. The webhook is a system-to-system call, not a free
+        user's request."""
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        monkeypatch.delenv("STRIPE_WEBHOOK_SECRET", raising=False)
+        # Seed well past the limit.
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=100,
+            report_path_prefix="/webhook/stripe",
+        )
+        # Webhook rejects for missing signature (its own logic) —
+        # specifically NOT a 429 from this middleware.
+        resp = client.post(
+            "/webhook/stripe", content=b"{}",
+            headers={"stripe-signature": "badsig"},
+        )
+        assert resp.status_code != 429
+        assert FREE_TIER_USAGE_HEADER not in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Unauthenticated / unknown-key requests must NOT be absorbed by
+# this middleware — they still get a 401/403 from require_api_key.
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54UnauthenticatedRequests:
+    def test_no_bearer_falls_through_to_401(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        resp = client.get("/experiments/recent")
+        assert resp.status_code == 401
+        assert FREE_TIER_USAGE_HEADER not in resp.headers
+
+    def test_unknown_bearer_falls_through_to_403(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert resp.status_code == 403
+        assert FREE_TIER_USAGE_HEADER not in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Dashboard banner
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54DashboardBanner:
+    _BANNER_ELEMENT = 'class="free-tier-banner"'
+
+    def test_free_dashboard_shows_banner(self):
+        html = render_dashboard_html(None, [], tier="free")
+        low = html.lower()
+        # The banner <p> element is present — not just the CSS
+        # class selector in <style>.
+        assert self._BANNER_ELEMENT in low
+        assert "using the free tier" in low
+        assert "upgrade for full access" in low
+
+    def test_premium_dashboard_has_no_banner(self):
+        html = render_dashboard_html(None, [], tier="premium")
+        assert self._BANNER_ELEMENT not in html.lower()
+        assert "using the free tier" not in html.lower()
+
+    def test_free_user_sees_banner_via_http(
+        self, client: TestClient, free_env,
+    ):
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert self._BANNER_ELEMENT in resp.text.lower()
+
+    def test_premium_user_has_no_banner_via_http(
+        self, client: TestClient, free_env,
+    ):
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert self._BANNER_ELEMENT not in resp.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Boundary / regression
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54BoundaryUnchanged:
+    def test_server_still_does_not_import_core(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for forbidden in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert forbidden not in src, (
+                f"SaaS boundary broken by Phase 5.4: {forbidden!r}"
+            )
+
+    def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST", (
+                    f"non-read-only verb introduced: {m} {path}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Header shape
+# ---------------------------------------------------------------------------
+
+
+class TestPhase54HeaderShape:
+    def test_usage_header_format_matches_spec(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "50")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=7,
+            report_path_prefix="/experiments/recent",
+        )
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        usage = resp.headers.get(FREE_TIER_USAGE_HEADER)
+        remaining = resp.headers.get(FREE_TIER_REMAINING_HEADER)
+        # Format: <current>/<limit> where current = previous + 1.
+        assert usage == "8/50"
+        assert remaining == "42"
+
+    def test_remaining_never_negative(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "3")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=3,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        assert resp.headers.get(FREE_TIER_REMAINING_HEADER) == "0"

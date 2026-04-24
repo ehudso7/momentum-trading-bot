@@ -1621,6 +1621,85 @@ operators tune it by changing the source. The legacy env vars
 not read by the landing handler.
 
 
+### Phase 5.4 — free-tier daily usage caps
+
+Controlled friction for free-tier callers, intended to lift
+conversion rate without affecting premium behaviour. Both caps
+are per-API-key / per-UTC-day and are fully reversible via env
+vars — unset both vars and the server reverts to the pre-Phase-5.4
+surface.
+
+**Env vars**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TRADING_FREE_MAX_REQUESTS_PER_DAY` | `50` | Max total protected requests per free-tier key per UTC day. Excess → `429`. |
+| `TRADING_FREE_MAX_REPORT_CALLS` | `10` | Stricter cap on `/reports/*` calls for free-tier keys. Excess → `403`. |
+
+Both resolvers are **fail-closed**: any non-positive-int value
+(`""`, `"abc"`, `"-1"`, `"0"`, `"1.5"`, `"nan"`) is rejected and
+the documented default is used instead. A typo cannot disable the
+cap.
+
+**Response headers (free-tier only).** Every free-tier response —
+success, 403, or 429 — carries:
+
+    X-Free-Tier-Usage: <current>/<limit>
+    X-Free-Tier-Remaining: <remaining>
+
+Premium responses never carry these headers, so a client SDK can
+trivially tell which tier it's on without a separate /tier
+endpoint.
+
+**Rejection bodies**
+
+    HTTP/1.1 429 Too Many Requests
+    Content-Type: application/json
+    X-Free-Tier-Usage: 50/50
+    X-Free-Tier-Remaining: 0
+
+    {"detail": "free tier limit reached — upgrade for continued access"}
+
+    HTTP/1.1 403 Forbidden
+    Content-Type: application/json
+    X-Free-Tier-Usage: 2/500
+    X-Free-Tier-Remaining: 498
+
+    {"detail": "upgrade required for full access"}
+
+**Surfaces NOT affected (strict invariants, tested):**
+
+1. Premium users — exempted before any count is loaded. Premium
+   requests never touch the usage log read path here.
+2. Public paths `/` and `/health` — same "fully unauthenticated"
+   contract as Phase 4.0.
+3. `POST /webhook/stripe` — system-to-system call, never a free
+   user. Exempt regardless of what the free-tier caller count is.
+4. Anonymous / unknown-key requests — pass through to
+   `require_api_key`, which still returns `401` / `403` /
+   `503`. The free-tier middleware never returns a response for
+   such requests (so the headers cannot be used as an
+   account-exists oracle).
+
+**Counter.** `_count_free_tier_usage_today(key_hash)` scans the
+Phase 4.6 usage log (`TRADING_API_USAGE_LOG_PATH`, default
+`data/api_usage.jsonl`) and returns
+`(total_today, report_calls_today)`. A report call is any row
+whose `path` starts with `/reports/`. Corrupt lines, missing
+file, and I/O errors all degrade gracefully to zeros — we prefer
+to let a request through than block a paying user on a disk
+outage.
+
+**Dashboard nudge.** When `/dashboard` is rendered for a free
+user, a yellow banner appears above the first report block:
+
+    You're using the free tier — upgrade for full access.
+
+Premium users see no banner. The banner is plain HTML — no JS,
+no form, no CTA link — so it adds zero attack surface and
+respects the "read-only" invariant from Phase 4.1.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
