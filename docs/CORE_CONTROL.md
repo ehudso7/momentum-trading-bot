@@ -33,6 +33,7 @@ See also:
 | `STRIPE_WEBHOOK_SECRET`                | `whsec_...`      | *(unset)* | SaaS API only | HMAC secret used to verify Stripe webhook signatures. Unset → `POST /webhook/stripe` fail-closed 503. (Phase 4.7) |
 | `STRIPE_PRICE_ID_PREMIUM`              | `price_...`      | *(unset)* | SaaS API only | Informational — operator-facing reference to the premium product. Not read by this codebase. (Phase 4.7) |
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH`    | path             | `data/stripe_premium_keys.json` | SaaS API only | Persistent JSON list of opaque API-key strings with active subscriptions. Survives restarts. (Phase 4.7) |
+| `TRADING_API_CONVERSION_LOG_PATH`      | path             | `data/api_conversions.jsonl` | SaaS API only | Append-only JSONL of free → paid conversion events. Hashed keys only — no PII, no card data. (Phase 4.9) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -1299,6 +1300,108 @@ is absent from both streams.
 - As a stopgap before Phase 4.9 (which may expose a public,
   authenticated checkout endpoint guarded by rate-limiting and
   per-user quotas).
+
+### Phase 4.9 — free → paid conversion tracking
+
+Appends one privacy-preserving JSONL event to
+`TRADING_API_CONVERSION_LOG_PATH` every time a Stripe subscription
+goes active (or trialing) for an API key we haven't previously
+counted as converted. Combined with the Phase 4.6 per-key usage
+log, this is enough to compute:
+
+- **Free users** (usage log, `tier == "free"` rows) — count of
+  distinct `key_hash`.
+- **Premium users** (usage log, `tier == "premium"` rows) — count
+  of distinct `key_hash`.
+- **Conversion events** (this log, `event == "converted"`) — count
+  of distinct `api_key_hash`.
+- **Conversion rate** = conversions / distinct-free-keys.
+- **Time-to-convert** = `timestamp` − `first_seen_timestamp` for
+  each record whose `first_seen_timestamp` is populated.
+
+#### Record shape
+
+| Field                  | Description |
+| ---                    | --- |
+| `timestamp`            | `datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')` of the webhook event |
+| `api_key_hash`         | `SHA-256(api_key)[:32]` — matches the Phase 4.6 usage-log hash exactly so BI pipelines can join the two files |
+| `event`                | Always `"converted"` in Phase 4.9. Reserved slot for future lifecycle events. |
+| `source`               | `"stripe"` today; reserved for future sources (`"manual"`, `"promo"`, etc.) |
+| `price_id`             | Extracted from `items.data[0].price.id` (or the legacy `plan.id`) — identifies the product, not the customer |
+| `first_seen_timestamp` | Earliest timestamp where this `api_key_hash` appears in the usage log; `null` when no prior usage recorded |
+
+Example (end-to-end, from a live webhook):
+
+```json
+{
+  "timestamp": "2026-04-24T19:14:08.069220Z",
+  "api_key_hash": "033014d328ab4d22057093c2e3912b11",
+  "event": "converted",
+  "source": "stripe",
+  "price_id": "price_premium_monthly_usd_2999",
+  "first_seen_timestamp": "2026-04-01T08:30:00.000000Z"
+}
+```
+
+This user's time-to-convert is therefore 23 days ≈ 23 × 86 400 s.
+
+#### Dedup semantics
+
+Per `api_key_hash`: once a conversion event has been recorded for a
+key, subsequent `subscription.created` deliveries (retries,
+reactivations after cancellation, plan changes) are **deduped** and
+do NOT create a new row. This matches the analytics question "did
+this user ever convert?" rather than "how often did they
+resubscribe?".
+
+The in-memory dedup set is rehydrated from disk on first call after
+a process restart, so the semantics survive redeploys.
+
+Concurrent calls on the same key race under a single
+`threading.Lock` — at most one thread ever writes a row for a
+given hash. A 20-thread stress test confirms this.
+
+#### Integration point
+
+`trading_bot.api.billing.handle_webhook_event` calls
+`trading_bot.api.conversion.record_conversion` inside a try/except
+whenever a `customer.subscription.created` event upgrades an API
+key to premium. The call is strictly best-effort: any exception
+during conversion tracking is caught, logged at DEBUG, and swallowed
+so the webhook response is unaffected (a dedicated test stubs
+`record_conversion` to raise and asserts the webhook still returns
+`action: "added"`).
+
+#### Privacy invariants (enforced by tests)
+
+- **No raw API key on disk.** Planted unique-marker tokens in
+  webhook bodies never appear in the conversion file.
+- **No PII.** Planted `customer.email`, `customer.name`,
+  `customer.metadata.pan`, `customer.metadata.cvv` in webhook
+  bodies never appear in the conversion file (only the opaque
+  `api_key_hash` and the non-sensitive `price_id` survive).
+- **No `Authorization` header, no webhook secret, no Stripe API
+  key** is ever written.
+- **Hash alignment.** The conversion log's `api_key_hash` equals
+  `SHA-256(api_key)[:32]` — identical to
+  `trading_bot.api.server._hash_api_key` and
+  `trading_bot.api.billing._hash_api_key` — a dedicated test
+  verifies all three produce the same digest.
+
+#### What you can compute once this is flowing
+
+```
+free users                = distinct(usage_log.key_hash) where tier="free"
+premium users             = distinct(usage_log.key_hash) where tier="premium"
+conversions               = distinct(conversion_log.api_key_hash)
+conversion rate           = conversions / free-user count
+avg time-to-convert (s)   = mean(conversion.timestamp
+                                 - conversion.first_seen_timestamp)
+conversions by price_id   = count(*) group by conversion.price_id
+```
+
+All of it is plain SQL / pandas on two JSONL files — no database,
+no PII, no card data.
 
 
 ## Phase 2.7 — dataset rotation (reference)

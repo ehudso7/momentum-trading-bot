@@ -313,6 +313,42 @@ def _extract_api_key_from_event_object(obj) -> Optional[str]:
     return None
 
 
+def _extract_price_id_from_event_object(obj) -> Optional[str]:
+    """
+    Pull the ``price_id`` out of a Stripe subscription event object.
+
+    Stripe's subscription object nests the price under
+    ``items.data[0].price.id``. We walk defensively because the
+    webhook delivery shape varies slightly between API versions.
+    Returns None on any miss — the conversion log accepts a null
+    ``price_id``.
+    """
+    if not isinstance(obj, dict):
+        return None
+    items = obj.get("items")
+    if isinstance(items, dict):
+        data = items.get("data")
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                price = first.get("price")
+                if isinstance(price, dict):
+                    pid = price.get("id")
+                    if pid:
+                        return str(pid)
+                # Stripe API versions where `price` is a bare id string.
+                if isinstance(price, str) and price:
+                    return price
+    # Some Stripe payloads expose ``plan.id`` at the subscription level
+    # for legacy compatibility — use it as a last-resort fallback.
+    plan = obj.get("plan")
+    if isinstance(plan, dict):
+        pid = plan.get("id")
+        if pid:
+            return str(pid)
+    return None
+
+
 def handle_webhook_event(event) -> dict:
     """
     Dispatch a parsed Stripe event to the cache.
@@ -345,6 +381,18 @@ def handle_webhook_event(event) -> dict:
         status = (isinstance(obj, dict) and str(obj.get("status") or "")).lower()
         if status in _ACTIVE_SUBSCRIPTION_STATUSES:
             add_premium_key(api_key)
+            # Phase 4.9 — fire-and-forget free→premium conversion
+            # tracking. Any failure is caught so the webhook still
+            # returns a success action to the caller.
+            try:
+                from trading_bot.api.conversion import record_conversion
+                record_conversion(
+                    api_key,
+                    source="stripe",
+                    price_id=_extract_price_id_from_event_object(obj),
+                )
+            except Exception as exc:
+                log.debug("billing.conversion_error", error=str(exc))
             return {"type": event_type, "action": "added"}
         return {
             "type": event_type,
