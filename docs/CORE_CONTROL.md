@@ -1979,6 +1979,71 @@ value at the time of rollout). They never need access to the
 raw copy through this pipeline — and cannot get it from disk.
 
 
+### Phase 5.9 — landing page visual polish
+
+`GET /` is still public, static, and deterministic — but now
+ships a polished SaaS-style design instead of a plain document
+layout. Every Phase 4.3 / 5.2 / 5.7 invariant continues to hold.
+
+**Design layout (5 `<section>` blocks unchanged):**
+
+1. **Hero** — gradient background (CSS `linear-gradient`),
+   centred headline + tagline + sub-line, plus the optional
+   `<p class="ref">Invited by: <code>…</code></p>` banner inside
+   the hero when `?ref=` is present.
+2. **How it works** — three-step `<ol class="feature-grid">`
+   styled as numbered cards via CSS `counter()`, single column
+   on mobile, three columns at ≥ 600 px.
+3. **Example output** — same illustrative tables, now wrapped in
+   `<div class="card example-card">` with a soft border, shadow,
+   and pill-style `.status-ok` badge.
+4. **Upgrade** — comparison table inside `<div class="card
+   compare-card">`, followed by two side-by-side `.cue` cards
+   carrying the soft conversion cues.
+5. **Get started** — CTA paragraph in `<div class="cta-card">`
+   with a light-blue gradient panel.
+
+**Stylesheet** — a new `_LANDING_PAGE_CSS` constant in
+`trading_bot/api/server.py`. Self-contained inline `<style>`
+block with:
+
+* CSS custom properties (`--primary`, `--surface`, `--border`,
+  …) for theming;
+* a single mobile-first breakpoint (`@media (min-width: 600px)`)
+  that collapses the feature grid from 1 → 3 columns and the
+  cue row from 1 → 2;
+* a second breakpoint at 880 px purely for whitespace;
+* zero JS, zero `<form>`, zero external resources (no Google
+  fonts, no CDN, no analytics tag) — pinned by
+  `test_no_external_resources`.
+
+**Invariants re-asserted by Phase 5.9 tests:**
+
+* No `<script>`, no `javascript:` URI, no `<form>` /
+  `<input>` / `<button>` / `on*` handlers / mutating
+  `method=…` attributes.
+* Hero gradient (`linear-gradient` + `.hero` selector),
+  feature-grid, compare-card, example-card, cue-row, and
+  cta-card class hooks all present in the rendered HTML.
+* Two `class="cue"` blocks render the soft cues from Phase 5.2
+  ("Most users upgrade after ~7 days." and "Premium users run
+  3–5x more requests than free users.").
+* Five `<section>` blocks (Phase 5.2 contract).
+* Legacy positioning phrases — `read-only`, `guardrail`,
+  `daily validation`, `audit trail`, `protected dashboard` —
+  all still present.
+* `<p class="ref">Invited by: <code>…</code></p>` exact format
+  for the ref banner; sanitiser unchanged
+  (`_sanitize_landing_ref_code` reused from Phase 5.1 growth
+  log).
+* Output is byte-identical for the same `?ref=` value across
+  calls; independent of env vars and disk state.
+* No leak of `scorer_config`, `TRADING_API_KEY`, or any
+  reports/manifest contents — even when fixtures with planted
+  markers are populated underneath the server.
+* The `/` route still accepts only `GET / HEAD / OPTIONS`.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

@@ -1343,6 +1343,216 @@ def health() -> dict[str, Any]:
 from trading_bot.api.growth import _sanitize_ref_code as _sanitize_landing_ref_code  # noqa: E402
 
 
+# Phase 5.9 — polished SaaS landing-page stylesheet. Inline only;
+# zero JavaScript, zero external resources, mobile-first via a
+# single ``@media (min-width: 600px)`` breakpoint. The block is
+# intentionally separate from ``_DASHBOARD_CSS`` so neither
+# stylesheet has to absorb the other's concerns.
+_LANDING_PAGE_CSS = """
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f6f8fb;
+    --surface: #ffffff;
+    --surface-soft: #eef3fa;
+    --primary: #2057b2;
+    --primary-dark: #0e2f5a;
+    --accent: #1a7f1a;
+    --text: #1f2730;
+    --muted: #5b6878;
+    --border: #dde3ed;
+    --shadow-sm: 0 1px 2px rgba(15, 33, 68, 0.06);
+    --shadow-md: 0 6px 18px rgba(15, 33, 68, 0.08);
+    --hero-grad: linear-gradient(140deg, #0e2f5a 0%, #2057b2 60%, #3a7bd8 100%);
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--text);
+    background: var(--bg);
+  }
+  h1, h2, h3 { color: var(--primary-dark); margin-top: 0; }
+  section {
+    padding: 2.5em 1.25em;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  section h2 {
+    font-size: 1.35em;
+    margin: 0 0 0.7em;
+    letter-spacing: -0.005em;
+  }
+  section.hero {
+    max-width: none;
+    background: var(--hero-grad);
+    color: #ffffff;
+    padding: 3.5em 1.5em 3em;
+    text-align: center;
+  }
+  section.hero h1 {
+    color: #ffffff;
+    font-size: 1.85em;
+    margin: 0 0 0.4em;
+    letter-spacing: -0.01em;
+  }
+  section.hero .tagline {
+    font-size: 1.15em;
+    opacity: 0.96;
+    max-width: 640px;
+    margin: 0 auto 0.6em;
+  }
+  section.hero .meta {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 0.88em;
+    margin: 0 auto 1.2em;
+  }
+  .ref {
+    display: inline-block;
+    background: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.32);
+    border-radius: 6px;
+    padding: 0.45em 0.85em;
+    margin: 0.4em auto 0;
+    color: #ffffff;
+    font-size: 0.92em;
+  }
+  .ref code {
+    background: rgba(255, 255, 255, 0.18);
+    padding: 0.05em 0.4em;
+    margin-left: 0.25em;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .feature-grid {
+    list-style: none;
+    padding: 0;
+    margin: 0.8em 0 0;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1em;
+    counter-reset: stepnum;
+  }
+  .feature-grid li {
+    counter-increment: stepnum;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1em 1.1em 1em 3em;
+    box-shadow: var(--shadow-sm);
+    position: relative;
+  }
+  .feature-grid li::before {
+    content: counter(stepnum);
+    position: absolute;
+    left: 0.85em;
+    top: 0.95em;
+    width: 1.7em;
+    height: 1.7em;
+    border-radius: 50%;
+    background: var(--primary);
+    color: #ffffff;
+    text-align: center;
+    line-height: 1.7em;
+    font-weight: 700;
+    font-size: 0.92em;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.2em 1.3em;
+    box-shadow: var(--shadow-sm);
+    margin-top: 0.6em;
+  }
+  .card table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.94em;
+  }
+  .card th, .card td {
+    text-align: left;
+    padding: 0.5em 0.65em;
+    border-bottom: 1px solid var(--border);
+  }
+  .card tr:last-child td { border-bottom: none; }
+  .example-card th { color: var(--muted); font-weight: 600; }
+  .example-card .kv td:first-child { color: var(--muted); width: 40%; }
+  .example-card table + table { margin-top: 0.7em; }
+  .status-ok {
+    display: inline-block;
+    color: var(--accent);
+    background: rgba(26, 127, 26, 0.1);
+    border-radius: 999px;
+    padding: 0.05em 0.7em;
+    font-weight: 700;
+    font-size: 0.88em;
+  }
+  .compare-card th {
+    background: var(--surface-soft);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.9em;
+  }
+  .compare-card td:first-child { color: var(--muted); }
+  .compare-card td:last-child {
+    color: var(--primary-dark);
+    font-weight: 600;
+  }
+  .cue-row {
+    margin-top: 1em;
+    display: grid;
+    gap: 0.8em;
+    grid-template-columns: 1fr;
+  }
+  .cue {
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.9em 1em;
+    text-align: center;
+    color: var(--primary-dark);
+    font-weight: 600;
+  }
+  .cta-card {
+    background: linear-gradient(180deg, #f3f8ff 0%, #e6efff 100%);
+    border: 1px solid #c8d8f4;
+    border-radius: var(--radius);
+    padding: 1.6em 1.4em;
+    text-align: center;
+    margin-top: 0.6em;
+    box-shadow: var(--shadow-md);
+  }
+  .cta-card p { margin: 0.4em 0; }
+  .cta-card strong { color: var(--primary-dark); }
+  .meta { color: var(--muted); font-size: 0.92em; }
+  footer {
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    text-align: center;
+    padding: 1.6em 1em;
+    font-size: 0.85em;
+    background: #ffffff;
+  }
+  @media (min-width: 600px) {
+    body { font-size: 16.5px; }
+    section { padding: 3em 2em; }
+    section.hero { padding: 5em 2em 3.5em; }
+    section.hero h1 { font-size: 2.5em; }
+    section.hero .tagline { font-size: 1.3em; }
+    .feature-grid { grid-template-columns: repeat(3, 1fr); }
+    .cue-row { grid-template-columns: 1fr 1fr; }
+  }
+  @media (min-width: 880px) {
+    section { padding: 3.5em 2em; }
+  }
+</style>
+""".strip()
+
+
 def _landing_page_body(ref_code: str) -> str:
     """
     Build the <body>…</body> of the landing page. Pure — takes
@@ -1372,7 +1582,7 @@ def _landing_page_body(ref_code: str) -> str:
         # --- Section 2: How it works ---
         "<section>"
         "<h2>How it works</h2>"
-        "<ol>"
+        "<ol class=\"feature-grid\">"
         "<li>Every candidate the trading bot evaluates is scored "
         "into an A / B / C / D / F tier — offline, without ever "
         "gating a live trade.</li>"
@@ -1391,6 +1601,7 @@ def _landing_page_body(ref_code: str) -> str:
         "<section>"
         "<h2>Example output</h2>"
         "<p class=\"meta\">Illustrative snapshot — not live data.</p>"
+        "<div class=\"card example-card\">"
         "<table class=\"kv\">"
         "<tr><td>Report date</td><td>2026-04-22</td></tr>"
         "<tr><td>Guardrail status</td>"
@@ -1410,10 +1621,12 @@ def _landing_page_body(ref_code: str) -> str:
         "<tr><td>0.55</td><td>45</td><td>58</td></tr>"
         "<tr><td>0.60</td><td>32</td><td>71</td></tr>"
         "</table>"
+        "</div>"
         "</section>"
         # --- Section 4: Upgrade trigger ---
         "<section>"
         "<h2>Upgrade</h2>"
+        "<div class=\"card compare-card\">"
         "<table>"
         "<tr><th>Capability</th><th>Free</th><th>Premium</th></tr>"
         "<tr><td>Daily validation reports</td>"
@@ -1423,21 +1636,26 @@ def _landing_page_body(ref_code: str) -> str:
         "<tr><td>Protected dashboard</td>"
         "<td>—</td><td>included</td></tr>"
         "</table>"
-        "<p class=\"meta\">"
-        "Most users upgrade after ~7 days. "
-        "Premium users run 3–5x more requests than free users."
-        "</p>"
+        "</div>"
+        "<div class=\"cue-row\">"
+        "<div class=\"cue\">Most users upgrade after ~7 days.</div>"
+        "<div class=\"cue\">Premium users run 3–5x more requests "
+        "than free users.</div>"
+        "</div>"
         "</section>"
         # --- Section 5: CTA ---
         "<section>"
         "<h2>Get started</h2>"
-        "<p>Request a Bearer API key from your operator to unlock "
-        "the full analytics surface — daily validation reports, "
-        "the audit trail, and the protected dashboard.</p>"
+        "<div class=\"cta-card\">"
+        "<p>Request a <strong>Bearer API key</strong> from your "
+        "operator to unlock the full analytics surface — "
+        "daily validation reports, the audit trail, and the "
+        "protected dashboard.</p>"
         "<p class=\"meta\">"
         "No sign-up fields on this page. No JavaScript. No trading "
         "endpoints. Every data endpoint requires a key."
         "</p>"
+        "</div>"
         "</section>"
         "<footer>"
         "This landing page is public. All analytics endpoints "
@@ -1471,7 +1689,7 @@ def render_landing_page_html(ref_code: str = "") -> str:
         "for the Momentum Trading Bot. See which trades your system "
         "should have taken — before risking money."
         "\">"
-        + _DASHBOARD_CSS +
+        + _LANDING_PAGE_CSS +
         "</head>"
         + _landing_page_body(ref_code)
     )
