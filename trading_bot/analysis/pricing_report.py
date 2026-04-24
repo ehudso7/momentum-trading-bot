@@ -43,7 +43,7 @@ import math
 import statistics
 import sys
 from collections import Counter, defaultdict
-from datetime import date as _date_type, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 

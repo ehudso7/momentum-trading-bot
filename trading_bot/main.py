@@ -21,7 +21,6 @@ import csv
 import signal
 import sys
 import threading
-import time
 from pathlib import Path
 
 import structlog
@@ -51,7 +50,6 @@ from trading_bot.utils.helpers import (
     is_near_close,
     is_premarket,
     now_et,
-    time_until_market_open,
 )
 from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager

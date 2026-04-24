@@ -44,13 +44,11 @@ import structlog
 from trading_bot.analysis.alpha_report import (
     DEFAULT_MIN_REQUIRED_OUTCOMES,
     build_report,
-    format_json,
     format_text,
     load_alpha_scores,
 )
 from trading_bot.core.alpha import get_alpha_scorer_config, get_alpha_scorer_fingerprint
 from trading_bot.reporting.experiment_manifest import (
-    DEFAULT_MANIFEST_PATH as _MANIFEST_DEFAULT,
     append_manifest_record,
     build_manifest_record,
 )

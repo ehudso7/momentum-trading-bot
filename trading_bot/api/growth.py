@@ -48,7 +48,7 @@ import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import structlog
 

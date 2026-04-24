@@ -839,7 +839,7 @@ def format_text(report: dict[str, Any]) -> str:
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
         if not rows:
-            lines.append(f"  (no data)")
+            lines.append("  (no data)")
             return
         for row in rows:
             lines.append(
