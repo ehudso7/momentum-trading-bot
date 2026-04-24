@@ -27,6 +27,7 @@ See also:
 | `TRADING_API_ALLOWED_ORIGINS`          | comma-sep origins | *(unset)* | SaaS API only | Optional CORS allow-list (e.g. `https://app.example.com,https://admin.example.com`). Unset → no cross-origin access. (Phase 4.2) |
 | `TRADING_API_RATE_LIMIT_PER_MINUTE`    | positive int     | `60`      | SaaS API only | In-memory per-client-IP rate limit. Invalid values fall back to 60 fail-closed. (Phase 4.2) |
 | `TRADING_API_AUDIT_LOG_PATH`           | path             | `data/api_access_audit.jsonl` | SaaS API only | Append-only JSONL file recording one metadata-only record per request. (Phase 4.4) |
+| `TRADING_API_PREMIUM_KEYS`             | comma-sep tokens | *(unset)* | SaaS API only | Bearer tokens that grant premium-tier access. Any other accepted token is treated as free tier. (Phase 4.5) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -874,6 +875,81 @@ Example (protected endpoint rejected with wrong key):
 Every response carries the same `request_id` stored in the audit
 record. Operators can use this to match a log entry, an audit row,
 and a client-side trace.
+
+### Phase 4.5 — access tier gating (free vs premium)
+
+Two access tiers controlled by Bearer-token classification:
+
+- **Free** — any accepted token that is NOT in
+  `TRADING_API_PREMIUM_KEYS`. Includes the legacy single
+  `TRADING_API_KEY` value when no premium env is set.
+- **Premium** — any token in `TRADING_API_PREMIUM_KEYS` (comma-
+  separated allow-list). Premium implicitly authenticates: a
+  premium-only deployment can leave `TRADING_API_KEY` unset.
+
+Both tiers must still send a valid `Authorization: Bearer <token>`
+header. Tier classification only changes which DATA the caller is
+allowed to read.
+
+#### Per-endpoint limits
+
+| Endpoint                       | Free                                  | Premium |
+| ---                            | ---                                   | --- |
+| `GET /reports/latest`          | allowed (sanitized)                   | allowed |
+| `GET /reports/{date}`          | only the last `MAX_FREE_TIER_DAYS` (3) days; older → 403 | any date |
+| `GET /experiments/recent`      | silent cap at `MAX_FREE_TIER_EXPERIMENTS` (3); explicit `?limit>3` → 403 | up to `?limit=100` |
+| `GET /experiments/{n}`         | `n ≤ 3`; otherwise → 403              | any `n` (subject to manifest length) |
+| `GET /dashboard`               | hides `Shadow filter simulation`; experiment table capped at 3 rows; "free tier" upgrade note shown | full layout |
+
+The free-tier date window uses the API process's UTC date. Today
+plus the previous two days are accepted. A future date is rejected
+the same way an old date is.
+
+#### Error shape
+
+When a free-tier request exceeds a limit:
+
+```
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"detail": "upgrade required for full access"}
+```
+
+#### Helpers
+
+- `_is_premium(api_key) -> bool` — True iff the key is listed in
+  `TRADING_API_PREMIUM_KEYS`.
+- `_enforce_free_limits(*, is_premium, date_requested=None,
+  n_experiments=None, explicit_limit=None) -> None` — raises 403
+  with the documented message when a free-tier request exceeds the
+  per-endpoint cap. Premium requests are short-circuit no-ops.
+- `_premium_keys_set() -> set[str]` — env-var parser used by
+  `_is_premium` and `require_api_key`.
+
+#### Deployment recipes
+
+```bash
+# Free-only public deployment (anyone with the shared key gets free tier)
+export TRADING_API_KEY="shared-free-key"
+
+# Mixed: free for the shared key, premium for whitelisted enterprise keys
+export TRADING_API_KEY="shared-free-key"
+export TRADING_API_PREMIUM_KEYS="ent-key-acme,ent-key-globex,ent-key-initech"
+
+# Premium-only deployment (no free tier)
+unset TRADING_API_KEY
+export TRADING_API_PREMIUM_KEYS="ent-key-acme,ent-key-globex"
+```
+
+#### Out of scope
+
+- No payment processing. Tier promotion is operator-driven (edit
+  the env var, rotate keys).
+- No per-user analytics beyond what the Phase 4.4 audit trail
+  already captures.
+- No mutating endpoints — the boundary tests still enforce
+  GET/HEAD/OPTIONS only after Phase 4.5.
 
 
 ## Phase 2.7 — dataset rotation (reference)

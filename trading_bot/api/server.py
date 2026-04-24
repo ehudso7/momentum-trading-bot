@@ -47,7 +47,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date as _date_type, datetime, timezone
 from html import escape as _esc
 from pathlib import Path
 from typing import Any, Optional
@@ -72,6 +72,14 @@ MANIFEST_PATH_ENV_VAR = "TRADING_API_MANIFEST_PATH"
 ALLOWED_ORIGINS_ENV_VAR = "TRADING_API_ALLOWED_ORIGINS"
 RATE_LIMIT_ENV_VAR = "TRADING_API_RATE_LIMIT_PER_MINUTE"
 DEFAULT_RATE_LIMIT_PER_MINUTE = 60
+
+# Phase 4.5 — access tiers (free vs premium).
+PREMIUM_KEYS_ENV_VAR = "TRADING_API_PREMIUM_KEYS"
+TIER_FREE = "free"
+TIER_PREMIUM = "premium"
+MAX_FREE_TIER_DAYS = 3            # /reports/{date} window for free tier
+MAX_FREE_TIER_EXPERIMENTS = 3     # /experiments/* cap for free tier
+UPGRADE_REQUIRED_DETAIL = "upgrade required for full access"
 
 DEFAULT_REPORTS_DIR = "reports"
 DEFAULT_MANIFEST_PATH = "data/alpha_experiments.jsonl"
@@ -249,25 +257,46 @@ def _is_authenticated_status(status_code: int) -> bool:
 _security = HTTPBearer(auto_error=False)
 
 
+def _premium_keys_set() -> set[str]:
+    """Parse the premium-keys env var into a set. Empty/unset → empty set."""
+    raw = os.getenv(PREMIUM_KEYS_ENV_VAR, "") or ""
+    if not raw.strip():
+        return set()
+    return {k.strip() for k in raw.split(",") if k.strip()}
+
+
+def _is_premium(api_key: Optional[str]) -> bool:
+    """True iff the supplied key is in TRADING_API_PREMIUM_KEYS."""
+    if not api_key:
+        return False
+    return api_key in _premium_keys_set()
+
+
 def require_api_key(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_security),
-) -> None:
+) -> str:
     """
     Reject any request that does not carry the correct
-    `Authorization: Bearer <TRADING_API_KEY>` header.
+    `Authorization: Bearer <token>` header. Returns the validated
+    token string so handlers can read it (e.g., for tier classification).
 
-    - 503 when the server has no API key configured. The server must
-      be explicitly set up to accept traffic.
-    - 401 when the header is missing or non-Bearer.
-    - 403 when the header's token does not match.
+    Accepted tokens:
+      - The single value of `TRADING_API_KEY` (free tier).
+      - Any value listed in `TRADING_API_PREMIUM_KEYS` (premium tier).
+
+    Failure modes:
+      - 503 when neither env var is set — fail-closed.
+      - 401 when the header is missing or non-Bearer.
+      - 403 when the header's token matches neither set.
     """
     configured = (os.getenv(API_KEY_ENV_VAR, "") or "").strip()
-    if not configured:
+    premium_keys = _premium_keys_set()
+    if not configured and not premium_keys:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "API key not configured on server; set TRADING_API_KEY "
-                "before accepting requests"
+                "and/or TRADING_API_PREMIUM_KEYS before accepting requests"
             ),
         )
     if creds is None:
@@ -280,10 +309,74 @@ def require_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization scheme must be Bearer",
         )
-    if creds.credentials != configured:
+    presented = creds.credentials
+    if presented != configured and presented not in premium_keys:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",
+        )
+    return presented
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.5 — free-tier limit enforcement
+# ---------------------------------------------------------------------------
+
+
+def _today_utc() -> _date_type:
+    """UTC date helper. Patchable in tests for deterministic windowing."""
+    return datetime.now(timezone.utc).date()
+
+
+def _free_date_allowed(date_str: str) -> bool:
+    """
+    Free tier may access dates within the last MAX_FREE_TIER_DAYS days
+    (today + the previous N-1). Older dates and future dates are blocked.
+    """
+    try:
+        target = _date_type.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        # Malformed dates are rejected upstream by `_validate_date`;
+        # return True here so the validator's 400 wins over the 403.
+        return True
+    today = _today_utc()
+    delta_days = (today - target).days
+    return 0 <= delta_days < MAX_FREE_TIER_DAYS
+
+
+def _enforce_free_limits(
+    *,
+    is_premium: bool,
+    date_requested: Optional[str] = None,
+    n_experiments: Optional[int] = None,
+    explicit_limit: Optional[int] = None,
+) -> None:
+    """
+    Raise HTTP 403 with the documented "upgrade required for full
+    access" message when a free-tier request exceeds the per-endpoint
+    cap. Premium requests are short-circuit no-ops.
+
+    Parameters (all optional — pass only those relevant to the route):
+      date_requested  : YYYY-MM-DD asked for; rejected if outside free window.
+      n_experiments   : 1-indexed nth-most-recent experiment; rejected if > cap.
+      explicit_limit  : caller-supplied `?limit=` value; rejected if > cap.
+    """
+    if is_premium:
+        return
+    if date_requested is not None and not _free_date_allowed(date_requested):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=UPGRADE_REQUIRED_DETAIL,
+        )
+    if n_experiments is not None and n_experiments > MAX_FREE_TIER_EXPERIMENTS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=UPGRADE_REQUIRED_DETAIL,
+        )
+    if explicit_limit is not None and explicit_limit > MAX_FREE_TIER_EXPERIMENTS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=UPGRADE_REQUIRED_DETAIL,
         )
 
 
@@ -778,14 +871,22 @@ def latest_report() -> dict[str, Any]:
     return _sanitize_report(data)
 
 
-@app.get(
-    "/reports/{date}",
-    tags=["reports"],
-    dependencies=[Depends(require_api_key)],
-)
-def report_for_date(date: str) -> dict[str, Any]:
-    """Return the daily report for the given YYYY-MM-DD."""
+@app.get("/reports/{date}", tags=["reports"])
+def report_for_date(
+    date: str,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Return the daily report for the given YYYY-MM-DD.
+
+    Free-tier accounts may request only dates within the last
+    `MAX_FREE_TIER_DAYS` (default: today and the previous two).
+    Older dates → 403 with the documented upgrade message.
+    """
     _validate_date(date)
+    _enforce_free_limits(
+        is_premium=_is_premium(api_key), date_requested=date,
+    )
     path = _reports_dir() / f"alpha_report_{date}.json"
     if not path.exists():
         raise HTTPException(
@@ -795,40 +896,61 @@ def report_for_date(date: str) -> dict[str, Any]:
     return _sanitize_report(_parse_report_file(path))
 
 
-@app.get(
-    "/experiments/recent",
-    tags=["experiments"],
-    dependencies=[Depends(require_api_key)],
-)
+@app.get("/experiments/recent", tags=["experiments"])
 def recent_experiments(
+    request: Request,
     limit: int = Query(10, ge=1, le=100),
+    api_key: str = Depends(require_api_key),
 ) -> dict[str, Any]:
     """
-    Return the last N experiment manifest records (default 10,
-    maximum 100). Empty manifest → `{"count": 0, "records": []}`.
+    Return the last N experiment manifest records.
+
+    - Default `limit=10`, maximum `100`.
+    - Free tier: when no `?limit=` is supplied, results are
+      silently capped at MAX_FREE_TIER_EXPERIMENTS (3). When a free
+      caller EXPLICITLY passes `?limit=` greater than the cap they
+      get a 403 with the documented upgrade message — this
+      distinguishes "I just want recent activity" from "I want more
+      than my tier allows".
+    - Empty manifest → `{"count": 0, "records": []}`.
     """
+    is_premium = _is_premium(api_key)
+    # Detect EXPLICIT use of the query param via raw query string —
+    # FastAPI cannot distinguish a default from an explicit value
+    # equal to the default.
+    explicit_limit = limit if "limit" in request.query_params else None
+    _enforce_free_limits(
+        is_premium=is_premium, explicit_limit=explicit_limit,
+    )
+    effective_limit = (
+        limit if is_premium else min(limit, MAX_FREE_TIER_EXPERIMENTS)
+    )
     records = _read_manifest_records(_manifest_path())
-    tail = records[-limit:] if limit > 0 else records
+    tail = records[-effective_limit:] if effective_limit > 0 else records
     sanitized = [_sanitize_manifest(r) for r in tail]
     return {"count": len(sanitized), "records": sanitized}
 
 
-@app.get(
-    "/experiments/{n}",
-    tags=["experiments"],
-    dependencies=[Depends(require_api_key)],
-)
-def experiment_by_index(n: int) -> dict[str, Any]:
+@app.get("/experiments/{n}", tags=["experiments"])
+def experiment_by_index(
+    n: int,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
     """
     Return the nth-most-recent experiment manifest record.
 
-    `n=1` is the most recent; `n=2` is the one before; etc.
+    - `n=1` is the most recent; `n=2` is the one before; etc.
+    - Free tier: `n` must be ≤ `MAX_FREE_TIER_EXPERIMENTS` (3);
+      otherwise 403.
     """
     if n < 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="n must be >= 1 (1 = most recent)",
         )
+    _enforce_free_limits(
+        is_premium=_is_premium(api_key), n_experiments=n,
+    )
     records = _read_manifest_records(_manifest_path())
     if not records:
         raise HTTPException(
@@ -1057,6 +1179,8 @@ def _render_experiments(records: list[dict]) -> str:
 def render_dashboard_html(
     report: Optional[dict],
     experiments: list[dict],
+    *,
+    tier: str = TIER_PREMIUM,
 ) -> str:
     """
     Build the dashboard HTML from sanitized inputs.
@@ -1066,8 +1190,19 @@ def render_dashboard_html(
     `_sanitize_manifest`). Because of that contract, no amount of
     upstream leakage can spill into the HTML — this renderer simply
     cannot access fields that have already been stripped.
+
+    `tier` controls the Phase 4.5 free-tier display rules:
+      - "premium" (default): full data, every section.
+      - "free": shadow_filter_simulation section is hidden, and the
+        recent-experiments table is capped at MAX_FREE_TIER_EXPERIMENTS.
     """
+    is_free = tier == TIER_FREE
     generated_at = _esc(datetime.now(timezone.utc).isoformat())
+
+    # Free tier: cap experiments at the documented limit BEFORE
+    # rendering. Newest entries win because the renderer reverses.
+    if is_free and experiments:
+        experiments = experiments[-MAX_FREE_TIER_EXPERIMENTS:]
 
     if report is None:
         report_block = (
@@ -1082,6 +1217,15 @@ def render_dashboard_html(
             f'<p class="fingerprint">scorer_fingerprint: {fp}</p>'
             if fp else ""
         )
+        # Shadow-filter section is hidden for free tier.
+        shadow_block = (
+            ""
+            if is_free
+            else (
+                "<h3>Shadow filter simulation</h3>"
+                f"{_render_shadow_sim(report)}"
+            )
+        )
         report_block = (
             "<section>"
             f"<h2>Latest report — {report_date}</h2>"
@@ -1092,8 +1236,7 @@ def render_dashboard_html(
             f"{_render_readiness(report)}"
             "<h3>Totals</h3>"
             f"{_render_totals(report)}"
-            "<h3>Shadow filter simulation</h3>"
-            f"{_render_shadow_sim(report)}"
+            f"{shadow_block}"
             "</section>"
         )
 
@@ -1101,7 +1244,12 @@ def render_dashboard_html(
         "<section>"
         "<h2>Recent experiments</h2>"
         f"{_render_experiments(experiments)}"
-        "</section>"
+        + (
+            f'<p class="meta">Free tier — capped at '
+            f"{MAX_FREE_TIER_EXPERIMENTS} rows. Upgrade for full history.</p>"
+            if is_free else ""
+        )
+        + "</section>"
     )
 
     return (
@@ -1128,9 +1276,10 @@ def render_dashboard_html(
     "/dashboard",
     response_class=HTMLResponse,
     tags=["dashboard"],
-    dependencies=[Depends(require_api_key)],
 )
-def dashboard() -> HTMLResponse:
+def dashboard(
+    api_key: str = Depends(require_api_key),
+) -> HTMLResponse:
     """
     Read-only HTML dashboard rendering the most recent daily report
     plus the last handful of experiment-manifest records.
@@ -1139,6 +1288,11 @@ def dashboard() -> HTMLResponse:
     missing: the page still returns 200 with explicit empty states.
     Never exposes scorer_config, filesystem paths, raw webhook URL,
     or any execution control.
+
+    Phase 4.5 free-tier rendering:
+      - The shadow-filter simulation section is hidden.
+      - The recent-experiments table is capped at
+        `MAX_FREE_TIER_EXPERIMENTS` rows with a small upgrade note.
     """
     # Load latest report (best-effort — empty state wins on any error).
     report: Optional[dict] = None
@@ -1162,7 +1316,8 @@ def dashboard() -> HTMLResponse:
     records = _read_manifest_records(_manifest_path())
     experiments = [_sanitize_manifest(r) for r in records[-10:]] if records else []
 
-    html = render_dashboard_html(report, experiments)
+    tier = TIER_PREMIUM if _is_premium(api_key) else TIER_FREE
+    html = render_dashboard_html(report, experiments, tier=tier)
     return HTMLResponse(content=html, status_code=200)
 
 

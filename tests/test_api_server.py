@@ -38,6 +38,10 @@ from trading_bot.api.server import (
 
 
 VALID_KEY = "secret_testing_key_123"
+# Phase 4.5: a separate free-tier key for tests that need to verify
+# tier-restricted behavior. The default `authed_env` fixture promotes
+# VALID_KEY to premium so existing test assumptions still hold.
+FREE_KEY = "free_tier_testing_key_456"
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +61,8 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         "TRADING_API_RATE_LIMIT_PER_MINUTE",
         # Phase 4.4 — audit log path.
         "TRADING_API_AUDIT_LOG_PATH",
+        # Phase 4.5 — premium-keys list.
+        "TRADING_API_PREMIUM_KEYS",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
@@ -85,10 +91,18 @@ def client() -> TestClient:
 
 @pytest.fixture
 def authed_env(monkeypatch, tmp_path: Path) -> dict[str, Path]:
-    """Configure the server to talk to tmp files with a known API key."""
+    """
+    Configure the server to talk to tmp files with a known API key.
+
+    Phase 4.5 default: VALID_KEY is also listed in
+    TRADING_API_PREMIUM_KEYS so existing tests get **premium** tier
+    behaviour (full access). Tier-specific tests can override or
+    override-then-clear the premium env var to exercise the free tier.
+    """
     reports_dir = tmp_path / "reports"
     manifest = tmp_path / "alpha_experiments.jsonl"
     monkeypatch.setenv(API_KEY_ENV_VAR, VALID_KEY)
+    monkeypatch.setenv("TRADING_API_PREMIUM_KEYS", VALID_KEY)
     monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
     monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
     return {"reports_dir": reports_dir, "manifest": manifest}
@@ -2238,3 +2252,584 @@ class TestPhase44BoundaryUnchanged:
         )
         raw = audit_path.read_text(encoding="utf-8")
         assert unique not in raw
+
+
+# ===========================================================================
+# Phase 4.5 — access tier gating (free vs premium)
+# ===========================================================================
+
+
+from datetime import date as _date_phase45, timedelta as _td_phase45  # noqa: E402
+
+from trading_bot.api.server import (  # noqa: E402
+    MAX_FREE_TIER_DAYS,
+    MAX_FREE_TIER_EXPERIMENTS,
+    PREMIUM_KEYS_ENV_VAR,
+    TIER_FREE,
+    TIER_PREMIUM,
+    UPGRADE_REQUIRED_DETAIL,
+    _free_date_allowed,
+    _is_premium,
+    _premium_keys_set,
+)
+
+
+@pytest.fixture
+def free_env(monkeypatch, tmp_path: Path) -> dict[str, Path]:
+    """
+    Set up the server with FREE_KEY accepted but NOT in the premium
+    list, plus VALID_KEY accepted AND in the premium list. Tests can
+    pick whichever Bearer they want to exercise the relevant tier.
+    """
+    reports_dir = tmp_path / "reports"
+    manifest = tmp_path / "alpha_experiments.jsonl"
+    monkeypatch.setenv(API_KEY_ENV_VAR, FREE_KEY)
+    monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, VALID_KEY)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
+    return {"reports_dir": reports_dir, "manifest": manifest}
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+class TestPremiumKeysSet:
+    def test_unset_returns_empty(self):
+        assert _premium_keys_set() == set()
+
+    def test_blank_returns_empty(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "   ")
+        assert _premium_keys_set() == set()
+
+    def test_single_key(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "alpha")
+        assert _premium_keys_set() == {"alpha"}
+
+    def test_multiple_keys_with_whitespace(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, " a , b , , c ")
+        assert _premium_keys_set() == {"a", "b", "c"}
+
+
+class TestIsPremium:
+    def test_no_premium_keys_means_no_one_is_premium(self):
+        assert _is_premium("anything") is False
+
+    def test_key_in_list_is_premium(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "vip-key")
+        assert _is_premium("vip-key") is True
+
+    def test_key_not_in_list_is_free(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "vip-key")
+        assert _is_premium("free-key") is False
+
+    def test_empty_or_none_is_free(self):
+        assert _is_premium("") is False
+        assert _is_premium(None) is False
+
+    def test_multiple_premium_keys(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "k1,k2,k3")
+        for k in ("k1", "k2", "k3"):
+            assert _is_premium(k) is True
+        assert _is_premium("k4") is False
+
+
+class TestFreeDateAllowed:
+    def test_today_allowed(self, monkeypatch):
+        from trading_bot.api import server as srv_mod
+        today = _date_phase45(2026, 4, 24)
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+        assert _free_date_allowed("2026-04-24") is True
+
+    def test_yesterday_allowed(self, monkeypatch):
+        from trading_bot.api import server as srv_mod
+        today = _date_phase45(2026, 4, 24)
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+        assert _free_date_allowed("2026-04-23") is True
+
+    def test_two_days_ago_allowed(self, monkeypatch):
+        from trading_bot.api import server as srv_mod
+        today = _date_phase45(2026, 4, 24)
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+        assert _free_date_allowed("2026-04-22") is True
+
+    def test_three_days_ago_blocked(self, monkeypatch):
+        from trading_bot.api import server as srv_mod
+        today = _date_phase45(2026, 4, 24)
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+        assert _free_date_allowed("2026-04-21") is False
+
+    def test_future_blocked(self, monkeypatch):
+        from trading_bot.api import server as srv_mod
+        today = _date_phase45(2026, 4, 24)
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+        assert _free_date_allowed("2026-04-25") is False
+
+    def test_malformed_date_returns_true_so_validator_owns_400(self, monkeypatch):
+        """Bad input should be rejected by `_validate_date` upstream
+        with 400, not by the tier gate with 403."""
+        from trading_bot.api import server as srv_mod
+        today = _date_phase45(2026, 4, 24)
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+        assert _free_date_allowed("not-a-date") is True
+
+
+# ---------------------------------------------------------------------------
+# /reports/{date} — date-window enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestReportsDateFreeTier:
+    @staticmethod
+    def _set_today(monkeypatch, today: _date_phase45):
+        from trading_bot.api import server as srv_mod
+        monkeypatch.setattr(srv_mod, "_today_utc", lambda: today)
+
+    def test_free_user_can_access_today(
+        self, client: TestClient, free_env, monkeypatch
+    ):
+        self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/2026-04-24",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_free_user_can_access_yesterday(
+        self, client: TestClient, free_env, monkeypatch
+    ):
+        self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
+        _write_report(free_env["reports_dir"], "2026-04-23")
+        resp = client.get(
+            "/reports/2026-04-23",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_free_user_can_access_two_days_ago(
+        self, client: TestClient, free_env, monkeypatch
+    ):
+        self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
+        _write_report(free_env["reports_dir"], "2026-04-22")
+        resp = client.get(
+            "/reports/2026-04-22",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_free_user_blocked_three_days_ago(
+        self, client: TestClient, free_env, monkeypatch
+    ):
+        self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
+        _write_report(free_env["reports_dir"], "2026-04-21")
+        resp = client.get(
+            "/reports/2026-04-21",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == UPGRADE_REQUIRED_DETAIL
+
+    def test_premium_user_can_access_old_date(
+        self, client: TestClient, free_env, monkeypatch
+    ):
+        self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
+        _write_report(free_env["reports_dir"], "2025-01-01")
+        resp = client.get(
+            "/reports/2025-01-01",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_premium_user_can_access_future_date(
+        self, client: TestClient, free_env, monkeypatch
+    ):
+        self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
+        _write_report(free_env["reports_dir"], "2030-01-01")
+        resp = client.get(
+            "/reports/2030-01-01",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_invalid_date_format_still_400_for_free(
+        self, client: TestClient, free_env
+    ):
+        """Bad format wins over tier check — 400, not 403."""
+        resp = client.get(
+            "/reports/not-a-date",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 400
+
+
+class TestReportsLatestFreeTier:
+    """Free users can access /reports/latest unconditionally (sanitized)."""
+
+    def test_free_user_can_get_latest_report(
+        self, client: TestClient, free_env
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /experiments/recent
+# ---------------------------------------------------------------------------
+
+
+class TestExperimentsRecentTier:
+    def _seed(self, manifest: Path, n: int) -> None:
+        records = [
+            _sample_manifest_record(f"2026-04-{i:02d}") for i in range(1, n + 1)
+        ]
+        _write_manifest_records(manifest, records)
+
+    def test_free_user_default_limit_caps_at_3(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 10)
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == MAX_FREE_TIER_EXPERIMENTS == 3
+
+    def test_free_user_explicit_limit_below_cap_works(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 10)
+        resp = client.get(
+            "/experiments/recent?limit=2",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 2
+
+    def test_free_user_explicit_limit_at_cap_works(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 10)
+        resp = client.get(
+            "/experiments/recent?limit=3",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 3
+
+    def test_free_user_explicit_limit_above_cap_returns_403(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 10)
+        resp = client.get(
+            "/experiments/recent?limit=4",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == UPGRADE_REQUIRED_DETAIL
+
+    def test_free_user_explicit_limit_matching_default_still_returns_403(
+        self, client: TestClient, free_env
+    ):
+        """Explicit `?limit=10` (= default) must still trigger 403,
+        because the user CHOSE to ask for more than their tier allows."""
+        self._seed(free_env["manifest"], 20)
+        resp = client.get(
+            "/experiments/recent?limit=10",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == UPGRADE_REQUIRED_DETAIL
+
+    def test_premium_user_default_limit_returns_10(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 20)
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 10
+
+    def test_premium_user_can_request_50(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 80)
+        resp = client.get(
+            "/experiments/recent?limit=50",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 50
+
+
+# ---------------------------------------------------------------------------
+# /experiments/{n}
+# ---------------------------------------------------------------------------
+
+
+class TestExperimentByIndexTier:
+    def _seed(self, manifest: Path, n: int) -> None:
+        records = [
+            _sample_manifest_record(f"2026-04-{i:02d}") for i in range(1, n + 1)
+        ]
+        _write_manifest_records(manifest, records)
+
+    def test_free_user_n1_to_n3_works(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 10)
+        for n in (1, 2, 3):
+            resp = client.get(
+                f"/experiments/{n}",
+                headers={"Authorization": f"Bearer {FREE_KEY}"},
+            )
+            assert resp.status_code == 200, n
+
+    def test_free_user_n4_returns_403(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 10)
+        resp = client.get(
+            "/experiments/4",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == UPGRADE_REQUIRED_DETAIL
+
+    def test_free_user_large_n_returns_403_not_404(
+        self, client: TestClient, free_env
+    ):
+        """Tier gate fires BEFORE the 'not enough records' 404."""
+        self._seed(free_env["manifest"], 1)
+        resp = client.get(
+            "/experiments/99",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+
+    def test_premium_user_n_above_3_works(
+        self, client: TestClient, free_env
+    ):
+        self._seed(free_env["manifest"], 20)
+        resp = client.get(
+            "/experiments/15",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+
+    def test_premium_user_n_too_large_still_404(
+        self, client: TestClient, free_env
+    ):
+        """Premium past the manifest length still hits the documented 404."""
+        self._seed(free_env["manifest"], 5)
+        resp = client.get(
+            "/experiments/99",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Dashboard tier rendering
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardTier:
+    def test_premium_user_sees_shadow_filter_section(
+        self, client: TestClient, free_env
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        _write_manifest_records(
+            free_env["manifest"],
+            [_sample_manifest_record(f"2026-04-{d:02d}") for d in range(1, 11)],
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        body = resp.text
+        assert "Shadow filter simulation" in body
+        # All 10 experiments visible.
+        for d in (1, 5, 10):
+            assert f"2026-04-{d:02d}" in body
+
+    def test_free_user_does_not_see_shadow_filter_section(
+        self, client: TestClient, free_env
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        body = resp.text
+        assert "Shadow filter simulation" not in body
+
+    def test_free_user_dashboard_caps_experiments_at_3(
+        self, client: TestClient, free_env
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        _write_manifest_records(
+            free_env["manifest"],
+            [_sample_manifest_record(f"2026-04-{d:02d}") for d in range(1, 11)],
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = resp.text
+        # Newest three: 2026-04-08, 2026-04-09, 2026-04-10 should appear.
+        for d in (8, 9, 10):
+            assert f"2026-04-{d:02d}" in body
+        # Oldest seven (1..7) must NOT appear in the experiments table.
+        for d in (1, 2, 3, 4, 5, 6, 7):
+            assert f"2026-04-{d:02d}" not in body, (
+                f"free dashboard leaked experiment 2026-04-{d:02d}"
+            )
+
+    def test_free_user_dashboard_shows_upgrade_note(
+        self, client: TestClient, free_env
+    ):
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        _write_manifest_records(
+            free_env["manifest"],
+            [_sample_manifest_record(f"2026-04-{d:02d}") for d in range(1, 11)],
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = resp.text.lower()
+        assert "free tier" in body
+        assert "upgrade" in body
+
+    def test_dashboard_does_not_leak_shadow_data_in_free_tier(
+        self, client: TestClient, free_env
+    ):
+        """The unique value inside shadow_filter_simulation must NOT
+        appear anywhere in the free-tier dashboard HTML."""
+        unique_marker = "ABC_SHADOW_LEAK_MARKER_XYZ"
+        _write_report(
+            free_env["reports_dir"], "2026-04-24",
+            shadow_filter_simulation=[
+                {"threshold": "A+B",
+                 "allowed_buy_count": unique_marker,  # placed deliberately
+                 "blocked_buy_count": 0},
+            ],
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert unique_marker not in resp.text
+
+    def test_free_user_still_sees_guardrails_and_readiness(
+        self, client: TestClient, free_env
+    ):
+        """Hiding shadow_filter_simulation must NOT hide other sections."""
+        _write_report(free_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = resp.text
+        assert "Guardrails" in body
+        assert "Promotion readiness" in body
+        assert "Totals" in body
+
+
+# ---------------------------------------------------------------------------
+# Auth still required + boundary unchanged
+# ---------------------------------------------------------------------------
+
+
+class TestPhase45BoundaryUnchanged:
+    def test_no_header_still_401_on_protected_endpoints(
+        self, client: TestClient, free_env
+    ):
+        for path in (
+            "/reports/latest",
+            "/reports/2026-04-24",
+            "/experiments/recent",
+            "/experiments/1",
+            "/dashboard",
+        ):
+            resp = client.get(path)
+            assert resp.status_code == 401, (
+                f"{path} must still require auth, got {resp.status_code}"
+            )
+
+    def test_unknown_key_still_403(
+        self, client: TestClient, free_env
+    ):
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer totally-bogus-key"},
+        )
+        assert resp.status_code == 403
+
+    def test_unconfigured_server_still_503(
+        self, client: TestClient, monkeypatch
+    ):
+        # Both env vars unset → fail-closed.
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(PREMIUM_KEYS_ENV_VAR, raising=False)
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 503
+
+    def test_premium_only_server_still_works(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        """A server with ONLY premium keys (no TRADING_API_KEY) is valid."""
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(PREMIUM_KEYS_ENV_VAR, "only-premium-key")
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(tmp_path / "r"))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+        # Premium key works.
+        resp = client.get(
+            "/health",
+            headers={"Authorization": "Bearer only-premium-key"},
+        )
+        assert resp.status_code == 200
+        # Anything else still 403.
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert resp.status_code == 403
+
+    def test_only_read_verbs_after_phase_4_5(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            for m in methods:
+                assert m in {"GET", "HEAD", "OPTIONS"}
+
+    def test_forbidden_imports_still_clean(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for pat in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert pat not in src
