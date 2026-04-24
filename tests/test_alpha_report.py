@@ -25,6 +25,7 @@ from trading_bot.analysis import alpha_report
 from trading_bot.analysis.alpha_report import (
     DECILE_LABELS,
     DEFAULT_MIN_REQUIRED_OUTCOMES,
+    SHADOW_FILTER_THRESHOLDS,
     TIER_ORDER,
     build_report,
     decile_stats,
@@ -38,6 +39,7 @@ from trading_bot.analysis.alpha_report import (
     promotion_readiness,
     reason_stats,
     regime_stats,
+    shadow_filter_simulation,
     tier_stats,
 )
 
@@ -1144,3 +1146,293 @@ def test_cli_comma_separated_smoke(tmp_path: Path):
     parsed = json.loads(result.stdout)
     assert parsed["sources"]["alpha_scores"]["resolved_files"] == 2
     assert parsed["totals"]["alpha_rows"] == 2
+
+
+# ===========================================================================
+# Phase 2.9 — shadow-mode tier-filter simulation.
+# ===========================================================================
+
+
+def _buy_row(symbol: str, tier: str, pnl: float, rr: float) -> dict:
+    return {
+        "symbol": symbol,
+        "tier": tier,
+        "action": "buy",
+        "score": 0.9,
+        "regime": "trending_bullish",
+        "pnl": pnl,
+        "rr_ratio": rr,
+        "matched": True,
+    }
+
+
+def _skip_row(symbol: str, tier: str) -> dict:
+    """A 'buy candidate that skipped' — should be ignored by the simulator."""
+    return {
+        "symbol": symbol,
+        "tier": tier,
+        "action": "skip",
+        "score": 0.5,
+        "regime": "range_bound",
+        "pnl": float("nan"),
+        "rr_ratio": float("nan"),
+        "matched": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Empty / baseline behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_filter_thresholds_exported_correctly():
+    # Exactly three thresholds, in the documented order.
+    labels = [label for label, _ in SHADOW_FILTER_THRESHOLDS]
+    assert labels == ["A only", "A+B", "A+B+C"]
+
+
+def test_shadow_filter_empty_frame_returns_three_zero_rows():
+    result = shadow_filter_simulation(pd.DataFrame())
+    assert len(result) == 3
+    for row in result:
+        assert row["allowed_buy_count"] == 0
+        assert row["blocked_buy_count"] == 0
+        assert row["allowed_outcome_count"] == 0
+        assert row["blocked_outcome_count"] == 0
+        assert row["allowed_win_rate"] is None
+        assert row["blocked_win_rate"] is None
+
+
+def test_shadow_filter_only_skips_returns_zero_counts():
+    df = pd.DataFrame([
+        _skip_row("AAA", "A"),
+        _skip_row("BBB", "C"),
+    ])
+    result = shadow_filter_simulation(df)
+    for row in result:
+        assert row["allowed_buy_count"] == 0
+        assert row["blocked_buy_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-threshold behaviour.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mixed_buys() -> pd.DataFrame:
+    """
+    Five buys across four tiers with mixed outcomes so we can assert
+    counts, win rates, and averages cleanly.
+
+    A:    AAA +200  (win, 2R)
+    A:    AAA2 -50  (loss, -0.5R)
+    B:    BBB +100  (win, 1R)
+    C:    CCC -100  (loss, -1R)
+    D:    DDD  +50  (win, 0.5R)
+    F:    FFF -200  (loss, -2R)
+    + one skip that must be ignored.
+    """
+    return pd.DataFrame([
+        _buy_row("AAA", "A", 200.0, 2.0),
+        _buy_row("AAA2", "A", -50.0, -0.5),
+        _buy_row("BBB", "B", 100.0, 1.0),
+        _buy_row("CCC", "C", -100.0, -1.0),
+        _buy_row("DDD", "D", 50.0, 0.5),
+        _buy_row("FFF", "F", -200.0, -2.0),
+        _skip_row("ZZZ", "A"),
+    ])
+
+
+def test_shadow_filter_a_only(mixed_buys: pd.DataFrame):
+    result = {r["threshold"]: r for r in shadow_filter_simulation(mixed_buys)}
+    r = result["A only"]
+    assert r["allowed_tiers"] == ["A"]
+    assert r["allowed_buy_count"] == 2        # AAA, AAA2
+    assert r["blocked_buy_count"] == 4        # BBB, CCC, DDD, FFF
+    assert r["allowed_outcome_count"] == 2
+    assert r["blocked_outcome_count"] == 4
+    # A side: 1 win / 2 = 50%, avg PnL (200-50)/2 = 75, avg R (2-0.5)/2 = 0.75
+    assert r["allowed_win_rate"] == pytest.approx(0.5, rel=1e-3)
+    assert r["allowed_avg_pnl"] == pytest.approx(75.0)
+    assert r["allowed_avg_r_multiple"] == pytest.approx(0.75)
+    # Blocked side: BBB+100, CCC-100, DDD+50, FFF-200 → 2/4 wins, avg -37.5, avg R -0.375
+    assert r["blocked_win_rate"] == pytest.approx(0.5, rel=1e-3)
+    assert r["blocked_avg_pnl"] == pytest.approx(-37.5)
+    assert r["blocked_avg_r_multiple"] == pytest.approx(-0.375)
+
+
+def test_shadow_filter_ab(mixed_buys: pd.DataFrame):
+    result = {r["threshold"]: r for r in shadow_filter_simulation(mixed_buys)}
+    r = result["A+B"]
+    assert sorted(r["allowed_tiers"]) == ["A", "B"]
+    assert r["allowed_buy_count"] == 3        # AAA, AAA2, BBB
+    assert r["blocked_buy_count"] == 3        # CCC, DDD, FFF
+    # Allowed: 2/3 winners (+200, -50, +100) avg=83.33, avg_R=(2-0.5+1)/3 = 0.833
+    assert r["allowed_win_rate"] == pytest.approx(2 / 3, rel=1e-3)
+    assert r["allowed_avg_pnl"] == pytest.approx(250 / 3, rel=1e-3)
+    assert r["allowed_avg_r_multiple"] == pytest.approx(2.5 / 3, rel=1e-3)
+    # Blocked: 1/3 winners (-100, 50, -200) avg=-83.33, avg_R=(-1+0.5-2)/3 = -0.833
+    assert r["blocked_win_rate"] == pytest.approx(1 / 3, rel=1e-3)
+    assert r["blocked_avg_pnl"] == pytest.approx(-250 / 3, rel=1e-3)
+    assert r["blocked_avg_r_multiple"] == pytest.approx(-2.5 / 3, rel=1e-3)
+
+
+def test_shadow_filter_abc(mixed_buys: pd.DataFrame):
+    result = {r["threshold"]: r for r in shadow_filter_simulation(mixed_buys)}
+    r = result["A+B+C"]
+    assert sorted(r["allowed_tiers"]) == ["A", "B", "C"]
+    assert r["allowed_buy_count"] == 4        # AAA, AAA2, BBB, CCC
+    assert r["blocked_buy_count"] == 2        # DDD, FFF
+    # Allowed: +200, -50, +100, -100 → 2/4 wins, avg=37.5
+    assert r["allowed_win_rate"] == pytest.approx(0.5)
+    assert r["allowed_avg_pnl"] == pytest.approx(37.5)
+    # Blocked: +50, -200 → 1/2 wins, avg=-75
+    assert r["blocked_win_rate"] == pytest.approx(0.5)
+    assert r["blocked_avg_pnl"] == pytest.approx(-75.0)
+
+
+def test_shadow_filter_blocked_plus_allowed_equals_total(mixed_buys: pd.DataFrame):
+    """Invariant: for every threshold, allowed + blocked = total buys (skip ignored)."""
+    total_buys = int((mixed_buys["action"] == "buy").sum())
+    for row in shadow_filter_simulation(mixed_buys):
+        assert row["allowed_buy_count"] + row["blocked_buy_count"] == total_buys
+
+
+# ---------------------------------------------------------------------------
+# Missing outcomes.
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_filter_missing_outcomes_handled_gracefully():
+    """
+    Some buys never matched a journal entry (tolerance-miss, open
+    position, etc.). They count in buy_count but NOT outcome_count.
+    """
+    df = pd.DataFrame([
+        _buy_row("AAA", "A", 100.0, 1.0),           # has outcome
+        dict(symbol="AAA2", tier="A", action="buy", score=0.9,
+             regime="bull", pnl=float("nan"), rr_ratio=float("nan"),
+             matched=False),                         # no outcome
+        _buy_row("FFF", "F", -50.0, -0.5),          # has outcome
+    ])
+    by = {r["threshold"]: r for r in shadow_filter_simulation(df)}
+    a_only = by["A only"]
+    # Two A buys (one of which has no outcome), zero-or-one F → blocked is FFF.
+    assert a_only["allowed_buy_count"] == 2
+    assert a_only["allowed_outcome_count"] == 1     # only AAA has a pnl
+    assert a_only["allowed_win_rate"] == pytest.approx(1.0)
+    assert a_only["allowed_avg_pnl"] == pytest.approx(100.0)
+    assert a_only["blocked_buy_count"] == 1
+    assert a_only["blocked_outcome_count"] == 1
+    assert a_only["blocked_win_rate"] == pytest.approx(0.0)
+    assert a_only["blocked_avg_pnl"] == pytest.approx(-50.0)
+
+
+def test_shadow_filter_no_realized_outcomes_leaves_stats_null():
+    """All buys unmatched → buy counts set, but every stat is None."""
+    df = pd.DataFrame([
+        dict(symbol="AAA", tier="A", action="buy", score=0.9,
+             regime="bull", pnl=float("nan"), rr_ratio=float("nan"), matched=False),
+        dict(symbol="FFF", tier="F", action="buy", score=0.2,
+             regime="bear", pnl=float("nan"), rr_ratio=float("nan"), matched=False),
+    ])
+    by = {r["threshold"]: r for r in shadow_filter_simulation(df)}
+    a_only = by["A only"]
+    assert a_only["allowed_buy_count"] == 1
+    assert a_only["blocked_buy_count"] == 1
+    assert a_only["allowed_outcome_count"] == 0
+    assert a_only["blocked_outcome_count"] == 0
+    assert a_only["allowed_win_rate"] is None
+    assert a_only["blocked_win_rate"] is None
+    assert a_only["allowed_avg_pnl"] is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end report integration.
+# ---------------------------------------------------------------------------
+
+
+def test_json_includes_shadow_filter_simulation(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    report = build_report(
+        alpha_path=alpha_csv,
+        decision_path=decision_csv,
+        journal_path=journal_csv,
+    )
+    parsed = json.loads(format_json(report))
+    assert "shadow_filter_simulation" in parsed
+    sim = parsed["shadow_filter_simulation"]
+    assert isinstance(sim, list)
+    assert len(sim) == 3
+    labels = [r["threshold"] for r in sim]
+    assert labels == ["A only", "A+B", "A+B+C"]
+    for row in sim:
+        # Every row has all the documented fields
+        for key in (
+            "allowed_tiers",
+            "allowed_buy_count", "blocked_buy_count",
+            "allowed_outcome_count", "blocked_outcome_count",
+            "allowed_win_rate", "blocked_win_rate",
+            "allowed_avg_pnl", "blocked_avg_pnl",
+            "allowed_avg_r_multiple", "blocked_avg_r_multiple",
+        ):
+            assert key in row, f"missing {key} in simulation row"
+
+
+def test_text_report_includes_shadow_filter_section(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    report = build_report(
+        alpha_path=alpha_csv,
+        decision_path=decision_csv,
+        journal_path=journal_csv,
+    )
+    txt = format_text(report)
+    assert "Shadow filter simulation:" in txt
+    assert "A only" in txt
+    assert "A+B" in txt
+    assert "A+B+C" in txt
+    assert "allowed_buys" in txt
+    assert "blocked_buys" in txt
+
+
+def test_report_sim_matches_fixture_counts(
+    alpha_csv: Path, decision_csv: Path, journal_csv: Path
+):
+    """
+    Fixture: 3 buys (AAA=A, BBB=A, EEE=B).
+
+    "A only"  → allowed AAA, BBB ; blocked EEE
+    "A+B"     → allowed AAA, BBB, EEE ; blocked 0
+    "A+B+C"   → allowed AAA, BBB, EEE ; blocked 0
+    """
+    report = build_report(
+        alpha_path=alpha_csv,
+        decision_path=decision_csv,
+        journal_path=journal_csv,
+    )
+    sim = {r["threshold"]: r for r in report["shadow_filter_simulation"]}
+
+    a_only = sim["A only"]
+    assert a_only["allowed_buy_count"] == 2
+    assert a_only["blocked_buy_count"] == 1
+    # Outcomes: AAA+200, BBB-50 → 1/2 wins, avg 75
+    assert a_only["allowed_outcome_count"] == 2
+    assert a_only["allowed_win_rate"] == pytest.approx(0.5)
+    assert a_only["allowed_avg_pnl"] == pytest.approx(75.0)
+    # EEE +50 blocked → 1/1 win
+    assert a_only["blocked_outcome_count"] == 1
+    assert a_only["blocked_win_rate"] == pytest.approx(1.0)
+    assert a_only["blocked_avg_pnl"] == pytest.approx(50.0)
+
+    ab = sim["A+B"]
+    assert ab["allowed_buy_count"] == 3
+    assert ab["blocked_buy_count"] == 0
+    assert ab["blocked_outcome_count"] == 0
+    assert ab["blocked_win_rate"] is None
+
+    abc = sim["A+B+C"]
+    assert abc["allowed_buy_count"] == 3
+    assert abc["blocked_buy_count"] == 0

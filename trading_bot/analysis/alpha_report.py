@@ -46,6 +46,14 @@ TIER_ORDER: list[str] = ["A", "B", "C", "D", "F"]
 HIGH_TIERS: list[str] = ["A", "B"]
 LOW_TIERS: list[str] = ["C", "D", "F"]
 
+# Phase 2.9 — tier-based "what if we had filtered trades?" thresholds.
+# Order matters — printed top-to-bottom in the text report.
+SHADOW_FILTER_THRESHOLDS: list[tuple[str, list[str]]] = [
+    ("A only", ["A"]),
+    ("A+B", ["A", "B"]),
+    ("A+B+C", ["A", "B", "C"]),
+]
+
 # Ten decile buckets [0.0, 0.1), [0.1, 0.2), …, [0.9, 1.0] — the last
 # bucket is extended by an epsilon so a score of exactly 1.0 is captured.
 DECILE_BINS: list[float] = [i / 10.0 for i in range(11)]
@@ -605,6 +613,91 @@ def promotion_readiness(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.9 — shadow-mode tier-filter simulation.
+# ---------------------------------------------------------------------------
+
+
+def _side_stats(prefix: str, df: pd.DataFrame) -> dict[str, Any]:
+    """Compute win_rate / avg_pnl / avg_r_multiple for one side of the split."""
+    pnl = _numeric_series(df, "pnl")
+    rr = _numeric_series(df, "rr_ratio")
+    outcome_count = int(len(pnl))
+
+    wr: Optional[float] = None
+    avg_pnl: Optional[float] = None
+    avg_r: Optional[float] = None
+    if outcome_count > 0:
+        wr = float((pnl > 0).sum()) / outcome_count
+        avg_pnl = float(pnl.mean())
+    if not rr.empty:
+        avg_r = float(rr.mean())
+
+    return {
+        f"{prefix}_outcome_count": outcome_count,
+        f"{prefix}_win_rate": round(wr, 4) if wr is not None else None,
+        f"{prefix}_avg_pnl": round(avg_pnl, 4) if avg_pnl is not None else None,
+        f"{prefix}_avg_r_multiple": round(avg_r, 4) if avg_r is not None else None,
+    }
+
+
+def _empty_filter_row(label: str, allowed_tiers: list[str]) -> dict[str, Any]:
+    """Baseline zero row used when the joined frame is empty."""
+    return {
+        "threshold": label,
+        "allowed_tiers": list(allowed_tiers),
+        "allowed_buy_count": 0,
+        "blocked_buy_count": 0,
+        "allowed_outcome_count": 0,
+        "allowed_win_rate": None,
+        "allowed_avg_pnl": None,
+        "allowed_avg_r_multiple": None,
+        "blocked_outcome_count": 0,
+        "blocked_win_rate": None,
+        "blocked_avg_pnl": None,
+        "blocked_avg_r_multiple": None,
+    }
+
+
+def shadow_filter_simulation(joined: pd.DataFrame) -> list[dict[str, Any]]:
+    """
+    Simulate "what if we had only allowed buys whose tier >= X?"
+
+    Operates exclusively on rows where `action == "buy"` — skips are
+    not part of the simulation because they never traded. For each
+    threshold (A only, A+B, A+B+C) the buys are partitioned into
+    `allowed` (tier meets threshold) and `blocked` (tier below it),
+    and both sides are summarised by realized outcomes.
+
+    SHADOW MODE ONLY. Nothing in the trading loop ever consults these
+    numbers — this is an offline "what if" answer used to decide
+    whether promoting alpha out of shadow would help or hurt.
+    """
+    if joined.empty or "tier" not in joined.columns or "action" not in joined.columns:
+        return [_empty_filter_row(label, tiers) for label, tiers in SHADOW_FILTER_THRESHOLDS]
+
+    buys = joined[joined["action"].astype(str).str.lower() == "buy"]
+    if buys.empty:
+        return [_empty_filter_row(label, tiers) for label, tiers in SHADOW_FILTER_THRESHOLDS]
+
+    tier_col = buys["tier"].astype(str)
+    out: list[dict[str, Any]] = []
+    for label, allowed_tiers in SHADOW_FILTER_THRESHOLDS:
+        allowed_set = set(allowed_tiers)
+        allowed = buys[tier_col.isin(allowed_set)]
+        blocked = buys[~tier_col.isin(allowed_set)]
+        row: dict[str, Any] = {
+            "threshold": label,
+            "allowed_tiers": list(allowed_tiers),
+            "allowed_buy_count": int(len(allowed)),
+            "blocked_buy_count": int(len(blocked)),
+        }
+        row.update(_side_stats("allowed", allowed))
+        row.update(_side_stats("blocked", blocked))
+        out.append(row)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Report builder.
 # ---------------------------------------------------------------------------
 
@@ -682,6 +775,7 @@ def build_report(
         "promotion_readiness": promotion_readiness(
             joined, min_required_outcomes=min_required_outcomes
         ),
+        "shadow_filter_simulation": shadow_filter_simulation(joined),
         "notes": notes,
     }
 
@@ -764,6 +858,33 @@ def format_text(report: dict[str, Any]) -> str:
     _section("By reason (top first)", "reason", report["reason_stats"])
     _section("By regime", "regime", report["regime_stats"])
     _section("By score decile", "decile", report.get("decile_stats", []))
+
+    sim_rows = report.get("shadow_filter_simulation") or []
+    if sim_rows:
+        lines.append("")
+        lines.append("Shadow filter simulation:")
+        header = (
+            f"  {'threshold':<8} "
+            f"{'allowed_buys':>12} {'blocked_buys':>12} "
+            f"{'a_out':>6} {'a_wr':>8} {'a_pnl':>10} {'a_R':>7} "
+            f"{'b_out':>6} {'b_wr':>8} {'b_pnl':>10} {'b_R':>7}"
+        )
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for row in sim_rows:
+            lines.append(
+                f"  {str(row['threshold']):<8} "
+                f"{row['allowed_buy_count']:>12} "
+                f"{row['blocked_buy_count']:>12} "
+                f"{row['allowed_outcome_count']:>6} "
+                f"{_fmt(row['allowed_win_rate'], '.2%'):>8} "
+                f"{_fmt(row['allowed_avg_pnl'], '.2f'):>10} "
+                f"{_fmt(row['allowed_avg_r_multiple'], '.2f'):>7} "
+                f"{row['blocked_outcome_count']:>6} "
+                f"{_fmt(row['blocked_win_rate'], '.2%'):>8} "
+                f"{_fmt(row['blocked_avg_pnl'], '.2f'):>10} "
+                f"{_fmt(row['blocked_avg_r_multiple'], '.2f'):>7}"
+            )
 
     readiness = report.get("promotion_readiness")
     if readiness:
