@@ -26,6 +26,7 @@ See also:
 | `TRADING_API_MANIFEST_PATH`            | path             | `data/alpha_experiments.jsonl` | SaaS API only | Path to the append-only manifest. (Phase 4.0) |
 | `TRADING_API_ALLOWED_ORIGINS`          | comma-sep origins | *(unset)* | SaaS API only | Optional CORS allow-list (e.g. `https://app.example.com,https://admin.example.com`). Unset → no cross-origin access. (Phase 4.2) |
 | `TRADING_API_RATE_LIMIT_PER_MINUTE`    | positive int     | `60`      | SaaS API only | In-memory per-client-IP rate limit. Invalid values fall back to 60 fail-closed. (Phase 4.2) |
+| `TRADING_API_AUDIT_LOG_PATH`           | path             | `data/api_access_audit.jsonl` | SaaS API only | Append-only JSONL file recording one metadata-only record per request. (Phase 4.4) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -798,6 +799,81 @@ request `/`, and assert none of the markers appear in the body.
 test_protected_endpoints_still_require_auth_after_root_exists`
 explicitly re-asserts that every `/reports/*`, `/experiments/*`,
 and `/dashboard` request without a Bearer token still returns 401.
+
+### Phase 4.4 — access audit trail
+
+Every request — public or protected, 2xx or 4xx or 429 or 500 — now
+appends one metadata-only JSONL record to
+`TRADING_API_AUDIT_LOG_PATH` (default `data/api_access_audit.jsonl`).
+Requests also return a response header `X-Request-ID` for client
+correlation.
+
+#### Record shape
+
+| Field              | Source |
+| ---                | --- |
+| `timestamp`        | `datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')` |
+| `method`           | `request.method` |
+| `path`             | `request.url.path` |
+| `status_code`      | final response status |
+| `duration_ms`      | wall-clock handler time, rounded to 2 decimals |
+| `client_ip`        | `X-Forwarded-For` first entry, else socket peer |
+| `authenticated`    | `False` when status ∈ {401, 403, 503}; else `True` |
+| `user_agent_hash`  | first 32 hex chars of `SHA256(UA)`; `null` when no UA |
+| `request_id`       | sanitized `X-Request-ID` header, else UUID4 hex |
+
+Example (protected endpoint rejected with wrong key):
+
+```json
+{
+  "timestamp": "2026-04-24T16:26:40.427876Z",
+  "method": "GET",
+  "path": "/reports/latest",
+  "status_code": 403,
+  "duration_ms": 2.63,
+  "client_ip": "203.0.113.7",
+  "authenticated": false,
+  "user_agent_hash": "b9f43238f762d9e026e2765701a55ee0",
+  "request_id": "f50be7067948454d874e63a5732201eb"
+}
+```
+
+#### Leakage guards (enforced by tests)
+
+- **Authorization header is never written.** Tests issue requests
+  with a unique-marker Bearer token, on both success and failure
+  paths, and assert the token, the word `Bearer`, and the word
+  `Authorization` never appear in the audit file.
+- **User-Agent is hashed, not stored.** The raw UA string never
+  enters the audit file. A SHA-256 truncated to 32 hex chars
+  stands in.
+- **Report / experiment bodies are never written.** Planted marker
+  strings inside upstream report JSON cannot appear in the audit
+  log — the audit writer only records metadata about the request.
+- **Client-supplied X-Request-ID is sanitized.** Only characters
+  in `[A-Za-z0-9\-_:.]` survive; length is capped at 64. Anything
+  stripped to empty triggers a UUID4 generation. Tests feed in
+  `<script>`, newlines, null bytes, and 500-character strings and
+  assert none of it lands in the log or the response header.
+
+#### Operational behaviour
+
+- **Best-effort.** Every I/O failure path is caught. If the audit
+  file cannot be written (permissions, disk full, directory
+  missing), the request still returns normally; the failure is
+  logged at DEBUG via structlog. `TestAuditFailureDoesNotFailRequest`
+  stubs the writer to raise and asserts the request still succeeds.
+- **Thread-safe.** Writes are serialized through a module-level
+  `threading.Lock`.
+- **Parent directory auto-created.** Pointing
+  `TRADING_API_AUDIT_LOG_PATH` at a non-existent nested directory
+  causes the writer to `mkdir(parents=True)` on first append.
+
+#### X-Request-ID response header
+
+Every response carries the same `request_id` stored in the audit
+record. Operators can use this to match a log entry, an audit row,
+and a client-side trace.
 
 
 ## Phase 2.7 — dataset rotation (reference)

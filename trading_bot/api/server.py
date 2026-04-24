@@ -40,11 +40,13 @@ Run with:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from html import escape as _esc
 from pathlib import Path
@@ -98,6 +100,21 @@ SECURITY_HEADERS: dict[str, str] = {
 # appropriate here — a single-process API server is the deployment target.
 _rate_limit_bucket: dict[str, tuple[int, float]] = {}
 _rate_limit_lock = threading.Lock()
+
+# Phase 4.4 — access audit trail.
+AUDIT_LOG_ENV_VAR = "TRADING_API_AUDIT_LOG_PATH"
+DEFAULT_AUDIT_LOG_PATH = "data/api_access_audit.jsonl"
+REQUEST_ID_HEADER = "X-Request-ID"
+REQUEST_ID_MAX_LENGTH = 64
+# Only ASCII alnum, `-`, `_`, `:`, `.` survive sanitization. Anything else
+# (including whitespace, control chars, unicode, HTML, newlines) is stripped.
+_REQUEST_ID_STRIP_RE = re.compile(r"[^A-Za-z0-9\-_:.]")
+# Statuses that mean "auth layer rejected the request". Everything else
+# (200, 404, 429, etc.) counts as `authenticated: true` — the client was
+# granted access, even if the resource itself did not exist.
+_UNAUTHENTICATED_STATUSES: frozenset[int] = frozenset({401, 403, 503})
+
+_audit_write_lock = threading.Lock()
 
 
 def _reports_dir() -> Path:
@@ -159,6 +176,70 @@ def _reset_rate_limit_bucket() -> None:
     """Test helper — drops all in-memory counters. Not routed."""
     with _rate_limit_lock:
         _rate_limit_bucket.clear()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.4 — access audit trail helpers
+# ---------------------------------------------------------------------------
+
+
+def _audit_log_path() -> Path:
+    return Path(os.getenv(AUDIT_LOG_ENV_VAR, DEFAULT_AUDIT_LOG_PATH))
+
+
+def _sanitize_request_id(raw: Optional[str]) -> str:
+    """
+    Strip to a safe character set, cap length, fall back to uuid4.
+
+    Accepts an arbitrary caller-provided ``X-Request-ID`` header —
+    which means the raw value is untrusted and could contain
+    anything, including HTML, newlines, or control characters.
+    Only characters in ``[A-Za-z0-9\\-_:.]`` survive. An empty
+    result after sanitization triggers uuid4 generation so every
+    request always has a stable id.
+    """
+    if raw:
+        cleaned = _REQUEST_ID_STRIP_RE.sub("", raw)[:REQUEST_ID_MAX_LENGTH]
+        if cleaned:
+            return cleaned
+    return uuid.uuid4().hex
+
+
+def _hash_user_agent(ua: Optional[str]) -> Optional[str]:
+    """Return a short SHA-256 hash of the raw User-Agent, or None."""
+    if not ua:
+        return None
+    digest = hashlib.sha256(ua.encode("utf-8", errors="replace")).hexdigest()
+    return digest[:32]
+
+
+def _append_audit_record(record: dict, path: Optional[Path] = None) -> None:
+    """
+    Thread-safely append a single JSONL record to the audit log.
+
+    Best-effort: every failure path is caught + logged at DEBUG.
+    Never raises — a disk outage must not fail a live API request.
+    """
+    target = path if path is not None else _audit_log_path()
+    try:
+        line = json.dumps(record, sort_keys=False, default=str)
+    except Exception as exc:
+        log.debug("audit.serialize_error", error=str(exc))
+        return
+    with _audit_write_lock:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as exc:
+            log.debug(
+                "audit.write_error", path=str(target), error=str(exc)
+            )
+
+
+def _is_authenticated_status(status_code: int) -> bool:
+    """Whether a response status represents an auth-layer acceptance."""
+    return int(status_code) not in _UNAUTHENTICATED_STATUSES
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +483,7 @@ async def request_logging_middleware(request: Request, call_next):
         )
         raise
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    request_id = getattr(getattr(request, "state", None), "request_id", None)
     log.info(
         "api.request",
         method=method,
@@ -409,7 +491,89 @@ async def request_logging_middleware(request: Request, call_next):
         status=response.status_code,
         duration_ms=duration_ms,
         client_ip=client_ip,
+        request_id=request_id,
     )
+    return response
+
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    """
+    Append one JSONL audit record per request. Sets X-Request-ID on
+    both request.state and the outgoing response headers.
+
+    Never logs the Authorization header. The User-Agent is hashed
+    (SHA-256, 32 hex chars) rather than stored verbatim so fingerprints
+    still cluster per client without persisting the raw identifier.
+
+    Must never fail the request — all exceptions from record building
+    or file I/O are caught and the response is returned unchanged.
+    """
+    start = time.perf_counter()
+    method = request.method
+    path = request.url.path
+    client_ip = _client_ip(request)
+    ua_hash = _hash_user_agent(request.headers.get("user-agent"))
+    request_id = _sanitize_request_id(request.headers.get(REQUEST_ID_HEADER))
+
+    # Make the id available to downstream middleware and the handler.
+    try:
+        request.state.request_id = request_id
+    except Exception:
+        # request.state should always exist on Starlette, but never raise.
+        pass
+
+    try:
+        response: Response = await call_next(request)
+    except Exception:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        try:
+            _append_audit_record({
+                "timestamp": (
+                    datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    )
+                ),
+                "method": method,
+                "path": path,
+                "status_code": 500,
+                "duration_ms": duration_ms,
+                "client_ip": client_ip,
+                "authenticated": False,
+                "user_agent_hash": ua_hash,
+                "request_id": request_id,
+            })
+        except Exception as exc:
+            log.debug("audit.record_build_error", error=str(exc))
+        raise
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    # Stamp the response with the request id so clients can correlate.
+    try:
+        response.headers[REQUEST_ID_HEADER] = request_id
+    except Exception:
+        pass
+
+    try:
+        _append_audit_record({
+            "timestamp": (
+                datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
+            ),
+            "method": method,
+            "path": path,
+            "status_code": int(response.status_code),
+            "duration_ms": duration_ms,
+            "client_ip": client_ip,
+            "authenticated": _is_authenticated_status(response.status_code),
+            "user_agent_hash": ua_hash,
+            "request_id": request_id,
+        })
+    except Exception as exc:
+        log.debug("audit.record_build_error", error=str(exc))
+
     return response
 
 

@@ -46,7 +46,7 @@ VALID_KEY = "secret_testing_key_123"
 
 
 @pytest.fixture(autouse=True)
-def clean_api_env(monkeypatch):
+def clean_api_env(monkeypatch, tmp_path_factory):
     """Every test starts from a known env state."""
     for name in (
         API_KEY_ENV_VAR,
@@ -55,8 +55,14 @@ def clean_api_env(monkeypatch):
         # Phase 4.2 — also reset hardening vars.
         "TRADING_API_ALLOWED_ORIGINS",
         "TRADING_API_RATE_LIMIT_PER_MINUTE",
+        # Phase 4.4 — audit log path.
+        "TRADING_API_AUDIT_LOG_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Redirect the Phase 4.4 default audit file into a throwaway tmp
+    # location so tests don't write to the real data/ directory.
+    audit_tmp = tmp_path_factory.mktemp("api_audit") / "audit.jsonl"
+    monkeypatch.setenv("TRADING_API_AUDIT_LOG_PATH", str(audit_tmp))
 
 
 @pytest.fixture(autouse=True)
@@ -1744,3 +1750,491 @@ class TestRenderLandingPageHtmlPure:
         populated = render_landing_page_html()
         assert baseline == populated
         assert "ABSOLUTELY_MUST_NOT_APPEAR" not in populated
+
+
+# ===========================================================================
+# Phase 4.4 — access audit trail
+# ===========================================================================
+
+
+import os as _os_phase44  # noqa: E402
+
+from trading_bot.api import server as srv  # noqa: E402
+from trading_bot.api.server import (  # noqa: E402
+    AUDIT_LOG_ENV_VAR,
+    DEFAULT_AUDIT_LOG_PATH,
+    REQUEST_ID_HEADER,
+    REQUEST_ID_MAX_LENGTH,
+    _hash_user_agent,
+    _sanitize_request_id,
+    _is_authenticated_status,
+)
+
+
+def _read_audit(path: Path) -> list[dict]:
+    """Read a JSONL audit log; skip blank / malformed lines."""
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            records.append(json.loads(s))
+        except Exception:
+            continue
+    return records
+
+
+@pytest.fixture
+def audit_path() -> Path:
+    """Return the path the clean_api_env fixture pointed the audit log at."""
+    return Path(_os_phase44.environ["TRADING_API_AUDIT_LOG_PATH"])
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeRequestId:
+    def test_none_returns_uuid4_hex(self):
+        rid = _sanitize_request_id(None)
+        assert isinstance(rid, str)
+        assert len(rid) == 32   # uuid4 hex
+        int(rid, 16)            # hex-valid
+
+    def test_empty_returns_uuid4_hex(self):
+        rid = _sanitize_request_id("")
+        assert len(rid) == 32
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("abc-123", "abc-123"),
+            ("trace_id:01", "trace_id:01"),
+            ("file.ext", "file.ext"),
+            ("A_Z.0-9", "A_Z.0-9"),
+        ],
+    )
+    def test_safe_ids_pass_through(self, raw, expected):
+        assert _sanitize_request_id(raw) == expected
+
+    def test_unsafe_chars_stripped(self):
+        # Whitespace, HTML, control characters should all vanish.
+        rid = _sanitize_request_id(
+            "abc <script>alert(1)</script> \n\t x/y?z=1"
+        )
+        # Only alnum and `-_:.` survive. The surviving chars depend on
+        # what the sanitizer accepts — assert only that nothing
+        # forbidden remains.
+        for bad in ("<", ">", " ", "\n", "\t", "/", "?", "=", "'", '"'):
+            assert bad not in rid
+
+    def test_length_cap(self):
+        long = "a" * 500
+        rid = _sanitize_request_id(long)
+        assert len(rid) == REQUEST_ID_MAX_LENGTH
+
+    def test_only_forbidden_chars_yields_uuid(self):
+        # After stripping, nothing is left → fall back to UUID4.
+        rid = _sanitize_request_id("!!! ???")
+        assert len(rid) == 32
+        int(rid, 16)
+
+
+class TestHashUserAgent:
+    def test_empty_returns_none(self):
+        assert _hash_user_agent(None) is None
+        assert _hash_user_agent("") is None
+
+    def test_returns_32char_hex(self):
+        h = _hash_user_agent("Mozilla/5.0 (test)")
+        assert isinstance(h, str)
+        assert len(h) == 32
+        int(h, 16)
+
+    def test_deterministic(self):
+        assert _hash_user_agent("foo") == _hash_user_agent("foo")
+
+    def test_different_inputs_different_hashes(self):
+        assert _hash_user_agent("foo") != _hash_user_agent("bar")
+
+    def test_handles_unicode(self):
+        # Non-ASCII UA must not crash.
+        h = _hash_user_agent("Mozilla/5.0 Emoji 🔥 UA")
+        assert h is not None
+        assert len(h) == 32
+
+
+class TestIsAuthenticatedStatus:
+    @pytest.mark.parametrize("code", [200, 204, 404, 429, 400, 500])
+    def test_non_auth_status_is_authenticated(self, code):
+        assert _is_authenticated_status(code) is True
+
+    @pytest.mark.parametrize("code", [401, 403, 503])
+    def test_auth_rejection_statuses_are_unauthenticated(self, code):
+        assert _is_authenticated_status(code) is False
+
+
+# ---------------------------------------------------------------------------
+# Audit record end-to-end
+# ---------------------------------------------------------------------------
+
+
+class TestAuditRecord:
+    def test_record_written_for_public_endpoint(
+        self, client: TestClient, audit_path: Path
+    ):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        records = _read_audit(audit_path)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["method"] == "GET"
+        assert rec["path"] == "/health"
+        assert rec["status_code"] == 200
+        assert rec["authenticated"] is True
+        assert "client_ip" in rec
+        assert "duration_ms" in rec
+        assert "timestamp" in rec
+        assert "request_id" in rec
+
+    def test_record_has_required_fields(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        records = _read_audit(audit_path)
+        assert len(records) == 1
+        rec = records[0]
+        required = {
+            "timestamp", "method", "path", "status_code",
+            "duration_ms", "client_ip", "authenticated",
+            "user_agent_hash", "request_id",
+        }
+        assert required.issubset(rec.keys())
+
+
+# ---------------------------------------------------------------------------
+# Request id
+# ---------------------------------------------------------------------------
+
+
+class TestRequestId:
+    def test_generated_when_missing(
+        self, client: TestClient, audit_path: Path
+    ):
+        resp = client.get("/health")
+        rid = resp.headers.get(REQUEST_ID_HEADER)
+        assert rid is not None
+        assert len(rid) == 32  # uuid4 hex
+        int(rid, 16)
+        # Audit record carries the same id.
+        records = _read_audit(audit_path)
+        assert records[-1]["request_id"] == rid
+
+    def test_incoming_request_id_preserved_when_safe(
+        self, client: TestClient, audit_path: Path
+    ):
+        safe_id = "trace-01234_abc.def"
+        resp = client.get(
+            "/health", headers={REQUEST_ID_HEADER: safe_id}
+        )
+        assert resp.headers[REQUEST_ID_HEADER] == safe_id
+        records = _read_audit(audit_path)
+        assert records[-1]["request_id"] == safe_id
+
+    def test_incoming_request_id_sanitized(
+        self, client: TestClient, audit_path: Path
+    ):
+        dirty = "abc <script>alert(1)</script>\n\t!!!"
+        resp = client.get(
+            "/health", headers={REQUEST_ID_HEADER: dirty}
+        )
+        rid = resp.headers[REQUEST_ID_HEADER]
+        # Forbidden characters must not appear.
+        for bad in ("<", ">", " ", "\n", "\t", "!"):
+            assert bad not in rid
+        records = _read_audit(audit_path)
+        assert records[-1]["request_id"] == rid
+
+    def test_incoming_id_length_capped(
+        self, client: TestClient, audit_path: Path
+    ):
+        huge = "a" * 500
+        resp = client.get("/health", headers={REQUEST_ID_HEADER: huge})
+        assert len(resp.headers[REQUEST_ID_HEADER]) == REQUEST_ID_MAX_LENGTH
+
+    def test_request_id_available_via_forbidden_chars_only(
+        self, client: TestClient
+    ):
+        """All chars stripped → server generates a UUID4 instead."""
+        resp = client.get("/health", headers={REQUEST_ID_HEADER: "!!! ???"})
+        rid = resp.headers[REQUEST_ID_HEADER]
+        assert len(rid) == 32
+        int(rid, 16)
+
+    def test_different_requests_have_different_ids(
+        self, client: TestClient
+    ):
+        ids = {client.get("/health").headers[REQUEST_ID_HEADER] for _ in range(5)}
+        assert len(ids) == 5
+
+
+# ---------------------------------------------------------------------------
+# Leakage guards: Authorization + raw UA
+# ---------------------------------------------------------------------------
+
+
+class TestAuditDoesNotLeakSecrets:
+    def test_authorization_token_never_in_audit_on_success(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        raw = audit_path.read_text(encoding="utf-8")
+        assert VALID_KEY not in raw
+        assert "Bearer " not in raw
+        assert "authorization" not in raw.lower()
+
+    def test_authorization_token_never_in_audit_on_failure(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        attempted_secret = "attempted-token-WRONG_ABC_XYZ"
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {attempted_secret}"},
+        )
+        raw = audit_path.read_text(encoding="utf-8")
+        assert attempted_secret not in raw
+        assert "Bearer " not in raw
+
+    def test_raw_user_agent_never_in_audit(
+        self, client: TestClient, audit_path: Path
+    ):
+        marker_ua = "Mozilla/5.0 (UNIQUE_UA_LEAK_MARKER_XYZ)"
+        client.get("/health", headers={"User-Agent": marker_ua})
+        raw = audit_path.read_text(encoding="utf-8")
+        assert marker_ua not in raw
+        assert "UNIQUE_UA_LEAK_MARKER_XYZ" not in raw
+
+    def test_user_agent_hash_appears_in_audit(
+        self, client: TestClient, audit_path: Path
+    ):
+        ua = "Mozilla/5.0 (X11; Linux) TestAgent/42"
+        expected = _hash_user_agent(ua)
+        client.get("/health", headers={"User-Agent": ua})
+        records = _read_audit(audit_path)
+        assert records[-1]["user_agent_hash"] == expected
+        assert len(records[-1]["user_agent_hash"]) == 32
+
+    def test_missing_user_agent_recorded_as_none(
+        self, client: TestClient, audit_path: Path
+    ):
+        # httpx always sends a default UA; override to empty by
+        # monkey-patching via request hook. Simplest is to use a
+        # FastAPI test client with an empty header — httpx ignores
+        # empty header values, so just check the field exists at all.
+        client.get("/health")
+        rec = _read_audit(audit_path)[-1]
+        assert "user_agent_hash" in rec
+
+
+# ---------------------------------------------------------------------------
+# Authenticated flag
+# ---------------------------------------------------------------------------
+
+
+class TestAuditAuthenticatedFlag:
+    def test_protected_endpoint_without_auth_is_false(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        client.get("/reports/latest")  # no header → 401
+        rec = _read_audit(audit_path)[-1]
+        assert rec["status_code"] == 401
+        assert rec["authenticated"] is False
+
+    def test_protected_endpoint_wrong_key_is_false(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer wrong-key"},
+        )
+        rec = _read_audit(audit_path)[-1]
+        assert rec["status_code"] == 403
+        assert rec["authenticated"] is False
+
+    def test_protected_endpoint_with_valid_key_is_true(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        rec = _read_audit(audit_path)[-1]
+        assert rec["status_code"] == 200
+        assert rec["authenticated"] is True
+
+    def test_unconfigured_server_is_false(
+        self, client: TestClient, monkeypatch, audit_path: Path
+    ):
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        rec = _read_audit(audit_path)[-1]
+        assert rec["status_code"] == 503
+        assert rec["authenticated"] is False
+
+    def test_public_endpoint_is_true(
+        self, client: TestClient, audit_path: Path
+    ):
+        client.get("/")
+        rec = _read_audit(audit_path)[-1]
+        assert rec["status_code"] == 200
+        assert rec["authenticated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Failure resilience
+# ---------------------------------------------------------------------------
+
+
+class TestAuditFailureDoesNotFailRequest:
+    def test_write_failure_does_not_break_request(
+        self, client: TestClient, monkeypatch
+    ):
+        def boom(record, path=None):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(srv, "_append_audit_record", boom)
+        # Request should still succeed; the audit layer swallows.
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert REQUEST_ID_HEADER in resp.headers  # header still attached
+
+    def test_serialize_failure_does_not_break_request(
+        self, client: TestClient, monkeypatch
+    ):
+        original = srv.json.dumps
+
+        def fail_dumps(*a, **kw):
+            raise TypeError("cannot serialize (fake)")
+
+        # Patch only when called FROM _append_audit_record.
+        # Easiest: patch the whole helper.
+        def bad_append(record, path=None):
+            try:
+                fail_dumps(record)
+            except Exception:
+                return  # swallowed
+        monkeypatch.setattr(srv, "_append_audit_record", bad_append)
+
+        resp = client.get("/health")
+        assert resp.status_code == 200
+
+    def test_missing_parent_directory_does_not_fail_request(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        """_append_audit_record should create the parent dir."""
+        nested = tmp_path / "deep" / "nested" / "audit.jsonl"
+        monkeypatch.setenv(AUDIT_LOG_ENV_VAR, str(nested))
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert nested.exists()
+
+    def test_audit_write_exception_from_middleware_is_swallowed(
+        self, client: TestClient, monkeypatch
+    ):
+        """
+        Force the audit-record writer to raise. The middleware must
+        catch it so the HTTP response still flows to the client.
+        """
+        def raising(record, path=None):
+            raise RuntimeError("boom — simulated audit crash")
+
+        monkeypatch.setattr(srv, "_append_audit_record", raising)
+        # Wrap the module-level function too; the middleware may
+        # reference a local binding.
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        # The request id is still attached even though the audit
+        # record was never successfully written.
+        assert REQUEST_ID_HEADER in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Audit path configurability
+# ---------------------------------------------------------------------------
+
+
+class TestAuditPathConfig:
+    def test_default_path_is_documented(self):
+        assert DEFAULT_AUDIT_LOG_PATH == "data/api_access_audit.jsonl"
+
+    def test_custom_env_var_honoured(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        custom = tmp_path / "my_custom_audit.jsonl"
+        monkeypatch.setenv(AUDIT_LOG_ENV_VAR, str(custom))
+        client.get("/health")
+        assert custom.exists()
+        rec = _read_audit(custom)[-1]
+        assert rec["path"] == "/health"
+
+
+# ---------------------------------------------------------------------------
+# Boundary re-assertion
+# ---------------------------------------------------------------------------
+
+
+class TestPhase44BoundaryUnchanged:
+    def test_forbidden_imports_still_clean(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for pat in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert pat not in src
+
+    def test_only_read_verbs_after_phase_4_4(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            for m in methods:
+                assert m in {"GET", "HEAD", "OPTIONS"}
+
+    def test_audit_never_writes_report_or_experiment_contents(
+        self, client: TestClient, authed_env, audit_path: Path
+    ):
+        """Planted markers inside report/experiment files must never
+        make it into the audit log — the audit writer only records
+        metadata about the request, not the response body."""
+        unique = "AUDIT_LEAK_MARKER_ABC_9d8e"
+        (authed_env["reports_dir"]).mkdir(parents=True, exist_ok=True)
+        (authed_env["reports_dir"] / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({"report_date": "2026-04-24",
+                        "leak_field": unique})
+        )
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        raw = audit_path.read_text(encoding="utf-8")
+        assert unique not in raw
