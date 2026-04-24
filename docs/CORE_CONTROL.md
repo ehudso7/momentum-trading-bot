@@ -280,6 +280,124 @@ any generic webhook consumer.
   state is required.
 
 
+## Phase 3.5 — scorer fingerprint + drift guard
+
+Every alpha score is now stamped with a SHA-256 fingerprint of the
+`RuleBasedAlphaScorer` configuration that produced it — weights,
+tier cutoffs, and the regime-score map. This lets the calibration
+pipeline detect when historical data was produced under a different
+set of weights than what the bot is currently running, which
+invalidates any comparison.
+
+This is metadata / CI protection only. The fingerprint does not
+affect scoring, filtering, execution, risk, or any other live-trade
+code path.
+
+### What's fingerprinted
+
+`trading_bot.core.alpha.get_alpha_scorer_config()` returns the
+exact dict that is hashed:
+
+- `scorer`: always `"RuleBasedAlphaScorer"` in Phase 3.5.
+- `weights`: `{gap, rvol, vol, regime, confidence, reason}`.
+- `tier_thresholds`: `{A, B, C, D}` — the lower bounds used by
+  `score_to_tier`.
+- `regime_scores`: per-regime multiplier map.
+
+Serialization uses `json.dumps(..., sort_keys=True, separators=(",",":"))`
+so whitespace cannot flip the hash, and the fingerprint is stable
+across processes, machines, and Python versions.
+
+Helpers:
+- `get_alpha_scorer_config() -> dict`
+- `get_alpha_scorer_fingerprint() -> str` (64-char hex)
+
+### Where it's surfaced
+
+1. **`alpha_scores.csv`** — new optional trailing column
+   `scorer_fingerprint`. Stamped per row on every write. Old CSV
+   files without the column still load (see "Backward compat"
+   below).
+2. **`alpha_report_<DATE>.json`** — top-level field
+   `scorer_fingerprint` is the CURRENT scorer's fingerprint at
+   report time, and `scorer_fingerprints_in_data` is the sorted
+   unique set of fingerprints observed in the source alpha file(s).
+3. **`alpha_report_<DATE>.txt`** — the header now includes a line
+   `Scorer fingerprint: <64-hex>` so operators can see the value
+   without opening the JSON.
+
+### Drift detection
+
+`evaluate_guardrails` now receives a `scorer_fingerprints` list
+(injected by `generate_daily_report` from the alpha file(s)):
+
+- **Multiple distinct fingerprints present.**
+  The guardrail raises `status="warning"` with reason
+  `"multiple alpha scorer fingerprints detected (N distinct) — …"`.
+  Sample data spans more than one weight configuration;
+  promotion-readiness cannot be trusted across the boundary.
+
+- **Fingerprint column missing entirely.**
+  The guardrail raises `status="warning"` with reason
+  `"alpha scorer fingerprint unavailable in source data — …"`.
+  This happens when the data was produced by a pre-Phase-3.5 bot.
+
+Drift is **never** a `critical` condition on its own. The documented
+ordering is unchanged — `critical` rules (allowed vs blocked A+B
+metrics) win over any drift finding; `insufficient_data` short-
+circuits before drift is even examined.
+
+### Backward compatibility
+
+- `trading_bot.analysis.alpha_report.load_alpha_scores` still reads
+  CSVs without the `scorer_fingerprint` column; legacy rows are
+  returned untouched.
+- `_collect_alpha_fingerprints` returns `[]` for files that lack
+  the column, which then triggers the documented "unavailable"
+  warning rather than a crash.
+- Globs can mix old and new files freely — both flow through the
+  same loader and the unique-fingerprint set is computed from
+  whatever rows supply one.
+
+### Example fingerprint
+
+On the Phase 3.5 default weights the fingerprint is a 64-char
+hexadecimal hash (example value — will differ if constants are
+retuned):
+
+```
+24b6f9a1c5f7e0d3a8b2c9e4f60d7a31b8c5e2f9a7d03b61c8e5f2a9d7b30415
+```
+
+Example JSON excerpt:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-24",
+  "scorer_fingerprint": "24b6f9a1c5f7e0d3…",
+  "scorer_fingerprints_in_data": ["24b6f9a1c5f7e0d3…"],
+  "guardrails": {
+    "status": "ok",
+    "reasons": ["…"],
+    "recommended_action": "…"
+  }
+}
+```
+
+### CI protection
+
+If you change any weight or threshold in `RuleBasedAlphaScorer`
+you should expect:
+- Every row from the first restart onward carries the new
+  fingerprint.
+- The next daily report lists both old and new fingerprints in
+  `scorer_fingerprints_in_data` and emits the drift-warning
+  guardrail.
+- Operators know to re-collect calibration before trusting the
+  promotion-readiness signal.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 See [`docs/DATASETS.md`](DATASETS.md) for the full spec. Short

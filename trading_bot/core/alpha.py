@@ -20,6 +20,8 @@ Modules:
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
 import threading
 from dataclasses import dataclass, field
@@ -80,6 +82,11 @@ CSV_HEADERS: list[str] = [
     "relative_volume",
     "volatility",
     "reasons",
+    # Phase 3.5 — fingerprint of the scorer configuration that
+    # produced this row. Optional: old files created before Phase 3.5
+    # will not have this column, and the analysis layer treats the
+    # column as nullable so legacy data still parses.
+    "scorer_fingerprint",
 ]
 
 # Tier cutoffs (inclusive lower bound).
@@ -333,6 +340,62 @@ class RuleBasedAlphaScorer:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3.5 — scorer fingerprint
+# ---------------------------------------------------------------------------
+
+
+def get_alpha_scorer_config() -> dict:
+    """
+    Return the scorer configuration that defines an alpha tier.
+
+    The returned dict covers every constant that, if changed,
+    invalidates previously collected calibration data:
+      - RuleBasedAlphaScorer feature weights (must sum to 1.0).
+      - Tier cutoffs A / B / C / D.
+      - Regime → score map.
+
+    Re-computed on every call so monkey-patching class attributes is
+    observable by `get_alpha_scorer_fingerprint()` without module
+    reloads.
+    """
+    return {
+        "scorer": "RuleBasedAlphaScorer",
+        "weights": {
+            "gap": RuleBasedAlphaScorer.GAP_WEIGHT,
+            "rvol": RuleBasedAlphaScorer.RVOL_WEIGHT,
+            "vol": RuleBasedAlphaScorer.VOL_WEIGHT,
+            "regime": RuleBasedAlphaScorer.REGIME_WEIGHT,
+            "confidence": RuleBasedAlphaScorer.CONF_WEIGHT,
+            "reason": RuleBasedAlphaScorer.REASON_WEIGHT,
+        },
+        "tier_thresholds": {
+            "A": TIER_A_MIN,
+            "B": TIER_B_MIN,
+            "C": TIER_C_MIN,
+            "D": TIER_D_MIN,
+        },
+        "regime_scores": dict(RuleBasedAlphaScorer._REGIME_SCORES),
+    }
+
+
+def get_alpha_scorer_fingerprint() -> str:
+    """
+    Deterministic SHA-256 fingerprint of the scorer configuration.
+
+    Stable across runs as long as weights, tier cutoffs, and regime
+    scores are unchanged. Serialization uses sorted keys and tight
+    separators so formatting whitespace cannot flip the hash.
+    """
+    payload = json.dumps(
+        get_alpha_scorer_config(),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # CSV logger
 # ---------------------------------------------------------------------------
 
@@ -408,6 +471,10 @@ class AlphaLogger:
             "relative_volume": round(float(snapshot.relative_volume), 3),
             "volatility": round(float(snapshot.volatility), 4),
             "reasons": "|".join(alpha.reasons),
+            # Phase 3.5 — stamped per-row so multi-day analysis can
+            # detect mid-dataset weight changes even when the file
+            # has been appended to across versions.
+            "scorer_fingerprint": get_alpha_scorer_fingerprint(),
         }
         current = self._current_path()
         with self._lock:

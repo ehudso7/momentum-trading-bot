@@ -46,7 +46,9 @@ from trading_bot.analysis.alpha_report import (
     build_report,
     format_json,
     format_text,
+    load_alpha_scores,
 )
+from trading_bot.core.alpha import get_alpha_scorer_fingerprint
 
 log = structlog.get_logger(__name__)
 
@@ -125,20 +127,61 @@ def _build_paths(
     return alpha_in, decision_in, journal_in, txt_out, json_out
 
 
-def _wrap_text_with_daily_header(report_date: str, body: str) -> str:
+def _wrap_text_with_daily_header(
+    report_date: str,
+    body: str,
+    scorer_fingerprint: Optional[str] = None,
+) -> str:
     """Prepend the daily header so the plain-text report is self-identifying."""
     bar = "=" * 78
-    return "\n".join([bar, f"{DAILY_HEADER} — {report_date}", bar, body])
+    lines = [bar, f"{DAILY_HEADER} — {report_date}"]
+    if scorer_fingerprint:
+        lines.append(f"Scorer fingerprint: {scorer_fingerprint}")
+    lines.extend([bar, body])
+    return "\n".join(lines)
 
 
-def _compose_json_payload(report: dict, report_date: str) -> dict:
+def _compose_json_payload(
+    report: dict,
+    report_date: str,
+    scorer_fingerprint: Optional[str] = None,
+) -> dict:
     """Return a copy of the analysis report decorated with daily metadata."""
     payload = {
         "report_type": "daily_alpha_validation",
         "report_date": report_date,
     }
+    if scorer_fingerprint is not None:
+        payload["scorer_fingerprint"] = scorer_fingerprint
     payload.update(report)
     return payload
+
+
+def _collect_alpha_fingerprints(alpha_path: Union[str, Path]) -> list[str]:
+    """
+    Read the alpha-scores CSV (respecting the Phase 2.8 glob / comma
+    spec) and return the sorted unique set of non-empty
+    ``scorer_fingerprint`` values.
+
+    Missing file or missing column → empty list (backward compat).
+    """
+    try:
+        df = load_alpha_scores(alpha_path)
+    except Exception:
+        return []
+    if df is None or "scorer_fingerprint" not in getattr(df, "columns", []):
+        return []
+    try:
+        series = df["scorer_fingerprint"].dropna()
+    except Exception:
+        return []
+    values: set[str] = set()
+    for v in series.tolist():
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            continue
+        values.add(s)
+    return sorted(values)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +310,33 @@ def evaluate_guardrails(report: dict) -> dict:
             f"A/B outcome_count={ab_outcome} is below "
             f"min_required_outcomes={min_req}"
         )
+
+    # Phase 3.5 — scorer-fingerprint drift.
+    #
+    # The optional `scorer_fingerprints` field is populated by
+    # `generate_daily_report` just before this function runs; a
+    # unit-test caller that omits it sees NO fingerprint checks.
+    # Drift is a WARNING condition only — never critical — because
+    # it invalidates the calibration signal but does not imply the
+    # live filter is misbehaving right now.
+    fingerprints_field = (report or {}).get("scorer_fingerprints")
+    if fingerprints_field is not None:
+        unique_fps = [
+            str(fp) for fp in fingerprints_field
+            if fp is not None and str(fp).strip()
+        ]
+        distinct = sorted(set(unique_fps))
+        if len(distinct) > 1:
+            warning_reasons.append(
+                f"multiple alpha scorer fingerprints detected "
+                f"({len(distinct)} distinct) — previous calibration "
+                f"data spans more than one weight configuration"
+            )
+        elif len(distinct) == 0:
+            warning_reasons.append(
+                "alpha scorer fingerprint unavailable in source data "
+                "— cannot verify the scorer hasn't drifted"
+            )
 
     if warning_reasons:
         return {
@@ -465,10 +535,30 @@ def generate_daily_report(
             min_required_outcomes=min_required_outcomes,
         )
 
+        # Phase 3.5 — collect fingerprints from the source data so
+        # the guardrail evaluator can detect drift, and compute the
+        # CURRENT scorer fingerprint for display/metadata. These are
+        # best-effort — any failure leaves both empty and the
+        # guardrail logic falls back to its pre-3.5 behaviour.
+        try:
+            data_fingerprints = _collect_alpha_fingerprints(alpha_in)
+        except Exception:
+            data_fingerprints = []
+        try:
+            current_fingerprint = get_alpha_scorer_fingerprint()
+        except Exception:
+            current_fingerprint = ""
+
         # Phase 3.3 — classify the day's alpha-filter performance.
-        guardrails = evaluate_guardrails(report)
-        report_with_guardrails = dict(report)
-        report_with_guardrails["guardrails"] = guardrails
+        # Inject `scorer_fingerprints` so Phase 3.5 drift detection
+        # fires within the same `evaluate_guardrails` call.
+        report_for_guardrails = dict(report)
+        report_for_guardrails["scorer_fingerprints"] = data_fingerprints
+        guardrails = evaluate_guardrails(report_for_guardrails)
+
+        report_with_extras = dict(report)
+        report_with_extras["guardrails"] = guardrails
+        report_with_extras["scorer_fingerprints_in_data"] = data_fingerprints
 
         txt_body = format_text(report)
         txt_body_with_guardrails = (
@@ -477,10 +567,14 @@ def generate_daily_report(
             + _format_guardrails_section(guardrails)
         )
         txt_payload = _wrap_text_with_daily_header(
-            report_date, txt_body_with_guardrails
+            report_date,
+            txt_body_with_guardrails,
+            scorer_fingerprint=current_fingerprint,
         )
         json_payload = _compose_json_payload(
-            report_with_guardrails, report_date
+            report_with_extras,
+            report_date,
+            scorer_fingerprint=current_fingerprint,
         )
         json_text = json.dumps(
             json_payload, indent=2, sort_keys=False, default=str

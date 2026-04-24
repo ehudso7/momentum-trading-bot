@@ -1453,3 +1453,339 @@ class TestGenerateDailyReportAlertIntegration:
 
 # Need this import for the subprocess CLI test above.
 import os  # noqa: E402
+
+
+# ===========================================================================
+# Phase 3.5 — scorer fingerprint + drift guard
+# ===========================================================================
+
+
+from trading_bot.core.alpha import get_alpha_scorer_fingerprint  # noqa: E402
+from trading_bot.reporting.daily_report import (  # noqa: E402
+    _collect_alpha_fingerprints,
+)
+
+
+class TestJsonReportIncludesScorerFingerprint:
+    def test_top_level_field_present(
+        self, populated_data_dir: tuple[Path, str], tmp_path: Path
+    ):
+        data_dir, report_date = populated_data_dir
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        payload = json.loads(result.json_path.read_text())
+        assert "scorer_fingerprint" in payload
+        assert payload["scorer_fingerprint"] == get_alpha_scorer_fingerprint()
+        assert len(payload["scorer_fingerprint"]) == 64
+
+    def test_also_reports_fingerprints_seen_in_source_data(
+        self, populated_data_dir: tuple[Path, str], tmp_path: Path
+    ):
+        data_dir, report_date = populated_data_dir
+        # Overwrite the existing alpha file with a fingerprinted version
+        fp = "f" * 64
+        (data_dir / f"alpha_scores_{report_date}.csv").write_text(
+            ",".join([
+                "timestamp", "symbol", "score", "tier", "action",
+                "confidence", "regime", "gap_pct", "relative_volume",
+                "volatility", "reasons", "scorer_fingerprint",
+            ]) + "\n"
+            + f"2026-04-24 09:45:00,AAA,0.92,A,buy,0.85,"
+              f"trending_bullish,12.0,15.0,3.5,r,{fp}\n"
+        )
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        payload = json.loads(result.json_path.read_text())
+        assert payload["scorer_fingerprints_in_data"] == [fp]
+
+
+class TestTextReportIncludesFingerprint:
+    def test_fingerprint_line_in_text_report(
+        self, populated_data_dir: tuple[Path, str], tmp_path: Path
+    ):
+        data_dir, report_date = populated_data_dir
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        txt = result.txt_path.read_text()
+        assert "Scorer fingerprint:" in txt
+        assert get_alpha_scorer_fingerprint() in txt
+
+
+# ---------------------------------------------------------------------------
+# _collect_alpha_fingerprints
+# ---------------------------------------------------------------------------
+
+
+class TestCollectAlphaFingerprints:
+    def test_missing_file_returns_empty_list(self, tmp_path: Path):
+        assert _collect_alpha_fingerprints(tmp_path / "absent.csv") == []
+
+    def test_file_without_column_returns_empty_list(self, tmp_path: Path):
+        p = tmp_path / "alpha.csv"
+        p.write_text(
+            "timestamp,symbol,score,tier,action,confidence,regime,"
+            "gap_pct,relative_volume,volatility,reasons\n"
+            "2026-04-24 09:45:00,AAA,0.9,A,buy,0.8,bull,10,10,3,r\n"
+        )
+        assert _collect_alpha_fingerprints(p) == []
+
+    def test_single_fingerprint(self, tmp_path: Path):
+        fp = "a" * 64
+        p = tmp_path / "alpha.csv"
+        p.write_text(
+            "timestamp,symbol,score,tier,action,confidence,regime,"
+            "gap_pct,relative_volume,volatility,reasons,scorer_fingerprint\n"
+            f"2026-04-24 09:45:00,AAA,0.9,A,buy,0.8,bull,10,10,3,r,{fp}\n"
+            f"2026-04-24 10:00:00,BBB,0.7,B,buy,0.7,bull,8,8,2,r,{fp}\n"
+        )
+        assert _collect_alpha_fingerprints(p) == [fp]
+
+    def test_multiple_fingerprints_sorted_unique(self, tmp_path: Path):
+        fp_a = "a" * 64
+        fp_b = "b" * 64
+        p = tmp_path / "alpha.csv"
+        p.write_text(
+            "timestamp,symbol,score,tier,action,confidence,regime,"
+            "gap_pct,relative_volume,volatility,reasons,scorer_fingerprint\n"
+            f"2026-04-24 09:45:00,AAA,0.9,A,buy,0.8,bull,10,10,3,r,{fp_b}\n"
+            f"2026-04-24 10:00:00,BBB,0.7,B,buy,0.7,bull,8,8,2,r,{fp_a}\n"
+            f"2026-04-24 10:05:00,CCC,0.9,A,buy,0.8,bull,10,10,3,r,{fp_a}\n"
+        )
+        got = _collect_alpha_fingerprints(p)
+        assert got == [fp_a, fp_b]  # sorted
+
+    def test_accepts_glob_pattern(self, tmp_path: Path):
+        fp_a = "a" * 64
+        fp_b = "b" * 64
+        for date_str, fp in [("2026-04-24", fp_a), ("2026-04-25", fp_b)]:
+            p = tmp_path / f"alpha_scores_{date_str}.csv"
+            p.write_text(
+                "timestamp,symbol,score,tier,action,confidence,regime,"
+                "gap_pct,relative_volume,volatility,reasons,scorer_fingerprint\n"
+                f"{date_str} 09:45:00,X,0.9,A,buy,0.8,bull,10,10,3,r,{fp}\n"
+            )
+        got = _collect_alpha_fingerprints(str(tmp_path / "alpha_scores_*.csv"))
+        assert got == sorted([fp_a, fp_b])
+
+
+# ---------------------------------------------------------------------------
+# Guardrail drift warnings
+# ---------------------------------------------------------------------------
+
+
+class TestGuardrailFingerprintDrift:
+    def _base_report(self) -> dict:
+        """Enough matched trades + healthy metrics so status defaults to ok."""
+        return {
+            "totals": {"matched_trades": 50},
+            "promotion_readiness": {
+                "status": "ready_for_shadow_filter_test",
+                "min_required_outcomes": 25,
+                "ab": {"outcome_count": 40},
+                "cdf": {"outcome_count": 10},
+            },
+            "shadow_filter_simulation": [
+                {"threshold": "A+B",
+                 "allowed_win_rate": 0.7, "blocked_win_rate": 0.3,
+                 "allowed_avg_r_multiple": 1.0, "blocked_avg_r_multiple": 0.0},
+            ],
+        }
+
+    def test_single_fingerprint_no_warning(self):
+        report = self._base_report()
+        report["scorer_fingerprints"] = ["a" * 64]
+        out = evaluate_guardrails(report)
+        assert out["status"] == GUARDRAIL_STATUS_OK
+        assert not any("fingerprint" in r for r in out["reasons"])
+
+    def test_multiple_fingerprints_emit_warning(self):
+        report = self._base_report()
+        report["scorer_fingerprints"] = ["a" * 64, "b" * 64]
+        out = evaluate_guardrails(report)
+        assert out["status"] == GUARDRAIL_STATUS_WARNING
+        assert any(
+            "multiple alpha scorer fingerprints" in r.lower()
+            for r in out["reasons"]
+        )
+
+    def test_missing_fingerprints_emit_warning(self):
+        report = self._base_report()
+        report["scorer_fingerprints"] = []    # explicitly empty
+        out = evaluate_guardrails(report)
+        assert out["status"] == GUARDRAIL_STATUS_WARNING
+        assert any(
+            "fingerprint unavailable" in r.lower() for r in out["reasons"]
+        )
+
+    def test_fingerprint_drift_never_escalates_to_critical(self):
+        """Drift is WARNING only — even when the A+B row shows bad perf
+        the fingerprint warning must be attached, not replaced."""
+        report = self._base_report()
+        # Tip the A+B row so critical would otherwise fire
+        report["shadow_filter_simulation"] = [
+            {"threshold": "A+B",
+             "allowed_win_rate": 0.2, "blocked_win_rate": 0.8,
+             "allowed_avg_r_multiple": 0.1, "blocked_avg_r_multiple": 1.5},
+        ]
+        report["scorer_fingerprints"] = ["a" * 64, "b" * 64]
+        out = evaluate_guardrails(report)
+        # Critical still wins because the data IS actually bad —
+        # drift alone never forces critical, but it cannot mask it
+        # either. The critical reasons must still be present.
+        assert out["status"] == GUARDRAIL_STATUS_CRITICAL
+        # (fingerprint warning is not added when status is critical
+        # because critical short-circuits before the warning block.)
+
+    def test_drift_warning_only_fires_when_scorer_fingerprints_key_present(self):
+        """A caller that doesn't supply the field sees no fingerprint logic."""
+        report = self._base_report()
+        # Key omitted entirely
+        out = evaluate_guardrails(report)
+        assert out["status"] == GUARDRAIL_STATUS_OK
+        assert not any("fingerprint" in r for r in out["reasons"])
+
+    def test_insufficient_data_short_circuits_before_fingerprint_check(self):
+        """Insufficient_data keeps its precedence — don't stack fingerprint
+        noise on top of an already-conclusive insufficient status."""
+        report = self._base_report()
+        report["totals"]["matched_trades"] = 1
+        report["scorer_fingerprints"] = []
+        out = evaluate_guardrails(report)
+        assert out["status"] == GUARDRAIL_STATUS_INSUFFICIENT
+        assert not any("fingerprint" in r for r in out["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# End-to-end drift detection in generate_daily_report
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateDailyReportDriftDetection:
+    """End-to-end: a rotated daily run with two distinct fingerprints
+    produces a warning guardrail AND lists the distinct fingerprints
+    in the JSON."""
+
+    @staticmethod
+    def _write_fixture(
+        data_dir: Path,
+        report_date: str,
+        fingerprints: list[str],
+        trades_per_fp: int = 15,
+    ) -> None:
+        """Write alpha + decision + journal with 2 * trades_per_fp entries."""
+        alpha_header = ",".join([
+            "timestamp", "symbol", "score", "tier", "action",
+            "confidence", "regime", "gap_pct", "relative_volume",
+            "volatility", "reasons", "scorer_fingerprint",
+        ])
+        dec_header = ",".join([
+            "timestamp", "symbol", "price", "gap_pct", "relative_volume",
+            "volatility", "regime", "action", "confidence", "reason",
+        ])
+        j_header = ",".join([
+            "date", "symbol", "side", "signal_type", "entry_price",
+            "exit_price", "shares", "pnl", "rr_ratio", "hold_time_minutes",
+            "entry_time", "exit_time", "exit_reason", "notes",
+        ])
+        alpha_rows = [alpha_header]
+        dec_rows = [dec_header]
+        j_rows = [j_header]
+
+        i = 0
+        for fp in fingerprints:
+            for k in range(trades_per_fp):
+                sym = f"S{i:03d}"
+                hh, mm = 9, 30 + i
+                # Keep times inside the hour
+                while mm >= 60:
+                    hh += 1
+                    mm -= 60
+                ts = f"{report_date} {hh:02d}:{mm:02d}:00"
+                entry_time = f"{hh:02d}:{mm:02d}:00"
+                exit_time = f"{(hh + 1) % 24:02d}:{mm:02d}:00"
+                # Alternate winners/losers so stats don't skew
+                pnl = 100.0 if k % 2 == 0 else -50.0
+                rr = 1.0 if k % 2 == 0 else -0.5
+                alpha_rows.append(
+                    f"{ts},{sym},0.9,A,buy,0.85,"
+                    f"trending_bullish,12.0,15.0,3.5,r,{fp}"
+                )
+                dec_rows.append(
+                    f"{ts},{sym},10.0,12.0,15.0,3.5,"
+                    f"trending_bullish,buy,0.85,executed"
+                )
+                j_rows.append(
+                    f"{report_date},{sym},buy,vwap_pullback,"
+                    f"10.0,{10.0 + pnl / 100:.2f},100,{pnl},{rr},30,"
+                    f"{entry_time},{exit_time},target,"
+                )
+                i += 1
+
+        (data_dir / f"alpha_scores_{report_date}.csv").write_text(
+            "\n".join(alpha_rows) + "\n"
+        )
+        (data_dir / f"decision_log_{report_date}.csv").write_text(
+            "\n".join(dec_rows) + "\n"
+        )
+        (data_dir / "journal.csv").write_text("\n".join(j_rows) + "\n")
+
+    def test_mixed_fingerprints_produce_warning_guardrail(
+        self, tmp_path: Path
+    ):
+        fp_a, fp_b = "a" * 64, "b" * 64
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        report_date = "2026-04-24"
+        self._write_fixture(data_dir, report_date, [fp_a, fp_b], trades_per_fp=15)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+
+        payload = json.loads(result.json_path.read_text())
+        gr = payload["guardrails"]
+        # Status is warning (drift triggers warning when otherwise ok)
+        assert gr["status"] == GUARDRAIL_STATUS_WARNING
+        assert any(
+            "multiple alpha scorer fingerprints" in r.lower()
+            for r in gr["reasons"]
+        )
+        # The JSON also lists the distinct data-side fingerprints
+        assert sorted(payload["scorer_fingerprints_in_data"]) == sorted([fp_a, fp_b])
+
+    def test_single_fingerprint_does_not_trigger_drift_warning(
+        self, tmp_path: Path
+    ):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        report_date = "2026-04-24"
+        self._write_fixture(data_dir, report_date, ["a" * 64], trades_per_fp=30)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        payload = json.loads(result.json_path.read_text())
+        gr = payload["guardrails"]
+        assert not any(
+            "multiple alpha scorer fingerprints" in r.lower()
+            for r in gr["reasons"]
+        )
+        assert payload["scorer_fingerprints_in_data"] == ["a" * 64]

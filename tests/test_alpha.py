@@ -450,3 +450,163 @@ def test_shadow_mode_scoring_is_read_only_on_inputs():
     scorer.score(snap, dec)
     assert snap == snap_copy
     assert dec == dec_copy
+
+
+# ===========================================================================
+# Phase 3.5 — scorer fingerprint
+# ===========================================================================
+
+
+import csv as _csv  # noqa: E402
+
+from trading_bot.core.alpha import (  # noqa: E402
+    get_alpha_scorer_config,
+    get_alpha_scorer_fingerprint,
+    AlphaLogger,
+)
+from trading_bot.core import alpha as alpha_mod  # noqa: E402
+
+
+class TestGetAlphaScorerConfig:
+    def test_returns_dict_with_all_documented_sections(self):
+        cfg = get_alpha_scorer_config()
+        # Top-level structure
+        assert isinstance(cfg, dict)
+        assert set(cfg.keys()) >= {
+            "scorer", "weights", "tier_thresholds", "regime_scores",
+        }
+        # Weight keys
+        assert set(cfg["weights"].keys()) == {
+            "gap", "rvol", "vol", "regime", "confidence", "reason",
+        }
+        # Tier thresholds
+        assert set(cfg["tier_thresholds"].keys()) == {"A", "B", "C", "D"}
+        # Regime-score map is a dict of strings to floats
+        assert isinstance(cfg["regime_scores"], dict)
+        assert all(isinstance(k, str) for k in cfg["regime_scores"].keys())
+
+    def test_weights_sum_to_one(self):
+        """Sanity: if this ever breaks a future phase has probably messed up."""
+        cfg = get_alpha_scorer_config()
+        assert abs(sum(cfg["weights"].values()) - 1.0) < 1e-9
+
+    def test_tier_thresholds_are_strictly_decreasing(self):
+        cfg = get_alpha_scorer_config()
+        a, b, c, d = [cfg["tier_thresholds"][t] for t in ("A", "B", "C", "D")]
+        assert a > b > c > d
+
+
+class TestGetAlphaScorerFingerprint:
+    def test_is_64_hex_sha256(self):
+        fp = get_alpha_scorer_fingerprint()
+        assert isinstance(fp, str)
+        assert len(fp) == 64
+        int(fp, 16)  # must be hex
+
+    def test_stable_across_calls(self):
+        assert get_alpha_scorer_fingerprint() == get_alpha_scorer_fingerprint()
+
+    def test_changes_if_gap_weight_changes(self, monkeypatch):
+        before = get_alpha_scorer_fingerprint()
+        monkeypatch.setattr(
+            alpha_mod.RuleBasedAlphaScorer, "GAP_WEIGHT", 0.25
+        )
+        after = get_alpha_scorer_fingerprint()
+        assert before != after
+
+    def test_changes_if_tier_threshold_changes(self, monkeypatch):
+        before = get_alpha_scorer_fingerprint()
+        monkeypatch.setattr(alpha_mod, "TIER_A_MIN", 0.85)
+        after = get_alpha_scorer_fingerprint()
+        assert before != after
+
+    def test_changes_if_regime_scores_change(self, monkeypatch):
+        before = get_alpha_scorer_fingerprint()
+        new_map = dict(alpha_mod.RuleBasedAlphaScorer._REGIME_SCORES)
+        new_map["trending_bullish"] = 0.99
+        monkeypatch.setattr(
+            alpha_mod.RuleBasedAlphaScorer, "_REGIME_SCORES", new_map
+        )
+        after = get_alpha_scorer_fingerprint()
+        assert before != after
+
+    def test_same_config_from_two_processes_produces_same_hash(self):
+        """
+        Stability is the whole point — compute fingerprint, re-import
+        module (simulates process restart), compute again. Must match.
+        """
+        import importlib
+        fp1 = get_alpha_scorer_fingerprint()
+        importlib.reload(alpha_mod)
+        fp2 = alpha_mod.get_alpha_scorer_fingerprint()
+        assert fp1 == fp2
+
+
+# ---------------------------------------------------------------------------
+# AlphaLogger writes the fingerprint column
+# ---------------------------------------------------------------------------
+
+
+class TestAlphaLoggerFingerprintColumn:
+    @staticmethod
+    def _snap_dec():
+        ts = datetime(2026, 4, 24, 10, 30)
+        snap = FeatureSnapshot(
+            symbol="TEST", timestamp=ts, price=10.0,
+            gap_pct=12.0, relative_volume=15.0, volatility=3.0,
+            regime="trending_bullish",
+        )
+        dec = SignalDecision(
+            timestamp=ts, symbol="TEST", action="buy",
+            confidence=0.85, reason="executed",
+        )
+        return snap, dec
+
+    def test_header_includes_scorer_fingerprint(self, tmp_path):
+        target = tmp_path / "alpha_scores.csv"
+        AlphaLogger(target)
+        with open(target) as f:
+            header = f.readline().strip().split(",")
+        assert "scorer_fingerprint" in header
+
+    def test_log_writes_fingerprint_value(self, tmp_path):
+        target = tmp_path / "alpha_scores.csv"
+        logger = AlphaLogger(target)
+        scorer = RuleBasedAlphaScorer()
+        snap, dec = self._snap_dec()
+        logger.log(scorer.score(snap, dec), snap, dec)
+
+        with open(target) as f:
+            rows = list(_csv.DictReader(f))
+        assert len(rows) == 1
+        assert rows[0]["scorer_fingerprint"] == get_alpha_scorer_fingerprint()
+        assert len(rows[0]["scorer_fingerprint"]) == 64
+
+    def test_multiple_rows_same_fingerprint_when_config_unchanged(self, tmp_path):
+        target = tmp_path / "alpha_scores.csv"
+        logger = AlphaLogger(target)
+        scorer = RuleBasedAlphaScorer()
+        snap, dec = self._snap_dec()
+        for _ in range(3):
+            logger.log(scorer.score(snap, dec), snap, dec)
+        with open(target) as f:
+            rows = list(_csv.DictReader(f))
+        fps = {r["scorer_fingerprint"] for r in rows}
+        assert len(fps) == 1
+
+    def test_fingerprint_flips_when_weights_flip_mid_run(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "alpha_scores.csv"
+        logger = AlphaLogger(target)
+        scorer = RuleBasedAlphaScorer()
+        snap, dec = self._snap_dec()
+        logger.log(scorer.score(snap, dec), snap, dec)
+        monkeypatch.setattr(
+            alpha_mod.RuleBasedAlphaScorer, "GAP_WEIGHT", 0.25
+        )
+        logger.log(scorer.score(snap, dec), snap, dec)
+        with open(target) as f:
+            rows = list(_csv.DictReader(f))
+        fps = {r["scorer_fingerprint"] for r in rows}
+        assert len(fps) == 2, "row-level fingerprinting must catch drift"

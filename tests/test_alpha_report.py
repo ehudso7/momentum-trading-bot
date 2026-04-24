@@ -1149,6 +1149,84 @@ def test_cli_comma_separated_smoke(tmp_path: Path):
 
 
 # ===========================================================================
+# Phase 3.5 — backward-compat for alpha CSVs without scorer_fingerprint
+# ===========================================================================
+
+
+def test_old_alpha_csv_without_fingerprint_still_loads(tmp_path: Path):
+    """
+    Files created before Phase 3.5 have 11 columns and no
+    `scorer_fingerprint`. The loader must tolerate that: the row is
+    returned untouched, and downstream analysis does not crash on
+    the missing column.
+    """
+    old_headers = [
+        "timestamp", "symbol", "score", "tier", "action", "confidence",
+        "regime", "gap_pct", "relative_volume", "volatility", "reasons",
+    ]
+    path = tmp_path / "old_alpha.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=old_headers)
+        writer.writeheader()
+        writer.writerow({
+            "timestamp": "2026-04-24 09:45:00", "symbol": "OLD",
+            "score": 0.9, "tier": "A", "action": "buy", "confidence": 0.8,
+            "regime": "trending_bullish", "gap_pct": 10.0,
+            "relative_volume": 10.0, "volatility": 3.0,
+            "reasons": "legacy_row",
+        })
+
+    # Contract: load returns a DataFrame with the single row; if the
+    # fingerprint column is absent (as it is here), downstream code
+    # must cope gracefully — see `_collect_alpha_fingerprints` which
+    # returns [] for this case.
+    df = load_alpha_scores(path)
+    assert len(df) == 1
+    assert df["symbol"].iloc[0] == "OLD"
+    # Either the column is present-as-NaN or entirely absent — both
+    # are acceptable. The important property is no crash and full
+    # row preservation.
+    if "scorer_fingerprint" in df.columns:
+        import pandas as _pd
+        assert _pd.isna(df["scorer_fingerprint"].iloc[0])
+
+
+def test_mixed_old_and_new_alpha_files_concatenate_cleanly(tmp_path: Path):
+    """An old 11-column file and a new 12-column file can be combined."""
+    old = tmp_path / "alpha_old.csv"
+    new = tmp_path / "alpha_new.csv"
+    old_headers = [
+        "timestamp", "symbol", "score", "tier", "action", "confidence",
+        "regime", "gap_pct", "relative_volume", "volatility", "reasons",
+    ]
+    new_headers = old_headers + ["scorer_fingerprint"]
+    with open(old, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=old_headers)
+        w.writeheader()
+        w.writerow({
+            "timestamp": "2026-04-24 09:45:00", "symbol": "OLD",
+            "score": 0.9, "tier": "A", "action": "buy", "confidence": 0.8,
+            "regime": "trending_bullish", "gap_pct": 10.0,
+            "relative_volume": 10.0, "volatility": 3.0,
+            "reasons": "old",
+        })
+    with open(new, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=new_headers)
+        w.writeheader()
+        w.writerow({
+            "timestamp": "2026-04-25 09:45:00", "symbol": "NEW",
+            "score": 0.9, "tier": "A", "action": "buy", "confidence": 0.8,
+            "regime": "trending_bullish", "gap_pct": 10.0,
+            "relative_volume": 10.0, "volatility": 3.0,
+            "reasons": "new", "scorer_fingerprint": "a" * 64,
+        })
+    df = load_alpha_scores(f"{old},{new}")
+    assert len(df) == 2
+    symbols = set(df["symbol"])
+    assert symbols == {"OLD", "NEW"}
+
+
+# ===========================================================================
 # Phase 2.9 — shadow-mode tier-filter simulation.
 # ===========================================================================
 
