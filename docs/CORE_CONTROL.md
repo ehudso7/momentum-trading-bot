@@ -542,6 +542,7 @@ trading decision or scoring internal.
 | GET    | `/reports/{date}`          | Yes  | Report for `YYYY-MM-DD` (sanitized). |
 | GET    | `/experiments/recent?limit=N` | Yes | Last N manifest records (sanitized). |
 | GET    | `/experiments/{n}`         | Yes  | Nth-most-recent manifest record (1 = most recent). |
+| GET    | `/dashboard`               | Yes  | Read-only HTML dashboard (Phase 4.1). |
 
 All non-`/health` endpoints require
 `Authorization: Bearer <TRADING_API_KEY>`. Unset `TRADING_API_KEY`
@@ -572,6 +573,50 @@ bypass authentication.
 - Rate limiting / DDOS protection are expected to come from the
   surrounding infrastructure (reverse proxy, API gateway). The
   server itself caps `/experiments/recent?limit=` at 100.
+
+### Phase 4.1 — read-only dashboard (`/dashboard`)
+
+An HTML page rendered server-side from the same sanitized helpers
+the JSON endpoints use. No new frontend framework, no build step —
+the page is a single self-contained HTML document with an inline
+`<style>` block.
+
+**Same auth as the JSON endpoints.** Bearer-token required;
+`/dashboard` obeys the identical 401/403/503 rules.
+
+**Sections (in order):**
+
+1. Header + generation timestamp.
+2. *Latest report* — date + scorer-fingerprint hash, guardrail
+   block (status badge, recommended action, reasons), promotion
+   readiness (A/B vs C/D/F outcomes table), totals, shadow-filter
+   simulation table.
+3. *Recent experiments* — last 10 manifest rows, newest first,
+   with per-row guardrail + readiness badges and a truncated
+   fingerprint.
+
+**Empty states** (each rendered at HTTP 200):
+
+- No reports on disk → "No daily reports available yet."
+- No manifest → "(no experiments recorded yet)".
+- Malformed report JSON → dashboard falls back to the empty-report
+  state; the page still renders.
+
+**Leakage guards (enforced by tests):**
+
+- `scorer_config` is never present (the same sanitizer as the
+  JSON endpoints is applied first).
+- Filesystem paths from `sources` (`path`, `resolved_paths`) and
+  from `report_paths` are stripped before rendering.
+- Raw `TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL` never appears — even
+  if a future bug caused the upstream manifest to leak one, the
+  sanitizer drops `report_paths` and the Phase 3.6 manifest only
+  stores a presence boolean for the webhook URL.
+- Page has no `<form>`, no `<input>`, no `<button>`, no
+  `onclick` / `onsubmit` handlers, no `method="POST|PUT|PATCH|DELETE"`.
+  The dashboard is a read-only document.
+- All dynamic strings are HTML-escaped via `html.escape`, so a
+  compromised upstream file cannot inject `<script>` tags.
 
 
 ## Phase 2.7 — dataset rotation (reference)

@@ -44,11 +44,13 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from html import escape as _esc
 from pathlib import Path
 from typing import Any, Optional
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 log = structlog.get_logger(__name__)
@@ -339,6 +341,329 @@ def experiment_by_index(n: int) -> dict[str, Any]:
             detail=f"only {len(records)} experiment record(s) on file",
         )
     return _sanitize_manifest(records[-n])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1 — read-only dashboard UI
+# ---------------------------------------------------------------------------
+
+
+_DASHBOARD_CSS = """
+<style>
+  :root {
+    color-scheme: light;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif;
+    margin: 2em;
+    color: #222;
+    background: #fafafa;
+  }
+  h1 { font-size: 1.45em; margin-bottom: 0.3em; color: #111; }
+  h2 {
+    font-size: 1.05em;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 0.3em;
+    margin-top: 2em;
+    color: #333;
+  }
+  section { margin-top: 1.5em; }
+  table { border-collapse: collapse; margin: 0.5em 0; background: #fff; }
+  th, td {
+    padding: 0.35em 0.75em;
+    border: 1px solid #e0e0e0;
+    text-align: left;
+    font-size: 0.9em;
+    white-space: nowrap;
+  }
+  th { background: #f3f3f3; font-weight: 600; color: #444; }
+  .meta { color: #666; font-size: 0.85em; }
+  .empty { color: #666; font-style: italic; margin: 1em 0; }
+  .fingerprint {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78em;
+    color: #666;
+  }
+  .status-ok       { color: #1a7f1a; font-weight: 600; }
+  .status-warning  { color: #b85c00; font-weight: 600; }
+  .status-critical { color: #c0262f; font-weight: 600; }
+  .status-insufficient_data { color: #666; font-weight: 600; }
+  .status-promising { color: #1a6fa3; font-weight: 600; }
+  .status-ready_for_shadow_filter_test { color: #1a7f1a; font-weight: 600; }
+  .status-weak    { color: #b85c00; font-weight: 600; }
+  .status-not_ready { color: #666; font-weight: 600; }
+  .kv td:first-child { color: #555; font-weight: 600; }
+  footer { margin-top: 3em; color: #999; font-size: 0.8em; }
+</style>
+""".strip()
+
+
+def _status_span(value: Optional[str]) -> str:
+    """Render a status string inside a span with the corresponding CSS class."""
+    if value is None:
+        return '<span class="meta">n/a</span>'
+    safe = _esc(str(value))
+    css_class = f"status-{_esc(str(value))}"
+    return f'<span class="{css_class}">{safe}</span>'
+
+
+def _fmt_pct(value) -> str:
+    try:
+        if value is None:
+            return "n/a"
+        return f"{float(value):.2%}"
+    except Exception:
+        return "n/a"
+
+
+def _fmt_num(value, spec: str = ".2f") -> str:
+    try:
+        if value is None:
+            return "n/a"
+        return format(float(value), spec)
+    except Exception:
+        return "n/a"
+
+
+def _render_totals(report: dict) -> str:
+    totals = report.get("totals") or {}
+    if not totals:
+        return '<p class="empty">(no totals available)</p>'
+    rows = "".join(
+        f"<tr><td>{_esc(str(k))}</td><td>{_esc(str(v))}</td></tr>"
+        for k, v in totals.items()
+    )
+    return f'<table class="kv">{rows}</table>'
+
+
+def _render_guardrail(report: dict) -> str:
+    gr = report.get("guardrails") or {}
+    status_html = _status_span(gr.get("status"))
+    action = _esc(str(gr.get("recommended_action") or ""))
+    reasons = gr.get("reasons") or []
+    if reasons:
+        reasons_html = "<ul>" + "".join(
+            f"<li>{_esc(str(r))}</li>" for r in reasons
+        ) + "</ul>"
+    else:
+        reasons_html = '<p class="meta">(no reasons recorded)</p>'
+    return (
+        f"<p>Status: {status_html}</p>"
+        f"<p><strong>Recommended action:</strong> {action or '<em>none</em>'}</p>"
+        f"<p><strong>Reasons:</strong></p>{reasons_html}"
+    )
+
+
+def _render_readiness(report: dict) -> str:
+    pr = report.get("promotion_readiness") or {}
+    if not pr:
+        return '<p class="empty">(no readiness data)</p>'
+    status_html = _status_span(pr.get("status"))
+    outcome = pr.get("outcome_count", "n/a")
+    min_req = pr.get("min_required_outcomes", "n/a")
+    ab = pr.get("ab") or {}
+    cdf = pr.get("cdf") or {}
+
+    def _side_row(name: str, side: dict) -> str:
+        return (
+            f"<tr>"
+            f"<td>{_esc(name)}</td>"
+            f"<td>{_esc(str(side.get('outcome_count', 'n/a')))}</td>"
+            f"<td>{_fmt_pct(side.get('win_rate'))}</td>"
+            f"<td>{_fmt_num(side.get('avg_r_multiple'))}</td>"
+            f"</tr>"
+        )
+
+    return (
+        f"<p>Status: {status_html}</p>"
+        f"<p>Outcomes: {_esc(str(outcome))} / {_esc(str(min_req))} required</p>"
+        f'<table><tr><th>cohort</th><th>outcomes</th><th>win_rate</th>'
+        f"<th>avg_R</th></tr>"
+        f"{_side_row('A/B', ab)}{_side_row('C/D/F', cdf)}"
+        f"</table>"
+    )
+
+
+def _render_shadow_sim(report: dict) -> str:
+    rows = report.get("shadow_filter_simulation") or []
+    if not rows:
+        return '<p class="empty">(no shadow simulation rows)</p>'
+    header = (
+        "<tr>"
+        "<th>threshold</th>"
+        "<th>allowed_buys</th>"
+        "<th>blocked_buys</th>"
+        "<th>allowed_outcomes</th>"
+        "<th>allowed_win_rate</th>"
+        "<th>allowed_avg_R</th>"
+        "<th>blocked_outcomes</th>"
+        "<th>blocked_win_rate</th>"
+        "<th>blocked_avg_R</th>"
+        "</tr>"
+    )
+    body = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        body.append(
+            "<tr>"
+            f"<td>{_esc(str(row.get('threshold', '')))}</td>"
+            f"<td>{_esc(str(row.get('allowed_buy_count', 'n/a')))}</td>"
+            f"<td>{_esc(str(row.get('blocked_buy_count', 'n/a')))}</td>"
+            f"<td>{_esc(str(row.get('allowed_outcome_count', 'n/a')))}</td>"
+            f"<td>{_fmt_pct(row.get('allowed_win_rate'))}</td>"
+            f"<td>{_fmt_num(row.get('allowed_avg_r_multiple'))}</td>"
+            f"<td>{_esc(str(row.get('blocked_outcome_count', 'n/a')))}</td>"
+            f"<td>{_fmt_pct(row.get('blocked_win_rate'))}</td>"
+            f"<td>{_fmt_num(row.get('blocked_avg_r_multiple'))}</td>"
+            "</tr>"
+        )
+    return f"<table>{header}{''.join(body)}</table>"
+
+
+def _render_experiments(records: list[dict]) -> str:
+    if not records:
+        return '<p class="empty">(no experiments recorded yet)</p>'
+    header = (
+        "<tr>"
+        "<th>timestamp</th>"
+        "<th>report_date</th>"
+        "<th>guardrail</th>"
+        "<th>readiness</th>"
+        "<th>fingerprint</th>"
+        "</tr>"
+    )
+    body = []
+    # Show newest first for operator readability.
+    for rec in reversed(records):
+        if not isinstance(rec, dict):
+            continue
+        gr = (rec.get("guardrails") or {}).get("status")
+        pr = (rec.get("promotion_readiness") or {}).get("status")
+        fp = str(rec.get("scorer_fingerprint") or "")
+        fp_display = f"{fp[:12]}…" if fp else "—"
+        body.append(
+            "<tr>"
+            f"<td>{_esc(str(rec.get('timestamp', '')))}</td>"
+            f"<td>{_esc(str(rec.get('report_date', '')))}</td>"
+            f"<td>{_status_span(gr)}</td>"
+            f"<td>{_status_span(pr)}</td>"
+            f'<td class="fingerprint">{_esc(fp_display)}</td>'
+            "</tr>"
+        )
+    return f"<table>{header}{''.join(body)}</table>"
+
+
+def render_dashboard_html(
+    report: Optional[dict],
+    experiments: list[dict],
+) -> str:
+    """
+    Build the dashboard HTML from sanitized inputs.
+
+    Pure function: does no I/O. The caller must pass already-sanitized
+    report and experiments dicts (via `_sanitize_report` /
+    `_sanitize_manifest`). Because of that contract, no amount of
+    upstream leakage can spill into the HTML — this renderer simply
+    cannot access fields that have already been stripped.
+    """
+    generated_at = _esc(datetime.now(timezone.utc).isoformat())
+
+    if report is None:
+        report_block = (
+            '<section><h2>Latest report</h2>'
+            '<p class="empty">No daily reports available yet.</p>'
+            "</section>"
+        )
+    else:
+        report_date = _esc(str(report.get("report_date") or "unknown"))
+        fp = _esc(str(report.get("scorer_fingerprint") or ""))
+        fp_display = (
+            f'<p class="fingerprint">scorer_fingerprint: {fp}</p>'
+            if fp else ""
+        )
+        report_block = (
+            "<section>"
+            f"<h2>Latest report — {report_date}</h2>"
+            f"{fp_display}"
+            "<h3>Guardrails</h3>"
+            f"{_render_guardrail(report)}"
+            "<h3>Promotion readiness</h3>"
+            f"{_render_readiness(report)}"
+            "<h3>Totals</h3>"
+            f"{_render_totals(report)}"
+            "<h3>Shadow filter simulation</h3>"
+            f"{_render_shadow_sim(report)}"
+            "</section>"
+        )
+
+    experiments_block = (
+        "<section>"
+        "<h2>Recent experiments</h2>"
+        f"{_render_experiments(experiments)}"
+        "</section>"
+    )
+
+    return (
+        "<!DOCTYPE html>"
+        "<html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<title>Momentum Trading Bot — Analytics Dashboard</title>"
+        f"{_DASHBOARD_CSS}"
+        "</head><body>"
+        "<h1>Momentum Trading Bot — Analytics Dashboard</h1>"
+        f'<p class="meta">Read-only view. Generated at {generated_at}.</p>'
+        f"{report_block}"
+        f"{experiments_block}"
+        "<footer>"
+        "This dashboard is served by the Phase 4.0/4.1 SaaS boundary "
+        "(trading_bot.api.server). It never exposes trade execution, "
+        "alpha scoring weights, or Core decision state."
+        "</footer>"
+        "</body></html>"
+    )
+
+
+@app.get(
+    "/dashboard",
+    response_class=HTMLResponse,
+    tags=["dashboard"],
+    dependencies=[Depends(require_api_key)],
+)
+def dashboard() -> HTMLResponse:
+    """
+    Read-only HTML dashboard rendering the most recent daily report
+    plus the last handful of experiment-manifest records.
+
+    Renders gracefully when the reports directory or manifest are
+    missing: the page still returns 200 with explicit empty states.
+    Never exposes scorer_config, filesystem paths, raw webhook URL,
+    or any execution control.
+    """
+    # Load latest report (best-effort — empty state wins on any error).
+    report: Optional[dict] = None
+    reports = _reports_dir()
+    if reports.is_dir():
+        candidates = sorted(reports.glob("alpha_report_*.json"))
+        if candidates:
+            try:
+                raw = json.loads(candidates[-1].read_text(encoding="utf-8"))
+            except Exception as exc:
+                log.warning(
+                    "dashboard.report_parse_error",
+                    path=str(candidates[-1]),
+                    error=str(exc),
+                )
+                raw = None
+            if isinstance(raw, dict):
+                report = _sanitize_report(raw)
+
+    # Load last 10 experiments.
+    records = _read_manifest_records(_manifest_path())
+    experiments = [_sanitize_manifest(r) for r in records[-10:]] if records else []
+
+    html = render_dashboard_html(report, experiments)
+    return HTMLResponse(content=html, status_code=200)
 
 
 # Nothing below this line. The api module deliberately imports

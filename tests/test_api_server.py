@@ -683,3 +683,343 @@ class TestResponseShape:
         assert required.issubset(body.keys()), (
             f"missing keys: {required - set(body.keys())}"
         )
+
+
+# ===========================================================================
+# Phase 4.1 — read-only dashboard UI
+# ===========================================================================
+
+
+from trading_bot.api.server import render_dashboard_html  # noqa: E402
+
+
+class TestDashboardAuth:
+    def test_missing_header_returns_401(self, client, authed_env):
+        resp = client.get("/dashboard")
+        assert resp.status_code == 401
+
+    def test_wrong_token_returns_403(self, client, authed_env):
+        resp = client.get(
+            "/dashboard", headers={"Authorization": "Bearer wrong_key"}
+        )
+        assert resp.status_code == 403
+
+    def test_unconfigured_server_returns_503(
+        self, client, monkeypatch, tmp_path: Path
+    ):
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(tmp_path / "reports"))
+        monkeypatch.setenv(
+            MANIFEST_PATH_ENV_VAR, str(tmp_path / "manifest.jsonl")
+        )
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert resp.status_code == 503
+
+
+class TestDashboardHtmlContent:
+    def test_returns_html_content_type(self, client, authed_env):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        # Basic HTML structure markers
+        body = resp.text
+        assert body.startswith("<!DOCTYPE html>")
+        assert "<html" in body and "</html>" in body
+        assert "<body>" in body and "</body>" in body
+
+    def test_contains_report_date(self, client, authed_env):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert "2026-04-24" in resp.text
+
+    def test_contains_guardrail_status(self, client, authed_env):
+        _write_report(
+            authed_env["reports_dir"], "2026-04-24",
+            guardrails={
+                "status": "warning",
+                "reasons": ["sample too small"],
+                "recommended_action": "wait",
+            },
+        )
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert "warning" in resp.text
+        # The reason should appear
+        assert "sample too small" in resp.text
+
+    def test_contains_readiness(self, client, authed_env):
+        _write_report(
+            authed_env["reports_dir"], "2026-04-24",
+            promotion_readiness={
+                "status": "ready_for_shadow_filter_test",
+                "outcome_count": 120,
+                "min_required_outcomes": 100,
+                "ab_outperforms": True,
+                "ab": {"outcome_count": 80, "win_rate": 0.7, "avg_r_multiple": 1.1},
+                "cdf": {"outcome_count": 40, "win_rate": 0.3, "avg_r_multiple": -0.2},
+            },
+        )
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "Promotion readiness" in body
+        assert "ready_for_shadow_filter_test" in body
+        # A/B and C/D/F cohort rows present
+        assert "A/B" in body
+        assert "C/D/F" in body
+
+    def test_contains_totals(self, client, authed_env):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "Totals" in body
+        assert "matched_trades" in body
+
+    def test_contains_shadow_filter_simulation(self, client, authed_env):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "Shadow filter simulation" in body
+        assert "A+B" in body
+
+    def test_contains_recent_experiments(self, client, authed_env):
+        _write_manifest_records(
+            authed_env["manifest"],
+            [
+                _sample_manifest_record("2026-04-22"),
+                _sample_manifest_record("2026-04-23"),
+                _sample_manifest_record("2026-04-24"),
+            ],
+        )
+        # no reports but experiments present — page still renders
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "Recent experiments" in body
+        # All three dates appear
+        for d in ("2026-04-22", "2026-04-23", "2026-04-24"):
+            assert d in body
+
+
+class TestDashboardEmptyStates:
+    def test_no_reports_shows_empty_state(self, client, authed_env):
+        # authed_env doesn't pre-create the reports dir
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert resp.status_code == 200
+        assert "No daily reports available yet" in resp.text
+
+    def test_no_experiments_shows_empty_state(self, client, authed_env):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "Recent experiments" in body
+        assert "no experiments recorded yet" in body.lower()
+
+    def test_both_empty(self, client, authed_env):
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert resp.status_code == 200
+        body = resp.text
+        # Page still renders with both empty states
+        assert "No daily reports available yet" in body
+        assert "no experiments recorded yet" in body.lower()
+
+    def test_malformed_report_falls_back_to_empty(self, client, authed_env):
+        """A corrupt report file must not break the page."""
+        authed_env["reports_dir"].mkdir(parents=True, exist_ok=True)
+        (authed_env["reports_dir"] / "alpha_report_bad.json").write_text(
+            "<not json>"
+        )
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        assert resp.status_code == 200
+        assert "No daily reports available yet" in resp.text
+
+
+class TestDashboardLeakageGuards:
+    """
+    The dashboard must not surface scorer internals, server paths,
+    or any execution control. Each test places a known secret /
+    sensitive string into the upstream data and asserts it is NOT
+    present in the rendered HTML.
+    """
+
+    def test_does_not_include_scorer_config(self, client, authed_env):
+        _write_report(
+            authed_env["reports_dir"], "2026-04-24",
+            scorer_config={
+                "weights": {"gap": 0.2, "rvol": 0.25, "unique_marker_XYZ": 9.99},
+            },
+        )
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "scorer_config" not in body
+        assert "unique_marker_XYZ" not in body
+        assert "0.25" not in body or "unique_marker_XYZ" not in body
+        # Fingerprint hash itself is fine and IS surfaced.
+        assert "a" * 64 in body
+
+    def test_does_not_include_filesystem_paths(self, client, authed_env):
+        """Source paths like /srv/prod/... must never render."""
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert "/srv/production" not in body
+        assert "/srv/prod/" not in body
+
+    def test_does_not_include_raw_webhook_url(self, client, authed_env):
+        secret = "https://hooks.example.com/services/T/XYZ_SECRET_TOKEN"
+        record = _sample_manifest_record("2026-04-24")
+        # Upstream already redacts — but as defense-in-depth, stash a
+        # sensitive value in a field the sanitizer strips:
+        record["report_paths"] = {"text": secret, "json": secret}
+        _write_manifest_records(authed_env["manifest"], [record])
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text
+        assert secret not in body
+        assert "XYZ_SECRET_TOKEN" not in body
+        assert "report_paths" not in body
+
+    def test_no_form_or_mutating_controls(self, client, authed_env):
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        _write_manifest_records(
+            authed_env["manifest"],
+            [_sample_manifest_record("2026-04-24")],
+        )
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body = resp.text.lower()
+        # Read-only surface: no <form>, no submit inputs, no
+        # hx/onclick handlers that could trigger writes.
+        for token in ("<form", "<input", "<button", "onclick", "onsubmit",
+                      "method=\"post\"", "method=\"put\"", "method=\"patch\"",
+                      "method=\"delete\""):
+            assert token not in body, f"dashboard includes mutating marker: {token}"
+
+    def test_does_not_expose_execution_terms(self, client, authed_env):
+        """The UI must not offer execution / simulation / placement."""
+        _write_report(authed_env["reports_dir"], "2026-04-24")
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        body_lower = resp.text.lower()
+        # Operator-facing words that would imply control:
+        for term in (
+            "place trade", "execute trade", "submit order",
+            "enable filter", "disable filter", "toggle", "start bot",
+        ):
+            assert term not in body_lower, (
+                f"dashboard surfaces an execution-adjacent term: {term}"
+            )
+
+
+class TestRenderDashboardHtmlPure:
+    """Pure renderer — sanity checks on the helper in isolation."""
+
+    def test_returns_string_on_none_report(self):
+        html = render_dashboard_html(None, [])
+        assert isinstance(html, str)
+        assert "No daily reports available yet" in html
+        assert html.startswith("<!DOCTYPE html>")
+
+    def test_handles_empty_experiments(self):
+        html = render_dashboard_html(
+            {"report_date": "2026-04-24",
+             "guardrails": {"status": "ok", "reasons": []},
+             "promotion_readiness": {"status": "promising"},
+             "totals": {},
+             "shadow_filter_simulation": []},
+            [],
+        )
+        assert "no experiments recorded yet" in html.lower()
+
+    def test_escapes_html_in_values(self):
+        """Any string coming from disk must be HTML-escaped so injected
+        tags cannot render."""
+        html = render_dashboard_html(
+            {
+                "report_date": "<script>alert(1)</script>",
+                "scorer_fingerprint": "a" * 64,
+                "guardrails": {
+                    "status": "warning",
+                    "reasons": ["<img src=x onerror=alert(1)>"],
+                    "recommended_action": "<b>bold</b>",
+                },
+                "promotion_readiness": {"status": "weak"},
+                "totals": {"<k>": "<v>"},
+                "shadow_filter_simulation": [{"threshold": "<A+B>"}],
+            },
+            [],
+        )
+        # No raw <script> or <img> tags from the injected payload.
+        assert "<script>alert(1)</script>" not in html
+        assert "<img src=x onerror=alert(1)>" not in html
+        # The escaped versions SHOULD appear.
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+        assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+    def test_renders_given_experiments_newest_first(self):
+        records = [
+            {"timestamp": "2026-04-22T00:00:00", "report_date": "2026-04-22",
+             "scorer_fingerprint": "a" * 64,
+             "guardrails": {"status": "ok"},
+             "promotion_readiness": {"status": "promising"}},
+            {"timestamp": "2026-04-23T00:00:00", "report_date": "2026-04-23",
+             "scorer_fingerprint": "a" * 64,
+             "guardrails": {"status": "warning"},
+             "promotion_readiness": {"status": "weak"}},
+        ]
+        html = render_dashboard_html(None, records)
+        # Newest first means 2026-04-23 appears before 2026-04-22.
+        assert html.index("2026-04-23") < html.index("2026-04-22")
+
+
+class TestDashboardRouteIsReadOnlyAgainstBoundary:
+    """The /dashboard route must not break any Phase 4.0 invariant."""
+
+    def test_dashboard_still_only_accepts_GET_HEAD_OPTIONS(self):
+        from trading_bot.api.server import app as _app
+        for route in _app.routes:
+            if getattr(route, "path", "") == "/dashboard":
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"})
+                break
+        else:
+            raise AssertionError("/dashboard route not registered")
+
+    def test_dashboard_does_not_match_banned_substrings(self):
+        """The dashboard path itself doesn't look like an exec hook."""
+        path = "/dashboard"
+        for banned in (
+            "/trade", "/order", "/execute", "/run",
+            "/simulate", "/backtest", "/live", "/paper",
+            "/scorer", "/filter",
+        ):
+            assert banned not in path.lower()
