@@ -24,6 +24,8 @@ See also:
 | `TRADING_API_KEY`                      | opaque string    | *(unset)* | SaaS API only | Required bearer token for every protected `/reports` / `/experiments` endpoint. Unset → server refuses all protected traffic. (Phase 4.0) |
 | `TRADING_API_REPORTS_DIR`              | path             | `reports` | SaaS API only | Directory holding `alpha_report_<DATE>.json`. (Phase 4.0) |
 | `TRADING_API_MANIFEST_PATH`            | path             | `data/alpha_experiments.jsonl` | SaaS API only | Path to the append-only manifest. (Phase 4.0) |
+| `TRADING_API_ALLOWED_ORIGINS`          | comma-sep origins | *(unset)* | SaaS API only | Optional CORS allow-list (e.g. `https://app.example.com,https://admin.example.com`). Unset → no cross-origin access. (Phase 4.2) |
+| `TRADING_API_RATE_LIMIT_PER_MINUTE`    | positive int     | `60`      | SaaS API only | In-memory per-client-IP rate limit. Invalid values fall back to 60 fail-closed. (Phase 4.2) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -617,6 +619,128 @@ the page is a single self-contained HTML document with an inline
   The dashboard is a read-only document.
 - All dynamic strings are HTML-escaped via `html.escape`, so a
   compromised upstream file cannot inject `<script>` tags.
+
+### Phase 4.2 — deployment hardening
+
+The API process is designed to be safe to deploy publicly behind a
+single Bearer API key. Phase 4.2 adds four overlapping safeguards
+— all driven by env vars so ops can flip them without a restart.
+
+#### Security headers
+
+Every response (including 2xx, 401, 403, 404, 429, and 503) carries:
+
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline';
+                         script-src 'none'; img-src 'self' data:;
+                         frame-ancestors 'none'; base-uri 'none';
+                         form-action 'none'
+```
+
+`script-src 'none'` makes it impossible to execute any JavaScript
+even if an upstream data file were to sneak a tag past the
+dashboard's HTML escaping. `frame-ancestors 'none'` plus
+`X-Frame-Options: DENY` stops clickjacking. The dashboard's inline
+`<style>` is whitelisted via `style-src 'unsafe-inline'`; scripts
+are still forbidden.
+
+#### CORS
+
+Controlled by `TRADING_API_ALLOWED_ORIGINS`. When unset (default),
+cross-origin requests get no CORS headers at all and preflights
+return 403 — the browser won't let a third-party page call the API.
+
+When set to a comma-separated allow-list, each match causes the
+server to add:
+
+```
+Access-Control-Allow-Origin: <echoed origin>
+Vary: Origin
+```
+
+Preflights (`OPTIONS`) for allowed origins return:
+
+```
+204 No Content
+Access-Control-Allow-Origin: <origin>
+Access-Control-Allow-Methods: GET, HEAD, OPTIONS
+Access-Control-Allow-Headers: Authorization
+Access-Control-Max-Age: 600
+```
+
+Disallowed origins' preflights return 403. Only `GET` is advertised
+because the API exposes no mutating verbs.
+
+#### Rate limiting
+
+Fixed 60-second window, keyed by resolved client IP
+(`X-Forwarded-For` first entry wins when present; otherwise the
+socket peer). In-memory map per process; multi-process deployments
+should rely on the reverse-proxy / WAF for cross-worker limits.
+
+- Default: 60 requests per IP per minute.
+- Override via `TRADING_API_RATE_LIMIT_PER_MINUTE=<positive int>`.
+- Any invalid value — empty, non-numeric, negative, zero, NaN,
+  inf, float — **falls back to 60**. A typo must never open the
+  server to unlimited traffic.
+- Over-limit requests are rejected with:
+  ```
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: <seconds until window reset>
+  Content-Type: application/json
+  {"detail": "rate limit exceeded"}
+  ```
+
+#### Request logging
+
+One structured log line per request, tagged `api.request`. Fields:
+
+| Field       | Source |
+| ---         | --- |
+| `method`    | `request.method` |
+| `path`      | `request.url.path` |
+| `status`    | final response status code |
+| `duration_ms` | wall-clock handler time, rounded to 2 decimals |
+| `client_ip` | `X-Forwarded-For` first entry, else socket peer |
+
+The middleware **never** touches the `Authorization` header. A test
+captures the log stream while an authenticated request is issued
+with a unique-marker token and asserts the token does not appear
+anywhere in the captured output.
+
+#### Deployment env var summary
+
+Minimum safe production deployment:
+
+```bash
+# Required
+export TRADING_API_KEY="<32+ random chars>"
+
+# Optional hardening
+export TRADING_API_ALLOWED_ORIGINS="https://app.example.com"
+export TRADING_API_RATE_LIMIT_PER_MINUTE="120"
+
+# Optional pointing
+export TRADING_API_REPORTS_DIR="/srv/analytics/reports"
+export TRADING_API_MANIFEST_PATH="/srv/analytics/data/alpha_experiments.jsonl"
+
+uvicorn trading_bot.api.server:app \
+    --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers
+```
+
+#### What Phase 4.2 does NOT do
+
+- It does not add any new endpoint.
+- It does not add any mutating verb — `TestPhase42BoundaryUnchanged`
+  re-asserts every Phase 4.0 invariant after the middleware stack
+  is in place.
+- It does not import any Core module.
+- It does not expose `scorer_config`, raw paths, or secrets.
+- It does not automate or enable TLS — a reverse proxy (Caddy,
+  nginx, Cloudflare) must terminate TLS in front of the app.
 
 
 ## Phase 2.7 — dataset rotation (reference)

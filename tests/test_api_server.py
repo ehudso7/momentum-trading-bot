@@ -48,8 +48,28 @@ VALID_KEY = "secret_testing_key_123"
 @pytest.fixture(autouse=True)
 def clean_api_env(monkeypatch):
     """Every test starts from a known env state."""
-    for name in (API_KEY_ENV_VAR, REPORTS_DIR_ENV_VAR, MANIFEST_PATH_ENV_VAR):
+    for name in (
+        API_KEY_ENV_VAR,
+        REPORTS_DIR_ENV_VAR,
+        MANIFEST_PATH_ENV_VAR,
+        # Phase 4.2 — also reset hardening vars.
+        "TRADING_API_ALLOWED_ORIGINS",
+        "TRADING_API_RATE_LIMIT_PER_MINUTE",
+    ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limit_bucket():
+    """
+    Phase 4.2: the TestClient shares a single "testclient" IP across
+    the whole suite — reset the in-memory counter between tests so
+    one test cannot poison another with rate-limit state.
+    """
+    from trading_bot.api.server import _reset_rate_limit_bucket
+    _reset_rate_limit_bucket()
+    yield
+    _reset_rate_limit_bucket()
 
 
 @pytest.fixture
@@ -1023,3 +1043,424 @@ class TestDashboardRouteIsReadOnlyAgainstBoundary:
             "/scorer", "/filter",
         ):
             assert banned not in path.lower()
+
+
+# ===========================================================================
+# Phase 4.2 — deployment hardening
+# ===========================================================================
+
+
+from trading_bot.api import server as server_mod  # noqa: E402
+from trading_bot.api.server import (  # noqa: E402
+    ALLOWED_ORIGINS_ENV_VAR,
+    DEFAULT_RATE_LIMIT_PER_MINUTE,
+    RATE_LIMIT_ENV_VAR,
+    SECURITY_HEADERS,
+    _allowed_origins,
+    _rate_limit_per_minute,
+)
+
+
+# ---------------------------------------------------------------------------
+# Security headers present on every response
+# ---------------------------------------------------------------------------
+
+
+class TestSecurityHeaders:
+    @pytest.mark.parametrize(
+        "path,auth",
+        [
+            ("/health", None),
+            ("/reports/latest", True),
+            ("/reports/latest", False),  # 401
+            ("/reports/2026-04-24", True),  # 404
+            ("/experiments/recent", True),
+            ("/experiments/1", True),  # 404 empty manifest
+            ("/dashboard", True),
+            ("/dashboard", False),  # 401
+        ],
+    )
+    def test_headers_present_on_every_response(
+        self, client: TestClient, authed_env, path, auth
+    ):
+        headers = {"Authorization": f"Bearer {VALID_KEY}"} if auth else {}
+        resp = client.get(path, headers=headers)
+        # Applies regardless of status code (200, 401, 404, 403...).
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["Referrer-Policy"] == "no-referrer"
+        csp = resp.headers.get("Content-Security-Policy") or ""
+        assert "default-src 'self'" in csp
+        assert "script-src 'none'" in csp
+        assert "frame-ancestors 'none'" in csp
+
+    def test_security_headers_applied_on_503(
+        self, client: TestClient, monkeypatch, tmp_path: Path
+    ):
+        """Even the 'not configured' 503 must carry security headers."""
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 503
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert "Content-Security-Policy" in resp.headers
+
+    def test_security_headers_applied_on_rate_limit_429(
+        self, client: TestClient, monkeypatch
+    ):
+        """429 responses must still carry security headers."""
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, "1")
+        client.get("/health")  # burn the budget
+        resp = client.get("/health")
+        assert resp.status_code == 429
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert "Content-Security-Policy" in resp.headers
+
+    def test_csp_allows_inline_style_for_dashboard(
+        self, client: TestClient, authed_env
+    ):
+        """Dashboard uses an inline <style> block — CSP must permit it."""
+        resp = client.get(
+            "/dashboard", headers={"Authorization": f"Bearer {VALID_KEY}"}
+        )
+        csp = resp.headers["Content-Security-Policy"]
+        assert "'unsafe-inline'" in csp  # scoped to style-src only
+        assert "style-src" in csp
+
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
+
+class TestCORSDefaultDisabled:
+    def test_no_cors_header_when_env_unset(
+        self, client: TestClient, authed_env
+    ):
+        resp = client.get(
+            "/health",
+            headers={"Origin": "https://example.com"},
+        )
+        assert "access-control-allow-origin" not in {
+            k.lower() for k in resp.headers
+        }
+
+    def test_protected_endpoint_no_cors_header_when_env_unset(
+        self, client: TestClient, authed_env
+    ):
+        resp = client.get(
+            "/reports/latest",
+            headers={
+                "Authorization": f"Bearer {VALID_KEY}",
+                "Origin": "https://example.com",
+            },
+        )
+        assert "access-control-allow-origin" not in {
+            k.lower() for k in resp.headers
+        }
+
+
+class TestCORSWhenConfigured:
+    def test_allowed_origin_gets_cors_header(
+        self, client: TestClient, authed_env, monkeypatch
+    ):
+        monkeypatch.setenv(
+            ALLOWED_ORIGINS_ENV_VAR, "https://app.example.com"
+        )
+        resp = client.get(
+            "/health",
+            headers={"Origin": "https://app.example.com"},
+        )
+        assert resp.headers.get("Access-Control-Allow-Origin") == (
+            "https://app.example.com"
+        )
+        assert "origin" in resp.headers.get("Vary", "").lower()
+
+    def test_disallowed_origin_no_cors_header(
+        self, client: TestClient, authed_env, monkeypatch
+    ):
+        monkeypatch.setenv(
+            ALLOWED_ORIGINS_ENV_VAR, "https://app.example.com"
+        )
+        resp = client.get(
+            "/health",
+            headers={"Origin": "https://attacker.example.net"},
+        )
+        assert "access-control-allow-origin" not in {
+            k.lower() for k in resp.headers
+        }
+
+    def test_multiple_origins_allowed(
+        self, client: TestClient, authed_env, monkeypatch
+    ):
+        monkeypatch.setenv(
+            ALLOWED_ORIGINS_ENV_VAR,
+            "https://a.example.com, https://b.example.com",
+        )
+        for origin in ("https://a.example.com", "https://b.example.com"):
+            resp = client.get("/health", headers={"Origin": origin})
+            assert resp.headers["Access-Control-Allow-Origin"] == origin
+
+    def test_preflight_allowed_origin(
+        self, client: TestClient, authed_env, monkeypatch
+    ):
+        monkeypatch.setenv(
+            ALLOWED_ORIGINS_ENV_VAR, "https://app.example.com"
+        )
+        resp = client.options(
+            "/reports/latest",
+            headers={
+                "Origin": "https://app.example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert resp.status_code == 204
+        assert resp.headers["Access-Control-Allow-Origin"] == (
+            "https://app.example.com"
+        )
+        assert "GET" in resp.headers.get("Access-Control-Allow-Methods", "")
+
+    def test_preflight_disallowed_origin(
+        self, client: TestClient, authed_env, monkeypatch
+    ):
+        monkeypatch.setenv(
+            ALLOWED_ORIGINS_ENV_VAR, "https://app.example.com"
+        )
+        resp = client.options(
+            "/reports/latest",
+            headers={
+                "Origin": "https://attacker.net",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert resp.status_code == 403
+
+
+class TestAllowedOriginsHelper:
+    def test_empty_when_unset(self):
+        assert _allowed_origins() == []
+
+    def test_strips_whitespace_and_empties(self, monkeypatch):
+        monkeypatch.setenv(
+            ALLOWED_ORIGINS_ENV_VAR,
+            " https://a.com , , https://b.com ",
+        )
+        assert _allowed_origins() == ["https://a.com", "https://b.com"]
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimit:
+    def test_defaults_to_60(self):
+        assert _rate_limit_per_minute() == DEFAULT_RATE_LIMIT_PER_MINUTE == 60
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("1", 1),
+            ("120", 120),
+            ("5000", 5000),
+        ],
+    )
+    def test_env_override_valid(self, monkeypatch, value, expected):
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, value)
+        assert _rate_limit_per_minute() == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        ["", "  ", "abc", "-5", "0", "3.14", "NaN", "inf", "1e100"],
+    )
+    def test_invalid_values_fall_back_to_default(
+        self, monkeypatch, value
+    ):
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, value)
+        assert _rate_limit_per_minute() == DEFAULT_RATE_LIMIT_PER_MINUTE
+
+    def test_under_limit_not_blocked(
+        self, client: TestClient, monkeypatch
+    ):
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, "5")
+        for _ in range(5):
+            resp = client.get("/health")
+            assert resp.status_code == 200
+
+    def test_over_limit_returns_429(
+        self, client: TestClient, monkeypatch
+    ):
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, "3")
+        for _ in range(3):
+            assert client.get("/health").status_code == 200
+        resp = client.get("/health")
+        assert resp.status_code == 429
+        assert resp.json()["detail"] == "rate limit exceeded"
+        assert "retry-after" in {k.lower() for k in resp.headers}
+
+    def test_invalid_rate_limit_env_still_applies_default_cap(
+        self, client: TestClient, monkeypatch
+    ):
+        """An invalid env value must NOT disable rate limiting — it
+        must revert to the documented 60 req/min default."""
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, "not-a-number")
+        # Confirm the helper says 60.
+        assert _rate_limit_per_minute() == 60
+        # Verify the middleware honours that — first 60 pass, 61st
+        # would be blocked. Running 5 to stay well under and confirm
+        # no unexpected 429.
+        for _ in range(5):
+            assert client.get("/health").status_code == 200
+
+    def test_rate_limit_is_per_client_ip(
+        self, client: TestClient, monkeypatch
+    ):
+        """Two distinct client IPs each get their own budget."""
+        monkeypatch.setenv(RATE_LIMIT_ENV_VAR, "2")
+        # Burn the budget as IP "1.1.1.1"
+        for _ in range(2):
+            resp = client.get(
+                "/health", headers={"X-Forwarded-For": "1.1.1.1"}
+            )
+            assert resp.status_code == 200
+        resp = client.get(
+            "/health", headers={"X-Forwarded-For": "1.1.1.1"}
+        )
+        assert resp.status_code == 429
+        # A different X-Forwarded-For still has its budget.
+        resp = client.get(
+            "/health", headers={"X-Forwarded-For": "2.2.2.2"}
+        )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Request logging
+# ---------------------------------------------------------------------------
+
+
+class TestRequestLogging:
+    def _capture(self, capsys):
+        # structlog is configured to write to stdout in the tests.
+        return capsys.readouterr().out
+
+    def test_successful_request_is_logged(
+        self, client: TestClient, authed_env, capsys
+    ):
+        client.get("/health")
+        out = self._capture(capsys)
+        assert "api.request" in out
+        assert "method=GET" in out
+        assert "path=/health" in out
+        assert "status=200" in out
+        assert "client_ip=" in out
+        assert "duration_ms=" in out
+
+    def test_auth_failure_is_logged_with_status_401(
+        self, client: TestClient, authed_env, capsys
+    ):
+        client.get("/reports/latest")
+        out = self._capture(capsys)
+        assert "api.request" in out
+        assert "path=/reports/latest" in out
+        assert "status=401" in out
+
+    def test_log_never_includes_bearer_token(
+        self, client: TestClient, authed_env, capsys
+    ):
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        out = self._capture(capsys)
+        # The token must not appear anywhere in the captured log
+        # output — not in its value form, not in substring form.
+        assert VALID_KEY not in out, (
+            f"bearer token leaked into logs:\n{out}"
+        )
+        # Neither should the word 'authorization' header appear in a
+        # way that carries a token.
+        assert "Bearer " not in out, "bearer scheme + token pattern in log"
+
+    def test_log_never_includes_bearer_token_on_wrong_key(
+        self, client: TestClient, authed_env, capsys
+    ):
+        secret_attempt = "attempted-secret-token-XYZ"
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {secret_attempt}"},
+        )
+        out = self._capture(capsys)
+        assert secret_attempt not in out
+
+    def test_log_uses_x_forwarded_for_when_present(
+        self, client: TestClient, authed_env, capsys
+    ):
+        client.get(
+            "/health", headers={"X-Forwarded-For": "203.0.113.7"}
+        )
+        out = self._capture(capsys)
+        assert "client_ip=203.0.113.7" in out
+
+    def test_log_uses_first_xff_ip_when_chain(
+        self, client: TestClient, authed_env, capsys
+    ):
+        client.get(
+            "/health",
+            headers={
+                "X-Forwarded-For": "198.51.100.1, 10.0.0.2, 10.0.0.3"
+            },
+        )
+        out = self._capture(capsys)
+        assert "client_ip=198.51.100.1" in out
+
+
+# ---------------------------------------------------------------------------
+# Boundary invariants STILL hold after Phase 4.2
+# ---------------------------------------------------------------------------
+
+
+class TestPhase42BoundaryUnchanged:
+    def test_still_only_read_verbs_after_middleware(self):
+        """Re-assert Phase 4.0 invariant — no mutating verbs added."""
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            for m in methods:
+                assert m in {"GET", "HEAD", "OPTIONS"}, (
+                    f"non-read-only method introduced: {m} {route.path}"
+                )
+
+    def test_forbidden_imports_still_enforced(self):
+        """Re-assert Phase 4.0 invariant — no Core imports."""
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        forbidden = [
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ]
+        for pattern in forbidden:
+            assert pattern not in src, (
+                f"SaaS boundary broken by Phase 4.2: {pattern!r}"
+            )
+
+    def test_no_trading_endpoint_paths_still(self):
+        banned = [
+            "/trade", "/order", "/execute", "/run",
+            "/simulate", "/backtest", "/live", "/paper",
+            "/scorer", "/filter",
+        ]
+        for route in app.routes:
+            path = getattr(route, "path", "") or ""
+            for word in banned:
+                assert word not in path.lower(), (
+                    f"suspicious route introduced: {path}"
+                )

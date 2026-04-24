@@ -43,14 +43,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from html import escape as _esc
 from pathlib import Path
 from typing import Any, Optional
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 log = structlog.get_logger(__name__)
@@ -64,10 +66,38 @@ API_KEY_ENV_VAR = "TRADING_API_KEY"
 REPORTS_DIR_ENV_VAR = "TRADING_API_REPORTS_DIR"
 MANIFEST_PATH_ENV_VAR = "TRADING_API_MANIFEST_PATH"
 
+# Phase 4.2 — deployment hardening.
+ALLOWED_ORIGINS_ENV_VAR = "TRADING_API_ALLOWED_ORIGINS"
+RATE_LIMIT_ENV_VAR = "TRADING_API_RATE_LIMIT_PER_MINUTE"
+DEFAULT_RATE_LIMIT_PER_MINUTE = 60
+
 DEFAULT_REPORTS_DIR = "reports"
 DEFAULT_MANIFEST_PATH = "data/alpha_experiments.jsonl"
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Fixed security headers. CSP allows only same-origin resources + inline
+# style (the dashboard ships a single <style> block). No scripts permitted.
+SECURITY_HEADERS: dict[str, str] = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'none'; "
+        "img-src 'self' data:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'; "
+        "form-action 'none'"
+    ),
+}
+
+# In-memory fixed-window rate-limit bucket: client_ip -> (count, window_start).
+# Thread-safe access is gated by `_rate_limit_lock`. Module-level state is
+# appropriate here — a single-process API server is the deployment target.
+_rate_limit_bucket: dict[str, tuple[int, float]] = {}
+_rate_limit_lock = threading.Lock()
 
 
 def _reports_dir() -> Path:
@@ -76,6 +106,59 @@ def _reports_dir() -> Path:
 
 def _manifest_path() -> Path:
     return Path(os.getenv(MANIFEST_PATH_ENV_VAR, DEFAULT_MANIFEST_PATH))
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.2 — env helpers for deployment hardening
+# ---------------------------------------------------------------------------
+
+
+def _rate_limit_per_minute() -> int:
+    """
+    Resolve the rate-limit env var. Any invalid value (non-int,
+    negative, zero, empty, garbage) falls back to the documented
+    default — a typo must never open the server to unlimited traffic.
+    """
+    raw = os.getenv(RATE_LIMIT_ENV_VAR, "")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_RATE_LIMIT_PER_MINUTE
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_RATE_LIMIT_PER_MINUTE
+    if n <= 0:
+        return DEFAULT_RATE_LIMIT_PER_MINUTE
+    return n
+
+
+def _allowed_origins() -> list[str]:
+    """Parse the CORS allow-list env var. Empty/unset → no CORS."""
+    raw = os.getenv(ALLOWED_ORIGINS_ENV_VAR, "")
+    if not raw or not raw.strip():
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _client_ip(request: Request) -> str:
+    """
+    Prefer `X-Forwarded-For` when behind a reverse proxy. Falls back
+    to the socket peer. Returns "unknown" if neither is available.
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        # Use the first entry — the original client.
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _reset_rate_limit_bucket() -> None:
+    """Test helper — drops all in-memory counters. Not routed."""
+    with _rate_limit_lock:
+        _rate_limit_bucket.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +326,138 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.2 — middleware stack
+#
+# FastAPI/Starlette applies registered middleware in REVERSE order: the
+# last one registered here runs OUTERMOST. We therefore register them in
+# the order (innermost → outermost):
+#
+#   1. rate_limit  — rejects excess requests close to the handler.
+#   2. logging     — measures + logs once, seeing final status even for
+#                    rate-limited 429s.
+#   3. cors        — attaches CORS response headers per config.
+#   4. security    — outermost; security headers get applied to EVERY
+#                    response, including 429, CORS preflight, and errors.
+#
+# None of the middleware ever logs the Authorization header. Rate limit
+# state is kept in a process-local dict; a reverse proxy / WAF is the
+# expected second line of defence for multi-process deployments.
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Reject clients that exceed the per-minute budget."""
+    limit = _rate_limit_per_minute()
+    client_ip = _client_ip(request)
+    now = time.time()
+    # Fixed 60-second window keyed by wall-clock minute.
+    window_start = (int(now) // 60) * 60
+
+    with _rate_limit_lock:
+        count, prev_window = _rate_limit_bucket.get(
+            client_ip, (0, window_start)
+        )
+        if prev_window != window_start:
+            count = 0
+        count += 1
+        _rate_limit_bucket[client_ip] = (count, window_start)
+
+    if count > limit:
+        retry_after = max(1, int(window_start + 60 - now))
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)},
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """
+    Log one structured line per request. NEVER touches the
+    Authorization header, so a bearer token cannot leak into the
+    observability pipeline.
+    """
+    start = time.perf_counter()
+    method = request.method
+    path = request.url.path
+    client_ip = _client_ip(request)
+    try:
+        response: Response = await call_next(request)
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log.warning(
+            "api.request_error",
+            method=method,
+            path=path,
+            status=500,
+            duration_ms=duration_ms,
+            client_ip=client_ip,
+            error_type=type(exc).__name__,
+        )
+        raise
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    log.info(
+        "api.request",
+        method=method,
+        path=path,
+        status=response.status_code,
+        duration_ms=duration_ms,
+        client_ip=client_ip,
+    )
+    return response
+
+
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    """
+    Tiny read-only CORS implementation driven by
+    `TRADING_API_ALLOWED_ORIGINS`. Env-driven so the server can be
+    reconfigured without a restart. Default (env unset) → zero CORS
+    headers and preflights return 403.
+    """
+    allowed = _allowed_origins()
+    origin = request.headers.get("origin")
+
+    # CORS preflight
+    if request.method == "OPTIONS" and origin is not None:
+        if origin in allowed:
+            return Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization",
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                },
+            )
+        return Response(status_code=403)
+
+    response: Response = await call_next(request)
+    if origin and origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        # Append to any existing Vary header instead of clobbering it.
+        vary = response.headers.get("vary")
+        response.headers["Vary"] = (
+            f"{vary}, Origin" if vary and "origin" not in vary.lower()
+            else (vary or "Origin")
+        )
+    return response
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Outermost middleware — applies security headers to every response."""
+    response: Response = await call_next(request)
+    for header, value in SECURITY_HEADERS.items():
+        response.headers[header] = value
+    return response
 
 
 @app.get("/health", tags=["public"])
