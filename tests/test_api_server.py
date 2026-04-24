@@ -70,6 +70,13 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         "STRIPE_WEBHOOK_SECRET",
         "STRIPE_PRICE_ID_PREMIUM",
         "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        # Phase 5.4 — free-tier daily caps.
+        "TRADING_FREE_MAX_REQUESTS_PER_DAY",
+        "TRADING_FREE_MAX_REPORT_CALLS",
+        # Phase 5.7 — operator-tunable nudge copy.
+        "TRADING_UPGRADE_BANNER_COPY",
+        "TRADING_LIMIT_HIT_COPY",
+        "TRADING_REPORT_LIMIT_COPY",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
@@ -4984,3 +4991,437 @@ class TestPhase55Boundary:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
                 assert path == "/webhook/stripe" and m == "POST"
+
+
+# ===========================================================================
+# Phase 5.7 — dynamic free-tier nudge copy
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    DEFAULT_LIMIT_HIT_COPY,
+    DEFAULT_REPORT_LIMIT_COPY,
+    DEFAULT_UPGRADE_BANNER_COPY,
+    LIMIT_HIT_COPY_ENV_VAR,
+    MAX_NUDGE_COPY_LENGTH,
+    REPORT_LIMIT_COPY_ENV_VAR,
+    UPGRADE_BANNER_COPY_ENV_VAR,
+    _limit_hit_copy,
+    _report_limit_copy,
+    _resolve_nudge_copy,
+    _upgrade_banner_copy,
+)
+
+
+class TestPhase57Resolver:
+    def test_unset_returns_default(self, monkeypatch):
+        monkeypatch.delenv("X_NEVER_SET_ENV", raising=False)
+        assert _resolve_nudge_copy(
+            "X_NEVER_SET_ENV", "fallback",
+        ) == "fallback"
+
+    def test_blank_returns_default(self, monkeypatch):
+        for blank in ("", "   ", "\t\t", " \t  "):
+            monkeypatch.setenv("X_NEVER_SET_ENV", blank)
+            assert _resolve_nudge_copy(
+                "X_NEVER_SET_ENV", "fallback",
+            ) == "fallback"
+
+    def test_explicit_value_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("X_NEVER_SET_ENV", "Custom prompt!")
+        assert _resolve_nudge_copy(
+            "X_NEVER_SET_ENV", "fallback",
+        ) == "Custom prompt!"
+
+    def test_strips_outer_whitespace(self, monkeypatch):
+        monkeypatch.setenv("X_NEVER_SET_ENV", "   Padded message   ")
+        assert _resolve_nudge_copy(
+            "X_NEVER_SET_ENV", "fallback",
+        ) == "Padded message"
+
+    # NUL bytes can't even be set via os.environ on Linux/macOS, so
+    # we don't try — the regex covers them anyway. Cover every other
+    # control char that an operator could plausibly type.
+    @pytest.mark.parametrize(
+        "ctrl", ["\x01", "\n", "\r", "\t", "\x7f", "\x1b"],
+    )
+    def test_control_characters_fall_back_to_default(
+        self, monkeypatch, ctrl,
+    ):
+        monkeypatch.setenv("X_NEVER_SET_ENV", f"hello{ctrl}world")
+        assert _resolve_nudge_copy(
+            "X_NEVER_SET_ENV", "fallback",
+        ) == "fallback"
+
+    def test_resolver_regex_rejects_nul_byte_input(self):
+        """Direct test of the resolver's regex with a NUL byte.
+        os.environ won't carry one, but the resolver could be
+        called with arbitrary input from somewhere else."""
+        # Bypass os.getenv by patching the call site indirectly:
+        # we can't put a NUL in env, so we exercise the regex
+        # branch by feeding via a fake env using a namespace swap.
+        import os as _os
+        original = _os.getenv
+        try:
+            _os.getenv = lambda k, d=None: "ok\x00bad" if k == "X_FAKE" else original(k, d)
+            assert _resolve_nudge_copy("X_FAKE", "fallback") == "fallback"
+        finally:
+            _os.getenv = original
+
+    def test_caps_at_max_length(self, monkeypatch):
+        long_value = "x" * 500
+        monkeypatch.setenv("X_NEVER_SET_ENV", long_value)
+        out = _resolve_nudge_copy("X_NEVER_SET_ENV", "fallback")
+        assert len(out) == MAX_NUDGE_COPY_LENGTH
+        assert out == "x" * MAX_NUDGE_COPY_LENGTH
+
+    def test_exactly_max_length_is_kept_as_is(self, monkeypatch):
+        boundary = "x" * MAX_NUDGE_COPY_LENGTH
+        monkeypatch.setenv("X_NEVER_SET_ENV", boundary)
+        assert _resolve_nudge_copy(
+            "X_NEVER_SET_ENV", "fallback",
+        ) == boundary
+
+    def test_unicode_passes_through(self, monkeypatch):
+        """Em-dashes, accents, emoji are printable Unicode and
+        should survive — the only filter is ASCII control chars."""
+        monkeypatch.setenv("X_NEVER_SET_ENV", "Upgrade — €5/mo · 🚀")
+        assert _resolve_nudge_copy(
+            "X_NEVER_SET_ENV", "fallback",
+        ) == "Upgrade — €5/mo · 🚀"
+
+
+class TestPhase57HelperFunctions:
+    def test_default_banner_copy_matches_spec(self, monkeypatch):
+        monkeypatch.delenv(UPGRADE_BANNER_COPY_ENV_VAR, raising=False)
+        assert _upgrade_banner_copy() == (
+            "You're using the free tier — upgrade for full access"
+        )
+        assert _upgrade_banner_copy() == DEFAULT_UPGRADE_BANNER_COPY
+
+    def test_default_limit_hit_copy_matches_spec(self, monkeypatch):
+        monkeypatch.delenv(LIMIT_HIT_COPY_ENV_VAR, raising=False)
+        assert _limit_hit_copy() == (
+            "free tier limit reached — upgrade for continued access"
+        )
+        assert _limit_hit_copy() == DEFAULT_LIMIT_HIT_COPY
+
+    def test_default_report_limit_copy_matches_spec(self, monkeypatch):
+        monkeypatch.delenv(REPORT_LIMIT_COPY_ENV_VAR, raising=False)
+        assert _report_limit_copy() == "upgrade required for full access"
+        assert _report_limit_copy() == DEFAULT_REPORT_LIMIT_COPY
+
+    def test_each_helper_is_isolated_from_the_others(self, monkeypatch):
+        monkeypatch.setenv(UPGRADE_BANNER_COPY_ENV_VAR, "BANNER_VAL")
+        monkeypatch.delenv(LIMIT_HIT_COPY_ENV_VAR, raising=False)
+        monkeypatch.delenv(REPORT_LIMIT_COPY_ENV_VAR, raising=False)
+        assert _upgrade_banner_copy() == "BANNER_VAL"
+        assert _limit_hit_copy() == DEFAULT_LIMIT_HIT_COPY
+        assert _report_limit_copy() == DEFAULT_REPORT_LIMIT_COPY
+
+
+class TestPhase57DashboardBanner:
+    def test_default_banner_appears_in_html(
+        self, client: TestClient, free_env,
+    ):
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert "using the free tier" in resp.text.lower()
+        assert "upgrade for full access" in resp.text.lower()
+
+    def test_custom_banner_appears_in_html(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            UPGRADE_BANNER_COPY_ENV_VAR, "Custom upgrade nudge — limited!",
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert "Custom upgrade nudge — limited!" in resp.text
+        assert "You're using the free tier" not in resp.text
+
+    def test_unsafe_html_is_escaped_not_executed(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            UPGRADE_BANNER_COPY_ENV_VAR, "<script>alert('xss')</script>",
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        body = resp.text
+        # No raw <script> tag anywhere on the page.
+        assert "<script>alert" not in body
+        # The escaped form is what landed in the HTML.
+        assert "&lt;script&gt;" in body
+
+    def test_long_banner_truncated_safely(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        long_value = "U" + ("p" * 500) + "!"
+        monkeypatch.setenv(UPGRADE_BANNER_COPY_ENV_VAR, long_value)
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        truncated = long_value[:MAX_NUDGE_COPY_LENGTH]
+        assert truncated in resp.text
+        assert long_value not in resp.text
+
+    def test_control_char_banner_falls_back_to_default(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        # Newline is settable via os.environ AND triggers the
+        # control-char branch in the resolver.
+        monkeypatch.setenv(
+            UPGRADE_BANNER_COPY_ENV_VAR, "evil\nbanner",
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert "evil" not in resp.text
+        assert "using the free tier" in resp.text.lower()
+
+    def test_premium_user_unaffected_by_banner_env(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            UPGRADE_BANNER_COPY_ENV_VAR,
+            "FREE TIER NUDGE THAT MUST NOT LEAK",
+        )
+        resp = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert 'class="free-tier-banner"' not in resp.text.lower()
+        assert "FREE TIER NUDGE THAT MUST NOT LEAK" not in resp.text
+
+    def test_render_function_accepts_explicit_copy(self):
+        html = render_dashboard_html(
+            None, [], tier="free", banner_copy="Hello free tier",
+        )
+        assert "Hello free tier" in html
+
+    def test_render_function_falls_back_to_env_when_copy_is_none(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(UPGRADE_BANNER_COPY_ENV_VAR, "ENV_BANNER_COPY")
+        html = render_dashboard_html(None, [], tier="free")
+        assert "ENV_BANNER_COPY" in html
+
+    def test_render_function_premium_ignores_banner_param(self):
+        html = render_dashboard_html(
+            None, [], tier="premium", banner_copy="Hello free tier",
+        )
+        assert "Hello free tier" not in html
+        assert 'class="free-tier-banner"' not in html.lower()
+
+
+class TestPhase57LimitHitCopy:
+    def test_default_429_message(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        assert resp.json() == {"detail": DEFAULT_LIMIT_HIT_COPY}
+
+    def test_custom_429_message_appears(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(LIMIT_HIT_COPY_ENV_VAR, "Slow down — upgrade!")
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        assert resp.json() == {"detail": "Slow down — upgrade!"}
+
+    def test_long_custom_429_truncated(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        long_msg = "Z" * 500
+        monkeypatch.setenv(LIMIT_HIT_COPY_ENV_VAR, long_msg)
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = resp.json()
+        assert resp.status_code == 429
+        assert len(body["detail"]) == MAX_NUDGE_COPY_LENGTH
+        assert body["detail"] == "Z" * MAX_NUDGE_COPY_LENGTH
+
+    def test_control_char_429_falls_back_to_default(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(LIMIT_HIT_COPY_ENV_VAR, "bad\nmessage")
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 429
+        assert resp.json() == {"detail": DEFAULT_LIMIT_HIT_COPY}
+
+    def test_premium_user_429_not_returned(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(LIMIT_HIT_COPY_ENV_VAR, "BUSTED_FREE_NUDGE")
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=VALID_KEY, n=100,
+            report_path_prefix="/experiments/recent",
+        )
+        free_env["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        free_env["manifest"].write_text(
+            json.dumps({"report_date": "2026-04-24"}) + "\n",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert resp.status_code == 200
+        assert "BUSTED_FREE_NUDGE" not in resp.text
+
+
+class TestPhase57ReportLimitCopy:
+    def test_default_403_message(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "500")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/reports/latest",
+        )
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": DEFAULT_REPORT_LIMIT_COPY}
+
+    def test_custom_403_message_appears(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            REPORT_LIMIT_COPY_ENV_VAR,
+            "Daily report quota reached — go premium.",
+        )
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "500")
+        monkeypatch.setenv(FREE_MAX_REPORT_CALLS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/reports/latest",
+        )
+        resp = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json() == {
+            "detail": "Daily report quota reached — go premium.",
+        }
+
+    def test_phase45_403s_keep_legacy_copy(
+        self, client: TestClient, free_env, monkeypatch,
+    ):
+        """Phase 4.5's "out-of-window date" 403s are semantically
+        distinct from the Phase 5.4/5.7 report-limit and intentionally
+        keep their original message."""
+        monkeypatch.setenv(
+            REPORT_LIMIT_COPY_ENV_VAR, "PHASE57_OVERRIDE_TEXT",
+        )
+        free_env["reports_dir"].mkdir(parents=True, exist_ok=True)
+        resp = client.get(
+            "/reports/2020-01-01",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "upgrade required for full access"}
+        assert "PHASE57_OVERRIDE_TEXT" not in resp.text
+
+
+class TestPhase57BoundaryUnchanged:
+    def test_server_still_does_not_import_core(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "server.py"
+        ).read_text()
+        for forbidden in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+        ):
+            assert forbidden not in src
+
+    def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert path == "/webhook/stripe" and m == "POST"
+
+    def test_responses_never_echo_env_var_names(
+        self, client: TestClient, free_env, usage_path: Path, monkeypatch,
+    ):
+        """Response bodies must never contain Phase 5.7 env-var
+        names — those are operator-side knobs, not user-facing
+        configuration leakage."""
+        monkeypatch.setenv(FREE_MAX_REQUESTS_ENV_VAR, "1")
+        _seed_usage_rows(
+            usage_path, key=FREE_KEY, n=1,
+            report_path_prefix="/experiments/recent",
+        )
+        resp = client.get(
+            "/experiments/recent",
+            headers={"Authorization": f"Bearer {FREE_KEY}"},
+        )
+        body = resp.text
+        for name in (
+            "TRADING_API_KEY",
+            "TRADING_FREE_MAX_REQUESTS_PER_DAY",
+            "TRADING_LIMIT_HIT_COPY",
+            "TRADING_UPGRADE_BANNER_COPY",
+            "TRADING_REPORT_LIMIT_COPY",
+        ):
+            assert name not in body

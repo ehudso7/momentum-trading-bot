@@ -110,6 +110,28 @@ _FREE_TIER_EXEMPT_PATHS: frozenset[str] = frozenset(
     {"/", "/health", "/webhook/stripe"}
 )
 
+# Phase 5.7 — dynamic free-tier nudge copy (reversible via env vars).
+# Operators can A/B different upgrade messages without redeploying.
+# Each env var overrides the corresponding default; an unset, blank,
+# or unsafe value falls back to the default fail-closed.
+UPGRADE_BANNER_COPY_ENV_VAR = "TRADING_UPGRADE_BANNER_COPY"
+LIMIT_HIT_COPY_ENV_VAR = "TRADING_LIMIT_HIT_COPY"
+REPORT_LIMIT_COPY_ENV_VAR = "TRADING_REPORT_LIMIT_COPY"
+DEFAULT_UPGRADE_BANNER_COPY = (
+    "You're using the free tier — upgrade for full access"
+)
+# The two API-detail defaults are aliases of the existing constants —
+# kept as separate names so the Phase 5.7 surface is greppable.
+DEFAULT_LIMIT_HIT_COPY = FREE_TIER_LIMIT_DETAIL
+DEFAULT_REPORT_LIMIT_COPY = UPGRADE_REQUIRED_DETAIL
+MAX_NUDGE_COPY_LENGTH = 180
+# Reject any value that contains an ASCII control character other
+# than space (0x20+). NUL through 0x1F minus tab/LF/CR are unsafe;
+# DEL (0x7F) is also stripped. We could allow tab/LF/CR but a copy
+# string with embedded newlines breaks JSON pretty-print and HTML
+# block layout, so we treat them as unsafe too.
+_NUDGE_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 DEFAULT_REPORTS_DIR = "reports"
 DEFAULT_MANIFEST_PATH = "data/alpha_experiments.jsonl"
 
@@ -231,6 +253,57 @@ def _free_max_requests_per_day() -> int:
 def _free_max_report_calls() -> int:
     return _parse_positive_int_env(
         FREE_MAX_REPORT_CALLS_ENV_VAR, DEFAULT_FREE_MAX_REPORT_CALLS,
+    )
+
+
+def _resolve_nudge_copy(env_var: str, default: str) -> str:
+    """
+    Phase 5.7 — fail-closed string-env resolver for upgrade nudges.
+
+    Rules (every failure mode → return ``default``):
+      * env var unset → default.
+      * value is empty / whitespace-only → default.
+      * value contains an ASCII control character (NUL..0x1F or
+        0x7F, including newlines / tabs) → default. Such characters
+        break JSON pretty-print, HTML layout, and a few terminal
+        loggers, so we refuse to pass them through.
+
+    Otherwise the value is stripped and truncated to
+    ``MAX_NUDGE_COPY_LENGTH`` characters.
+
+    The returned string is *raw* — callers MUST run it through
+    ``html.escape`` before injecting into HTML, and MUST place it
+    in a JSON-encoded body for API responses (FastAPI's
+    JSONResponse already handles this).
+    """
+    raw = os.getenv(env_var)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        return default
+    if _NUDGE_CONTROL_CHARS_RE.search(s):
+        return default
+    if len(s) > MAX_NUDGE_COPY_LENGTH:
+        s = s[:MAX_NUDGE_COPY_LENGTH]
+    return s
+
+
+def _upgrade_banner_copy() -> str:
+    return _resolve_nudge_copy(
+        UPGRADE_BANNER_COPY_ENV_VAR, DEFAULT_UPGRADE_BANNER_COPY,
+    )
+
+
+def _limit_hit_copy() -> str:
+    return _resolve_nudge_copy(
+        LIMIT_HIT_COPY_ENV_VAR, DEFAULT_LIMIT_HIT_COPY,
+    )
+
+
+def _report_limit_copy() -> str:
+    return _resolve_nudge_copy(
+        REPORT_LIMIT_COPY_ENV_VAR, DEFAULT_REPORT_LIMIT_COPY,
     )
 
 
@@ -902,9 +975,10 @@ async def free_tier_middleware(request: Request, call_next):
     if total_today >= max_total:
         # Phase 5.5 — telemetry is best-effort; never affects the response.
         _emit_upgrade_event(request, api_key, "daily_request_limit_hit")
+        # Phase 5.7 — operator-overridable copy.
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": FREE_TIER_LIMIT_DETAIL},
+            content={"detail": _limit_hit_copy()},
             headers={
                 FREE_TIER_USAGE_HEADER: usage_header,
                 FREE_TIER_REMAINING_HEADER: "0",
@@ -912,9 +986,10 @@ async def free_tier_middleware(request: Request, call_next):
         )
     if is_report and reports_today >= max_reports:
         _emit_upgrade_event(request, api_key, "report_limit_hit")
+        # Phase 5.7 — operator-overridable copy.
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
-            content={"detail": UPGRADE_REQUIRED_DETAIL},
+            content={"detail": _report_limit_copy()},
             headers={
                 FREE_TIER_USAGE_HEADER: usage_header,
                 FREE_TIER_REMAINING_HEADER: str(remaining),
@@ -1832,15 +1907,22 @@ def render_dashboard_html(
     experiments: list[dict],
     *,
     tier: str = TIER_PREMIUM,
+    banner_copy: Optional[str] = None,
 ) -> str:
     """
     Build the dashboard HTML from sanitized inputs.
 
-    Pure function: does no I/O. The caller must pass already-sanitized
-    report and experiments dicts (via `_sanitize_report` /
-    `_sanitize_manifest`). Because of that contract, no amount of
-    upstream leakage can spill into the HTML — this renderer simply
-    cannot access fields that have already been stripped.
+    Pure-ish function: the only I/O is a single ``os.getenv`` lookup
+    when ``banner_copy`` is left ``None`` (default), at which point
+    the renderer resolves the Phase 5.7 ``TRADING_UPGRADE_BANNER_COPY``
+    env var. Pass an explicit ``banner_copy`` from a test to make
+    the call fully deterministic.
+
+    The caller must pass already-sanitized report and experiments
+    dicts (via `_sanitize_report` / `_sanitize_manifest`). Because
+    of that contract, no amount of upstream leakage can spill into
+    the HTML — this renderer simply cannot access fields that have
+    already been stripped.
 
     `tier` controls the Phase 4.5 free-tier display rules:
       - "premium" (default): full data, every section.
@@ -1903,15 +1985,24 @@ def render_dashboard_html(
         + "</section>"
     )
 
-    # Phase 5.4 — free-tier nudge banner. Rendered before the
-    # first report block so it's the first thing a free user sees
-    # when they load the dashboard.
-    free_tier_banner = (
-        '<p class="free-tier-banner">'
-        'You&#39;re using the free tier — upgrade for full access.'
-        "</p>"
-        if is_free else ""
-    )
+    # Phase 5.4 — free-tier nudge banner. Rendered before the first
+    # report block so it's the first thing a free user sees when
+    # they load the dashboard. Phase 5.7: copy is operator-tunable
+    # via ``TRADING_UPGRADE_BANNER_COPY`` and HTML-escaped at render
+    # time.
+    if is_free:
+        resolved_copy = (
+            banner_copy
+            if isinstance(banner_copy, str) and banner_copy
+            else _upgrade_banner_copy()
+        )
+        free_tier_banner = (
+            '<p class="free-tier-banner">'
+            f"{_esc(resolved_copy)}"
+            "</p>"
+        )
+    else:
+        free_tier_banner = ""
 
     return (
         "<!DOCTYPE html>"

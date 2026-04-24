@@ -1799,6 +1799,80 @@ No PII. No paths leaking raw secrets. Reversible by simply
 ignoring the log file.
 
 
+### Phase 5.7 — dynamic free-tier nudge copy
+
+The three free-tier upgrade prompts the server emits — the
+`/dashboard` banner, the Phase 5.4 daily-request `429`, and the
+Phase 5.4 report-limit `403` — are now operator-tunable via env
+vars. Premium behaviour is untouched, no API endpoints change,
+and unsetting all three env vars reverts the server to the
+pre-Phase-5.7 surface byte-for-byte.
+
+**Env vars + defaults**
+
+| Env var | Surface | Default copy |
+|---|---|---|
+| `TRADING_UPGRADE_BANNER_COPY` | `<p class="free-tier-banner">` on `/dashboard` (free tier only) | `You're using the free tier — upgrade for full access` |
+| `TRADING_LIMIT_HIT_COPY` | `429 detail` from `free_tier_middleware` | `free tier limit reached — upgrade for continued access` |
+| `TRADING_REPORT_LIMIT_COPY` | `403 detail` from `free_tier_middleware` on `/reports/*` | `upgrade required for full access` |
+
+**Resolver semantics** (`_resolve_nudge_copy`):
+
+1. env unset → default
+2. value strips to `""` → default
+3. value contains any ASCII control character (NUL..0x1F or 0x7F,
+   incl. tab / newline / CR) → default
+4. value > `MAX_NUDGE_COPY_LENGTH` (180 chars) → truncated to 180
+
+The returned string is **raw**. Callers MUST escape on output:
+
+* the dashboard banner runs the resolved copy through
+  `html.escape` before inserting into `<p class="free-tier-banner">`;
+* the `429` / `403` paths place the resolved copy inside a
+  `JSONResponse` `{"detail": ...}` body, where FastAPI's JSON
+  encoder handles escaping.
+
+A test asserts the dashboard renders `<script>alert(1)</script>` as
+`&lt;script&gt;alert(1)&lt;/script&gt;` (no live tag).
+
+**What is NOT touched by Phase 5.7**
+
+* Phase 4.5's `/reports/{date}` (out-of-window date) and
+  `/experiments/*` (over-cap) `403`s — semantically distinct
+  from "you ran out of report calls today" and intentionally
+  keep their `upgrade required for full access` literal. A
+  dedicated test (`test_phase45_403s_keep_legacy_copy`) pins
+  this contract.
+* Premium responses — the dashboard renders no banner element
+  for premium users, regardless of how the env var is set. The
+  custom copy never appears anywhere in a premium response.
+* The copy does NOT propagate into telemetry. The Phase 5.5
+  upgrade-events JSONL only stores the event name (e.g.
+  `dashboard_banner_seen`), the user hash, the path, and the
+  request_id — never the rendered copy. So an operator can A/B
+  the banner without polluting the audit trail.
+
+**Examples**
+
+Custom banner element rendered for a free user:
+
+    <p class="free-tier-banner">Like what you see? Upgrade to unlock the full audit trail.</p>
+
+Custom `429` response after a free user exhausts the daily cap:
+
+    HTTP/1.1 429 Too Many Requests
+    content-type: application/json
+    x-free-tier-usage: 1/1
+    x-free-tier-remaining: 0
+
+    {"detail":"You hit your daily request budget — upgrade for unlimited access."}
+
+**Reversibility.** `unset TRADING_UPGRADE_BANNER_COPY
+TRADING_LIMIT_HIT_COPY TRADING_REPORT_LIMIT_COPY` restores the
+default messages immediately on the next request — no restart
+needed; the resolver runs per-request.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
