@@ -17,9 +17,10 @@ See also:
 
 | Env var                           | Values        | Default | Scope               | What it does |
 | ---                               | ---           | ---     | ---                 | --- |
-| `TRADING_DATA_ROTATION`           | `daily` / `none` | `none` | Paper + live       | Rotate Core CSVs to `*_YYYY-MM-DD.csv`. (Phase 2.7) |
-| `TRADING_ALPHA_FILTER_ENABLED`    | `true` / `false` | `false` | **Paper only**   | Allow the alpha filter to block weak trades. (Phase 3) |
-| `TRADING_ALPHA_FILTER_MIN_TIER`   | `A` / `B` / `C` | `B`    | Paper only         | Minimum alpha tier required to pass the filter. (Phase 3) |
+| `TRADING_DATA_ROTATION`                | `daily` / `none` | `none`    | Paper + live  | Rotate Core CSVs to `*_YYYY-MM-DD.csv`. (Phase 2.7) |
+| `TRADING_ALPHA_FILTER_ENABLED`         | `true` / `false` | `false`   | **Paper only**| Allow the alpha filter to block weak trades. (Phase 3) |
+| `TRADING_ALPHA_FILTER_MIN_TIER`        | `A` / `B` / `C`  | `B`       | Paper only    | Minimum alpha tier required to pass the filter. (Phase 3) |
+| `TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL`  | URL string       | *(unset)* | Any           | Optional Slack/Discord webhook for warning/critical guardrail alerts. (Phase 3.4) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -212,6 +213,71 @@ a side-less comparison.
 Guardrails are a diagnostic layer. They can neither enable nor
 disable the filter themselves — that is still an explicit operator
 decision via the `TRADING_ALPHA_FILTER_ENABLED` env var.
+
+
+## Phase 3.4 — optional webhook alerts
+
+Set `TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL` to a Slack or Discord
+incoming-webhook URL to be notified when the daily guardrail
+classification is `warning` or `critical`. Alerts fire once per
+daily report — at shutdown and at the midnight rollover — not on
+every tick. The URL is read at report time so an operator can flip
+it on or off without a restart.
+
+### Safety invariants
+
+1. **Off by default.** When the env var is unset, no network call
+   is made and behaviour is byte-identical to Phase 3.3.
+2. **`ok` and `insufficient_data` are silent.** Only `warning` and
+   `critical` trigger a POST. Daily "nothing to see here" pings
+   would train operators to ignore the channel.
+3. **Alerts never fail the report.** HTTP errors, connection
+   errors, DNS failures, and timeouts are all caught. The text and
+   JSON report files are written before the POST is attempted, so
+   file creation is unaffected by network issues. The failure
+   reason is recorded on `DailyReportResult.alert_error` and in the
+   structured log `guardrail_alert.request_error` /
+   `guardrail_alert.non_success`.
+4. **No auto-toggling.** This phase does **not** flip
+   `TRADING_ALPHA_FILTER_ENABLED` on or off — even `critical`
+   alerts merely inform the operator.
+
+### Payload shape
+
+Compatible with both Slack (`text`) and Discord (`content`). Extra
+structured fields are ignored by chat providers but are useful for
+any generic webhook consumer.
+
+```json
+{
+  "text":    "🚨 Alpha guardrail *CRITICAL* for 2026-04-24\nRecommended action: disable TRADING_ALPHA_FILTER_ENABLED and re-run the analysis\nReasons:\n• allowed avg R -0.433 < blocked avg R 1.000 at the A+B threshold\n• allowed win rate 0.00% < blocked win rate 100.00% at the A+B threshold\nText report: reports/alpha_report_2026-04-24.txt\nJSON report: reports/alpha_report_2026-04-24.json",
+  "content": "...same as text...",
+  "report_date": "2026-04-24",
+  "status": "critical",
+  "recommended_action": "disable TRADING_ALPHA_FILTER_ENABLED and re-run the analysis before re-enabling — the filter is rejecting better trades than it keeps",
+  "reasons": [
+    "allowed avg R -0.433 < blocked avg R 1.000 at the A+B threshold",
+    "allowed win rate 0.00% < blocked win rate 100.00% at the A+B threshold"
+  ],
+  "text_report_path": "reports/alpha_report_2026-04-24.txt",
+  "json_report_path": "reports/alpha_report_2026-04-24.json"
+}
+```
+
+### Rollback
+
+- **To disable alerts:** unset `TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL`
+  or set it to an empty string, then restart the bot (or simply
+  wait until the next report runs — the URL is read at report time,
+  not cached). No code changes required.
+- **To temporarily silence a noisy channel:** change the webhook URL
+  to a known-dead endpoint; alerts will fail silently and the
+  `guardrail_alert.non_success` log will record why.
+- **To roll back the feature entirely:** revert the Phase 3.4 commit
+  and the `requests` dependency calls — `trading_bot/reporting/
+  daily_report.py` is the only touched file. Since the feature is
+  fully opt-in (webhook URL unset by default), no cleanup of saved
+  state is required.
 
 
 ## Phase 2.7 — dataset rotation (reference)

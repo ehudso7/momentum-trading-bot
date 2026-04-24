@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import date as _date_type
 from pathlib import Path
 from typing import Optional, Union
 
+import requests
 import structlog
 
 from trading_bot.analysis.alpha_report import (
@@ -63,6 +65,16 @@ GUARDRAIL_STATUS_WARNING = "warning"
 GUARDRAIL_STATUS_CRITICAL = "critical"
 GUARDRAIL_STATUS_INSUFFICIENT = "insufficient_data"
 
+# Phase 3.4 — optional webhook alerts. Read from env at report time so
+# a running bot can be reconfigured without code changes.
+GUARDRAIL_WEBHOOK_ENV_VAR = "TRADING_ALPHA_GUARDRAIL_WEBHOOK_URL"
+GUARDRAIL_WEBHOOK_TIMEOUT_SECONDS = 5.0
+# Only these statuses trigger an alert. "ok" and "insufficient_data"
+# are intentionally silent — daily noise is worse than no alert.
+GUARDRAIL_ALERT_STATUSES: frozenset[str] = frozenset(
+    [GUARDRAIL_STATUS_WARNING, GUARDRAIL_STATUS_CRITICAL]
+)
+
 
 @dataclass
 class DailyReportResult:
@@ -74,6 +86,8 @@ class DailyReportResult:
     success: bool
     error: Optional[str] = None
     guardrail_status: Optional[str] = None
+    alert_sent: bool = False
+    alert_error: Optional[str] = None
 
 
 def _today_str() -> str:
@@ -296,11 +310,129 @@ def _format_guardrails_section(guardrails: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.4 — optional Slack / Discord webhook alerts
+# ---------------------------------------------------------------------------
+
+
+def should_send_guardrail_alert(status: Optional[str]) -> bool:
+    """
+    Pure predicate: should a webhook alert be dispatched for this
+    guardrail status?
+
+    Only ``warning`` and ``critical`` trigger alerts. ``ok`` and
+    ``insufficient_data`` are intentionally silent — the Phase 3.3
+    rationale is that a daily "nothing to see here" ping is worse
+    than no ping, and that an early-run insufficient sample is
+    expected rather than notable.
+    """
+    if not status:
+        return False
+    return str(status).strip().lower() in GUARDRAIL_ALERT_STATUSES
+
+
+def build_guardrail_alert_payload(
+    *,
+    date: str,
+    status: str,
+    recommended_action: str,
+    reasons: list[str],
+    txt_path: Union[str, Path],
+    json_path: Union[str, Path],
+) -> dict:
+    """
+    Build a webhook-agnostic JSON payload. Compatible with both Slack
+    (consumes ``text``) and Discord (consumes ``content``); unknown
+    top-level keys are silently ignored by both, so we also include
+    structured fields for logging / generic webhooks.
+    """
+    reasons_list = list(reasons or [])
+    reasons_block = (
+        "\n".join(f"• {r}" for r in reasons_list) if reasons_list else "(none)"
+    )
+    emoji = "🚨" if str(status).lower() == GUARDRAIL_STATUS_CRITICAL else "⚠️"
+    message = (
+        f"{emoji} Alpha guardrail *{status.upper()}* for {date}\n"
+        f"Recommended action: {recommended_action}\n"
+        f"Reasons:\n{reasons_block}\n"
+        f"Text report: {txt_path}\n"
+        f"JSON report: {json_path}"
+    )
+    return {
+        # Slack — shown as message body
+        "text": message,
+        # Discord — shown as message body
+        "content": message,
+        # Structured extras — ignored by chat providers but useful
+        # for generic webhook consumers and log inspection.
+        "report_date": date,
+        "status": status,
+        "recommended_action": recommended_action,
+        "reasons": reasons_list,
+        "text_report_path": str(txt_path),
+        "json_report_path": str(json_path),
+    }
+
+
+def send_guardrail_alert(
+    webhook_url: str,
+    payload: dict,
+    timeout: float = GUARDRAIL_WEBHOOK_TIMEOUT_SECONDS,
+) -> tuple[bool, Optional[str]]:
+    """
+    POST `payload` to `webhook_url`. Returns ``(sent, error)``.
+
+    - `sent=True, error=None` on HTTP 2xx.
+    - `sent=False, error="<reason>"` on any other outcome.
+    Never raises — every exception path is caught so the daily
+    report writer cannot be derailed by network trouble.
+    """
+    if not webhook_url:
+        return False, "missing_webhook_url"
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=timeout)
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        log.warning("guardrail_alert.request_error", error=msg)
+        return False, msg
+
+    try:
+        status_code = int(getattr(response, "status_code", 0))
+    except Exception:
+        status_code = 0
+
+    if 200 <= status_code < 300:
+        log.info(
+            "guardrail_alert.sent",
+            status_code=status_code,
+            payload_status=payload.get("status"),
+            payload_date=payload.get("report_date"),
+        )
+        return True, None
+
+    # Best-effort: extract a short body snippet to aid debugging.
+    try:
+        body = getattr(response, "text", "")[:200]
+    except Exception:
+        body = ""
+    msg = f"http_{status_code}:{body}"
+    log.warning("guardrail_alert.non_success", status_code=status_code, body=body)
+    return False, msg
+
+
+def _resolve_webhook_url(explicit: Optional[str]) -> str:
+    """Explicit caller argument wins, else fall back to env var."""
+    if explicit is not None:
+        return str(explicit).strip()
+    return (os.getenv(GUARDRAIL_WEBHOOK_ENV_VAR, "") or "").strip()
+
+
 def generate_daily_report(
     date: Optional[str] = None,
     data_dir: Union[str, Path] = DEFAULT_DATA_DIR,
     reports_dir: Union[str, Path] = DEFAULT_REPORTS_DIR,
     min_required_outcomes: int = DEFAULT_MIN_REQUIRED_OUTCOMES,
+    webhook_url: Optional[str] = None,
 ) -> DailyReportResult:
     """
     Build and persist the daily alpha validation report for `date`.
@@ -370,6 +502,39 @@ def generate_daily_report(
             matched_trades=report.get("totals", {}).get("matched_trades", 0),
             guardrail_status=result.guardrail_status,
         )
+
+        # Phase 3.4 — optional webhook alert. Only for warning /
+        # critical; never for ok / insufficient_data. Any failure
+        # here is logged and swallowed so the report itself still
+        # counts as successful.
+        try:
+            if should_send_guardrail_alert(result.guardrail_status):
+                resolved_url = _resolve_webhook_url(webhook_url)
+                if resolved_url:
+                    payload = build_guardrail_alert_payload(
+                        date=report_date,
+                        status=guardrails.get("status", ""),
+                        recommended_action=guardrails.get(
+                            "recommended_action", ""
+                        ),
+                        reasons=list(guardrails.get("reasons") or []),
+                        txt_path=txt_out,
+                        json_path=json_out,
+                    )
+                    sent, err = send_guardrail_alert(resolved_url, payload)
+                    result.alert_sent = sent
+                    result.alert_error = err
+        except Exception as alert_exc:
+            # Defense-in-depth: send_guardrail_alert already catches,
+            # but guard the whole block so a payload-building bug
+            # cannot bubble up to the caller either.
+            result.alert_sent = False
+            result.alert_error = f"{type(alert_exc).__name__}: {alert_exc}"
+            log.warning(
+                "daily_report.alert_error",
+                date=report_date,
+                error=result.alert_error,
+            )
     except Exception as exc:
         # Swallow — this report is best-effort and must never block shutdown.
         result.error = f"{type(exc).__name__}: {exc}"

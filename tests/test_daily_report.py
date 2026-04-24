@@ -30,10 +30,14 @@ from trading_bot.reporting.daily_report import (
     GUARDRAIL_STATUS_INSUFFICIENT,
     GUARDRAIL_STATUS_OK,
     GUARDRAIL_STATUS_WARNING,
+    GUARDRAIL_WEBHOOK_ENV_VAR,
     DailyReportResult,
+    build_guardrail_alert_payload,
     evaluate_guardrails,
     generate_daily_report,
     main,
+    send_guardrail_alert,
+    should_send_guardrail_alert,
 )
 
 
@@ -956,3 +960,496 @@ def test_evaluate_guardrails_handles_malformed_fields():
         GUARDRAIL_STATUS_CRITICAL,
         GUARDRAIL_STATUS_INSUFFICIENT,
     }
+
+
+# ===========================================================================
+# Phase 3.4 — guardrail webhook alerts
+# ===========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _clear_webhook_env(monkeypatch):
+    """Every Phase 3.4 test starts with a clean env."""
+    monkeypatch.delenv(GUARDRAIL_WEBHOOK_ENV_VAR, raising=False)
+
+
+@pytest.fixture
+def guarded_report_factory(populated_data_dir):
+    """
+    Build a callable that forces a specific guardrail status on the
+    next `generate_daily_report` invocation by monkey-patching the
+    evaluator.
+    """
+    def _make(monkeypatch, status, reasons=None, action="do x"):
+        def fake_evaluate(report):
+            return {
+                "status": status,
+                "reasons": list(reasons or [f"reason for {status}"]),
+                "recommended_action": action,
+            }
+        monkeypatch.setattr(daily_report_mod, "evaluate_guardrails", fake_evaluate)
+        return populated_data_dir
+
+    return _make
+
+
+# ---------------------------------------------------------------------------
+# should_send_guardrail_alert — pure predicate
+# ---------------------------------------------------------------------------
+
+
+class TestShouldSendGuardrailAlert:
+    def test_warning_sends(self):
+        assert should_send_guardrail_alert(GUARDRAIL_STATUS_WARNING) is True
+
+    def test_critical_sends(self):
+        assert should_send_guardrail_alert(GUARDRAIL_STATUS_CRITICAL) is True
+
+    def test_ok_does_not_send(self):
+        assert should_send_guardrail_alert(GUARDRAIL_STATUS_OK) is False
+
+    def test_insufficient_data_does_not_send(self):
+        assert should_send_guardrail_alert(GUARDRAIL_STATUS_INSUFFICIENT) is False
+
+    @pytest.mark.parametrize("value", [None, "", "   ", "unknown", "foo"])
+    def test_unknown_or_missing_does_not_send(self, value):
+        assert should_send_guardrail_alert(value) is False
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("WARNING", True), ("Warning", True), ("  warning  ", True),
+            ("CRITICAL", True), ("Critical", True),
+            ("OK", False), ("Ok", False),
+        ],
+    )
+    def test_case_and_whitespace_tolerant(self, value, expected):
+        assert should_send_guardrail_alert(value) is expected
+
+
+# ---------------------------------------------------------------------------
+# build_guardrail_alert_payload — required fields
+# ---------------------------------------------------------------------------
+
+
+class TestBuildGuardrailAlertPayload:
+    def test_payload_has_all_required_fields(self, tmp_path: Path):
+        payload = build_guardrail_alert_payload(
+            date="2026-04-24",
+            status="critical",
+            recommended_action="disable TRADING_ALPHA_FILTER_ENABLED",
+            reasons=["allowed avg R 0.1 < blocked 1.0", "win rate flipped"],
+            txt_path=tmp_path / "alpha_report_2026-04-24.txt",
+            json_path=tmp_path / "alpha_report_2026-04-24.json",
+        )
+        # Structured fields
+        assert payload["report_date"] == "2026-04-24"
+        assert payload["status"] == "critical"
+        assert payload["recommended_action"] == "disable TRADING_ALPHA_FILTER_ENABLED"
+        assert payload["reasons"] == [
+            "allowed avg R 0.1 < blocked 1.0",
+            "win rate flipped",
+        ]
+        assert "alpha_report_2026-04-24.txt" in payload["text_report_path"]
+        assert "alpha_report_2026-04-24.json" in payload["json_report_path"]
+        # Slack + Discord compatible message bodies
+        assert "text" in payload and "content" in payload
+        assert payload["text"] == payload["content"]
+        assert "2026-04-24" in payload["text"]
+        assert "CRITICAL" in payload["text"]
+        assert "allowed avg R" in payload["text"]
+
+    def test_payload_is_json_serializable(self, tmp_path: Path):
+        payload = build_guardrail_alert_payload(
+            date="2026-04-24",
+            status="warning",
+            recommended_action="review",
+            reasons=[],
+            txt_path=tmp_path / "x.txt",
+            json_path=tmp_path / "x.json",
+        )
+        # Must round-trip through json without custom encoders
+        dumped = json.dumps(payload)
+        assert "warning" in dumped
+        parsed = json.loads(dumped)
+        assert parsed["status"] == "warning"
+
+    def test_payload_handles_empty_reasons(self, tmp_path: Path):
+        payload = build_guardrail_alert_payload(
+            date="2026-04-24",
+            status="warning",
+            recommended_action="review",
+            reasons=[],
+            txt_path=tmp_path / "a.txt",
+            json_path=tmp_path / "a.json",
+        )
+        assert payload["reasons"] == []
+        assert "(none)" in payload["text"]
+
+    def test_payload_warning_emoji_differs_from_critical(self, tmp_path: Path):
+        """Just make sure the two look different so they're visually distinguishable."""
+        p_warn = build_guardrail_alert_payload(
+            date="2026-04-24", status="warning",
+            recommended_action="x", reasons=["y"],
+            txt_path=tmp_path / "a.txt", json_path=tmp_path / "a.json",
+        )
+        p_crit = build_guardrail_alert_payload(
+            date="2026-04-24", status="critical",
+            recommended_action="x", reasons=["y"],
+            txt_path=tmp_path / "a.txt", json_path=tmp_path / "a.json",
+        )
+        # They share the message template but the leading emoji differs.
+        assert p_warn["text"] != p_crit["text"]
+
+
+# ---------------------------------------------------------------------------
+# send_guardrail_alert — never raises, reports error cleanly
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int = 200, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+
+class TestSendGuardrailAlert:
+    def test_missing_url_reports_error_without_posting(self, monkeypatch):
+        called = {"n": 0}
+
+        def fake_post(*args, **kwargs):  # pragma: no cover
+            called["n"] += 1
+            return _FakeResponse()
+
+        monkeypatch.setattr(daily_report_mod.requests, "post", fake_post)
+        sent, err = send_guardrail_alert("", {"status": "warning"})
+        assert sent is False
+        assert err == "missing_webhook_url"
+        assert called["n"] == 0
+
+    def test_success_2xx(self, monkeypatch):
+        monkeypatch.setattr(
+            daily_report_mod.requests, "post",
+            lambda *a, **kw: _FakeResponse(200, "ok"),
+        )
+        sent, err = send_guardrail_alert("https://example/webhook", {})
+        assert sent is True
+        assert err is None
+
+    def test_non_2xx_returns_false(self, monkeypatch):
+        monkeypatch.setattr(
+            daily_report_mod.requests, "post",
+            lambda *a, **kw: _FakeResponse(500, "internal"),
+        )
+        sent, err = send_guardrail_alert("https://example/webhook", {})
+        assert sent is False
+        assert err is not None
+        assert "500" in err
+
+    def test_request_exception_caught(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise ConnectionError("dns fail")
+        monkeypatch.setattr(daily_report_mod.requests, "post", boom)
+        sent, err = send_guardrail_alert("https://example/webhook", {})
+        assert sent is False
+        assert "ConnectionError" in err
+        assert "dns fail" in err
+
+    def test_timeout_propagated_as_error_not_raise(self, monkeypatch):
+        import socket
+
+        def timeout(*args, **kwargs):
+            raise socket.timeout("took too long")
+        monkeypatch.setattr(daily_report_mod.requests, "post", timeout)
+        sent, err = send_guardrail_alert("https://example/webhook", {})
+        assert sent is False
+        assert err is not None
+
+    def test_passes_json_body_not_data(self, monkeypatch):
+        captured = {}
+
+        def capture(url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs.get("json")
+            captured["timeout"] = kwargs.get("timeout")
+            return _FakeResponse(204, "")
+
+        monkeypatch.setattr(daily_report_mod.requests, "post", capture)
+        payload = {"text": "hi", "status": "warning"}
+        send_guardrail_alert("https://example/webhook", payload, timeout=3.0)
+        assert captured["url"] == "https://example/webhook"
+        assert captured["json"] == payload
+        assert captured["timeout"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# generate_daily_report — end-to-end webhook behavior
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_post(monkeypatch, *, response: _FakeResponse = None,
+                      recorder: Optional[list] = None, raises: Exception = None):
+    """Helper: stub requests.post and optionally record calls."""
+    rec = recorder if recorder is not None else []
+    resp = response or _FakeResponse(204, "")
+
+    def fake_post(url, *args, **kwargs):
+        if raises is not None:
+            raise raises
+        rec.append({
+            "url": url,
+            "json": kwargs.get("json"),
+            "timeout": kwargs.get("timeout"),
+        })
+        return resp
+
+    monkeypatch.setattr(daily_report_mod.requests, "post", fake_post)
+    return rec
+
+
+class TestGenerateDailyReportAlertIntegration:
+    # ---- No env var → no alert ----
+
+    def test_no_env_var_no_network_call(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        calls = _install_fake_post(monkeypatch)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        assert result.success is True
+        assert result.alert_sent is False
+        assert result.alert_error is None  # didn't attempt
+        assert calls == []
+
+    # ---- Env var set but status does NOT trigger alert ----
+
+    def test_ok_status_does_not_alert(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(monkeypatch, GUARDRAIL_STATUS_OK)
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://example/webhook")
+        calls = _install_fake_post(monkeypatch)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        assert result.alert_sent is False
+        assert calls == [], "no POST should happen for ok"
+
+    def test_insufficient_data_does_not_alert(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_INSUFFICIENT
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://example/webhook")
+        calls = _install_fake_post(monkeypatch)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        assert result.alert_sent is False
+        assert calls == []
+
+    # ---- Env var set AND status triggers alert ----
+
+    def test_warning_sends_alert(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_WARNING,
+            reasons=["sample size small"],
+            action="keep filter disabled",
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://example/webhook")
+        calls = _install_fake_post(monkeypatch)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        assert result.alert_sent is True
+        assert result.alert_error is None
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["url"] == "https://example/webhook"
+        # Payload sanity
+        body = call["json"]
+        assert body["status"] == GUARDRAIL_STATUS_WARNING
+        assert body["report_date"] == report_date
+        assert body["recommended_action"] == "keep filter disabled"
+        assert body["reasons"] == ["sample size small"]
+        assert "text_report_path" in body and "json_report_path" in body
+
+    def test_critical_sends_alert(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://example/webhook")
+        calls = _install_fake_post(monkeypatch)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        assert result.alert_sent is True
+        assert len(calls) == 1
+        assert calls[0]["json"]["status"] == GUARDRAIL_STATUS_CRITICAL
+
+    # ---- Failure paths must not fail the report ----
+
+    def test_webhook_500_does_not_fail_report(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://example/webhook")
+        _install_fake_post(monkeypatch, response=_FakeResponse(500, "oops"))
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        # Report itself still succeeded.
+        assert result.success is True
+        # But alert was NOT sent and the error is recorded.
+        assert result.alert_sent is False
+        assert result.alert_error is not None
+        assert "500" in result.alert_error
+        # Files still exist.
+        assert result.txt_path.exists()
+        assert result.json_path.exists()
+
+    def test_webhook_connection_error_does_not_fail_report(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://example/webhook")
+        _install_fake_post(
+            monkeypatch, raises=ConnectionError("network down"),
+        )
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+        )
+        assert result.success is True
+        assert result.alert_sent is False
+        assert result.alert_error is not None
+        assert "ConnectionError" in result.alert_error
+
+    # ---- Explicit argument wins over env var ----
+
+    def test_explicit_webhook_url_wins_over_env(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://env/webhook")
+        calls = _install_fake_post(monkeypatch)
+
+        generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+            webhook_url="https://explicit/webhook",
+        )
+        assert len(calls) == 1
+        assert calls[0]["url"] == "https://explicit/webhook"
+
+    def test_empty_explicit_webhook_does_not_alert(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        """Passing empty string explicitly must NOT fall back to env."""
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        monkeypatch.setenv(GUARDRAIL_WEBHOOK_ENV_VAR, "https://env/webhook")
+        calls = _install_fake_post(monkeypatch)
+
+        result = generate_daily_report(
+            date=report_date,
+            data_dir=data_dir,
+            reports_dir=tmp_path / "reports",
+            min_required_outcomes=1,
+            webhook_url="",
+        )
+        assert calls == []
+        assert result.alert_sent is False
+
+    # ---- CLI still works ----
+
+    def test_cli_still_works_when_env_unset(
+        self, populated_data_dir, tmp_path: Path, capsys
+    ):
+        data_dir, report_date = populated_data_dir
+        rc = main([
+            "--date", report_date,
+            "--data-dir", str(data_dir),
+            "--reports-dir", str(tmp_path / "reports"),
+            "--min-outcomes", "1",
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "guardrail status" in out.lower()
+
+    def test_cli_subprocess_with_env_var_and_warning(
+        self, guarded_report_factory, tmp_path: Path, monkeypatch
+    ):
+        """CLI still exits 0 even when the webhook fails — by design."""
+        data_dir, report_date = guarded_report_factory(
+            monkeypatch, GUARDRAIL_STATUS_CRITICAL
+        )
+        # A URL that cannot resolve → subprocess will try to POST,
+        # requests will raise, daily_report will swallow, exit 0.
+        # We still want the CLI path to be exercised in a subprocess.
+        env = os.environ.copy()
+        env[GUARDRAIL_WEBHOOK_ENV_VAR] = "http://127.0.0.1:1/no-such-endpoint"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.reporting.daily_report",
+                "--date", report_date,
+                "--data-dir", str(data_dir),
+                "--reports-dir", str(tmp_path / "reports"),
+                "--min-outcomes", "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "guardrail status" in result.stdout.lower()
+
+
+# Need this import for the subprocess CLI test above.
+import os  # noqa: E402
