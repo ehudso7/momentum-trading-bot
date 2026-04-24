@@ -9,6 +9,9 @@ Used together with `trading_bot.analysis.alpha_report` to validate
 whether alpha scores predict realized outcomes before promoting alpha
 into live execution.
 
+See [`CORE_CONTROL.md`](CORE_CONTROL.md) for the env-var switches
+that control rotation and the paper-only alpha filter gate.
+
 - [`data/decision_log.csv`](#datadecision_logcsv-phase-15)  — one row per candidate evaluated
 - [`data/alpha_scores.csv`](#dataalpha_scorescsv-phase-2)  — one row per alpha score produced
 - [`data/journal.csv`](#datajournalcsv-existing) — one row per closed trade
@@ -38,7 +41,7 @@ outcomes, and executed buys.
 | `regime`          | str    | `RegimeDetector.detect(SPY)` | `trending_bullish`, `trending_bearish`, `range_bound`, `high_volatility`, `low_volatility`, or `unknown`. |
 | `action`          | str    | per-branch                   | `"buy"` or `"skip"`. |
 | `confidence`      | float  | `TradeSignal.confidence` or advisor, fallback 0.5 | Strategy/advisor confidence at the decision moment. |
-| `reason`          | str    | per-branch                   | `"executed"` for buys. For skips: `"already_held"`, `"empty_bars"`, `"strategy:<detail>"`, `"risk:<detail>"`, `"correlation:<detail>"`, `"advisor:<detail>"`, `"broker_rejected"`, `"equity_api_failed"`, `"zero_equity"`. |
+| `reason`          | str    | per-branch                   | `"executed"` for buys. For skips: `"already_held"`, `"empty_bars"`, `"strategy:<detail>"`, `"risk:<detail>"`, `"correlation:<detail>"`, `"advisor:<detail>"`, `"broker_rejected"`, `"equity_api_failed"`, `"zero_equity"`, or (Phase 3, paper only) `"alpha_filter_blocked:tier=<T>:min=<MIN>"`. |
 
 Header is created on first instantiation of `DecisionLogger`. Append
 failures are logged at DEBUG and never raise into the trading loop.

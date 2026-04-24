@@ -57,7 +57,7 @@ from trading_bot.utils.logger import setup_logging
 from trading_bot.utils.notifications import NotificationManager
 from trading_bot.models.domain import FeatureSnapshot, RejectedSignal, SignalDecision
 from trading_bot.persistence.decision_log import DecisionLogger
-from trading_bot.core.alpha import AlphaLogger, RuleBasedAlphaScorer
+from trading_bot.core.alpha import AlphaFilter, AlphaLogger, RuleBasedAlphaScorer
 from trading_bot.utils.indicators import compute_atr
 from trading_bot.utils.reports import DailySummaryReport
 
@@ -177,6 +177,22 @@ class TradingBot:
         alpha_log_path = Path(config.journal_csv_path).parent / "alpha_scores.csv"
         self._alpha_scorer = RuleBasedAlphaScorer()
         self._alpha_logger = AlphaLogger(alpha_log_path)
+
+        # Phase 3 Core conversion: opt-in paper-only alpha filter gate.
+        # OFF by default — when the env var TRADING_ALPHA_FILTER_ENABLED=true
+        # and the bot is in paper mode, weak-tier trades (below
+        # TRADING_ALPHA_FILTER_MIN_TIER, default B) are rejected AFTER the
+        # risk engine approves them. LIVE mode always ignores the filter.
+        self._alpha_filter = AlphaFilter(
+            scorer=self._alpha_scorer,
+            run_mode=config.run_mode.value,
+        )
+        if self._alpha_filter.active:
+            log.info(
+                "bot.alpha_filter_active",
+                min_tier=self._alpha_filter.min_tier,
+                run_mode=self._alpha_filter.run_mode,
+            )
 
         # Daily auto-reset tracking
         self._last_trading_date: str | None = None
@@ -817,6 +833,29 @@ class TradingBot:
                     snapshot,
                     action="skip",
                     reason=f"advisor:{advisor_reason}",
+                    confidence=advisor_rec.confidence,
+                )
+                continue
+
+            # Phase 3: paper-only alpha filter gate. Runs AFTER every
+            # risk / correlation / advisor check so it can ONLY block
+            # an already-approved trade — never approve one risk
+            # rejected, never upsize, never bypass any safety rail.
+            # Live mode always returns blocked=False.
+            filter_decision = self._alpha_filter.check(
+                snapshot, confidence=advisor_rec.confidence
+            )
+            if filter_decision.blocked:
+                log.info(
+                    "bot.alpha_filter_blocked",
+                    symbol=candidate.symbol,
+                    tier=filter_decision.tier,
+                    min_tier=filter_decision.min_tier,
+                )
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=filter_decision.reason,
                     confidence=advisor_rec.confidence,
                 )
                 continue

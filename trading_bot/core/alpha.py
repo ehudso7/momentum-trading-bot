@@ -43,6 +43,17 @@ ROTATION_NONE = "none"
 ROTATION_DAILY = "daily"
 _VALID_ROTATIONS = (ROTATION_NONE, ROTATION_DAILY)
 
+# Phase 3 — paper-only alpha filter gate.
+# Off by default; only active in paper mode. Never touches live mode.
+FILTER_ENABLED_ENV_VAR = "TRADING_ALPHA_FILTER_ENABLED"
+FILTER_MIN_TIER_ENV_VAR = "TRADING_ALPHA_FILTER_MIN_TIER"
+FILTER_DEFAULT_ENABLED = False
+FILTER_DEFAULT_MIN_TIER = "B"
+FILTER_VALID_MIN_TIERS: tuple[str, ...] = ("A", "B", "C")
+# Tier weakness ordering — lower index = stronger. A trade with tier t
+# passes a minimum of min iff _TIER_INDEX[t] <= _TIER_INDEX[min].
+_TIER_INDEX: dict[str, int] = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+
 
 def _today_str() -> str:
     """Return today's date as YYYY-MM-DD. Patchable from tests."""
@@ -409,3 +420,206 @@ class AlphaLogger:
                 log.debug(
                     "alpha_log.write_error", path=str(current), error=str(e)
                 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — paper-only alpha filter gate.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_filter_enabled(enabled: Optional[object]) -> bool:
+    """
+    Explicit constructor arg wins over the env var. Unrecognized
+    values resolve to False — the filter is OFF by default and a
+    typo must never turn it on.
+    """
+    if isinstance(enabled, bool):
+        return enabled
+    raw = enabled if enabled is not None else os.getenv(
+        FILTER_ENABLED_ENV_VAR, str(FILTER_DEFAULT_ENABLED)
+    )
+    return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _resolve_min_tier(min_tier: Optional[str]) -> str:
+    """
+    Explicit arg wins over env var. Unknown / typo values silently
+    fall back to FILTER_DEFAULT_MIN_TIER — a typo must never relax
+    the filter to "F" or similar.
+    """
+    raw = min_tier if min_tier is not None else os.getenv(
+        FILTER_MIN_TIER_ENV_VAR, FILTER_DEFAULT_MIN_TIER
+    )
+    value = (str(raw) or "").strip().upper()
+    if value not in FILTER_VALID_MIN_TIERS:
+        return FILTER_DEFAULT_MIN_TIER
+    return value
+
+
+@dataclass
+class FilterDecision:
+    """
+    Result of consulting the alpha filter for a single would-be trade.
+
+    `blocked=True` means the candidate failed the tier threshold AND
+    the filter is currently active (enabled + paper mode). In every
+    other case the filter is a no-op and `blocked=False`.
+    """
+
+    blocked: bool
+    reason: str  # "" when not blocked
+    min_tier: str
+    tier: Optional[str]  # the scored tier, when scoring ran; else None
+    enabled: bool
+    run_mode: str
+
+    def to_dict(self) -> dict:
+        return {
+            "blocked": self.blocked,
+            "reason": self.reason,
+            "min_tier": self.min_tier,
+            "tier": self.tier,
+            "enabled": self.enabled,
+            "run_mode": self.run_mode,
+        }
+
+
+class AlphaFilter:
+    """
+    Phase 3 alpha filter. Opt-in, paper-only, blocking-only.
+
+    Safety invariants (also enforced by where ``check`` is called in
+    ``TradingBot._tick``):
+
+    - LIVE mode NEVER runs the filter. If the operator enables it in
+      live, a warning is logged once at construction and `check()`
+      returns `blocked=False` for every candidate.
+    - The filter is OFF by default — an unset env var and no
+      constructor arg yield byte-identical behaviour to the
+      pre-Phase-3 bot.
+    - The filter can ONLY block. It cannot approve a trade the risk
+      engine rejected, cannot increase size, cannot skip the
+      correlation/advisor checks. In the main loop it is invoked
+      AFTER risk / correlation / advisor and purely decides whether
+      the already-approved buy should still be issued.
+
+    Env vars:
+      - TRADING_ALPHA_FILTER_ENABLED  (default false)
+      - TRADING_ALPHA_FILTER_MIN_TIER (default B; invalid → B)
+    """
+
+    LIVE_MODE_TOKEN = "live"
+    PAPER_MODE_TOKEN = "paper"
+
+    def __init__(
+        self,
+        scorer: "AlphaScorer",
+        run_mode: str,
+        enabled: Optional[object] = None,
+        min_tier: Optional[str] = None,
+    ) -> None:
+        self._scorer = scorer
+        self._run_mode = (str(run_mode) or self.PAPER_MODE_TOKEN).strip().lower()
+        self._enabled = _resolve_filter_enabled(enabled)
+        self._min_tier = _resolve_min_tier(min_tier)
+
+        if self._enabled and self._run_mode == self.LIVE_MODE_TOKEN:
+            log.warning(
+                "alpha_filter_ignored_in_live_mode",
+                min_tier=self._min_tier,
+                detail=(
+                    "TRADING_ALPHA_FILTER_ENABLED=true but run_mode is "
+                    "live — the alpha filter is only honoured in paper "
+                    "mode and will be ignored for this session."
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # Introspection (used by tests and status logging)
+    # ------------------------------------------------------------------
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def min_tier(self) -> str:
+        return self._min_tier
+
+    @property
+    def run_mode(self) -> str:
+        return self._run_mode
+
+    @property
+    def active(self) -> bool:
+        """True iff the filter can actually block a trade this session."""
+        return self._enabled and self._run_mode == self.PAPER_MODE_TOKEN
+
+    # ------------------------------------------------------------------
+    # Core decision
+    # ------------------------------------------------------------------
+
+    def check(
+        self,
+        snapshot: FeatureSnapshot,
+        confidence: float = 0.5,
+    ) -> FilterDecision:
+        """
+        Decide whether to allow or block a would-be buy.
+
+        When the filter is inactive (live mode, disabled, or both)
+        returns `blocked=False` immediately without computing a score.
+
+        When active, scores the candidate with a tentative "buy"
+        decision so the reason-component of the score reflects the
+        would-be outcome rather than the blocked state.
+        """
+        if not self.active:
+            return FilterDecision(
+                blocked=False,
+                reason="",
+                min_tier=self._min_tier,
+                tier=None,
+                enabled=self._enabled,
+                run_mode=self._run_mode,
+            )
+
+        tentative = SignalDecision(
+            timestamp=snapshot.timestamp,
+            symbol=snapshot.symbol,
+            action="buy",
+            confidence=float(confidence),
+            reason="executed",
+        )
+        alpha = self._scorer.score(snapshot, tentative)
+
+        if self._tier_meets_min(alpha.tier):
+            return FilterDecision(
+                blocked=False,
+                reason="",
+                min_tier=self._min_tier,
+                tier=alpha.tier,
+                enabled=True,
+                run_mode=self._run_mode,
+            )
+
+        return FilterDecision(
+            blocked=True,
+            reason=f"alpha_filter_blocked:tier={alpha.tier}:min={self._min_tier}",
+            min_tier=self._min_tier,
+            tier=alpha.tier,
+            enabled=True,
+            run_mode=self._run_mode,
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tier_index(tier: str) -> int:
+        """Weakness index. Unknown tiers are treated as weakest possible."""
+        return _TIER_INDEX.get((tier or "").upper(), 99)
+
+    def _tier_meets_min(self, tier: str) -> bool:
+        return self._tier_index(tier) <= self._tier_index(self._min_tier)
