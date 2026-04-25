@@ -36,16 +36,26 @@ from trading_bot.api.execution import (
     FREE_LIMIT_MAX,
     FREE_LIMIT_MIN,
     MAX_CHANGE_PCT,
+    MODE_EXPORT_ENV,
+    MODE_ROLLBACK,
+    MODE_ROLLOUT_PLAN,
     OUTCOME_APPLIED,
     OUTCOME_DRY_RUN,
     OUTCOME_NO_ACTIONABLE,
     OUTCOME_REJECTED_CHANGE_TOO_LARGE,
     OUTCOME_REJECTED_NO_CHANGE,
     OUTCOME_REJECTED_OUT_OF_BOUNDS,
+    ROLLOUT_MONITORING_WINDOW_DAYS,
     TIGHTEN_REDUCTION_PCT,
     VALID_ACTIONS,
     VALID_OUTCOMES,
+    VALID_ROLLOUT_MODES,
     apply_action,
+    build_operator_artifact,
+    build_rollout_steps,
+    format_export_env_text,
+    format_rollback_text,
+    format_rollout_plan_text,
     load_recommendations,
     pick_actionable,
     plan_action,
@@ -713,3 +723,483 @@ class TestBoundary:
             assert forbidden not in src, (
                 f"execution.py reaches into Core: {forbidden!r}"
             )
+
+
+# ===========================================================================
+# Phase 11.1 — Operator rollout plan
+# ===========================================================================
+
+
+_REQUIRED_ARTIFACT_KEYS: frozenset[str] = frozenset({
+    "mode",
+    "recommendation_id",
+    "priority",
+    "action",
+    "env_var",
+    "previous_value",
+    "new_value",
+    "rollback_value",
+    "export_command",
+    "rollback_command",
+    "rollout_steps",
+    "monitoring_window_days",
+    "actionable",
+})
+
+
+class TestArtifactConstants:
+    def test_mode_constants_pinned(self):
+        assert MODE_EXPORT_ENV == "export_env"
+        assert MODE_ROLLBACK == "rollback"
+        assert MODE_ROLLOUT_PLAN == "rollout_plan"
+        assert VALID_ROLLOUT_MODES == {
+            MODE_EXPORT_ENV, MODE_ROLLBACK, MODE_ROLLOUT_PLAN,
+        }
+
+    def test_monitoring_window_documented(self):
+        assert ROLLOUT_MONITORING_WINDOW_DAYS == 7
+
+
+class TestBuildOperatorArtifact:
+    def _plan_for(self, current: int = 100) -> dict:
+        return plan_action(
+            {
+                "id": REC_TIGHTEN_FREE_LIMIT,
+                "priority": PRIORITY_HIGH,
+                "rationale": "test",
+            },
+            current_value=current,
+        )
+
+    def test_envelope_carries_every_documented_key(self):
+        plan = self._plan_for(100)
+        for mode in (MODE_EXPORT_ENV, MODE_ROLLBACK, MODE_ROLLOUT_PLAN):
+            art = build_operator_artifact(plan, mode=mode)
+            assert set(art.keys()) == _REQUIRED_ARTIFACT_KEYS, (
+                f"missing/extra keys in mode={mode}: "
+                f"{_REQUIRED_ARTIFACT_KEYS ^ set(art.keys())}"
+            )
+
+    def test_envelope_values_match_plan(self):
+        plan = self._plan_for(100)
+        art = build_operator_artifact(plan, mode=MODE_ROLLOUT_PLAN)
+        assert art["mode"] == MODE_ROLLOUT_PLAN
+        assert art["recommendation_id"] == REC_TIGHTEN_FREE_LIMIT
+        assert art["priority"] == PRIORITY_HIGH
+        assert art["action"] == ACTION_SET_FREE_LIMIT
+        assert art["env_var"] == FREE_LIMIT_ENV_VAR
+        assert art["previous_value"] == 100
+        assert art["new_value"] == 75
+        # The rollback target is the previous value.
+        assert art["rollback_value"] == 100
+        assert art["export_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=75"
+        )
+        assert art["rollback_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=100"
+        )
+        assert art["monitoring_window_days"] == (
+            ROLLOUT_MONITORING_WINDOW_DAYS
+        )
+        assert art["actionable"] is True
+
+    def test_no_actionable_plan_yields_actionable_false(self):
+        art = build_operator_artifact(None, mode=MODE_ROLLOUT_PLAN)
+        assert art["actionable"] is False
+        assert art["rollout_steps"] == []
+        assert art["export_command"] is None
+        assert art["rollback_command"] is None
+        # Mode is preserved so a downstream consumer can branch.
+        assert art["mode"] == MODE_ROLLOUT_PLAN
+        # Monitoring-window constant survives even on the no-op shape.
+        assert art["monitoring_window_days"] == (
+            ROLLOUT_MONITORING_WINDOW_DAYS
+        )
+
+    def test_unknown_mode_raises(self):
+        plan = self._plan_for(100)
+        with pytest.raises(ValueError, match="unknown operator rollout mode"):
+            build_operator_artifact(plan, mode="reset_database")
+
+
+class TestBuildRolloutSteps:
+    def test_steps_are_numbered_one_through_six(self):
+        plan = plan_action(
+            {"id": REC_TIGHTEN_FREE_LIMIT, "priority": PRIORITY_HIGH},
+            current_value=100,
+        )
+        steps = build_rollout_steps(plan)
+        assert len(steps) == 6
+        for idx, step in enumerate(steps, start=1):
+            assert step.startswith(f"{idx}."), (
+                f"step {idx} not properly numbered: {step!r}"
+            )
+
+    def test_steps_reference_concrete_command_targets(self):
+        plan = plan_action(
+            {"id": REC_TIGHTEN_FREE_LIMIT, "priority": PRIORITY_HIGH},
+            current_value=100,
+        )
+        text = "\n".join(build_rollout_steps(plan))
+        # Must reference Phase 10.4/10.5 monitoring CLI.
+        assert "growth_intel" in text
+        # Must reference launch_check smoke per the spec.
+        assert "launch_check --smoke" in text
+        # Must include the literal env-var assignment for both
+        # forward and rollback.
+        assert f"{FREE_LIMIT_ENV_VAR}=75" in text  # forward
+        assert f"{FREE_LIMIT_ENV_VAR}=100" in text  # rollback
+        # Monitoring window must mention the documented number of
+        # days.
+        assert f"{ROLLOUT_MONITORING_WINDOW_DAYS} days" in text
+
+
+# ---------------------------------------------------------------------------
+# CLI: --export-env
+# ---------------------------------------------------------------------------
+
+
+class TestCliExportEnv:
+    def test_export_env_prints_only_assignment(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--export-env"])
+        out = capsys.readouterr().out.strip()
+        assert rc == 0
+        # One line, exactly the documented shape.
+        assert out == f"{FREE_LIMIT_ENV_VAR}=38"
+        # No env mutation, no log row.
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+    def test_export_env_no_actionable_returns_zero(
+        self,
+        restore_free_limit_env,
+        tmp_path: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        rc = ex.main([
+            "--export-env",
+            "--upgrade-path", str(tmp_path / "absent.jsonl"),
+            "--share-path", str(tmp_path / "absent.jsonl"),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        # Comment-style no-op; safe to paste into a shell.
+        assert out.startswith("#")
+        assert "no actionable" in out
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+    def test_export_env_json(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--export-env", "--json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert set(parsed.keys()) == _REQUIRED_ARTIFACT_KEYS
+        assert parsed["mode"] == MODE_EXPORT_ENV
+        assert parsed["new_value"] == 38
+        assert parsed["rollback_value"] == 50
+        assert parsed["export_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=38"
+        )
+        assert parsed["rollback_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=50"
+        )
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: --rollback
+# ---------------------------------------------------------------------------
+
+
+class TestCliRollback:
+    def test_rollback_prints_only_previous_value(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--rollback"])
+        out = capsys.readouterr().out.strip()
+        assert rc == 0
+        # Rollback target = previous_value (50 default).
+        assert out == f"{FREE_LIMIT_ENV_VAR}=50"
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+    def test_rollback_json(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--rollback", "--json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["mode"] == MODE_ROLLBACK
+        assert parsed["rollback_value"] == 50
+        # Same envelope shape, same fields, same values.
+        assert parsed["new_value"] == 38
+        assert parsed["rollback_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=50"
+        )
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+    def test_rollback_no_actionable(
+        self,
+        restore_free_limit_env,
+        tmp_path: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        rc = ex.main([
+            "--rollback",
+            "--upgrade-path", str(tmp_path / "absent.jsonl"),
+            "--share-path", str(tmp_path / "absent.jsonl"),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        assert out.startswith("#")
+        assert "no actionable" in out
+        assert _read_log(execution_log) == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: --rollout-plan
+# ---------------------------------------------------------------------------
+
+
+class TestCliRolloutPlan:
+    def test_rollout_plan_text_contains_required_sections(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--rollout-plan"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "OPERATOR ROLLOUT PLAN" in out
+        assert REC_TIGHTEN_FREE_LIMIT in out
+        assert FREE_LIMIT_ENV_VAR in out
+        assert "previous_value : 50" in out
+        assert "new_value      : 38" in out
+        assert "rollback_value : 50" in out
+        assert (
+            f"monitoring     : {ROLLOUT_MONITORING_WINDOW_DAYS} days" in out
+        )
+        # The six numbered steps must all be visible.
+        for n in range(1, 7):
+            assert f"{n}." in out
+        # Shell helpers must be on screen for copy/paste.
+        assert f"export {FREE_LIMIT_ENV_VAR}=38" in out
+        assert f"export {FREE_LIMIT_ENV_VAR}=50" in out
+        # Spec-required activities must each be referenced.
+        assert "launch_check --smoke" in out
+        assert "growth_intel" in out
+        # No env mutation, no log row.
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+    def test_rollout_plan_json(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--rollout-plan", "--json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        # Stable envelope shape.
+        assert set(parsed.keys()) == _REQUIRED_ARTIFACT_KEYS
+        assert parsed["mode"] == MODE_ROLLOUT_PLAN
+        # Six steps are present and numbered.
+        steps = parsed["rollout_steps"]
+        assert len(steps) == 6
+        for idx, step in enumerate(steps, start=1):
+            assert step.startswith(f"{idx}.")
+        # Forward + rollback shell helpers carry the documented form.
+        assert parsed["export_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=38"
+        )
+        assert parsed["rollback_command"] == (
+            f"export {FREE_LIMIT_ENV_VAR}=50"
+        )
+        # No side effects.
+        assert FREE_LIMIT_ENV_VAR not in os.environ
+        assert _read_log(execution_log) == []
+
+    def test_rollout_plan_no_actionable_human_readable(
+        self,
+        restore_free_limit_env,
+        tmp_path: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        rc = ex.main([
+            "--rollout-plan",
+            "--upgrade-path", str(tmp_path / "absent.jsonl"),
+            "--share-path", str(tmp_path / "absent.jsonl"),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "OPERATOR ROLLOUT PLAN" in out
+        assert "no actionable recommendation" in out
+        assert _read_log(execution_log) == []
+
+
+# ---------------------------------------------------------------------------
+# Mutual exclusion + interaction with --apply
+# ---------------------------------------------------------------------------
+
+
+class TestRolloutFlagsMutualExclusion:
+    def test_export_env_and_apply_are_mutually_exclusive(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        capsys,
+    ):
+        with pytest.raises(SystemExit):
+            ex.main(["--apply", "--export-env"])
+
+    def test_rollback_and_rollout_plan_are_mutually_exclusive(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        capsys,
+    ):
+        with pytest.raises(SystemExit):
+            ex.main(["--rollback", "--rollout-plan"])
+
+    def test_force_alone_without_apply_prints_help(
+        self,
+        restore_free_limit_env,
+        capsys,
+    ):
+        rc = ex.main(["--force"])
+        assert rc == 2
+
+    def test_existing_apply_force_path_unchanged(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+        capsys,
+    ):
+        """Phase 11.1 must not regress the Phase 11 --apply --force
+        behaviour: env mutation + audit-log row."""
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = ex.main(["--apply", "--force"])
+        assert rc == 0
+        assert os.environ[FREE_LIMIT_ENV_VAR] == "38"
+        rows = _read_log(execution_log)
+        assert len(rows) == 1
+        assert rows[0]["outcome"] == OUTCOME_APPLIED
+
+
+# ---------------------------------------------------------------------------
+# Leak-guard: rollout artifacts never carry api_key_hash content.
+# ---------------------------------------------------------------------------
+
+
+class TestRolloutArtifactNoLeak:
+    def test_no_raw_marker_or_hash_in_artifact(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+    ):
+        marker = "RAW_API_KEY_PHASE_11_1_DO_NOT_LEAK"
+        h = _hash(marker)
+        # Plant the marker hash deep in the seed funnel.
+        upgrade_log.parent.mkdir(parents=True, exist_ok=True)
+        upgrade_log.write_text("\n".join([
+            json.dumps({
+                "timestamp": "2026-04-25T12:00:00Z",
+                "api_key_hash": h, "event": EVENT_UPGRADE_SHOWN,
+                "tier": "free", "request_id": None,
+                "reason": "usage_limit",
+                "endpoint": "/reports/latest",
+            }),
+            json.dumps({
+                "timestamp": "2026-04-25T12:01:00Z",
+                "api_key_hash": h, "event": EVENT_UPGRADE_COMPLETED,
+                "tier": "free", "request_id": None,
+                "reason": "usage_limit",
+                "endpoint": "/reports/latest",
+            }),
+        ]) + "\n", encoding="utf-8")
+        share_log.parent.mkdir(parents=True, exist_ok=True)
+        share_log.write_text("", encoding="utf-8")
+
+        for mode in (MODE_EXPORT_ENV, MODE_ROLLBACK, MODE_ROLLOUT_PLAN):
+            plan = plan_action(
+                pick_actionable(load_recommendations()),
+            )
+            art = build_operator_artifact(plan, mode=mode)
+            rendered = json.dumps(art, default=str)
+            assert marker not in rendered
+            assert h not in rendered
+            # The rendered text formats also must not surface the
+            # hash.
+            text_renderer = {
+                MODE_EXPORT_ENV: format_export_env_text,
+                MODE_ROLLBACK: format_rollback_text,
+                MODE_ROLLOUT_PLAN: format_rollout_plan_text,
+            }[mode]
+            assert marker not in text_renderer(art)
+            assert h not in text_renderer(art)
+
+    def test_rollout_artifacts_do_not_write_action_log(
+        self,
+        restore_free_limit_env,
+        upgrade_log: Path,
+        share_log: Path,
+        execution_log: Path,
+    ):
+        """Triple-check: across every Phase 11.1 mode the action
+        log stays empty even after building a real artifact end-
+        to-end."""
+        _seed_strong_funnel(upgrade_log, share_log)
+        for mode_arg in (
+            "--export-env", "--rollback", "--rollout-plan",
+        ):
+            ex.main([mode_arg])
+            ex.main([mode_arg, "--json"])
+        assert _read_log(execution_log) == []
+        assert FREE_LIMIT_ENV_VAR not in os.environ

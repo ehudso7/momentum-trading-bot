@@ -635,6 +635,236 @@ def format_status_text(status: dict, *, force: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase 11.1 — Operator rollout artifacts
+# ---------------------------------------------------------------------------
+#
+# Three additional CLI surfaces produce *operator-facing* artifacts
+# without any side effects: ``--export-env`` prints the bare env
+# assignment for the planned action; ``--rollback`` prints the bare
+# env assignment that reverts to the previous value; ``--rollout-plan``
+# prints a numbered checklist that walks the operator through a
+# safe production rollout.
+#
+# Every artifact is a pure function of the planner output:
+#   * no env mutation,
+#   * no audit-log row,
+#   * no Railway / Stripe / network call.
+#
+# When combined with ``--json``, all three modes emit the SAME
+# envelope shape (with a ``mode`` discriminator) so downstream
+# tooling can branch deterministically.
+
+#: Stable mode tags exposed in the JSON envelope under ``"mode"``.
+#: Operators / dashboards can pin against these strings.
+MODE_EXPORT_ENV = "export_env"
+MODE_ROLLBACK = "rollback"
+MODE_ROLLOUT_PLAN = "rollout_plan"
+
+VALID_ROLLOUT_MODES: frozenset[str] = frozenset({
+    MODE_EXPORT_ENV,
+    MODE_ROLLBACK,
+    MODE_ROLLOUT_PLAN,
+})
+
+#: Operator-facing monitoring window, surfaced in the rollout plan.
+ROLLOUT_MONITORING_WINDOW_DAYS = 7
+
+
+def _shell_assignment(env_var: str, value: object) -> str:
+    """``KEY=VALUE`` — bare shell-compatible assignment. Values are
+    always integers in this layer, so no quoting is required."""
+    return f"{env_var}={value}"
+
+
+def _shell_export(env_var: str, value: object) -> str:
+    """``export KEY=VALUE`` — explicit ``export`` form for shell
+    scripts that need the value to propagate to child processes."""
+    return f"export {env_var}={value}"
+
+
+def build_rollout_steps(plan: dict) -> list[str]:
+    """
+    Return the numbered operator checklist for a planned action.
+    Pure: same plan ⇒ same list.
+    """
+    env_var = plan.get("env_var", FREE_LIMIT_ENV_VAR)
+    new_value = plan.get("new_value")
+    rollback_value = plan.get("previous_value")
+    return [
+        f"1. Review the recommendation "
+        f"(id={plan.get('recommendation_id', '?')}, "
+        f"priority={plan.get('priority', '?')}). "
+        f"Confirm the rationale still matches current funnel data via "
+        f"`python -m trading_bot.api.growth_intel --summary --recommend`.",
+        f"2. Set the env var on Railway (or your deployment "
+        f"env file): {_shell_assignment(env_var, new_value)}",
+        "3. Redeploy the API service so the new value is loaded by "
+        "every worker process.",
+        "4. Run `python -m trading_bot.api.launch_check --smoke` "
+        "against the deployed URL to confirm auth + reports + usage "
+        "still respond as expected.",
+        f"5. Monitor `python -m trading_bot.api.growth_intel "
+        f"--summary --recommend` for "
+        f"{ROLLOUT_MONITORING_WINDOW_DAYS} days. Watch the "
+        f"shown→clicked rate, clicked→completed rate, and overall "
+        f"conversion rate.",
+        f"6. Roll back if click-through or conversion drops: "
+        f"{_shell_assignment(env_var, rollback_value)} "
+        f"and redeploy.",
+    ]
+
+
+def build_operator_artifact(
+    plan: Optional[dict],
+    *,
+    mode: str,
+) -> dict:
+    """
+    Compose the documented Phase 11.1 envelope from a planner
+    output. ``mode`` must be one of ``VALID_ROLLOUT_MODES``.
+
+    Returns the envelope shape used by the JSON output of
+    ``--export-env``, ``--rollback``, and ``--rollout-plan``::
+
+        {
+          "mode":              "export_env" | "rollback" | "rollout_plan",
+          "recommendation_id": str | None,
+          "priority":          str | None,
+          "action":            str | None,
+          "env_var":           str | None,
+          "previous_value":    int | None,
+          "new_value":         int | None,
+          "rollback_value":    int | None,
+          "export_command":    "export KEY=VALUE" | None,
+          "rollback_command":  "export KEY=VALUE" | None,
+          "rollout_steps":     [str, ...] | [],
+          "monitoring_window_days": int,
+          "actionable":        bool,
+        }
+
+    When ``plan`` is None (no actionable recommendation), every
+    plan-derived field is ``None`` and ``rollout_steps`` is ``[]``.
+    The caller (CLI or programmatic) is expected to treat
+    ``actionable=False`` as a no-op.
+    """
+    if mode not in VALID_ROLLOUT_MODES:
+        raise ValueError(
+            f"unknown operator rollout mode {mode!r} — "
+            f"expected one of {sorted(VALID_ROLLOUT_MODES)}"
+        )
+
+    if plan is None:
+        return {
+            "mode": mode,
+            "recommendation_id": None,
+            "priority": None,
+            "action": None,
+            "env_var": None,
+            "previous_value": None,
+            "new_value": None,
+            "rollback_value": None,
+            "export_command": None,
+            "rollback_command": None,
+            "rollout_steps": [],
+            "monitoring_window_days": ROLLOUT_MONITORING_WINDOW_DAYS,
+            "actionable": False,
+        }
+
+    env_var = plan.get("env_var")
+    new_value = plan.get("new_value")
+    previous_value = plan.get("previous_value")
+    return {
+        "mode": mode,
+        "recommendation_id": plan.get("recommendation_id"),
+        "priority": plan.get("priority"),
+        "action": plan.get("action"),
+        "env_var": env_var,
+        "previous_value": previous_value,
+        "new_value": new_value,
+        "rollback_value": previous_value,
+        "export_command": _shell_export(env_var, new_value)
+            if env_var is not None and new_value is not None
+            else None,
+        "rollback_command": _shell_export(env_var, previous_value)
+            if env_var is not None and previous_value is not None
+            else None,
+        "rollout_steps": build_rollout_steps(plan),
+        "monitoring_window_days": ROLLOUT_MONITORING_WINDOW_DAYS,
+        "actionable": True,
+    }
+
+
+def format_export_env_text(artifact: dict) -> str:
+    """Bare shell-compatible env assignment, plus a no-op stderr-
+    style comment when nothing is actionable."""
+    if not artifact.get("actionable"):
+        return (
+            "# no actionable recommendation — "
+            "nothing to export."
+        )
+    return _shell_assignment(
+        artifact["env_var"], artifact["new_value"],
+    )
+
+
+def format_rollback_text(artifact: dict) -> str:
+    """Bare shell-compatible rollback assignment."""
+    if not artifact.get("actionable"):
+        return (
+            "# no actionable recommendation — "
+            "nothing to roll back."
+        )
+    return _shell_assignment(
+        artifact["env_var"], artifact["rollback_value"],
+    )
+
+
+def format_rollout_plan_text(artifact: dict) -> str:
+    """Render the operator checklist as plain text."""
+    bar = "=" * 72
+    lines: list[str] = []
+    lines.append(bar)
+    lines.append("OPERATOR ROLLOUT PLAN")
+    lines.append(bar)
+
+    if not artifact.get("actionable"):
+        lines.append(
+            "no actionable recommendation — Phase 10.5 returned "
+            "no rule the execution layer can apply mechanically. "
+            "Nothing to roll out."
+        )
+        lines.append(bar)
+        return "\n".join(lines)
+
+    lines.append(
+        f"recommendation : {artifact.get('recommendation_id', '?')} "
+        f"[{str(artifact.get('priority', '?')).upper()}]"
+    )
+    lines.append(f"action         : {artifact.get('action', '?')}")
+    lines.append(f"env_var        : {artifact.get('env_var', '?')}")
+    lines.append(f"previous_value : {artifact.get('previous_value', '?')}")
+    lines.append(f"new_value      : {artifact.get('new_value', '?')}")
+    lines.append(f"rollback_value : {artifact.get('rollback_value', '?')}")
+    lines.append(
+        f"monitoring     : "
+        f"{artifact.get('monitoring_window_days', '?')} days"
+    )
+    lines.append("")
+    lines.append("Steps:")
+    for step in artifact.get("rollout_steps", []) or []:
+        lines.append(f"  {step}")
+    lines.append("")
+    lines.append("Shell helpers (copy/paste):")
+    if artifact.get("export_command"):
+        lines.append(f"  {artifact['export_command']}")
+    if artifact.get("rollback_command"):
+        lines.append(f"  # rollback")
+        lines.append(f"  {artifact['rollback_command']}")
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -648,15 +878,54 @@ def _build_parser() -> argparse.ArgumentParser:
             "Read-only by default; pass --force to mutate the live "
             "env var and append one row to the action log. The "
             "free-tier limit is the only knob the layer is willing "
-            "to touch."
+            "to touch. Phase 11.1 adds three operator-rollout "
+            "modes (--export-env / --rollback / --rollout-plan) "
+            "that emit shell-pasteable artifacts without any side "
+            "effect."
         ),
     )
-    parser.add_argument(
+    # --apply / --export-env / --rollback / --rollout-plan are
+    # mutually exclusive — each is a different "what does this
+    # invocation do?" mode. ``required=True`` keeps the no-args
+    # path printing help and exiting 2 (existing contract).
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--apply", action="store_true",
         help=(
             "Plan + (in dry-run) print the proposed action. "
-            "Required: without --apply the CLI prints help and "
-            "exits 2."
+            "Combine with --force to actually mutate "
+            "$TRADING_FREE_DAILY_REQUEST_LIMIT in the current "
+            "process and append one row to the action log."
+        ),
+    )
+    mode_group.add_argument(
+        "--export-env", action="store_true",
+        dest="export_env",
+        help=(
+            "Phase 11.1 — print the shell-compatible env "
+            "assignment for the planned action (e.g. "
+            "``TRADING_FREE_DAILY_REQUEST_LIMIT=38``). Does not "
+            "apply, does not write the action log."
+        ),
+    )
+    mode_group.add_argument(
+        "--rollback", action="store_true",
+        help=(
+            "Phase 11.1 — print the shell-compatible rollback "
+            "env assignment (sets the var back to its previous "
+            "value). Does not apply, does not write the action "
+            "log."
+        ),
+    )
+    mode_group.add_argument(
+        "--rollout-plan", action="store_true",
+        dest="rollout_plan",
+        help=(
+            "Phase 11.1 — print an operator checklist that walks "
+            "the rollout: review recommendation, set env var on "
+            "Railway, redeploy, run launch_check --smoke, monitor "
+            "growth_intel for 7 days, and the rollback command. "
+            "Does not apply, does not write the action log."
         ),
     )
     parser.add_argument(
@@ -664,12 +933,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Combined with --apply, actually mutate "
             "$TRADING_FREE_DAILY_REQUEST_LIMIT in the current "
-            "process and append one row to the action log."
+            "process and append one row to the action log. "
+            "Ignored by --export-env / --rollback / --rollout-plan."
         ),
     )
     parser.add_argument(
         "--json", action="store_true",
-        help="Emit a JSON status dict instead of plain text.",
+        help=(
+            "Emit JSON instead of plain text. With --apply, the "
+            "JSON is the action-status dict; with the Phase 11.1 "
+            "rollout modes, the JSON is the documented operator "
+            "envelope."
+        ),
     )
     parser.add_argument(
         "--upgrade-path", default=None,
@@ -702,9 +977,51 @@ def _exit_code_for(outcome: str) -> int:
     return 3
 
 
+def _resolve_plan_for_rollout(
+    *,
+    upgrade_path: Optional[str],
+    share_path: Optional[str],
+) -> Optional[dict]:
+    """Shared helper — load + pick + plan in one call. Pure: no
+    env mutation, no log write."""
+    recommendations = load_recommendations(
+        upgrade_path=upgrade_path,
+        share_path=share_path,
+    )
+    return plan_action(pick_actionable(recommendations))
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # Phase 11.1 — operator rollout modes never mutate anything.
+    rollout_mode: Optional[str] = None
+    if args.export_env:
+        rollout_mode = MODE_EXPORT_ENV
+    elif args.rollback:
+        rollout_mode = MODE_ROLLBACK
+    elif args.rollout_plan:
+        rollout_mode = MODE_ROLLOUT_PLAN
+
+    if rollout_mode is not None:
+        plan = _resolve_plan_for_rollout(
+            upgrade_path=args.upgrade_path,
+            share_path=args.share_path,
+        )
+        artifact = build_operator_artifact(plan, mode=rollout_mode)
+        if args.json:
+            print(json.dumps(
+                artifact, indent=2, sort_keys=False, default=str,
+            ))
+        else:
+            if rollout_mode == MODE_EXPORT_ENV:
+                print(format_export_env_text(artifact))
+            elif rollout_mode == MODE_ROLLBACK:
+                print(format_rollback_text(artifact))
+            else:
+                print(format_rollout_plan_text(artifact))
+        return 0
 
     if not args.apply:
         parser.print_help()

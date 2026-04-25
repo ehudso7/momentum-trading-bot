@@ -3940,6 +3940,95 @@ log is never touched, even on rejection.
   any automatic action.
 
 
+### Phase 11.1 — operator rollout plan
+
+Phase 11 mutates the live ``os.environ`` only inside the calling
+Python process — convenient for testing, useless for a rolling
+restart. Phase 11.1 makes the same execution layer **operationally
+usable** by adding three CLI surfaces that emit shell-pasteable
+operator artifacts. None of them touch Railway, mutate
+infrastructure, write the action log, or change ``os.environ``.
+
+**The three modes**
+
+| Flag              | Stdout (text)                                                        | JSON envelope mode  |
+|-------------------|----------------------------------------------------------------------|---------------------|
+| ``--export-env``  | ``KEY=VALUE`` for the planned new value (one line, copy/paste).      | ``"export_env"``    |
+| ``--rollback``    | ``KEY=VALUE`` for the previous value (one line, copy/paste).         | ``"rollback"``      |
+| ``--rollout-plan``| Numbered 6-step operator checklist + shell helpers.                  | ``"rollout_plan"``  |
+
+When no actionable recommendation is available, ``--export-env``
+and ``--rollback`` print a ``# no actionable recommendation`` shell
+comment so the line is still safe to paste into a script.
+``--rollout-plan`` prints a human-readable explanation under the
+same banner header.
+
+**Operator workflow**
+
+::
+
+    # 1. Inspect what would change (no side effects).
+    python -m trading_bot.api.execution --rollout-plan
+
+    # 2. Grab the env assignment for the deploy.
+    NEW=$(python -m trading_bot.api.execution --export-env)
+    echo "$NEW"
+    # → TRADING_FREE_DAILY_REQUEST_LIMIT=38
+
+    # 3. Set the var on Railway (or your deployment env file)
+    #    and redeploy.
+
+    # 4. Smoke the deployed URL.
+    python -m trading_bot.api.launch_check --smoke
+
+    # 5. Monitor for 7 days.
+    python -m trading_bot.api.growth_intel --summary --recommend
+
+    # 6. If click-through or conversion drops, paste the rollback:
+    python -m trading_bot.api.execution --rollback
+    # → TRADING_FREE_DAILY_REQUEST_LIMIT=50
+    # … then redeploy.
+
+**JSON envelope** (used by ``--export-env --json``,
+``--rollback --json``, and ``--rollout-plan --json``)::
+
+    {
+      "mode":                  "export_env" | "rollback" | "rollout_plan",
+      "recommendation_id":     "tighten_free_limit" | null,
+      "priority":              "high" | "medium" | "low" | null,
+      "action":                "set_free_limit" | null,
+      "env_var":               "TRADING_FREE_DAILY_REQUEST_LIMIT" | null,
+      "previous_value":        int | null,
+      "new_value":             int | null,
+      "rollback_value":        int | null,
+      "export_command":        "export KEY=VALUE" | null,
+      "rollback_command":      "export KEY=VALUE" | null,
+      "rollout_steps":         [str, ...],
+      "monitoring_window_days": 7,
+      "actionable":            bool
+    }
+
+The shape is **stable across all three modes** — only ``mode``
+varies — so a downstream consumer can branch on the discriminator
+and read the same fields. ``actionable=False`` indicates the
+no-op shape (every plan-derived field is ``null`` and
+``rollout_steps`` is ``[]``).
+
+**Boundary** (Phase 11 invariants preserved)
+
+* No new HTTP route, no Railway / Stripe / network call.
+* ``--export-env`` / ``--rollback`` / ``--rollout-plan`` are
+  mutually exclusive with each other AND with ``--apply``;
+  argparse rejects any combination.
+* ``--force`` is ignored by the rollout modes.
+* No ``api_key_hash`` field on any rollout artifact, even when
+  the underlying funnel data was driven by hashed users; pinned
+  by ``tests/test_api_execution.py::TestRolloutArtifactNoLeak``.
+* Existing Phase 11 ``--apply`` / ``--apply --force`` behaviour
+  is byte-identical; pinned by
+  ``test_existing_apply_force_path_unchanged``.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
