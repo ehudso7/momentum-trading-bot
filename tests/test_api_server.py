@@ -8869,3 +8869,322 @@ class TestPhase84FunnelLoggingFailureDoesNotBreakRequest:
         # The 429 still comes back even though the funnel writer raised.
         assert r.status_code == 429
         assert r.json()["detail"]
+
+
+# ===========================================================================
+# Phase 9.1 — insight layer (integration with /reports/latest + /dashboard)
+# ===========================================================================
+
+
+def _phase91_full_report_dict(date: str, *, buy_rows: int = 30) -> dict:
+    """Daily report carrying every field the Phase 9.1 rules consume."""
+    return {
+        "report_type": "daily_alpha_validation",
+        "report_date": date,
+        "scorer_fingerprint": "f" * 64,
+        "totals": {
+            "alpha_rows": 100, "buy_rows": buy_rows, "skip_rows": 70,
+        },
+        "promotion_readiness": {
+            "ready": False, "consecutive_passing_days": 5,
+        },
+        "regime_stats": {
+            "trending": {"hits": 12},
+            "choppy": {"hits": 3},
+        },
+        # Premium-only deep stats — keep them populated so we can also
+        # verify the free projection still drops them.
+        "tier_stats": {"A": {"count": 5}},
+        "reason_stats": {"alpha_filter_blocked:tier=D:min=B": 3},
+        "decile_stats": [{"decile": 1, "n": 10}],
+        "shadow_filter_simulation": [{"row_id": "x", "would_block": False}],
+        "guardrails": {"any_critical": False, "warnings": []},
+        "sources": {
+            "alpha_scores": {
+                "exists": True, "rows": 100, "resolved_files": 1,
+            },
+        },
+    }
+
+
+def _write_phase91_report(reports_dir: Path, date: str, *, buy_rows: int = 30) -> Path:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    target = reports_dir / f"alpha_report_{date}.json"
+    target.write_text(
+        json.dumps(_phase91_full_report_dict(date, buy_rows=buy_rows)),
+        encoding="utf-8",
+    )
+    return target
+
+
+@pytest.fixture
+def phase91_env(monkeypatch, tmp_path: Path):
+    """Manifest-backed deployment with a populated reports dir.
+    Phase 9.1 tests only care about the response shape, not Stripe."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+def _issue_phase91_key(tier: str = "free") -> tuple[str, str]:
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=f"phase91-{tier}")
+    return result["api_key"], result["key_hash"]
+
+
+def _promote_phase91_to_premium(
+    raw: str, key_hash: str, monkeypatch, tmp_path: Path,
+):
+    from trading_bot.api import billing
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase91")
+    monkeypatch.setenv(
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        str(tmp_path / "stripe_cache_phase91.json"),
+    )
+    billing.reset_cache_for_tests()
+    billing.handle_webhook_event({
+        "type": "customer.subscription.created",
+        "data": {"object": {
+            "status": "active",
+            "metadata": {"key_hash": key_hash},
+        }},
+    })
+    billing.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# /reports/latest — insights attached
+# ---------------------------------------------------------------------------
+
+
+class TestPhase91ReportsLatestInsightsPremium:
+    def test_premium_gets_full_insight_list(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant 2 reports so the trend rule has something to compare.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "insights" in body
+        ids = [e["id"] for e in body["insights"]]
+        # All three rules fire because the report has all three fields.
+        assert ids == [
+            "trend.buy_delta", "promotion.readiness", "regime.dominant",
+        ]
+        trend = body["insights"][0]
+        # Premium evidence carries the deep fields.
+        assert "curr_buy_rows" in trend["evidence"]
+        assert "prev_buy_rows" in trend["evidence"]
+        assert "percent_change" in trend["evidence"]
+
+
+class TestPhase91ReportsLatestInsightsFree:
+    def test_free_gets_at_most_two_insights(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tier"] == "free"
+        assert "insights" in body
+        assert len(body["insights"]) <= 2
+        # Evidence on the free trend insight is trimmed to the
+        # documented allow-list (no curr/prev/percent fields).
+        trend = [
+            e for e in body["insights"]
+            if e["id"] == "trend.buy_delta"
+        ][0]
+        assert set(trend["evidence"].keys()) == {"delta", "direction"}
+
+    def test_free_insight_schema_complete(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        for entry in body["insights"]:
+            assert set(entry.keys()) == {
+                "id", "title", "summary", "confidence",
+                "severity", "evidence", "action",
+            }
+
+
+class TestPhase91ReportsLatestInsightsTrendPrev:
+    def test_trend_only_when_prev_exists(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant ONLY today — no prior-day report, so trend rule is skipped.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        ids = [e["id"] for e in body["insights"]]
+        assert "trend.buy_delta" not in ids
+        # The other two rules still fire.
+        assert "promotion.readiness" in ids
+        assert "regime.dominant" in ids
+
+
+class TestPhase91ReportsLatestNoLeak:
+    def test_raw_key_absent_from_insights_response(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in body_text
+
+
+# ---------------------------------------------------------------------------
+# /dashboard — insights rendered into HTML
+# ---------------------------------------------------------------------------
+
+
+class TestPhase91DashboardInsights:
+    def test_premium_dashboard_renders_insights_section(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Section header is present.
+        assert "<h2>Insights</h2>" in html
+        # All three insight titles surface for premium.
+        assert "Buy volume up vs prior day" in html
+        assert "Promotion readiness" in html
+        assert "Dominant regime" in html
+
+    def test_free_dashboard_renders_at_most_two_insights(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Two list items in the Insights section (trend + readiness).
+        # The third rule (regime) is dropped by FREE_INSIGHT_LIMIT=2.
+        assert "<h2>Insights</h2>" in html
+        # Tally insights by counting the per-entry CSS class.
+        n_insights = html.count('class="insight insight-')
+        assert n_insights == 2
+
+    def test_dashboard_no_insights_section_when_no_report(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # No reports planted → insights list empty → section absent.
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert "<h2>Insights</h2>" not in html
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting invariants
+# ---------------------------------------------------------------------------
+
+
+class TestPhase91CrossCutting:
+    def test_no_new_mutating_route(self):
+        """Phase 9.1 is helper code — no new HTTP routes."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 9.1 leaked a mutating route: {m} {path}"
+                )
+
+    def test_usage_enforcement_still_applies(
+        self, client: TestClient, phase91_env, monkeypatch,
+    ):
+        """The new insights field MUST NOT silence the Phase 8.1
+        429 enforcement."""
+        raw, key_hash = _issue_phase91_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429

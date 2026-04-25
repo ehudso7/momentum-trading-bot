@@ -3246,6 +3246,105 @@ entrypoint.
   (``TRADING_API_UPGRADE_EVENTS_LOG_PATH``) are unchanged.
 
 
+### Phase 9.1 — insight layer
+
+A small, deterministic insight builder that decorates the existing
+``/reports/latest`` JSON and the ``/dashboard`` HTML with an
+``insights`` field. Pure function — same inputs always produce the
+same outputs; no Stripe / network / time-of-day side effects.
+
+**Module**
+
+``trading_bot/api/insights.py`` — pure stdlib, imports nothing
+from FastAPI / structlog / the rest of ``trading_bot``. Two
+public entry points:
+
+```python
+build_insights(report, prev_report=None) -> list[dict]
+truncate_for_free(insights, *, max_count=FREE_INSIGHT_LIMIT) -> list[dict]
+```
+
+**Insight schema** (every entry conforms)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``id``         | ``str``                            | one of ``KNOWN_INSIGHT_IDS`` |
+| ``title``      | ``str``                            | one-line headline |
+| ``summary``    | ``str``                            | 1-2 sentence explanation |
+| ``confidence`` | ``float``                          | clamped to ``[0.0, 1.0]`` |
+| ``severity``   | ``"info"`` / ``"warn"`` / ``"critical"`` | ops attention level |
+| ``evidence``   | ``dict``                           | rule-specific supporting numbers |
+| ``action``     | ``str``                            | next-step hint for the operator |
+
+**Three deterministic rules**
+
+| ID                       | When it fires | Severity | Confidence basis |
+|---|---|---|---|
+| ``trend.buy_delta``      | both reports have ``totals.buy_rows`` | ``info``, or ``warn`` when buys drop ≥ 50% vs prior day | ``abs(delta) / prev`` clamped |
+| ``promotion.readiness``  | report has ``promotion_readiness`` | ``info`` when ready or building, ``warn`` when blocked | ``1.0`` ready / streak-scaled / ``0.8`` blocked |
+| ``regime.dominant``      | report has ``regime_stats`` with non-zero hits | ``info`` | dominance share |
+
+The output list is ordered ``[trend, readiness, regime]`` — fixed
+regardless of the input report. Rules with insufficient data
+silently drop themselves.
+
+**Tier-aware projection**
+
+* Premium → full ``insights`` list with full ``evidence`` per
+  entry.
+* Free → at most ``FREE_INSIGHT_LIMIT`` (``= 2``) entries; each
+  surviving entry's ``evidence`` is projected through a per-rule
+  allow-list:
+
+  | ID                       | Free-tier evidence keys |
+  |---|---|
+  | ``trend.buy_delta``      | ``delta``, ``direction`` |
+  | ``promotion.readiness``  | ``ready`` |
+  | ``regime.dominant``      | ``regime`` |
+
+  Insights with an unrecognised ``id`` are dropped entirely
+  (fail-closed for future rules without an allow-list).
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — best-effort prior-day load (falls
+  back to ``None`` on missing / parse error), then
+  ``build_insights`` → tier-aware truncation → ``insights`` field
+  on the response. Free response also still carries the
+  ``upgrade`` envelope (Phase 8.3) when Stripe is configured.
+* ``GET /dashboard`` — same prior-day load, same insights compute,
+  threaded through ``render_dashboard_html`` as a new optional
+  ``insights`` kwarg. Renderer adds an "Insights" ``<section>`` of
+  ``<li>`` entries with severity-tagged CSS classes
+  (``insight-info`` / ``insight-warn`` / ``insight-critical``).
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any insight or in any rendered HTML. Pinned by
+  ``TestPhase91ReportsLatestNoLeak::test_raw_key_absent_from_insights_response``.
+* The rule helpers consume only the sanitised report (Phase 4.0
+  ``_sanitize_report`` strips ``scorer_config`` / filesystem
+  paths). The insight layer cannot surface Core internals because
+  it can't see them.
+* Free tier truncation is mechanical — the allow-list lives next
+  to the rule definitions in ``insights.py`` so a new rule that
+  forgets its allow-list is dropped from free output.
+
+**Boundary**
+
+* No new HTTP route. Phase 9.1 is helper code wired into existing
+  routes / renderer. Pinned by
+  ``TestPhase91CrossCutting::test_no_new_mutating_route``.
+* No new logs. No new env vars.
+* Phase 8.1 / 8.2 / 8.3 / 8.4 still apply unchanged — the
+  ``insights`` field rides alongside the ``upgrade`` field, and a
+  429 from the usage layer short-circuits before the report
+  handler ever runs (so insights are simply not computed for
+  rate-limited requests).
+* Pure stdlib import — pinned by
+  ``tests/test_insights.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

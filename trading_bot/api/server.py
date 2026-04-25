@@ -68,6 +68,7 @@ from trading_bot.api.billing import (
     is_stripe_configured,
     verify_webhook_signature,
 )
+from trading_bot.api.insights import build_insights, truncate_for_free
 
 log = structlog.get_logger(__name__)
 
@@ -2577,6 +2578,12 @@ def latest_report(
     upgrade hint). The per-row stats, decile breakdowns, and
     shadow-filter simulation rows are part of the premium
     offering.
+
+    Phase 9.1 — both tiers also receive an ``insights`` list
+    derived from the latest report and (best-effort) the prior
+    day's report. Free callers receive at most
+    ``FREE_INSIGHT_LIMIT`` insights with evidence trimmed to the
+    documented allow-list.
     """
     reports = _reports_dir()
     if not reports.is_dir():
@@ -2591,9 +2598,26 @@ def latest_report(
             detail="no daily reports available",
         )
     data = _sanitize_report(_parse_report_file(candidates[-1]))
+    # Phase 9.1 — best-effort prior-day load. Any failure (missing
+    # file, parse error, sanitiser hiccup) yields ``None`` so the
+    # trend rule simply skips itself.
+    prev = None
+    if len(candidates) >= 2:
+        try:
+            prev = _sanitize_report(_parse_report_file(candidates[-2]))
+        except Exception as exc:
+            log.debug(
+                "reports_latest.prev_load_failed",
+                path=str(candidates[-2]), error=str(exc),
+            )
+            prev = None
+    insights = build_insights(data, prev)
+
     if _is_premium_user(request):
+        data["insights"] = insights
         return data
     free_body = _project_report_for_free(data)
+    free_body["insights"] = truncate_for_free(insights)
     upgrade = _build_upgrade_payload(
         request, reason="limited_access", required=False, is_premium=False,
     )
@@ -2957,12 +2981,46 @@ def _render_experiments(records: list[dict]) -> str:
     return f"<table>{header}{''.join(body)}</table>"
 
 
+def _render_insights_block(insights: Optional[list[dict]]) -> str:
+    """
+    Phase 9.1 — small dashboard section listing the precomputed
+    insights. Pure HTML; the caller has already truncated the
+    ``insights`` list to the appropriate tier.
+    """
+    if not insights:
+        return ""
+    items: list[str] = []
+    for entry in insights:
+        if not isinstance(entry, dict):
+            continue
+        title = _esc(str(entry.get("title", "")))
+        summary = _esc(str(entry.get("summary", "")))
+        action = _esc(str(entry.get("action", "")))
+        severity = _esc(str(entry.get("severity", "info")))
+        items.append(
+            f'<li class="insight insight-{severity}">'
+            f'<strong>{title}</strong>'
+            f'<p class="insight-summary">{summary}</p>'
+            f'<p class="insight-action">{action}</p>'
+            f"</li>"
+        )
+    if not items:
+        return ""
+    return (
+        "<section>"
+        "<h2>Insights</h2>"
+        f'<ul class="insights">{"".join(items)}</ul>'
+        "</section>"
+    )
+
+
 def render_dashboard_html(
     report: Optional[dict],
     experiments: list[dict],
     *,
     tier: str = TIER_PREMIUM,
     banner_copy: Optional[str] = None,
+    insights: Optional[list[dict]] = None,
 ) -> str:
     """
     Build the dashboard HTML from sanitized inputs.
@@ -3059,6 +3117,8 @@ def render_dashboard_html(
     else:
         free_tier_banner = ""
 
+    insights_block = _render_insights_block(insights)
+
     return (
         "<!DOCTYPE html>"
         "<html lang=\"en\"><head>"
@@ -3070,6 +3130,7 @@ def render_dashboard_html(
         f'<p class="meta">Read-only view. Generated at {generated_at}.</p>'
         f"{free_tier_banner}"
         f"{report_block}"
+        f"{insights_block}"
         f"{experiments_block}"
         "<footer>"
         "This dashboard is served by the Phase 4.0/4.1 SaaS boundary "
@@ -3106,6 +3167,7 @@ def dashboard(
     # Load latest report (best-effort — empty state wins on any error).
     report: Optional[dict] = None
     reports = _reports_dir()
+    prev_report: Optional[dict] = None
     if reports.is_dir():
         candidates = sorted(reports.glob("alpha_report_*.json"))
         if candidates:
@@ -3120,6 +3182,22 @@ def dashboard(
                 raw = None
             if isinstance(raw, dict):
                 report = _sanitize_report(raw)
+            # Phase 9.1 — best-effort prior-day load for the trend
+            # insight. Failure modes (missing / corrupt / unreadable)
+            # all collapse to ``None`` so the trend rule simply
+            # skips itself.
+            if len(candidates) >= 2:
+                try:
+                    prev_raw = json.loads(
+                        candidates[-2].read_text(encoding="utf-8"),
+                    )
+                    if isinstance(prev_raw, dict):
+                        prev_report = _sanitize_report(prev_raw)
+                except Exception as exc:
+                    log.debug(
+                        "dashboard.prev_report_load_failed",
+                        path=str(candidates[-2]), error=str(exc),
+                    )
 
     # Load last 10 experiments.
     records = _read_manifest_records(_manifest_path())
@@ -3127,6 +3205,10 @@ def dashboard(
 
     is_premium = _is_premium_user(request)
     tier = TIER_PREMIUM if is_premium else TIER_FREE
+    # Phase 9.1 — compute insights from the FULL report (before the
+    # free-tier projection trims regime_stats / etc.) so the rules
+    # see every signal. Truncation for free callers happens after.
+    insights = build_insights(report, prev_report) if report is not None else []
     # Phase 8.2 — when the caller is on the free tier, pass the
     # report through the same allow-list that gates /reports/latest
     # so the dashboard cannot accidentally surface the deep tier /
@@ -3134,6 +3216,8 @@ def dashboard(
     # offering. Premium callers see the full sanitised report.
     if not is_premium and report is not None:
         report = _project_report_for_free(report)
+    if not is_premium:
+        insights = truncate_for_free(insights)
     # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
     # string rendered to the user is also the one we hash into the
     # telemetry row. Premium users skip the resolver entirely (no
@@ -3141,6 +3225,7 @@ def dashboard(
     banner_copy = _upgrade_banner_copy() if tier == TIER_FREE else None
     html = render_dashboard_html(
         report, experiments, tier=tier, banner_copy=banner_copy,
+        insights=insights,
     )
     if tier == TIER_FREE:
         # Phase 5.5 + 5.8 — the banner is rendered in the HTML
