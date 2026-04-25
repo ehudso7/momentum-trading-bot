@@ -1080,6 +1080,100 @@ def _stats_cli(argv: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 7.2 — bulk revocation cleanup helper
+# ---------------------------------------------------------------------------
+
+
+def _build_revoke_many_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys revoke-many",
+        description=(
+            "Append one revocation row per --key-hash. Useful for "
+            "launch-day cleanup of test keys: pass every test hash "
+            "in one invocation. Duplicate hashes are accepted but "
+            "always materialise as 'revoked' on the read side."
+        ),
+    )
+    parser.add_argument(
+        "--key-hash", action="append", default=[], dest="key_hashes",
+        help=(
+            "SHA-256(api_key)[:32] hash to revoke. May be passed "
+            "multiple times. At least one is required."
+        ),
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional operator-facing free-text reason applied to "
+            "every revocation row in this batch (capped at "
+            f"{key_store.REVOCATION_REASON_MAX_LENGTH} chars)."
+        ),
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help=(
+            "Override the revocation log path "
+            f"(default: ${key_store.KEYS_REVOKED_ENV_VAR} or "
+            f"{key_store.DEFAULT_KEYS_REVOKED_PATH})."
+        ),
+    )
+    return parser
+
+
+def _revoke_many_cli(argv: list[str]) -> int:
+    args = _build_revoke_many_parser().parse_args(argv)
+
+    cleaned: list[str] = []
+    for raw in args.key_hashes:
+        h = (raw or "").strip()
+        if not h:
+            print(
+                "error: --key-hash entries must not be blank",
+                file=sys.stderr,
+            )
+            return 2
+        cleaned.append(h)
+    if not cleaned:
+        print(
+            "error: at least one --key-hash is required",
+            file=sys.stderr,
+        )
+        return 2
+
+    target = (
+        Path(args.revoked_path) if args.revoked_path else None
+    )
+
+    written: list[dict] = []
+    failed: list[tuple[str, str]] = []
+    for h in cleaned:
+        try:
+            record = key_store.append_revocation(
+                key_hash=h, reason=args.reason, target=target,
+            )
+            written.append(record)
+        except ValueError as exc:
+            failed.append((h, str(exc)))
+        except Exception as exc:  # noqa: BLE001 — operator-facing
+            failed.append((h, f"{type(exc).__name__}: {exc}"))
+
+    final_path = (
+        target if target is not None else key_store.revoked_path()
+    )
+    print("API key bulk revocation:")
+    print(f"  revoked_path  : {final_path}")
+    print(f"  reason        : {args.reason or '(none)'}")
+    print(f"  written       : {len(written)}")
+    for rec in written:
+        print(f"    - {rec['key_hash']}  at {rec['timestamp']}")
+    if failed:
+        print(f"  failed        : {len(failed)}")
+        for h, msg in failed:
+            print(f"    - {h}: {msg}")
+    return 0 if not failed else 1
+
+
 def _build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot.api.keys",
@@ -1094,6 +1188,11 @@ def _build_top_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "list",
         help="Inspect the manifest with optional tier / ref filters.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "revoke-many",
+        help="Append a revocation row for each --key-hash.",
         add_help=False,
     )
     subparsers.add_parser(

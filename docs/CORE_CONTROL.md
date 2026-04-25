@@ -2462,6 +2462,67 @@ configured. No new HTTP endpoint is added — the Stripe webhook
 already existed (`POST /webhook/stripe`, Phase 4.7).
 
 
+### Phase 7.1 — browser icon noise cleanup
+
+Browsers auto-request `/favicon.ico`, `/apple-touch-icon.png`, and
+`/apple-touch-icon-precomposed.png` on every page view. We do not
+ship icon assets, so those requests would otherwise 404 and bloat
+the audit log. Three explicit routes return `204 No Content` with
+no body, no auth required, and the standard security-header set
+still applied. The icon paths are added to both
+`_FREE_TIER_EXEMPT_PATHS` and `_PUBLIC_PATHS_NO_USAGE` so a browser
+that refreshes a page 100 times cannot consume free-tier quota or
+pollute per-key usage metrics. Pinned by
+`tests/test_api_server.py::TestPhase71IconRoutes`.
+
+
+### Phase 7.2 — production launch lockdown
+
+Hardening + verification + cleanup wrapped in one phase so a real
+launch can ship safely.
+
+**1. `railway.toml` is locked.** The production start command
+`chmod -R 777 /app/data || true && uvicorn trading_bot.api.server:app
+--host 0.0.0.0 --port 8080` is fixed in the repo and pinned by
+`tests/test_launch_check.py::TestRailwayTomlLockdown`. The toml file
+must NOT invoke `keys issue` / `revoke` / `list` at boot — issuance
+remains operator-only.
+
+**2. `python -m trading_bot.api.launch_check`** is a pure-stdlib
+operator CLI that verifies the deployment is launch-ready: every
+required env var is set, paths are writable, and nothing points at
+`/tmp` (rejected unless `--allow-tmp`) or repo-local `data/`
+(rejected when `RAILWAY_ENVIRONMENT` is set). Returns exit 0 + prints
+`READY` on success, exit 1 + `NOT READY` on any failure. JSON output
+via `--json`.
+
+**3. `python -m trading_bot.api.launch_check --smoke ...`** combines
+the env check with the Phase 6.5 HTTP smoke runner — same six
+checks (public landing, health, 401, 403/503, 200/404, dashboard).
+The supplied `--api-key` is hashed in-process; the raw value never
+appears in any output. The smoke runner is injectable so the
+combined wrapper is fully unit-testable without real network IO.
+
+**4. `python -m trading_bot.api.keys revoke-many --key-hash H ...`**
+appends one revocation row per `--key-hash`. Useful for launch-day
+cleanup when several test keys need to be invalidated at once.
+Duplicates are accepted; the read side (`list`, `show`) deduplicates
+into "revoked = yes". The CLI accepts ONLY pre-hashed values so an
+operator cannot accidentally land a raw key on disk via this path.
+
+**5. Launch Day Checklist** — the full operator runbook lives in
+[`DEPLOYMENT.md`](DEPLOYMENT.md) ("Launch Day Checklist" section).
+Eight steps: lock `railway.toml`, set Railway env vars, issue real
+keys from the Railway shell, revoke test keys, run `launch_check`,
+run `launch_check --smoke`, wire Stripe AFTER auth passes,
+hand-deliver keys securely.
+
+**No new public endpoints.** Phase 7.2 adds three CLIs and zero
+HTTP routes. The only mutating route in the entire app remains
+`POST /webhook/stripe` — pinned by
+`tests/test_launch_check.py::TestNoNewPublicEndpoints`.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
