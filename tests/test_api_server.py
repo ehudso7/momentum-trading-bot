@@ -6445,3 +6445,106 @@ class TestPhase70NoRawKeyInStripeCache:
             "Phase 7.0: raw api_key must never appear in the Stripe cache"
         )
         assert issued["key_hash"] in body
+
+
+# ===========================================================================
+# Phase 7.1 — browser icon noise cleanup
+# ===========================================================================
+
+
+ICON_PATHS = (
+    "/favicon.ico",
+    "/apple-touch-icon.png",
+    "/apple-touch-icon-precomposed.png",
+)
+
+
+class TestPhase71IconRoutes:
+    """All three browser icon routes return 204 No Content with
+    security headers applied and no auth required."""
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_returns_204_no_content(self, client: TestClient, path: str):
+        r = client.get(path)
+        assert r.status_code == 204
+        assert r.content == b""
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_no_auth_required(self, client: TestClient, path: str):
+        # No Authorization header — still 204, never 401/403/503.
+        r = client.get(path)
+        assert r.status_code == 204
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_also_204_when_no_api_key_configured(
+        self, client: TestClient, monkeypatch, path: str,
+    ):
+        """Even when the server has NO auth configured, icon routes
+        must not 503 — they're public by browser convention."""
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        r = client.get(path)
+        assert r.status_code == 204
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_security_headers_still_applied(
+        self, client: TestClient, path: str,
+    ):
+        r = client.get(path)
+        assert r.headers.get("X-Content-Type-Options") == "nosniff"
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert r.headers.get("Referrer-Policy") == "no-referrer"
+        assert "Content-Security-Policy" in r.headers
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_only_safe_verbs_registered(self, path: str):
+        """No POST/PUT/DELETE/PATCH on any icon route."""
+        for route in app.routes:
+            if getattr(route, "path", "") == path:
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"}), (
+                    f"{path} registered a mutating verb: {methods}"
+                )
+
+    def test_icons_do_not_count_toward_free_tier_cap(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        """Phase 5.4 free-tier cap must NOT apply to icon requests —
+        a browser that refreshes a page 100 times must not lock the
+        user out of /reports/."""
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "5")
+        # Raise the Phase 4.2 per-IP cap well above the hammer count
+        # so this test isolates the Phase 5.4 free-tier behaviour.
+        monkeypatch.setenv("TRADING_API_RATE_LIMIT_PER_MINUTE", "1000")
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(authed_env["reports_dir"], today)
+        h = {"Authorization": f"Bearer {VALID_KEY}"}
+
+        # Hammer the icons — they should NOT consume the daily cap.
+        for _ in range(20):
+            for p in ICON_PATHS:
+                r = client.get(p, headers=h)
+                assert r.status_code == 204
+
+        # A real protected request still succeeds (cap untouched).
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 200
+
+    def test_icons_do_not_write_usage_log_rows(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        """Icon requests are noise — they must not pollute the
+        per-key usage log."""
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        # No Authorization header — icon routes should still 204 without
+        # any usage row.
+        for p in ICON_PATHS:
+            client.get(p)
+        if usage_path.exists():
+            body = usage_path.read_text(encoding="utf-8")
+            for p in ICON_PATHS:
+                assert p not in body, (
+                    f"Phase 7.1: icon path {p!r} should not be in the usage log"
+                )

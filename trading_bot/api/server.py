@@ -106,9 +106,16 @@ FREE_TIER_LIMIT_DETAIL = (
 # Paths that count as "report calls" for the stricter cap.
 _FREE_TIER_REPORT_PATH_PREFIX = "/reports/"
 # Paths that Phase 5.4 does NOT count toward the daily cap and
-# must NEVER emit a 429/403 from this middleware.
+# must NEVER emit a 429/403 from this middleware. Phase 7.1 adds
+# the three browser icon routes — they are public by browser
+# convention and must not count as paid surface area.
 _FREE_TIER_EXEMPT_PATHS: frozenset[str] = frozenset(
-    {"/", "/health", "/webhook/stripe"}
+    {
+        "/", "/health", "/webhook/stripe",
+        "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+    }
 )
 
 # Phase 5.7 — dynamic free-tier nudge copy (reversible via env vars).
@@ -181,7 +188,17 @@ USAGE_LOG_ENV_VAR = "TRADING_API_USAGE_LOG_PATH"
 DEFAULT_USAGE_LOG_PATH = "data/api_usage.jsonl"
 # Paths that are NEVER counted in the usage log. Everything else
 # is considered a "protected" request for billing/adoption purposes.
-_PUBLIC_PATHS_NO_USAGE: frozenset[str] = frozenset({"/", "/health"})
+_PUBLIC_PATHS_NO_USAGE: frozenset[str] = frozenset(
+    {
+        "/", "/health",
+        # Phase 7.1 — browser icon routes are auto-requested by the
+        # browser on every page view and never carry an Authorization
+        # header. Excluding them keeps the per-key usage log clean.
+        "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+    }
+)
 
 _usage_write_lock = threading.Lock()
 
@@ -1407,6 +1424,48 @@ def health() -> dict[str, Any]:
         "service": "momentum-trading-bot-analytics",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.1 — browser icon noise cleanup
+# ---------------------------------------------------------------------------
+#
+# Browsers auto-request /favicon.ico, /apple-touch-icon.png, and
+# /apple-touch-icon-precomposed.png on almost every page view. We do
+# not ship icon assets, so those requests otherwise 404. Returning
+# 204 No Content keeps the audit log clean without shipping any
+# binary asset. Security headers still apply (they come from the
+# global response-header middleware).
+#
+# No auth required — these URLs are public by browser convention and
+# are never used to carry secrets.
+
+
+_ICON_ROUTES: tuple[str, ...] = (
+    "/favicon.ico",
+    "/apple-touch-icon.png",
+    "/apple-touch-icon-precomposed.png",
+)
+
+
+def _icon_204() -> Response:
+    """Return an empty 204 with no body and no Content-Type."""
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/favicon.ico", tags=["public"])
+def favicon_ico() -> Response:
+    return _icon_204()
+
+
+@app.get("/apple-touch-icon.png", tags=["public"])
+def apple_touch_icon() -> Response:
+    return _icon_204()
+
+
+@app.get("/apple-touch-icon-precomposed.png", tags=["public"])
+def apple_touch_icon_precomposed() -> Response:
+    return _icon_204()
 
 
 # ---------------------------------------------------------------------------
