@@ -443,6 +443,200 @@ def _issue_cli(argv: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 6.2 — manifest inspection
+# ---------------------------------------------------------------------------
+
+
+# The complete public field-set the ``list`` view is allowed to
+# emit. Anything outside this set is dropped on read — so even a
+# poisoned / hand-edited manifest with stray secret-looking fields
+# (``api_key``, ``label``, ``checkout_url``, …) cannot leak through
+# this code path.
+LIST_OUTPUT_FIELDS: tuple[str, ...] = (
+    "created_at",
+    "key_hash",
+    "tier",
+    "ref_code",
+    "checkout_session_id",
+)
+
+
+def _read_manifest_records(path: Path) -> list[dict]:
+    """
+    Load the manifest into a list of dicts. Tolerant of:
+
+      * missing file → ``[]``
+      * unreadable file → ``[]``
+      * blank lines → skipped
+      * malformed JSON → skipped
+      * non-dict JSON values → skipped
+    """
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    out: list[dict] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            out.append(parsed)
+    return out
+
+
+def list_keys(
+    *,
+    tier_filter: Optional[str] = None,
+    ref_filter: Optional[str] = None,
+    manifest_path: Optional[Path] = None,
+) -> list[dict]:
+    """
+    Return manifest rows projected to ``LIST_OUTPUT_FIELDS`` only,
+    optionally filtered by tier and/or ref_code, sorted newest
+    first by ``created_at``.
+
+    Filters are AND-combined: a row must pass every supplied
+    filter to be included.
+
+    The ``ref_filter`` value is run through the same Phase 5.1
+    growth sanitiser used at write time so the operator's
+    ``--ref twitter-launch_2026`` matches the byte-identical value
+    that landed in the file. A filter value that sanitises to the
+    empty string (e.g. ``"!@#"``) is treated as "no filter
+    supplied" — the operator's intent there is ambiguous and we
+    prefer not to silently filter to zero rows.
+    """
+    target = manifest_path if manifest_path is not None else _manifest_path()
+    records = _read_manifest_records(target)
+
+    tier_norm: Optional[str] = None
+    if tier_filter is not None:
+        t = str(tier_filter).strip().lower()
+        if t:
+            tier_norm = t
+
+    ref_norm: Optional[str] = None
+    if ref_filter is not None:
+        cleaned = _sanitize_ref_code(ref_filter)
+        if cleaned:
+            ref_norm = cleaned
+
+    out: list[dict] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if tier_norm is not None:
+            row_tier = rec.get("tier")
+            if not isinstance(row_tier, str) or row_tier.lower() != tier_norm:
+                continue
+        if ref_norm is not None:
+            row_ref = rec.get("ref_code")
+            if not isinstance(row_ref, str) or row_ref != ref_norm:
+                continue
+        # Project to allowed fields ONLY. Anything else is dropped.
+        out.append({k: rec.get(k) for k in LIST_OUTPUT_FIELDS})
+
+    # ISO-8601 with Z suffix sorts lexicographically the same as
+    # chronologically, so newest-first is just reverse=True.
+    out.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return out
+
+
+def _format_list_text(rows: list[dict]) -> str:
+    """Pretty-print ``list_keys`` output as a fixed-width table."""
+    if not rows:
+        return "(no records)"
+    header = (
+        f"{'created_at':<27} "
+        f"{'key_hash':<32} "
+        f"{'tier':<8} "
+        f"{'ref_code':<24} "
+        f"{'checkout_session_id'}"
+    )
+    lines = [header, "-" * len(header)]
+    for r in rows:
+        ref = r.get("ref_code") or "-"
+        cs = r.get("checkout_session_id") or "-"
+        lines.append(
+            f"{str(r.get('created_at') or ''):<27} "
+            f"{str(r.get('key_hash') or ''):<32} "
+            f"{str(r.get('tier') or ''):<8} "
+            f"{str(ref)[:24]:<24} "
+            f"{cs}"
+        )
+    return "\n".join(lines)
+
+
+def _format_list_json(rows: list[dict]) -> str:
+    return json.dumps(rows, indent=2, sort_keys=False, default=str)
+
+
+def _build_list_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys list",
+        description=(
+            "Inspect the operator-only API-key manifest. Emits ONLY "
+            "the documented public fields (created_at, key_hash, "
+            "tier, ref_code, checkout_session_id). Raw API keys, "
+            "raw labels, and Stripe checkout URLs are never present "
+            "in the manifest by Phase 6.0/6.1 design and never in "
+            "this output."
+        ),
+    )
+    parser.add_argument(
+        "--tier", default=None, choices=sorted(VALID_TIERS),
+        help="Restrict to a single tier (free | premium).",
+    )
+    parser.add_argument(
+        "--ref", default=None,
+        help=(
+            "Restrict to rows whose ref_code equals the supplied "
+            "value (after sanitising through the Phase 5.1 growth "
+            "helper). A value that sanitises to empty is ignored."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON instead of the plain-text table.",
+    )
+    parser.add_argument(
+        "--manifest-path", default=None,
+        help=(
+            "Override the manifest path "
+            f"(default: ${KEYS_MANIFEST_ENV_VAR} or "
+            f"{DEFAULT_KEYS_MANIFEST_PATH})."
+        ),
+    )
+    return parser
+
+
+def _list_cli(argv: list[str]) -> int:
+    args = _build_list_parser().parse_args(argv)
+    manifest_path = (
+        Path(args.manifest_path) if args.manifest_path else None
+    )
+
+    rows = list_keys(
+        tier_filter=args.tier,
+        ref_filter=args.ref,
+        manifest_path=manifest_path,
+    )
+
+    if args.json:
+        print(_format_list_json(rows))
+    else:
+        print(_format_list_text(rows))
+    return 0
+
+
 def _build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot.api.keys",
@@ -452,6 +646,11 @@ def _build_top_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "issue",
         help="Generate a new API key and append a manifest row.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "list",
+        help="Inspect the manifest with optional tier / ref filters.",
         add_help=False,
     )
     return parser
@@ -466,11 +665,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     command, rest = argv[0], argv[1:]
     if command == "issue":
         return _issue_cli(rest)
+    if command == "list":
+        return _list_cli(rest)
     if command in ("-h", "--help"):
         _build_top_parser().print_help()
         return 0
     print(f"error: unknown command '{command}'", file=sys.stderr)
-    print("available commands: issue", file=sys.stderr)
+    print("available commands: issue, list", file=sys.stderr)
     return 2
 
 

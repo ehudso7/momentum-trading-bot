@@ -2217,6 +2217,75 @@ the existing operator-only `python -m trading_bot.api.keys issue`
 shell command.
 
 
+### Phase 6.2 — manifest inspection CLI (`keys list`)
+
+A new operator-only `list` subcommand on the existing keys CLI
+lets the operator safely inspect the issuance manifest without
+ever revealing a raw key, raw label, or checkout URL.
+
+**Command**
+
+    python -m trading_bot.api.keys list                  # all rows
+    python -m trading_bot.api.keys list --tier free      # filter by tier
+    python -m trading_bot.api.keys list --tier premium
+    python -m trading_bot.api.keys list --ref hn-launch  # filter by ref_code
+    python -m trading_bot.api.keys list --tier free --ref hn-launch   # AND
+    python -m trading_bot.api.keys list --json           # machine output
+    python -m trading_bot.api.keys list --manifest-path <path>
+
+**Public field set** — the only fields ever emitted, by either
+the text or JSON formatter:
+
+    LIST_OUTPUT_FIELDS = (
+        "created_at",
+        "key_hash",
+        "tier",
+        "ref_code",
+        "checkout_session_id",
+    )
+
+`label_hash` is in the manifest (Phase 6.0) but **not** in the
+list output. Operators who need it can read the file directly;
+the public CLI surface stays as small as possible.
+
+**Defense-in-depth contract.** The reader projects every row
+to `LIST_OUTPUT_FIELDS` BEFORE rendering. Even if the manifest
+were hand-edited (or mis-written by some future code path) and
+contained stray fields like `api_key`, `label`, or
+`checkout_url`, the `list` view would silently drop them.
+Pinned by `TestPhase62OutputProjection`.
+
+**Tolerance**
+
+* Missing manifest → empty output (text: `(no records)`; JSON: `[]`).
+* Blank lines → skipped.
+* Malformed JSON → skipped.
+* Non-dict JSON values → skipped.
+* Unreadable file → empty (no exception).
+
+**Filter semantics**
+
+* `--tier`: case-insensitive exact match on `tier`.
+* `--ref`: the operator-supplied value is run through the same
+  Phase 5.1 growth sanitiser used at write time, then compared
+  by exact equality. So `--ref "<script>xss</script>"` matches
+  rows whose stored `ref_code == "scriptxssscript"`. A filter
+  value that sanitises to the empty string (e.g. `"!@#"`) is
+  treated as **no filter** — better than silently filtering to
+  zero rows.
+* Combined filters AND together; a row must pass every supplied
+  filter.
+
+**Sort** — newest first by `created_at` (ISO-8601 with `Z`
+suffix sorts lexicographically the same as chronologically).
+
+**No new public surface.** The `list` command lives behind the
+existing operator-only `python -m trading_bot.api.keys` shell
+entry-point. There is still no HTTP endpoint, no form, no JSON
+API, no env var added. The dispatcher's "available commands"
+help text now lists both `issue` and `list`.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
