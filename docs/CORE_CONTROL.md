@@ -1979,6 +1979,244 @@ value at the time of rollout). They never need access to the
 raw copy through this pipeline — and cannot get it from disk.
 
 
+### Phase 5.9 — landing page visual polish
+
+`GET /` is still public, static, and deterministic — but now
+ships a polished SaaS-style design instead of a plain document
+layout. Every Phase 4.3 / 5.2 / 5.7 invariant continues to hold.
+
+**Design layout (5 `<section>` blocks unchanged):**
+
+1. **Hero** — gradient background (CSS `linear-gradient`),
+   centred headline + tagline + sub-line, plus the optional
+   `<p class="ref">Invited by: <code>…</code></p>` banner inside
+   the hero when `?ref=` is present.
+2. **How it works** — three-step `<ol class="feature-grid">`
+   styled as numbered cards via CSS `counter()`, single column
+   on mobile, three columns at ≥ 600 px.
+3. **Example output** — same illustrative tables, now wrapped in
+   `<div class="card example-card">` with a soft border, shadow,
+   and pill-style `.status-ok` badge.
+4. **Upgrade** — comparison table inside `<div class="card
+   compare-card">`, followed by two side-by-side `.cue` cards
+   carrying the soft conversion cues.
+5. **Get started** — CTA paragraph in `<div class="cta-card">`
+   with a light-blue gradient panel.
+
+**Stylesheet** — a new `_LANDING_PAGE_CSS` constant in
+`trading_bot/api/server.py`. Self-contained inline `<style>`
+block with:
+
+* CSS custom properties (`--primary`, `--surface`, `--border`,
+  …) for theming;
+* a single mobile-first breakpoint (`@media (min-width: 600px)`)
+  that collapses the feature grid from 1 → 3 columns and the
+  cue row from 1 → 2;
+* a second breakpoint at 880 px purely for whitespace;
+* zero JS, zero `<form>`, zero external resources (no Google
+  fonts, no CDN, no analytics tag) — pinned by
+  `test_no_external_resources`.
+
+**Invariants re-asserted by Phase 5.9 tests:**
+
+* No `<script>`, no `javascript:` URI, no `<form>` /
+  `<input>` / `<button>` / `on*` handlers / mutating
+  `method=…` attributes.
+* Hero gradient (`linear-gradient` + `.hero` selector),
+  feature-grid, compare-card, example-card, cue-row, and
+  cta-card class hooks all present in the rendered HTML.
+* Two `class="cue"` blocks render the soft cues from Phase 5.2
+  ("Most users upgrade after ~7 days." and "Premium users run
+  3–5x more requests than free users.").
+* Five `<section>` blocks (Phase 5.2 contract).
+* Legacy positioning phrases — `read-only`, `guardrail`,
+  `daily validation`, `audit trail`, `protected dashboard` —
+  all still present.
+* `<p class="ref">Invited by: <code>…</code></p>` exact format
+  for the ref banner; sanitiser unchanged
+  (`_sanitize_landing_ref_code` reused from Phase 5.1 growth
+  log).
+* Output is byte-identical for the same `?ref=` value across
+  calls; independent of env vars and disk state.
+* No leak of `scorer_config`, `TRADING_API_KEY`, or any
+  reports/manifest contents — even when fixtures with planted
+  markers are populated underneath the server.
+* The `/` route still accepts only `GET / HEAD / OPTIONS`.
+
+
+### Phase 6.0 — operator-only API key issuance CLI
+
+`trading_bot.api.keys` ships a single `issue` subcommand that
+generates one new API key (free or premium) and appends one row
+to an operator-only manifest. There is **no** public sign-up
+endpoint, no form, no JSON API for any of this — the entire
+surface is invoked by hand from a deployment shell.
+
+**Command**
+
+    python -m trading_bot.api.keys issue \
+        --tier free|premium \
+        --label "<operator-supplied label>" \
+        [--checkout \
+         --success-url <https://...> \
+         --cancel-url  <https://...>] \
+        [--manifest-path <path>]
+
+**Manifest** — `data/api_keys_manifest.jsonl` (override via
+`TRADING_API_KEYS_MANIFEST_PATH`). Append-only, thread-safe,
+schema:
+
+    {
+      "created_at":           "2026-04-24T12:00:00.000000Z",
+      "key_hash":             "<SHA-256(api_key)[:32]>",
+      "label_hash":           "<SHA-256(label)[:32]>",
+      "tier":                 "free" | "premium",
+      "checkout_session_id":  "cs_..." | null
+    }
+
+**Stdout** prints the raw `api_key` exactly once (the operator
+delivers it to the user) plus the same five hash/metadata
+fields, and — when `--checkout` is used — `checkout_session_id`
+and `checkout_url` for the operator to forward to the customer.
+
+**Privacy invariants (every one tested)**
+
+* Raw `api_key` is **never** persisted. Only `SHA-256(...)[:32]`,
+  byte-identical to the hash used by server / billing /
+  conversion / growth / upgrade_events so the manifest joins
+  cleanly with every other Phase 4/5 log on a single column.
+* Raw `label` is **never** persisted. Only its SHA-256 prefix.
+  An operator who issues a key for `alice@example.com` cannot
+  reverse the manifest into a list of customer emails — the
+  hash is one-way.
+* The Stripe Checkout `url` is **never** persisted. Only the
+  short-lived `checkout_session_id` is. URLs contain redirect
+  state we don't need to retain.
+* No customer email / name / IP / payment field is ever stored.
+
+**Atomicity contract.** If `--checkout` is requested and Stripe
+fails (network error, missing `STRIPE_API_KEY`, missing
+`STRIPE_PRICE_ID_PREMIUM`, etc.), the manifest row is NOT
+written and the CLI exits with code 3. So a manifest row implies
+"issuance + checkout-session-creation succeeded end-to-end" —
+operators can retry cleanly without leaving phantom keys behind.
+Pinned by `test_stripe_failure_does_not_write_manifest` and
+`TestCheckoutInProcessViaPatch::test_checkout_failure_returns_three`.
+
+**CLI exit codes**
+
+| Code | Meaning |
+|---|---|
+| 0 | Success — key issued, manifest row written |
+| 2 | Argument validation failure (bad tier, missing URLs, blank label, …) |
+| 3 | Stripe / billing failure during `--checkout` (no manifest row written) |
+
+**Generation parameters**
+
+* Key body: `secrets.token_urlsafe(32)` → 43 URL-safe characters
+  drawn from `[A-Za-z0-9\-_]`. Far above the 32-byte minimum
+  the spec asks for; all randomness from the OS CSPRNG.
+* Hash: `SHA-256(api_key)[:32]` — 128 bits of grouping
+  precision, identical to every other Phase 4/5 log.
+
+**Boundary** — the keys module imports nothing from
+`trading_bot.core.*`, `trading_bot.execution`,
+`trading_bot.portfolio`, `trading_bot.risk`,
+`trading_bot.scanners`, `trading_bot.strategies`, or
+`trading_bot.main`. Only the lazy import of
+`trading_bot.api.billing.create_checkout_session` for the
+`--checkout` path. Pinned by source-grep test.
+
+
+### Phase 6.1 — referral key issuance flow
+
+The Phase 6.0 `issue` subcommand grows a single optional flag —
+`--ref <code>` — so an operator can pre-attribute a key to a
+referral / source channel at creation time, instead of relying
+on the user later hitting `?ref=`.
+
+**Command (additive)**
+
+    python -m trading_bot.api.keys issue \
+        --tier free|premium \
+        --label "<operator label>" \
+        --ref  "<channel code>"          # NEW; optional
+        [--checkout --success-url … --cancel-url …]
+
+**Manifest schema (single new field)**
+
+    {
+      "created_at":           "...Z",
+      "key_hash":             "<SHA-256(api_key)[:32]>",
+      "label_hash":           "<SHA-256(label)[:32]>",
+      "tier":                 "free" | "premium",
+      "checkout_session_id":  "cs_..." | null,
+      "ref_code":             "<sanitised>" | null   # ← Phase 6.1
+    }
+
+**Sanitisation contract.** `--ref` is run through the same
+`_sanitize_ref_code` helper the live `?ref=` middleware (Phase
+5.1 growth log) uses:
+
+* Charset: `[A-Za-z0-9\-_:.]`. Anything else is stripped.
+* Cap: 64 chars (truncated, not rejected).
+* Empty input, `None`, or a value that the sanitiser strips to
+  `""` is treated as "no ref" — the manifest stores `null` and
+  no Stripe metadata is set.
+
+Pinning this to the same helper means the manifest's `ref_code`
+is byte-identical to whatever the growth log would have stored
+for the same input, so downstream BI joins work cleanly across
+both files. Asserted by
+`TestPhase61RefSanitization::test_sanitiser_matches_growth_sanitiser`.
+
+**Stripe metadata pass-through.** `billing.create_checkout_session`
+gains a single optional `ref_code: Optional[str] = None` kwarg.
+When `--checkout` and a non-empty sanitised `--ref` are both
+present, the value flows into the Stripe POST body's
+`metadata[ref_code]` and `subscription_data[metadata][ref_code]`
+fields — alongside the existing Phase 4.7 `metadata[api_key]`
+fields. The Phase 4.7 webhook handler still keys on
+`metadata[api_key]`; `ref_code` is purely for downstream
+attribution analysis.
+
+End-to-end stub-HTTP test:
+`TestPhase61BillingMetadataFields::test_ref_code_lands_in_stripe_metadata`.
+
+**Backward compatibility (tested):**
+
+* `--ref` is optional. Omitting it leaves the manifest row
+  byte-equivalent to a Phase 6.0 row except for the new
+  `"ref_code": null` field.
+* The CLI stdout line for `ref_code` only appears when present.
+  Operators who don't use `--ref` see the exact Phase 6.0
+  output.
+* Calls to `issue_key()` that don't pass the `ref_code=` kwarg
+  still work.
+* Calls to `create_checkout_session()` that don't pass
+  `ref_code=` still produce the exact same Stripe POST body as
+  before (no `metadata[ref_code]` field) — pinned by
+  `test_no_ref_means_no_ref_metadata`.
+
+**Privacy invariants (re-asserted):**
+
+* Raw `api_key` never persisted (only the hash).
+* Raw `label` never persisted (only the hash).
+* Raw `--ref` value is sanitised before any persistence or
+  Stripe call. A `<script>alert(1)</script>` becomes
+  `scriptalert1script` on the manifest and on Stripe; the angle
+  brackets, slashes, and parens never appear on disk or in the
+  POST body. Pinned by `test_unsafe_chars_stripped` and
+  `test_only_sanitised_ref_passed_never_raw`.
+* Stripe checkout `url` still never persisted.
+* No customer email / IP / payment field is ever stored.
+
+**No new public surface.** Phase 6.1 adds no HTTP endpoint, no
+form, no JSON API, no env var. The whole feature lives behind
+the existing operator-only `python -m trading_bot.api.keys issue`
+shell command.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

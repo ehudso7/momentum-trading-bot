@@ -3763,8 +3763,11 @@ class TestPhase52HasConversionSections:
     def test_has_how_it_works_section(self, client: TestClient):
         body = client.get("/").text
         assert "<h2>How it works</h2>" in body
-        # The three-step list is an <ol> with 3 <li> children.
-        ol_start = body.find("<ol>")
+        # The three-step list is an <ol …> with 3 <li> children. We
+        # match the open tag without the trailing ">" so the
+        # Phase 5.9 polish (which adds class="feature-grid") still
+        # passes here.
+        ol_start = body.find("<ol")
         ol_end = body.find("</ol>", ol_start)
         assert ol_start != -1 and ol_end != -1
         assert body.count("<li>", ol_start, ol_end) == 3
@@ -5602,3 +5605,220 @@ class TestPhase58OtherEventsHaveNullHash:
         (row,) = _read_upgrade_events(upgrade_events_path)
         assert row["event"] == "experiment_limit_blocked"
         assert row["copy_variant_hash"] is None
+
+
+# ===========================================================================
+# Phase 5.9 — landing page visual polish
+# ===========================================================================
+
+
+class TestPhase59HasPolishedStyling:
+    """The landing page now ships a polished SaaS-style stylesheet."""
+
+    def test_inline_style_block_present(self, client: TestClient):
+        body = client.get("/").text
+        # Inline <style>; no external CSS link to a third party.
+        assert "<style>" in body
+        assert "</style>" in body
+        # No external CSS link — would break "no API calls" rule and
+        # CSP. We allow same-origin links in principle but the
+        # landing page in particular ships zero of them.
+        assert "<link " not in body.lower()
+
+    def test_no_external_resources(self, client: TestClient):
+        """No third-party fonts, images, scripts, or trackers."""
+        body = client.get("/").text.lower()
+        for token in (
+            "http://", "https://",
+            "fonts.googleapis", "cdnjs", "cdn.jsdelivr",
+            "google-analytics", "googletagmanager",
+        ):
+            assert token not in body, (
+                f"landing page references external resource: {token}"
+            )
+
+    def test_uses_css_variables(self, client: TestClient):
+        """Mark of a real stylesheet rather than three ad-hoc rules."""
+        body = client.get("/").text
+        assert ":root" in body
+        # At least a handful of named tokens.
+        for var in ("--primary", "--bg", "--surface", "--border"):
+            assert var in body, f"missing CSS variable: {var}"
+
+    def test_hero_section_has_gradient(self, client: TestClient):
+        """A SaaS-style hero — gradient background, not a flat box."""
+        body = client.get("/").text.lower()
+        assert "linear-gradient" in body
+        assert "section.hero" in body or ".hero " in body
+
+    def test_mobile_first_media_query(self, client: TestClient):
+        """Mobile-first → @media (min-width: …) breakpoints."""
+        body = client.get("/").text
+        assert "@media (min-width:" in body
+
+    def test_feature_grid_present(self, client: TestClient):
+        """The 3-step "How it works" list renders as a grid of
+        feature cards."""
+        body = client.get("/").text
+        assert "feature-grid" in body
+        # The grid lives on the <ol>; the existing 3-li contract
+        # still holds (verified by Phase 5.2's how-it-works test).
+        assert "<ol class=\"feature-grid\">" in body
+
+    def test_example_output_in_card(self, client: TestClient):
+        body = client.get("/").text
+        assert "example-card" in body
+
+    def test_compare_card_present(self, client: TestClient):
+        body = client.get("/").text
+        assert "compare-card" in body
+
+    def test_cue_row_present(self, client: TestClient):
+        """The two soft-conversion cues each render in their own
+        styled card so they read as two equal-weight prompts."""
+        body = client.get("/").text
+        assert "cue-row" in body
+        assert body.count('class="cue"') == 2
+
+    def test_cta_card_present(self, client: TestClient):
+        body = client.get("/").text
+        assert "cta-card" in body
+
+
+class TestPhase59StillSafeAndStatic:
+    """Re-assert every safety invariant after the visual rewrite —
+    polish must not have re-opened any attack surface."""
+
+    def test_no_form_or_inputs_or_buttons(self, client: TestClient):
+        body = client.get("/?ref=any").text.lower()
+        for token in (
+            "<form", "<input", "<button",
+            "onclick", "onsubmit", "onchange",
+            "method=\"post\"", "method=\"put\"",
+            "method=\"patch\"", "method=\"delete\"",
+            "method='post'", "method='put'",
+            "method='patch'", "method='delete'",
+        ):
+            assert token not in body, (
+                f"polish reintroduced mutating marker: {token}"
+            )
+
+    def test_no_script_or_javascript_uri(self, client: TestClient):
+        body = client.get("/?ref=any").text.lower()
+        assert "<script" not in body
+        assert "javascript:" not in body
+
+    def test_no_protected_data_leaks(
+        self, client: TestClient, authed_env,
+    ):
+        """Plant unique markers across reports / manifest and
+        re-assert the polished page never echoes them."""
+        reports_dir: Path = authed_env["reports_dir"]
+        manifest: Path = authed_env["manifest"]
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({
+                "report_date": "2026-04-24",
+                "scorer_config": {"weights": {"gap": 0.7},
+                                  "PHASE59_LEAK_MARKER_A": True},
+            })
+        )
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"PHASE59_LEAK_MARKER_B": "keep-out"}) + "\n"
+        )
+        body = client.get("/?ref=some").text
+        for marker in (
+            "PHASE59_LEAK_MARKER_A",
+            "PHASE59_LEAK_MARKER_B",
+            "scorer_config",
+            "TRADING_API_KEY",
+        ):
+            assert marker not in body, f"leaked: {marker}"
+
+
+class TestPhase59RefBannerStillSanitized:
+    def test_ref_banner_renders_in_hero(self, client: TestClient):
+        body = client.get("/?ref=hn-launch").text
+        # Same exact contract as Phase 5.2: <p class="ref">…<code>…</code></p>.
+        assert (
+            '<p class="ref">Invited by: <code>hn-launch</code></p>'
+        ) in body
+
+    def test_ref_xss_is_neutralised(self, client: TestClient):
+        body = client.get("/?ref=<script>alert(1)</script>").text
+        # The sanitiser strips < > / etc. so the displayed value is
+        # safe ASCII only.
+        assert "<script>alert(1)</script>" not in body
+        assert "<script" not in body.lower()
+        assert "javascript:" not in body.lower()
+
+    def test_no_ref_no_banner(self, client: TestClient):
+        body = client.get("/").text
+        assert "Invited by" not in body
+
+
+class TestPhase59StillDeterministic:
+    def test_same_ref_byte_identical(self):
+        a = render_landing_page_html("hn-launch")
+        b = render_landing_page_html("hn-launch")
+        assert a == b
+
+    def test_no_ref_byte_identical(self):
+        a = render_landing_page_html()
+        b = render_landing_page_html()
+        assert a == b
+
+    def test_different_refs_produce_different_html(self):
+        a = render_landing_page_html("twitter-q2")
+        b = render_landing_page_html("hn-launch")
+        assert a != b
+
+    def test_does_not_depend_on_env_or_disk(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        baseline = render_landing_page_html()
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(tmp_path / "reports"))
+        monkeypatch.setenv(
+            MANIFEST_PATH_ENV_VAR, str(tmp_path / "manifest.jsonl"),
+        )
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "alpha_report_2026-04-24.json").write_text(
+            json.dumps({"leak": "MUST_NOT_APPEAR"})
+        )
+        populated = render_landing_page_html()
+        assert baseline == populated
+        assert "MUST_NOT_APPEAR" not in populated
+
+
+class TestPhase59HtmlShape:
+    def test_viewport_meta_for_mobile(self, client: TestClient):
+        body = client.get("/").text
+        assert (
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        ) in body
+
+    def test_legacy_positioning_phrases_intact(self, client: TestClient):
+        low = client.get("/").text.lower()
+        for phrase in (
+            "read-only",
+            "guardrail",
+            "daily validation",
+            "audit trail",
+            "protected dashboard",
+        ):
+            assert phrase in low, f"polish lost positioning phrase: {phrase!r}"
+
+    def test_still_five_sections(self, client: TestClient):
+        body = client.get("/").text
+        assert body.count("<section") == 5
+        assert body.count("</section>") == 5
+
+    def test_landing_route_only_get_head_options(self):
+        for route in app.routes:
+            if getattr(route, "path", "") == "/":
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"})
+                break
+        else:
+            raise AssertionError("/ route not registered")
