@@ -40,7 +40,12 @@ The same files also need to be:
 |---|---|---|
 | `TRADING_API_KEY` | optional | Single-tenant legacy free-tier key. Phase 6.2 made this optional — the deployment is still configured if a manifest exists. |
 | `TRADING_API_PREMIUM_KEYS` | optional | Comma-separated env premium keys. Operator override. |
-| `STRIPE_API_KEY` | premium subscriptions | Presence enables Stripe-primary classification. |
+| `STRIPE_API_KEY` | premium subscriptions | Presence enables Stripe-primary classification. Legacy alias of `STRIPE_SECRET_KEY` for the Phase 7.3 checkout endpoint. |
+| `STRIPE_SECRET_KEY` | `POST /billing/checkout` | Stripe REST auth. Preferred over the legacy `STRIPE_API_KEY` for new deployments. (Phase 7.3) |
+| `STRIPE_PREMIUM_PRICE_ID` | `POST /billing/checkout` | Stripe Price ID of the premium subscription. Falls back to `STRIPE_PRICE_ID_PREMIUM`. (Phase 7.3) |
+| `TRADING_PUBLIC_BASE_URL` | `POST /billing/checkout` | Absolute URL prefix for Stripe success/cancel redirects (e.g. `https://your-host.example.com`). (Phase 7.3) |
+| `STRIPE_CHECKOUT_SUCCESS_PATH` | optional | Override the success-redirect path. Default: `/dashboard?checkout=success`. (Phase 7.3) |
+| `STRIPE_CHECKOUT_CANCEL_PATH` | optional | Override the cancel-redirect path. Default: `/dashboard?checkout=cancel`. (Phase 7.3) |
 | `STRIPE_WEBHOOK_SECRET` | premium subscriptions | Required for `POST /webhook/stripe`. |
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH` | premium subscriptions | Recommended Railway path: `/data/stripe_premium_keys.json` (same volume as the manifests). |
 

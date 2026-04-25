@@ -1051,24 +1051,41 @@ class TestCliCheckout:
 
 
 class TestPhase48NoNewApiRoute:
-    def test_no_checkout_route_on_server(self):
-        """Phase 4.8 must NOT add a /checkout endpoint to the FastAPI app."""
+    def test_no_signup_or_subscribe_routes(self):
+        """Phase 4.8 forbade public sign-up endpoints. Phase 7.3 added
+        the SINGLE authenticated upgrade route ``POST /billing/checkout``;
+        this test still forbids every other shape (sign-up forms,
+        public /upgrade, /subscribe, /checkout in unrelated paths)."""
         from trading_bot.api.server import app
         forbidden_fragments = (
-            "/checkout",
+            "/signup",
+            "/sign-up",
+            "/register",
             "/subscribe",
             "/upgrade",
-            "/billing/checkout",
         )
         for route in app.routes:
             path = getattr(route, "path", "") or ""
             for frag in forbidden_fragments:
                 assert frag not in path, (
-                    f"Phase 4.8 introduced a public billing route: {path}"
+                    f"public billing surface introduced: {path}"
                 )
 
+    def test_billing_checkout_route_is_authenticated(self):
+        """Phase 7.3: ``POST /billing/checkout`` exists and requires
+        authentication. The route is sanctioned, but it must NOT be
+        a public sign-up endpoint."""
+        from fastapi.testclient import TestClient
+        from trading_bot.api.server import app
+        client = TestClient(app)
+        # No Authorization header → 401, never 200.
+        r = client.post("/billing/checkout")
+        assert r.status_code in {401, 503}, r.status_code
+
     def test_only_non_read_verb_is_still_webhook_stripe(self):
-        """The only mutating route must still be POST /webhook/stripe."""
+        """The only mutating routes are POST /webhook/stripe (Phase 4.7)
+        and POST /billing/checkout (Phase 7.3). Anything else is a regression."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         from trading_bot.api.server import app
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
@@ -1076,7 +1093,7 @@ class TestPhase48NoNewApiRoute:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
+                assert (m, path) in allowed, (
                     f"Phase 4.8 leaked a mutating route: {m} {path}"
                 )
 
@@ -1279,3 +1296,258 @@ class TestPhase70HashOnlyPersistence:
         assert is_premium_hash("0" * 32) is False
         assert is_premium_hash("") is False
         assert is_premium_hash(None) is False
+
+
+# ===========================================================================
+# Phase 7.3 — create_checkout_session_for_hash (hash-only metadata)
+# ===========================================================================
+
+
+from trading_bot.api.billing import (  # noqa: E402
+    BillingAPIError,
+    BillingConfigError,
+    STRIPE_PREMIUM_PRICE_ID_ENV_VAR,
+    STRIPE_SECRET_KEY_ENV_VAR,
+    create_checkout_session_for_hash,
+)
+
+
+@pytest.fixture
+def phase73_stripe_env(monkeypatch, tmp_path: Path):
+    """Configure both Phase 7.3 env vars for the helper tests."""
+    monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_phase73")
+    monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_test_phase73")
+    return tmp_path
+
+
+class _FakePoster:
+    """Records every Stripe POST so tests can assert exact metadata shape."""
+
+    def __init__(
+        self,
+        response: Optional[dict] = None,
+        raise_exc: Optional[Exception] = None,
+    ):
+        self.response = response or {
+            "id": "cs_test_phase73",
+            "url": "https://checkout.stripe.com/c/cs_test_phase73",
+        }
+        self.raise_exc = raise_exc
+        self.calls: list[dict] = []
+
+    def __call__(self, *, url: str, data: dict, auth, timeout: float):
+        self.calls.append({
+            "url": url, "data": dict(data), "auth": auth, "timeout": timeout,
+        })
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        # Return the response as-is so tests can simulate non-dict
+        # Stripe payloads (the helper must reject those).
+        if isinstance(self.response, dict):
+            return dict(self.response)
+        return self.response
+
+
+class TestCreateCheckoutSessionForHash:
+    def test_happy_path_returns_documented_fields(
+        self, phase73_stripe_env,
+    ):
+        poster = _FakePoster()
+        result = create_checkout_session_for_hash(
+            key_hash="a" * 32,
+            success_url="https://example.com/dashboard?checkout=success",
+            cancel_url="https://example.com/dashboard?checkout=cancel",
+            http_post=poster,
+        )
+        assert result == {
+            "checkout_session_id": "cs_test_phase73",
+            "checkout_url": "https://checkout.stripe.com/c/cs_test_phase73",
+            "key_hash": "a" * 32,
+            "tier_to": "premium",
+        }
+
+    def test_metadata_contains_key_hash_not_raw_key(
+        self, phase73_stripe_env,
+    ):
+        """The hash must land in metadata; the raw api_key must NEVER
+        be sent to Stripe under any field name."""
+        poster = _FakePoster()
+        marker = "RAW_KEY_PHASE73_DO_NOT_LEAK"
+        # Even though the helper takes a hash, simulate the realistic
+        # case where the operator pre-hashes their secret marker.
+        h = hashlib.sha256(marker.encode("utf-8")).hexdigest()[:32]
+        create_checkout_session_for_hash(
+            key_hash=h,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        data = poster.calls[0]["data"]
+        # Documented metadata fields are present:
+        assert data["client_reference_id"] == h
+        assert data["metadata[key_hash]"] == h
+        assert data["metadata[tier_from]"] == "free"
+        assert data["metadata[tier_to]"] == "premium"
+        assert data["subscription_data[metadata][key_hash]"] == h
+        assert data["subscription_data[metadata][tier_to]"] == "premium"
+        # The raw api_key marker is absent from EVERY field:
+        for value in data.values():
+            assert marker not in str(value)
+        # And the legacy raw-key field is NOT present.
+        assert "metadata[api_key]" not in data
+        assert "subscription_data[metadata][api_key]" not in data
+
+    def test_subscription_mode_and_price_id(self, phase73_stripe_env):
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="b" * 32,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        data = poster.calls[0]["data"]
+        assert data["mode"] == "subscription"
+        assert data["line_items[0][price]"] == "price_test_phase73"
+        assert data["line_items[0][quantity]"] == "1"
+
+    def test_success_and_cancel_urls_propagated(
+        self, phase73_stripe_env,
+    ):
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="c" * 32,
+            success_url="https://app.example.com/welcome",
+            cancel_url="https://app.example.com/cancel",
+            http_post=poster,
+        )
+        data = poster.calls[0]["data"]
+        assert data["success_url"] == "https://app.example.com/welcome"
+        assert data["cancel_url"] == "https://app.example.com/cancel"
+
+    def test_legacy_env_var_fallback(self, monkeypatch):
+        """STRIPE_SECRET_KEY / STRIPE_PREMIUM_PRICE_ID are preferred,
+        but the legacy STRIPE_API_KEY / STRIPE_PRICE_ID_PREMIUM names
+        must keep working so existing deployments don't break."""
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_legacy_test")
+        monkeypatch.setenv("STRIPE_PRICE_ID_PREMIUM", "price_legacy_test")
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="d" * 32,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        assert poster.calls[0]["auth"] == ("sk_legacy_test", "")
+        assert poster.calls[0]["data"]["line_items[0][price]"] == "price_legacy_test"
+
+    def test_missing_secret_raises_billing_config_error(
+        self, monkeypatch,
+    ):
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+        monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_x")
+        with pytest.raises(BillingConfigError) as exc:
+            create_checkout_session_for_hash(
+                key_hash="e" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+        assert STRIPE_SECRET_KEY_ENV_VAR in str(exc.value)
+
+    def test_missing_price_id_raises_billing_config_error(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_x")
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv("STRIPE_PRICE_ID_PREMIUM", raising=False)
+        with pytest.raises(BillingConfigError) as exc:
+            create_checkout_session_for_hash(
+                key_hash="f" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+        assert STRIPE_PREMIUM_PRICE_ID_ENV_VAR in str(exc.value)
+
+    def test_blank_hash_rejected(self, phase73_stripe_env):
+        for h in ("", "   ", None):
+            with pytest.raises(ValueError):
+                create_checkout_session_for_hash(
+                    key_hash=h,  # type: ignore[arg-type]
+                    success_url="https://e.com/ok",
+                    cancel_url="https://e.com/cancel",
+                    http_post=_FakePoster(),
+                )
+
+    def test_blank_urls_rejected(self, phase73_stripe_env):
+        with pytest.raises(ValueError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32, success_url="",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+        with pytest.raises(ValueError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32, success_url="https://e.com/ok",
+                cancel_url="",
+                http_post=_FakePoster(),
+            )
+
+    def test_url_with_newline_rejected(self, phase73_stripe_env):
+        with pytest.raises(ValueError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok\nX-Inject: pwn",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+
+    def test_stripe_non_dict_response_raises_api_error(
+        self, phase73_stripe_env,
+    ):
+        bad = _FakePoster()
+        bad.response = ["not", "a", "dict"]  # type: ignore[assignment]
+        with pytest.raises(BillingAPIError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=bad,
+            )
+
+    def test_stripe_missing_id_or_url_raises_api_error(
+        self, phase73_stripe_env,
+    ):
+        bad = _FakePoster(response={"id": "cs_x"})  # missing url
+        with pytest.raises(BillingAPIError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=bad,
+            )
+
+    def test_stripe_failure_propagates_as_api_error(
+        self, phase73_stripe_env,
+    ):
+        boom = _FakePoster(raise_exc=BillingAPIError("simulated stripe 500"))
+        with pytest.raises(BillingAPIError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=boom,
+            )
+
+    def test_stripe_secret_used_in_basic_auth(self, phase73_stripe_env):
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="a" * 32,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        assert poster.calls[0]["auth"] == ("sk_test_phase73", "")

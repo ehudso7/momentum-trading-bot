@@ -717,9 +717,11 @@ class TestBoundaryEnforcement:
             for method in methods:
                 if method in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe", (
-                    f"non-read-only route detected: {method} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both.
+                assert (method, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only route detected: {method} {path}"
                 assert method == "POST", (
                     f"/webhook/stripe may only accept POST, got {method}"
                 )
@@ -1517,9 +1519,11 @@ class TestPhase42BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_forbidden_imports_still_enforced(self):
         """Re-assert Phase 4.0 invariant — no Core imports."""
@@ -1782,9 +1786,11 @@ class TestLandingPageBoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_landing_route_accepts_only_get_head_options(self):
         for route in app.routes:
@@ -2307,9 +2313,11 @@ class TestPhase44BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_audit_never_writes_report_or_experiment_contents(
         self, client: TestClient, authed_env, audit_path: Path
@@ -2896,9 +2904,11 @@ class TestPhase45BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_forbidden_imports_still_clean(self):
         src = (
@@ -3264,9 +3274,11 @@ class TestPhase46BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method: {m} {path}"
 
     def test_forbidden_imports_still_clean_after_phase_4_6(self):
         src = (
@@ -3747,13 +3759,15 @@ class TestWebhookNeverPersistsSensitiveData:
 
 class TestPhase47Boundary:
     def test_only_non_read_verb_is_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
+                assert (m, path) in allowed, (
                     f"non-read-only method {m} on {path}"
                 )
 
@@ -4053,9 +4067,11 @@ class TestPhase52DoesNotAddNewMutatingRoute:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"Phase 5.2 introduced a non-read verb: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"Phase 5.2 introduced a non-read verb: {m} {path}"
 
     def test_root_accepts_only_get_head_options(self):
         for route in app.routes:
@@ -4644,13 +4660,15 @@ class TestPhase54BoundaryUnchanged:
             )
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
+                assert (m, path) in allowed, (
                     f"non-read-only verb introduced: {m} {path}"
                 )
 
@@ -5039,13 +5057,15 @@ class TestPhase55Boundary:
             assert forbidden not in src
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST"
+                assert (m, path) in allowed
 
 
 # ===========================================================================
@@ -5448,13 +5468,15 @@ class TestPhase57BoundaryUnchanged:
             assert forbidden not in src
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST"
+                assert (m, path) in allowed
 
     def test_responses_never_echo_env_var_names(
         self, client: TestClient, free_env, usage_path: Path, monkeypatch,
@@ -6548,3 +6570,361 @@ class TestPhase71IconRoutes:
                 assert p not in body, (
                     f"Phase 7.1: icon path {p!r} should not be in the usage log"
                 )
+
+
+# ===========================================================================
+# Phase 7.3 — POST /billing/checkout (authenticated end-user upgrade)
+# ===========================================================================
+
+
+class _CheckoutFakePoster:
+    """Records every Stripe POST so tests can assert exact metadata shape."""
+
+    def __init__(self, response=None, raise_exc=None):
+        self.response = response or {
+            "id": "cs_phase73_endpoint",
+            "url": "https://checkout.stripe.com/c/cs_phase73_endpoint",
+        }
+        self.raise_exc = raise_exc
+        self.calls = []
+
+    def __call__(self, *, url, data, auth, timeout):
+        self.calls.append({"url": url, "data": dict(data), "auth": auth})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return dict(self.response) if isinstance(self.response, dict) else self.response
+
+
+@pytest.fixture
+def checkout_env(monkeypatch, tmp_path: Path):
+    """
+    Configure the server with a free-tier manifest key + Stripe env
+    + a public base URL so POST /billing/checkout can succeed.
+    """
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "manifest.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_phase73_endpoint")
+    monkeypatch.setenv("STRIPE_PREMIUM_PRICE_ID", "price_test_phase73_endpoint")
+    monkeypatch.setenv("TRADING_PUBLIC_BASE_URL", "https://api.example.com")
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+def _issue_free_for_checkout() -> tuple[str, str]:
+    """Issue a free key in-process and return (raw, hash)."""
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier="free", label="phase73-checkout")
+    return result["api_key"], result["key_hash"]
+
+
+def _patch_stripe_poster(monkeypatch, fake: _CheckoutFakePoster):
+    from trading_bot.api import billing as _billing_mod
+    monkeypatch.setattr(_billing_mod, "_post_to_stripe", fake)
+
+
+class TestPhase73CheckoutAuth:
+    def test_missing_auth_returns_401(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        # Fail-closed posture requires manifest to be non-empty for 401
+        # (vs 503). Pre-issue a key so the deployment is "configured".
+        _issue_free_for_checkout()
+        r = client.post("/billing/checkout")
+        assert r.status_code == 401
+
+    def test_bogus_key_returns_403(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert r.status_code == 403
+
+
+class TestPhase73CheckoutHappyPath:
+    def test_free_key_creates_checkout_session(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["checkout_session_id"] == "cs_phase73_endpoint"
+        assert body["checkout_url"].startswith("https://checkout.stripe.com/")
+        assert body["key_hash"] == key_hash
+        assert body["tier_to"] == "premium"
+
+    def test_response_never_includes_raw_api_key(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, _ = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        assert raw not in r.text
+
+    def test_stripe_metadata_contains_key_hash_not_raw(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        data = fake.calls[0]["data"]
+        # Hash present in EVERY documented metadata field.
+        assert data["client_reference_id"] == key_hash
+        assert data["metadata[key_hash]"] == key_hash
+        assert data["metadata[tier_from]"] == "free"
+        assert data["metadata[tier_to]"] == "premium"
+        # Raw key absent from the entire form payload.
+        for value in data.values():
+            assert raw not in str(value), (
+                f"raw api_key leaked into Stripe metadata: {value!r}"
+            )
+
+    def test_stripe_subscription_metadata_contains_key_hash(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        data = fake.calls[0]["data"]
+        assert data["subscription_data[metadata][key_hash]"] == key_hash
+        assert data["subscription_data[metadata][tier_to]"] == "premium"
+
+    def test_default_success_and_cancel_urls(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        data = fake.calls[0]["data"]
+        assert data["success_url"] == (
+            "https://api.example.com/dashboard?checkout=success"
+        )
+        assert data["cancel_url"] == (
+            "https://api.example.com/dashboard?checkout=cancel"
+        )
+
+    def test_overridden_success_and_cancel_paths(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.setenv("STRIPE_CHECKOUT_SUCCESS_PATH", "/welcome")
+        monkeypatch.setenv("STRIPE_CHECKOUT_CANCEL_PATH", "/back")
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        data = fake.calls[0]["data"]
+        assert data["success_url"] == "https://api.example.com/welcome"
+        assert data["cancel_url"] == "https://api.example.com/back"
+
+
+class TestPhase73CheckoutAlreadyPremium:
+    def test_premium_key_returns_409(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, _ = _issue_free_for_checkout()
+        # Promote the key via the existing webhook path so the
+        # premium classifier returns True.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        # Make sure Stripe is "configured" so _is_premium hits the
+        # cache path.
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase73_already_premium")
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 409
+        assert "already premium" in r.json()["detail"].lower()
+
+
+class TestPhase73CheckoutMisconfigured:
+    def test_missing_stripe_secret_returns_503(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.delenv("STRIPE_SECRET_KEY", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+        raw, _ = _issue_free_for_checkout()
+        # Don't patch _post_to_stripe — config check fails first.
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 503
+        assert "STRIPE_SECRET_KEY" in r.json()["detail"]
+
+    def test_missing_premium_price_id_returns_503(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.delenv("STRIPE_PREMIUM_PRICE_ID", raising=False)
+        monkeypatch.delenv("STRIPE_PRICE_ID_PREMIUM", raising=False)
+        raw, _ = _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 503
+        assert "STRIPE_PREMIUM_PRICE_ID" in r.json()["detail"]
+
+    def test_missing_public_base_url_returns_503(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        raw, _ = _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 503
+        assert "TRADING_PUBLIC_BASE_URL" in r.json()["detail"]
+
+
+class TestPhase73CheckoutStripeFailure:
+    def test_stripe_api_error_returns_502(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster(
+            raise_exc=BillingAPIError("simulated stripe 500"),
+        )
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 502
+        assert "checkout provider error" in r.json()["detail"].lower()
+
+    def test_stripe_returns_malformed_payload_502(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster(response={"id": "cs_x"})  # missing url
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 502
+
+
+class TestPhase73CheckoutNoPersistence:
+    """The checkout_url returned to the caller must NOT land on disk
+    in any operator log — manifest, revoked, usage, audit, premium
+    cache, conversion, upgrade events."""
+
+    def test_checkout_url_never_persisted_to_any_log(
+        self, client: TestClient, checkout_env, monkeypatch, tmp_path: Path,
+    ):
+        # Distinctive marker so a substring search is meaningful.
+        marker = "https://checkout.stripe.com/c/cs_PHASE73_LEAK_GUARD_xyz"
+        fake = _CheckoutFakePoster(response={
+            "id": "cs_PHASE73_LEAK_GUARD_xyz",
+            "url": marker,
+        })
+        _patch_stripe_poster(monkeypatch, fake)
+        # Point the Stripe cache at a tmp path inside checkout_env's tree.
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(checkout_env["keys_manifest"].parent / "stripe_cache.json"),
+        )
+        from trading_bot.api import billing
+        billing.reset_cache_for_tests()
+
+        raw, _ = _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        # The response DOES carry the URL (caller-safe).
+        assert marker in r.text
+
+        # Every operator log on disk must NOT contain it.
+        logs_to_check: list[Path] = [
+            checkout_env["keys_manifest"],
+            checkout_env["keys_revoked"],
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            Path(os.environ["TRADING_API_AUDIT_LOG_PATH"]),
+            Path(os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]),
+            checkout_env["keys_manifest"].parent / "stripe_cache.json",
+        ]
+        for path in logs_to_check:
+            if path.exists():
+                body = path.read_text(encoding="utf-8")
+                assert marker not in body, (
+                    f"checkout_url leaked into {path}"
+                )
+
+    def test_raw_api_key_never_persisted_after_checkout(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Manifest stores hash, not raw key.
+        manifest_body = checkout_env["keys_manifest"].read_text("utf-8")
+        assert raw not in manifest_body
+        assert key_hash in manifest_body
+        # Audit log never contains the raw key in any form.
+        audit_path = Path(os.environ["TRADING_API_AUDIT_LOG_PATH"])
+        if audit_path.exists():
+            assert raw not in audit_path.read_text("utf-8")
+        # Usage log uses hashes only.
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        if usage_path.exists():
+            assert raw not in usage_path.read_text("utf-8")

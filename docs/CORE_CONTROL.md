@@ -2574,9 +2574,121 @@ run `launch_check --smoke`, wire Stripe AFTER auth passes,
 hand-deliver keys securely.
 
 **No new public endpoints.** Phase 7.2 adds three CLIs and zero
-HTTP routes. The only mutating route in the entire app remains
-`POST /webhook/stripe` — pinned by
-`tests/test_launch_check.py::TestNoNewPublicEndpoints`.
+HTTP routes. Phase 7.3 (the next section) explicitly adds one new
+mutating route — `POST /billing/checkout` — alongside the existing
+`POST /webhook/stripe`; the single-mutating-route invariant in
+`tests/test_launch_check.py::TestNoNewPublicEndpoints` lists both.
+
+
+### Phase 7.3 — authenticated Stripe Checkout endpoint
+
+> The user requested this work as "Phase 7.1"; it ships here as 7.3
+> to avoid collision with the previously-shipped Phase 7.1 (browser
+> icon noise cleanup) and Phase 7.2 (production launch lockdown).
+> The behaviour is identical to the spec.
+
+A free-tier user calls `POST /billing/checkout` to receive a Stripe
+Checkout Session URL that flips them to premium on payment via the
+existing Phase 4.7 / 7.0 webhook plumbing. There is no public
+sign-up form — the caller must already authenticate with an issued
+manifest key.
+
+**Request**
+
+```
+POST /billing/checkout
+Authorization: Bearer <issued-key>
+```
+
+**Response (200)**
+
+```json
+{
+  "checkout_session_id": "cs_test_...",
+  "checkout_url": "https://checkout.stripe.com/c/cs_test_...",
+  "key_hash": "<SHA-256(api_key)[:32]>",
+  "tier_to": "premium"
+}
+```
+
+The `checkout_url` is short-lived and lives in memory only — it is
+returned to the caller but persisted nowhere on the server.
+
+**Status codes**
+
+| Code | When |
+|---|---|
+| 200 | Free key, Stripe Checkout Session created. |
+| 401 | Missing `Authorization: Bearer` header. |
+| 403 | Key not in manifest (or revoked). |
+| 409 | Already premium — manage the existing subscription via Stripe. |
+| 502 | Stripe API returned a non-2xx or malformed payload. |
+| 503 | `STRIPE_SECRET_KEY`, `STRIPE_PREMIUM_PRICE_ID`, or `TRADING_PUBLIC_BASE_URL` is unset. |
+
+**Env vars (required for live operation)**
+
+| Env var | Purpose | Fallback |
+|---|---|---|
+| `STRIPE_SECRET_KEY` | Stripe REST auth (Basic, password empty). | `STRIPE_API_KEY` (legacy Phase 4.7 name) |
+| `STRIPE_PREMIUM_PRICE_ID` | Stripe Price ID of the premium subscription. | `STRIPE_PRICE_ID_PREMIUM` (legacy) |
+| `TRADING_PUBLIC_BASE_URL` | Absolute URL prefix for success/cancel redirects (e.g. `https://your-host.example.com`). | — |
+
+**Env vars (optional)**
+
+| Env var | Default |
+|---|---|
+| `STRIPE_CHECKOUT_SUCCESS_PATH` | `/dashboard?checkout=success` |
+| `STRIPE_CHECKOUT_CANCEL_PATH`  | `/dashboard?checkout=cancel`  |
+
+**What goes to Stripe**
+
+The handler builds a subscription-mode Checkout Session POST with:
+
+```
+mode                                          = subscription
+line_items[0][price]                          = STRIPE_PREMIUM_PRICE_ID
+line_items[0][quantity]                       = 1
+success_url                                   = TRADING_PUBLIC_BASE_URL + success path
+cancel_url                                    = TRADING_PUBLIC_BASE_URL + cancel path
+client_reference_id                           = <key_hash>
+metadata[key_hash]                            = <key_hash>
+metadata[tier_from]                           = free
+metadata[tier_to]                             = premium
+subscription_data[metadata][key_hash]         = <key_hash>
+subscription_data[metadata][tier_to]          = premium
+customer_creation                             = always
+```
+
+Note: `metadata[api_key]` (legacy Phase 4.7 raw-key field) is
+**deliberately absent** from this code path. The Stripe webhook
+handler extends to consume `metadata[key_hash]` in a future phase;
+until then the existing operator-CLI flow (`keys issue --checkout`)
+continues to populate `metadata[api_key]` for back-compat.
+
+**Privacy invariants (every one tested)**
+
+* The raw `api_key` is **never** sent to Stripe. Pinned by
+  `test_metadata_contains_key_hash_not_raw_key` and
+  `test_stripe_metadata_contains_key_hash_not_raw`.
+* The `checkout_url` is **never** persisted to the manifest, the
+  revocation log, the usage log, the audit log, the Stripe premium
+  cache, the conversion log, or the upgrade-events log. Pinned by
+  `test_checkout_url_never_persisted_to_any_log`.
+* The 409 response for an already-premium caller does not echo
+  the raw key. Pinned by `test_premium_key_returns_409`.
+* Misconfiguration responses (503) name the missing env var, never
+  the caller's key. Pinned by the `TestPhase73CheckoutMisconfigured`
+  class.
+
+**Boundary**
+
+* The checkout helper (`billing.create_checkout_session_for_hash`)
+  reuses Phase 4.8's `_post_to_stripe`, `BillingConfigError`, and
+  `BillingAPIError` — no new HTTP code paths to maintain.
+* `POST /billing/checkout` joins `POST /webhook/stripe` as the only
+  mutating routes in the entire app. Pinned across
+  `tests/test_billing.py`, `tests/test_api_server.py`, and
+  `tests/test_launch_check.py`.
 
 
 ## Phase 2.7 — dataset rotation (reference)

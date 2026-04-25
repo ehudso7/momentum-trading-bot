@@ -59,7 +59,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from trading_bot.api import key_store
 from trading_bot.api.billing import (
+    BillingAPIError,
+    BillingConfigError,
     STRIPE_WEBHOOK_SECRET_ENV_VAR,
+    create_checkout_session_for_hash,
     handle_webhook_event,
     is_premium_via_stripe,
     is_stripe_configured,
@@ -1940,6 +1943,147 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         "received": True,
         "action": result.get("action", "ignored"),
         "type": result.get("type", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.3 — POST /billing/checkout (authenticated end-user upgrade)
+# ---------------------------------------------------------------------------
+#
+# A free-tier caller hits this endpoint to receive a Stripe Checkout
+# Session URL that — once paid — flips them to premium via the
+# existing Phase 4.7 / 7.0 webhook plumbing.
+#
+# Identity flows through ``key_hash`` exclusively:
+#   * the supplied bearer key is hashed by ``require_api_key`` and
+#     stashed on ``request.state.api_key_hash`` (Phase 6.2);
+#   * the hash is forwarded to Stripe in metadata and as
+#     ``client_reference_id``;
+#   * the raw key never leaves the request frame.
+#
+# Env vars (required for live operation):
+#   STRIPE_SECRET_KEY            (or legacy STRIPE_API_KEY)
+#   STRIPE_PREMIUM_PRICE_ID      (or legacy STRIPE_PRICE_ID_PREMIUM)
+#   TRADING_PUBLIC_BASE_URL      (e.g. https://your-host.example.com)
+#
+# Env vars (optional, with defaults):
+#   STRIPE_CHECKOUT_SUCCESS_PATH (default /dashboard?checkout=success)
+#   STRIPE_CHECKOUT_CANCEL_PATH  (default /dashboard?checkout=cancel)
+
+PUBLIC_BASE_URL_ENV_VAR = "TRADING_PUBLIC_BASE_URL"
+CHECKOUT_SUCCESS_PATH_ENV_VAR = "STRIPE_CHECKOUT_SUCCESS_PATH"
+CHECKOUT_CANCEL_PATH_ENV_VAR = "STRIPE_CHECKOUT_CANCEL_PATH"
+DEFAULT_CHECKOUT_SUCCESS_PATH = "/dashboard?checkout=success"
+DEFAULT_CHECKOUT_CANCEL_PATH = "/dashboard?checkout=cancel"
+
+
+def _build_checkout_redirect_urls() -> tuple[str, str]:
+    """
+    Return (success_url, cancel_url). Raises ``HTTPException(503)``
+    when ``TRADING_PUBLIC_BASE_URL`` is unset — Stripe Checkout
+    requires absolute URLs so we cannot guess.
+    """
+    base = (os.getenv(PUBLIC_BASE_URL_ENV_VAR, "") or "").strip()
+    if not base:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"checkout not configured: {PUBLIC_BASE_URL_ENV_VAR} "
+                "is unset"
+            ),
+        )
+    base = base.rstrip("/")
+    success_path = (
+        os.getenv(CHECKOUT_SUCCESS_PATH_ENV_VAR, "") or ""
+    ).strip() or DEFAULT_CHECKOUT_SUCCESS_PATH
+    cancel_path = (
+        os.getenv(CHECKOUT_CANCEL_PATH_ENV_VAR, "") or ""
+    ).strip() or DEFAULT_CHECKOUT_CANCEL_PATH
+    if not success_path.startswith("/"):
+        success_path = "/" + success_path
+    if not cancel_path.startswith("/"):
+        cancel_path = "/" + cancel_path
+    return (base + success_path, base + cancel_path)
+
+
+@app.post("/billing/checkout", tags=["billing"])
+def billing_checkout(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Authenticated free → premium Checkout Session creator.
+
+    Flow:
+      1. ``require_api_key`` authenticates the caller. The raw key is
+         consumed by the dependency and the SHA-256 hash is stashed
+         on ``request.state.api_key_hash``.
+      2. If the caller is already premium, return 409 — there's
+         nothing to upgrade. The customer should manage the existing
+         subscription via the Stripe customer portal (separate flow).
+      3. Build Stripe Checkout success/cancel URLs from
+         ``TRADING_PUBLIC_BASE_URL`` + the optional path env vars.
+      4. Call ``billing.create_checkout_session_for_hash`` with the
+         hash. The raw key is never forwarded to Stripe.
+      5. Return ``checkout_session_id``, ``checkout_url``,
+         ``key_hash``, ``tier_to``. The session URL is short-lived
+         and is NOT persisted to any operator log.
+    """
+    # Phase 6.2 always sets api_key_hash on request.state when auth
+    # succeeded; the explicit hash() call is defensive in case a
+    # future refactor unsets it.
+    cached_hash = getattr(
+        getattr(request, "state", None), "api_key_hash", None,
+    )
+    key_hash = cached_hash or key_store.hash_api_key(api_key)
+    if not key_hash:
+        # Should be unreachable since require_api_key guarantees a key.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to derive key_hash for authenticated caller",
+        )
+
+    if _is_premium(api_key, request=request):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "this key is already premium; manage the existing "
+                "subscription via Stripe directly"
+            ),
+        )
+
+    try:
+        success_url, cancel_url = _build_checkout_redirect_urls()
+        result = create_checkout_session_for_hash(
+            key_hash=key_hash,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+    except HTTPException:
+        raise
+    except BillingConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"checkout not configured: {exc}",
+        )
+    except BillingAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"checkout provider error: {exc}",
+        )
+    except ValueError as exc:
+        # Should not happen since we control the inputs, but treat as
+        # configuration if it does.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"checkout not configured: {exc}",
+        )
+
+    return {
+        "checkout_session_id": result["checkout_session_id"],
+        "checkout_url": result["checkout_url"],
+        "key_hash": result["key_hash"],
+        "tier_to": result["tier_to"],
     }
 
 

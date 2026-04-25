@@ -767,6 +767,148 @@ def create_checkout_session(
 
 
 # ---------------------------------------------------------------------------
+# Phase 7.3 — end-user Stripe Checkout (hash-only, request-driven)
+# ---------------------------------------------------------------------------
+#
+# The Phase 4.8 ``create_checkout_session`` above is operator-only and
+# sends the raw ``api_key`` to Stripe metadata so the existing
+# Phase 4.7 webhook can resolve subscription.created back to the right
+# customer. That posture predates Phase 6.2's hash-only auth path.
+#
+# Phase 7.3 adds an end-user-facing Checkout creator that NEVER puts
+# the raw key into Stripe metadata. Identity flows through ``key_hash``
+# (the same SHA-256 prefix that the auth path looks up). The webhook
+# handler in ``handle_webhook_event`` will be extended to accept
+# ``metadata[key_hash]`` alongside the legacy ``metadata[api_key]``
+# in a future phase; for now, the Phase 7.3 endpoint relies on the
+# Stripe cache being populated via the existing webhook contract.
+#
+# Env vars (preferred names new in Phase 7.3, legacy fallbacks kept):
+#
+#   STRIPE_SECRET_KEY           — required (falls back to STRIPE_API_KEY)
+#   STRIPE_PREMIUM_PRICE_ID     — required (falls back to
+#                                  STRIPE_PRICE_ID_PREMIUM)
+#
+
+STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
+STRIPE_PREMIUM_PRICE_ID_ENV_VAR = "STRIPE_PREMIUM_PRICE_ID"
+
+
+def _resolve_stripe_secret() -> str:
+    """STRIPE_SECRET_KEY (preferred) → STRIPE_API_KEY (legacy)."""
+    primary = (os.getenv(STRIPE_SECRET_KEY_ENV_VAR, "") or "").strip()
+    if primary:
+        return primary
+    return (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
+
+
+def _resolve_premium_price_id() -> str:
+    """STRIPE_PREMIUM_PRICE_ID (preferred) → STRIPE_PRICE_ID_PREMIUM (legacy)."""
+    primary = (
+        os.getenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "") or ""
+    ).strip()
+    if primary:
+        return primary
+    return (
+        os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or ""
+    ).strip()
+
+
+def create_checkout_session_for_hash(
+    *,
+    key_hash: str,
+    success_url: str,
+    cancel_url: str,
+    http_post: Optional[HttpPoster] = None,
+) -> dict:
+    """
+    Create a Stripe Checkout session for the supplied ``key_hash``.
+
+    The raw API key is NEVER touched by this function — the caller
+    must hash the presented key first. Stripe metadata carries only
+    the hash, so even a Stripe-side leak cannot expose plaintext
+    keys.
+
+    Returns a small caller-safe dict::
+
+        {
+            "checkout_session_id": "cs_...",
+            "checkout_url":        "https://checkout.stripe.com/...",
+            "key_hash":            "<as supplied>",
+            "tier_to":             "premium",
+        }
+
+    Fail-closed: raises ``BillingConfigError`` when the secret key
+    or the premium price id are unset; raises ``BillingAPIError``
+    on any non-2xx Stripe response or malformed payload.
+    """
+    if not key_hash or not isinstance(key_hash, str) or not key_hash.strip():
+        raise ValueError("key_hash is required")
+    if not success_url or not str(success_url).strip():
+        raise ValueError("success_url is required")
+    if not cancel_url or not str(cancel_url).strip():
+        raise ValueError("cancel_url is required")
+    for name, value in (
+        ("success_url", success_url), ("cancel_url", cancel_url),
+    ):
+        if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
+            raise ValueError(
+                f"{name} contains forbidden whitespace / control characters"
+            )
+
+    stripe_secret = _resolve_stripe_secret()
+    price_id = _resolve_premium_price_id()
+    if not stripe_secret:
+        raise BillingConfigError(
+            f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured"
+        )
+    if not price_id:
+        raise BillingConfigError(
+            f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured"
+        )
+
+    key_hash = key_hash.strip()
+    data = {
+        "mode": "subscription",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        # Stripe-level identity is the HASH, never the raw key.
+        "client_reference_id": key_hash,
+        "metadata[key_hash]": key_hash,
+        "metadata[tier_from]": "free",
+        "metadata[tier_to]": "premium",
+        "subscription_data[metadata][key_hash]": key_hash,
+        "subscription_data[metadata][tier_to]": "premium",
+        "customer_creation": "always",
+    }
+
+    poster = http_post if http_post is not None else _post_to_stripe
+    payload = poster(
+        url=f"{STRIPE_API_BASE_URL}/checkout/sessions",
+        data=data,
+        auth=(stripe_secret, ""),
+        timeout=STRIPE_API_TIMEOUT_SECONDS,
+    )
+    if not isinstance(payload, dict):
+        raise BillingAPIError("stripe returned non-object JSON")
+
+    session_id = str(payload.get("id") or "")
+    checkout_url = str(payload.get("url") or "")
+    if not session_id or not checkout_url:
+        raise BillingAPIError(
+            "stripe response missing 'id' or 'url' field"
+        )
+    return {
+        "checkout_session_id": session_id,
+        "checkout_url": checkout_url,
+        "key_hash": key_hash,
+        "tier_to": "premium",
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI — operator-only invocation. Never prints the raw API key.
 # ---------------------------------------------------------------------------
 
