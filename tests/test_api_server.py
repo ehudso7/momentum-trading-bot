@@ -6928,3 +6928,169 @@ class TestPhase73CheckoutNoPersistence:
         usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
         if usage_path.exists():
             assert raw not in usage_path.read_text("utf-8")
+
+
+# ===========================================================================
+# Phase 7.4 — end-to-end /billing/checkout → webhook[key_hash] → premium
+# ===========================================================================
+
+
+class TestPhase74CheckoutWebhookEndToEnd:
+    """The Phase 7.3 endpoint plus the Phase 7.4 webhook handler
+    must compose into a complete free → premium flow that requires
+    no raw API key on the wire to Stripe and no env-var edits."""
+
+    def test_checkout_then_webhook_promotes_to_premium(
+        self, client: TestClient, checkout_env, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        from trading_bot.api.keys import issue_key
+
+        # Stripe + manifest plumbing.
+        cache_path = tmp_path / "stripe_cache_phase74.json"
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_path),
+        )
+        billing.reset_cache_for_tests()
+
+        # Free key + report so /reports/latest can return 200.
+        result = issue_key(tier="free", label="phase74-e2e")
+        raw = result["api_key"]
+        key_hash = result["key_hash"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+
+        # Step 1: /billing/checkout — returns a Checkout URL.
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        r1 = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r1.status_code == 200, r1.text
+        body = r1.json()
+        assert body["key_hash"] == key_hash
+        # Confirm the key_hash was actually placed in the Stripe payload.
+        forwarded = fake.calls[0]["data"]
+        assert forwarded["metadata[key_hash]"] == key_hash
+        assert "metadata[api_key]" not in forwarded
+
+        # Sanity — pre-webhook the key is FREE. Tighten the cap so
+        # the next /reports/latest call demonstrates that.
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        h = {"Authorization": f"Bearer {raw}"}
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        assert client.get("/reports/latest", headers=h).status_code == 403
+
+        # Step 2: Stripe fires customer.subscription.created with the
+        # SAME metadata Phase 7.3 sent (key_hash only — no api_key).
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {
+                    "key_hash": key_hash,
+                    "tier_from": "free",
+                    "tier_to": "premium",
+                },
+            }},
+        })
+        assert result["action"] == "added"
+        assert result["identity"] == "key_hash"
+
+        # Reset the in-memory premium cache so the server re-reads.
+        billing.reset_cache_for_tests()
+
+        # Step 3: same key now resolves as PREMIUM and bypasses the
+        # free-tier cap.
+        for _ in range(5):
+            assert client.get(
+                "/reports/latest", headers=h,
+            ).status_code == 200
+
+        # And the on-disk cache contains ONLY the hash — no raw key.
+        body_disk = cache_path.read_text(encoding="utf-8")
+        assert key_hash in body_disk
+        assert raw not in body_disk
+
+    def test_cancellation_via_hash_reverts_to_free(
+        self, client: TestClient, checkout_env, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        from trading_bot.api.keys import issue_key
+
+        cache_path = tmp_path / "stripe_cache_phase74_cancel.json"
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_path),
+        )
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        billing.reset_cache_for_tests()
+
+        result = issue_key(tier="free", label="phase74-cancel")
+        raw, key_hash = result["api_key"], result["key_hash"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Promote via hash path.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        for _ in range(3):
+            assert client.get("/reports/latest", headers=h).status_code == 200
+
+        # Cancel via hash path.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        billing.reset_cache_for_tests()
+
+        # Back to free → cap applies.
+        statuses = [
+            client.get("/reports/latest", headers=h).status_code
+            for _ in range(3)
+        ]
+        assert 403 in statuses, (
+            f"expected 403 after cancellation; got {statuses!r}"
+        )
+
+    def test_unissued_key_hash_in_webhook_does_not_grant_access(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        """A Stripe replay carrying a key_hash we never issued must
+        NOT promote that hash. The HTTP layer also still 403s."""
+        from trading_bot.api import billing
+
+        # Configure for a clean Stripe-only state.
+        billing.reset_cache_for_tests()
+        # Pre-issue someone ELSE so the deployment is configured.
+        from trading_bot.api.keys import issue_key
+        issue_key(tier="free", label="some-other-user")
+
+        phantom_hash = "f" * 32
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": phantom_hash},
+            }},
+        })
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+
+        # And no fake bearer can be invented to use the phantom hash —
+        # the auth path requires a key whose hash matches a manifest
+        # row, not a hash itself.
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {phantom_hash}"},
+        )
+        assert r.status_code == 403

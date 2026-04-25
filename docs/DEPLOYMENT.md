@@ -411,8 +411,23 @@ Only after step 6 reports `READY`:
   `customer.subscription.deleted`, `invoice.payment_failed`.
 * Copy the signing secret into `STRIPE_WEBHOOK_SECRET` and redeploy.
 * Smoke-test one real Checkout to confirm the webhook flips the
-  customer's tier to premium (Phase 7.0 does this automatically as
-  long as the `metadata.api_key` matches an issued manifest row).
+  customer's tier to premium. The webhook accepts BOTH identity
+  shapes:
+  - `metadata[api_key]` (Phase 4.7 / 4.8 — operator-CLI
+    `keys issue --checkout` flow)
+  - `metadata[key_hash]` (Phase 7.3 — `POST /billing/checkout` flow,
+    no raw key on the wire)
+
+  Either one is verified against the issuance manifest before the
+  premium cache is mutated. Revoked hashes can never be re-promoted
+  by a Stripe replay regardless of which identity field carries
+  them. See `docs/CORE_CONTROL.md` § Phase 7.4 for the full table.
+
+* If both `STRIPE_API_KEY` (legacy) and `STRIPE_SECRET_KEY` (Phase
+  7.3 preferred) are set, they should hold the same Stripe-side
+  credential — `is_stripe_configured()` accepts either. Operators
+  rolling forward from a Phase 4.7 deployment may set just
+  `STRIPE_SECRET_KEY` and remove the legacy alias.
 
 ### 8 — Hand-deliver keys securely
 

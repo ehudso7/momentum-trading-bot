@@ -2691,6 +2691,93 @@ continues to populate `metadata[api_key]` for back-compat.
   `tests/test_launch_check.py`.
 
 
+### Phase 7.4 — hash-based Stripe webhook promotion
+
+Closes the loop on the Phase 7.3 hash-only Checkout flow. The
+Stripe webhook handler now accepts ``metadata[key_hash]`` directly,
+so a customer paying through `POST /billing/checkout` is auto-
+promoted to premium without any raw API key ever reaching Stripe
+or this server's billing path.
+
+**Webhook identity extraction (Phase 7.4 contract)**
+
+`_extract_identity_from_event_object` returns a `(api_key, key_hash)`
+tuple, pulling each independently from `object.metadata` and
+defensively from `object.customer.metadata`. The handler prefers
+`key_hash` when both are present.
+
+| Source on Stripe object | Phase | Promoted as |
+|---|---|---|
+| `metadata[key_hash]` | 7.3 / 7.4 (preferred) | hash directly |
+| `metadata[api_key]` | 4.7 / 4.8 (legacy operator-CLI) | hash of api_key |
+| neither | — | `{action: ignored, reason: no_identity_on_event}` |
+
+The handler's response gains an `"identity"` field
+(`"key_hash"` or `"api_key"`) so operators can see which path the
+event flowed through.
+
+**Manifest gate (unchanged semantics, hash-input variant added)**
+
+* `_verify_against_manifest(api_key)` (Phase 7.0) — hashes then
+  validates.
+* `_verify_hash_against_manifest(key_hash)` (new in Phase 7.4) —
+  validates the hash directly. Both check
+  `key_store.lookup_key_hash(...) is not None` AND
+  `not key_store.is_revoked(...)`. A revoked hash can never be
+  re-promoted by a Stripe replay, regardless of which identity
+  field the event carries.
+
+**Premium-cache helpers (hash-only, Phase 7.0 schema preserved)**
+
+| Function | Input | Notes |
+|---|---|---|
+| `add_premium_key(api_key)` | raw key | Hashes, then delegates to `add_premium_hash`. |
+| `add_premium_hash(key_hash)` | hash | New in Phase 7.4 — bypasses the redundant hash. |
+| `remove_premium_key(api_key)` | raw key | Hashes, then delegates to `remove_premium_hash`. |
+| `remove_premium_hash(key_hash)` | hash | New in Phase 7.4 — symmetric removal. |
+
+The on-disk schema (`data/stripe_premium_keys.json` — list of
+SHA-256[:32] hashes) is unchanged.
+
+**Conversion logging (Phase 4.9 surface, hash-input variant added)**
+
+`record_conversion(api_key, ...)` now delegates to a new
+`record_conversion_for_hash(key_hash, ...)`. The Phase 7.4 webhook
+handler picks the variant matching the event's identity source. The
+on-disk row schema (`data/api_conversions.jsonl`) is unchanged —
+both paths land an `api_key_hash` row.
+
+**`is_stripe_configured()` widened**
+
+Now returns True if EITHER `STRIPE_API_KEY` (legacy) OR
+`STRIPE_SECRET_KEY` (Phase 7.3 preferred) is set. Operators
+migrating to the new env-var name no longer need to set both.
+
+**Auth precedence (unchanged)**
+
+Stripe still wins over manifest tier, regardless of which path
+populated the cache. A key promoted via the Phase 7.4 hash flow
+is indistinguishable from one promoted via the Phase 4.7 raw-key
+flow on the read side.
+
+**Privacy invariants pinned by tests**
+
+| Invariant | Pinned by |
+|---|---|
+| Raw API key never required for the Phase 7.4 promotion path | `TestPhase74WebhookHashPath::test_valid_key_hash_promotes` |
+| Premium cache contains only hashes after a hash-path event | `TestPhase74WebhookPersistence::test_premium_cache_contains_only_hash_after_hash_path` |
+| Planted PII (email, name, PAN, CVV) in the event never reaches the cache | `TestPhase74WebhookPersistence::test_planted_pii_in_event_does_not_reach_cache` |
+| Revoked hashes cannot be re-promoted by Stripe replay | `TestPhase74WebhookHashPath::test_revoked_key_hash_does_not_promote` |
+| Legacy `metadata[api_key]` flow still works | `TestPhase74LegacyApiKeyPathStillWorks` (2 tests) |
+| Hash-path cancellation/payment_failed correctly remove premium | `TestPhase74WebhookCancellationByHash` (2 tests) |
+| End-to-end /billing/checkout → webhook[key_hash] → premium | `TestPhase74CheckoutWebhookEndToEnd::test_checkout_then_webhook_promotes_to_premium` |
+
+`POST /billing/checkout` is now fully hash-only end-to-end:
+checkout → Stripe → webhook → premium cache. No raw key on the
+wire to Stripe; no raw key in the cache file; no raw key in any
+operator log.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
