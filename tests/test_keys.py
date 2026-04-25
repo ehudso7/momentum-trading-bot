@@ -1064,3 +1064,240 @@ class TestPhase61Cli:
         assert "<script>" not in result.stdout
         body = manifest_path.read_text(encoding="utf-8")
         assert "<script>" not in body
+
+
+# ===========================================================================
+# Phase 6.2 — revoke subcommand
+# ===========================================================================
+
+
+@pytest.fixture
+def revoked_path(tmp_path: Path, monkeypatch) -> Path:
+    p = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(p))
+    # Reset key_store caches so a previous test's revoked file
+    # doesn't leak into this one.
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
+    yield p
+    key_store.reset_caches_for_tests()
+
+
+def _read_revocations(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s:
+            rows.append(json.loads(s))
+    return rows
+
+
+class TestPhase62RevokeApi:
+    """In-process invocation of ``main`` with ``revoke`` argv."""
+
+    def test_revoke_by_hash_writes_row(self, revoked_path: Path):
+        h = "a" * 32
+        rc = keys_main([
+            "revoke", "--key-hash", h, "--reason", "leaked",
+        ])
+        assert rc == 0
+        (row,) = _read_revocations(revoked_path)
+        assert row["key_hash"] == h
+        assert row["reason"] == "leaked"
+        assert "timestamp" in row
+
+    def test_revoke_by_raw_key_stores_only_hash(
+        self, revoked_path: Path,
+    ):
+        marker = "RAW_KEY_REVOKE_DO_NOT_LEAK_ABCXYZ"
+        expected_hash = _hash_api_key(marker)
+
+        rc = keys_main(["revoke", "--api-key", marker, "--reason", "rotation"])
+        assert rc == 0
+
+        (row,) = _read_revocations(revoked_path)
+        assert row["key_hash"] == expected_hash
+        body = revoked_path.read_text(encoding="utf-8")
+        assert marker not in body
+        # Sanity — the hash is present.
+        assert expected_hash in body
+
+    def test_revoke_blank_hash_rejected(self, revoked_path: Path):
+        rc = keys_main(["revoke", "--key-hash", "   "])
+        assert rc == 2
+        assert _read_revocations(revoked_path) == []
+
+    def test_revoke_blank_raw_key_rejected(self, revoked_path: Path):
+        rc = keys_main(["revoke", "--api-key", "   "])
+        assert rc == 2
+        assert _read_revocations(revoked_path) == []
+
+    def test_revoke_requires_one_of_two_inputs(
+        self, revoked_path: Path,
+    ):
+        # argparse calls sys.exit(2) on a missing required group.
+        with pytest.raises(SystemExit) as exc:
+            keys_main(["revoke"])
+        assert exc.value.code == 2
+        assert _read_revocations(revoked_path) == []
+
+    def test_revoke_rejects_both_inputs(
+        self, revoked_path: Path,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            keys_main([
+                "revoke",
+                "--api-key", "k",
+                "--key-hash", "h" * 32,
+            ])
+        assert exc.value.code == 2
+        assert _read_revocations(revoked_path) == []
+
+    def test_revoke_reason_optional(self, revoked_path: Path):
+        rc = keys_main(["revoke", "--key-hash", "b" * 32])
+        assert rc == 0
+        (row,) = _read_revocations(revoked_path)
+        assert "reason" not in row
+
+    def test_revoke_path_override(self, tmp_path: Path):
+        custom = tmp_path / "alt_revoked.jsonl"
+        rc = keys_main([
+            "revoke",
+            "--key-hash", "c" * 32,
+            "--revoked-path", str(custom),
+        ])
+        assert rc == 0
+        assert custom.exists()
+
+
+class TestPhase62RevokeCli:
+    """Subprocess-level CLI test — verifies argv parsing & exit codes."""
+
+    def test_subprocess_revoke_by_hash(self, tmp_path: Path):
+        revoked = tmp_path / "api_keys_revoked.jsonl"
+        h = "d" * 32
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "revoke", "--key-hash", h, "--reason", "test",
+            ],
+            capture_output=True, text=True,
+            env={
+                **__import__("os").environ,
+                "TRADING_API_KEYS_REVOKED_PATH": str(revoked),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert "revoked" in result.stdout.lower()
+        rows = _read_revocations(revoked)
+        assert len(rows) == 1
+        assert rows[0]["key_hash"] == h
+
+    def test_subprocess_revoke_by_raw_key_does_not_leak(
+        self, tmp_path: Path,
+    ):
+        revoked = tmp_path / "api_keys_revoked.jsonl"
+        marker = "RAW_KEY_SUBPROC_DO_NOT_LEAK"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "revoke", "--api-key", marker,
+            ],
+            capture_output=True, text=True,
+            env={
+                **__import__("os").environ,
+                "TRADING_API_KEYS_REVOKED_PATH": str(revoked),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        body = revoked.read_text(encoding="utf-8")
+        assert marker not in body
+        assert marker not in result.stdout
+
+    def test_subprocess_unknown_command_exits_nonzero(self):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "no-such-command",
+            ],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 2
+        assert "available commands" in result.stderr
+        assert "revoke" in result.stderr
+
+
+class TestPhase62IssueRevokeRoundTrip:
+    """Issue a key, revoke it via the CLI, and assert the manifest +
+    revocation log together describe the lifecycle correctly."""
+
+    def test_issue_then_revoke_by_hash(
+        self, manifest_path: Path, tmp_path: Path,
+    ):
+        issued = issue_key(tier="free", label="alice")
+        api_key = issued["api_key"]
+        key_hash = issued["key_hash"]
+
+        revoked = tmp_path / "api_keys_revoked.jsonl"
+        rc = keys_main([
+            "revoke", "--key-hash", key_hash,
+            "--revoked-path", str(revoked),
+            "--reason", "user-requested",
+        ])
+        assert rc == 0
+
+        # Manifest still has the original row …
+        manifest_rows = _read(manifest_path)
+        assert any(r["key_hash"] == key_hash for r in manifest_rows)
+
+        # … and the revocation log records exactly the hash.
+        (rev,) = _read_revocations(revoked)
+        assert rev["key_hash"] == key_hash
+        assert rev["reason"] == "user-requested"
+        # Raw issued api_key never landed on disk.
+        body = revoked.read_text(encoding="utf-8")
+        assert api_key not in body
+
+    def test_issue_then_revoke_by_raw_key(
+        self, manifest_path: Path, tmp_path: Path,
+    ):
+        issued = issue_key(tier="premium", label="bob")
+        api_key = issued["api_key"]
+        key_hash = issued["key_hash"]
+
+        revoked = tmp_path / "api_keys_revoked.jsonl"
+        rc = keys_main([
+            "revoke", "--api-key", api_key,
+            "--revoked-path", str(revoked),
+        ])
+        assert rc == 0
+
+        (rev,) = _read_revocations(revoked)
+        assert rev["key_hash"] == key_hash
+        body = revoked.read_text(encoding="utf-8")
+        assert api_key not in body
+
+
+class TestPhase62NoCoreImports:
+    """The Phase 6.0 boundary still holds after Phase 6.2."""
+
+    def test_keys_module_does_not_reach_into_core(self):
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "trading_bot" / "api" / "keys.py"
+        ).read_text()
+        for forbidden in (
+            "from trading_bot.core.alpha",
+            "from trading_bot.execution",
+            "from trading_bot.portfolio",
+            "from trading_bot.risk",
+            "from trading_bot.scanners",
+            "from trading_bot.strategies",
+            "from trading_bot.main",
+            "from trading_bot.api.server",
+        ):
+            assert forbidden not in src, (
+                f"keys.py imports restricted surface: {forbidden!r}"
+            )

@@ -90,6 +90,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from trading_bot.api import key_store
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -452,6 +454,104 @@ def _issue_cli(argv: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 6.2 — revoke subcommand
+# ---------------------------------------------------------------------------
+
+
+def _build_revoke_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys revoke",
+        description=(
+            "Append a revocation row for an issued API key. The "
+            "revoked hash is rejected on the next request — no "
+            "server restart needed. Operators may provide either the "
+            "key_hash directly (preferred) or the raw api_key (which "
+            "is hashed in-process and discarded immediately — never "
+            "persisted)."
+        ),
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--key-hash", default=None,
+        help="SHA-256(api_key)[:32] hash to revoke (preferred).",
+    )
+    group.add_argument(
+        "--api-key", default=None,
+        help=(
+            "Raw API key to revoke. Hashed in-process; the raw value "
+            "is NEVER written to the revocation log."
+        ),
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional operator-facing free-text reason for revocation "
+            f"(capped at {key_store.REVOCATION_REASON_MAX_LENGTH} chars)."
+        ),
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help=(
+            "Override the revocation log path "
+            f"(default: ${key_store.KEYS_REVOKED_ENV_VAR} or "
+            f"{key_store.DEFAULT_KEYS_REVOKED_PATH})."
+        ),
+    )
+    return parser
+
+
+def _revoke_cli(argv: list[str]) -> int:
+    args = _build_revoke_parser().parse_args(argv)
+
+    if args.key_hash:
+        key_hash = str(args.key_hash).strip()
+        if not key_hash:
+            print("error: --key-hash must not be blank", file=sys.stderr)
+            return 2
+    else:
+        raw = str(args.api_key or "").strip()
+        if not raw:
+            print("error: --api-key must not be blank", file=sys.stderr)
+            return 2
+        key_hash = key_store.hash_api_key(raw)
+        # Drop the raw value from the local frame as soon as possible.
+        # Python can't truly zero-out the string, but we can at least
+        # avoid keeping the binding around for any longer than needed.
+        del raw
+
+    target = (
+        Path(args.revoked_path) if args.revoked_path else None
+    )
+
+    try:
+        record = key_store.append_revocation(
+            key_hash=key_hash,
+            reason=args.reason,
+            target=target,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — operator-facing CLI
+        print(
+            f"error: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+
+    final_path = (
+        target if target is not None else key_store.revoked_path()
+    )
+    print("API key revoked (revocation row appended):")
+    print(f"  key_hash      : {record['key_hash']}")
+    print(f"  timestamp     : {record['timestamp']}")
+    if record.get("reason"):
+        print(f"  reason        : {record['reason']}")
+    print(f"  revoked_path  : {final_path}")
+    return 0
+
+
 def _build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot.api.keys",
@@ -461,6 +561,11 @@ def _build_top_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "issue",
         help="Generate a new API key and append a manifest row.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "revoke",
+        help="Append a revocation row for an issued API key.",
         add_help=False,
     )
     return parser
@@ -475,11 +580,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     command, rest = argv[0], argv[1:]
     if command == "issue":
         return _issue_cli(rest)
+    if command == "revoke":
+        return _revoke_cli(rest)
     if command in ("-h", "--help"):
         _build_top_parser().print_help()
         return 0
     print(f"error: unknown command '{command}'", file=sys.stderr)
-    print("available commands: issue", file=sys.stderr)
+    print("available commands: issue, revoke", file=sys.stderr)
     return 2
 
 

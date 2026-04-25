@@ -57,6 +57,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from trading_bot.api import key_store
 from trading_bot.api.billing import (
     STRIPE_WEBHOOK_SECRET_ENV_VAR,
     handle_webhook_event,
@@ -456,39 +457,71 @@ def _premium_keys_set() -> set[str]:
     return {k.strip() for k in raw.split(",") if k.strip()}
 
 
-def _is_premium(api_key: Optional[str]) -> bool:
+def _is_premium(
+    api_key: Optional[str],
+    request: Optional[Request] = None,
+) -> bool:
     """
     True iff the supplied key is premium.
 
-    Phase 4.7 precedence:
-      1. If Stripe is configured (STRIPE_API_KEY set) AND the cache
-         shows this api_key as having an active subscription → True.
-      2. Otherwise, fall back to the Phase 4.5 env-var list —
-         this continues to work when Stripe is not configured AND
-         gives operators an override path when Stripe IS configured.
+    Precedence (Phase 6.2):
+      1. If a request is supplied AND ``require_api_key`` already
+         resolved the tier, honour the cached value on
+         ``request.state.api_key_tier``. This avoids re-hashing /
+         re-reading the manifest for every helper that asks.
+      2. If Stripe is configured AND the cache shows this api_key
+         as having an active subscription → premium.
+      3. If the key is in ``TRADING_API_PREMIUM_KEYS`` → premium
+         (operator override; works even when Stripe is configured).
+      4. If the manifest entry for this key has tier="premium" AND
+         the key has not been revoked → premium.
+      5. Otherwise → free / not premium.
 
+    A revoked key is never premium (the manifest path checks revocation).
     Empty / None input → False.
     """
     if not api_key:
         return False
+    if request is not None:
+        cached = getattr(
+            getattr(request, "state", None), "api_key_tier", None,
+        )
+        if cached == TIER_PREMIUM:
+            return True
+        if cached == TIER_FREE:
+            return False
     if is_stripe_configured() and is_premium_via_stripe(api_key):
         return True
-    return api_key in _premium_keys_set()
+    if api_key in _premium_keys_set():
+        return True
+    entry = key_store.verify_api_key(api_key)
+    if entry is not None and entry.tier == TIER_PREMIUM:
+        return True
+    return False
 
 
 def _is_known_key(api_key: Optional[str]) -> bool:
     """
-    Phase 5.4 helper: True iff ``api_key`` would be accepted by
-    ``require_api_key`` (free or premium). Used by the free-tier
-    middleware to decide whether to enforce or fall through; the
-    actual authentication still happens at the route dependency.
+    True iff ``api_key`` would be accepted by ``require_api_key``
+    (free or premium, env-backed or manifest-backed). Used by the
+    free-tier middleware to decide whether to enforce or fall
+    through; the actual authentication still happens at the route
+    dependency.
+
+    A revoked manifest key is NOT known.
     """
     if not api_key:
         return False
     configured = (os.getenv(API_KEY_ENV_VAR, "") or "").strip()
     if configured and api_key == configured:
         return True
-    return _is_premium(api_key) or api_key in _premium_keys_set()
+    if api_key in _premium_keys_set():
+        return True
+    if is_stripe_configured() and is_premium_via_stripe(api_key):
+        return True
+    if key_store.verify_api_key(api_key) is not None:
+        return True
+    return False
 
 
 def _extract_bearer_token(request: Request) -> Optional[str]:
@@ -628,29 +661,42 @@ def require_api_key(
     `Authorization: Bearer <token>` header. Returns the validated
     token string so handlers can read it (e.g., for tier classification).
 
-    Accepted tokens:
-      - The single value of `TRADING_API_KEY` (free tier).
-      - Any value listed in `TRADING_API_PREMIUM_KEYS` (premium tier).
+    Accepted tokens (Phase 6.2 precedence):
+      1. Revoked manifest hash → 403 (rejected before any other check
+         so a revoked key cannot be reinstated by also appearing in
+         the env-var lists).
+      2. ``TRADING_API_KEY`` exact match → free tier.
+      3. ``TRADING_API_PREMIUM_KEYS`` membership → premium tier.
+      4. Stripe-cached active subscription (when Stripe is
+         configured) → premium tier.
+      5. Manifest entry (``data/api_keys_manifest.jsonl``) with
+         ``tier="premium"`` → premium tier.
+      6. Manifest entry with ``tier="free"`` → free tier.
+      7. Otherwise → 403.
 
     Failure modes:
-      - 503 when neither env var is set — fail-closed.
+      - 503 when no env keys AND no usable manifest entries — fail-closed.
       - 401 when the header is missing or non-Bearer.
-      - 403 when the header's token matches neither set.
+      - 403 when the header's token matches none of the sources, or
+        when the presented key has been revoked.
 
-    Side effect on success: the validated token is stashed on
-    ``request.state.api_key`` so the Phase 4.6 usage-metrics
-    middleware can read it without re-validating. The token NEVER
-    leaves the request's in-memory state — it is not logged and
-    not persisted.
+    Side effect on success: the validated token, its hash, and its
+    resolved tier are stashed on ``request.state`` so downstream
+    middleware/handlers can read them without re-hashing or
+    re-resolving. The raw token NEVER leaves the request's
+    in-memory state — it is not logged and not persisted.
     """
     configured = (os.getenv(API_KEY_ENV_VAR, "") or "").strip()
     premium_keys = _premium_keys_set()
-    if not configured and not premium_keys:
+    manifest_active = key_store.has_active_keys()
+    if not configured and not premium_keys and not manifest_active:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "API key not configured on server; set TRADING_API_KEY "
-                "and/or TRADING_API_PREMIUM_KEYS before accepting requests"
+                "API key not configured on server; set TRADING_API_KEY, "
+                "TRADING_API_PREMIUM_KEYS, or issue a key via "
+                "`python -m trading_bot.api.keys issue` before "
+                "accepting requests"
             ),
         )
     if creds is None:
@@ -664,15 +710,51 @@ def require_api_key(
             detail="Authorization scheme must be Bearer",
         )
     presented = creds.credentials
-    if presented != configured and presented not in premium_keys:
+
+    # Revocation is the very first check after parsing — a revoked
+    # key must never authenticate, even if it also happens to match
+    # an env var. This makes revocation the unambiguous kill switch.
+    presented_hash = key_store.hash_api_key(presented)
+    if presented_hash and key_store.is_revoked(presented_hash):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",
         )
+
+    # Precedence (Phase 6.2):
+    #   1. Stripe active/cache → premium  (so a cancelled Stripe
+    #      subscription cannot be silently reinstated by the same
+    #      key also appearing in the manifest as premium)
+    #   2. env premium list   → premium  (operator override)
+    #   3. manifest premium   → premium  (CLI-issued)
+    #   4. manifest free      → free     (CLI-issued)
+    #   5. env single key     → free     (legacy single-tenant deploy)
+    #   6. otherwise          → 403
+    resolved_tier: Optional[str] = None
+    if is_stripe_configured() and is_premium_via_stripe(presented):
+        resolved_tier = TIER_PREMIUM
+    elif presented in premium_keys:
+        resolved_tier = TIER_PREMIUM
+    else:
+        entry = key_store.verify_api_key(presented)
+        if entry is not None:
+            resolved_tier = entry.tier
+        elif configured and presented == configured:
+            resolved_tier = TIER_FREE
+
+    if resolved_tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key",
+        )
+
     # Stash only after validation — failure paths raised above never
-    # reach this line, so `api_key` on request.state implies "auth OK".
+    # reach this line, so the presence of `api_key` / `api_key_tier`
+    # on request.state implies "auth OK".
     try:
         request.state.api_key = presented
+        request.state.api_key_hash = presented_hash
+        request.state.api_key_tier = resolved_tier
     except Exception:
         pass
     return presented
@@ -1192,12 +1274,23 @@ async def usage_middleware(request: Request, call_next):
         return response
 
     try:
+        # Phase 6.2 — prefer the values cached on request.state by
+        # require_api_key so we don't re-hash the same key or
+        # re-resolve the same tier per request.
+        cached_hash = getattr(
+            getattr(request, "state", None), "api_key_hash", None,
+        )
+        key_hash = cached_hash if cached_hash else _hash_api_key(api_key)
         record = {
             "timestamp": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%S.%fZ"
             ),
-            "key_hash": _hash_api_key(api_key),
-            "tier": TIER_PREMIUM if _is_premium(api_key) else TIER_FREE,
+            "key_hash": key_hash,
+            "tier": (
+                TIER_PREMIUM
+                if _is_premium(api_key, request=request)
+                else TIER_FREE
+            ),
             "method": request.method,
             "path": request.url.path,
             "status_code": int(response.status_code),
@@ -1829,7 +1922,7 @@ def report_for_date(
     """
     _validate_date(date)
     _enforce_free_limits(
-        is_premium=_is_premium(api_key),
+        is_premium=_is_premium(api_key, request=request),
         date_requested=date,
         request=request,
         api_key=api_key,
@@ -1861,7 +1954,7 @@ def recent_experiments(
       than my tier allows".
     - Empty manifest → `{"count": 0, "records": []}`.
     """
-    is_premium = _is_premium(api_key)
+    is_premium = _is_premium(api_key, request=request)
     # Detect EXPLICIT use of the query param via raw query string —
     # FastAPI cannot distinguish a default from an explicit value
     # equal to the default.
@@ -1900,7 +1993,7 @@ def experiment_by_index(
             detail="n must be >= 1 (1 = most recent)",
         )
     _enforce_free_limits(
-        is_premium=_is_premium(api_key),
+        is_premium=_is_premium(api_key, request=request),
         n_experiments=n,
         request=request,
         api_key=api_key,
@@ -2307,7 +2400,9 @@ def dashboard(
     records = _read_manifest_records(_manifest_path())
     experiments = [_sanitize_manifest(r) for r in records[-10:]] if records else []
 
-    tier = TIER_PREMIUM if _is_premium(api_key) else TIER_FREE
+    tier = (
+        TIER_PREMIUM if _is_premium(api_key, request=request) else TIER_FREE
+    )
     # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
     # string rendered to the user is also the one we hash into the
     # telemetry row. Premium users skip the resolver entirely (no

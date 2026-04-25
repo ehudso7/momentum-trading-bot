@@ -35,6 +35,8 @@ See also:
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH`    | path             | `data/stripe_premium_keys.json` | SaaS API only | Persistent JSON list of opaque API-key strings with active subscriptions. Survives restarts. (Phase 4.7) |
 | `TRADING_API_CONVERSION_LOG_PATH`      | path             | `data/api_conversions.jsonl` | SaaS API only | Append-only JSONL of free → paid conversion events. Hashed keys only — no PII, no card data. (Phase 4.9) |
 | `TRADING_API_GROWTH_LOG_PATH`          | path             | `data/api_growth.jsonl`      | SaaS API only | Append-only JSONL of `?ref=<code>` referral events. Dedup'd per (hash, ref) within 24h. Hashed keys only. (Phase 5.1) |
+| `TRADING_API_KEYS_MANIFEST_PATH`       | path             | `data/api_keys_manifest.jsonl` | SaaS API only | Append-only JSONL of operator-issued keys (Phase 6.0/6.1). Server reads it as an auth source — keys whose hash appears here authenticate without env-var edits. Hashed keys only. (Phase 6.2) |
+| `TRADING_API_KEYS_REVOKED_PATH`        | path             | `data/api_keys_revoked.jsonl`  | SaaS API only | Append-only JSONL of revocation events. A revoked hash is rejected with 403 even when the same raw key also matches `TRADING_API_KEY` or appears in the Stripe cache. Hashed keys only. (Phase 6.2) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -2215,6 +2217,131 @@ End-to-end stub-HTTP test:
 form, no JSON API, no env var. The whole feature lives behind
 the existing operator-only `python -m trading_bot.api.keys issue`
 shell command.
+
+
+### Phase 6.2 — manifest-backed API key authentication
+
+Keys issued by `python -m trading_bot.api.keys issue` (Phase 6.0/6.1)
+are now accepted by the live API server **without** editing
+`TRADING_API_KEY` or `TRADING_API_PREMIUM_KEYS`. The server hashes
+the presented bearer token (`SHA-256(api_key)[:32]`) and looks the
+hash up in the issuance manifest. The raw key is never persisted —
+the manifest only stores the hash, the same posture as Phase 6.0.
+
+**Files**
+
+| File | Default | Env var | Written by | Read by |
+|---|---|---|---|---|
+| Issuance manifest | `data/api_keys_manifest.jsonl` | `TRADING_API_KEYS_MANIFEST_PATH` | `keys issue` | server auth |
+| Revocation log | `data/api_keys_revoked.jsonl` | `TRADING_API_KEYS_REVOKED_PATH` | `keys revoke` | server auth |
+
+The manifest schema is unchanged from Phase 6.0/6.1 — `key_hash`,
+`tier`, `created_at`, `label_hash`, `ref_code`,
+`checkout_session_id`. The server only consults `key_hash` and
+`tier`; the other fields stay for operator forensics.
+
+The revocation log is also append-only JSONL:
+
+```json
+{
+  "timestamp":  "2026-04-25T12:34:56.789012Z",
+  "key_hash":   "<SHA-256(api_key)[:32]>",
+  "reason":     "<operator free text — capped at 200 chars>"
+}
+```
+
+**Authentication precedence** (top to bottom — first match wins):
+
+```
+1. revoked hash             → 403 (kill switch beats every source)
+2. Stripe-cache premium      → premium  (Phase 4.7 contract preserved)
+3. TRADING_API_PREMIUM_KEYS  → premium  (operator override)
+4. manifest tier="premium"   → premium  (CLI-issued, hash lookup)
+5. manifest tier="free"      → free     (CLI-issued, hash lookup)
+6. TRADING_API_KEY exact     → free     (legacy single-tenant)
+7. otherwise                 → 403
+```
+
+A revoked manifest hash is rejected even when the same raw key is
+also listed in `TRADING_API_PREMIUM_KEYS` or cached by Stripe —
+revocation is the unambiguous kill switch. Manifest-premium does
+**not** override a Stripe cancellation: if Stripe drops a key from
+its cache (cancellation / payment failure) and that key only
+appears in the manifest as premium, the request resolves through
+the manifest. If the manifest does NOT list it, the key falls back
+to whatever the next applicable source returns.
+
+**Fail-closed config**
+
+Protected endpoints return `503` only when the deployment is
+not configured for any auth source:
+
+```
+TRADING_API_KEY unset
+  AND TRADING_API_PREMIUM_KEYS unset
+  AND issuance manifest empty (no parseable rows)
+```
+
+If at least one of those is configured, an unknown bearer token
+gets `403 Invalid API key` — never `503`. A revoked-only manifest
+still counts as configured (revocation does not unconfigure the
+deployment back to 503).
+
+**Hot reload**
+
+`trading_bot.api.key_store` caches both files in process memory
+keyed on `(path, mtime)`. When a new key is issued or revoked, the
+next request picks up the change automatically — no server
+restart required.
+
+**Operator workflow**
+
+```bash
+# Issue a free-tier key (Phase 6.0)
+python -m trading_bot.api.keys issue --tier free --label "alice"
+# → prints raw api_key ONCE; record it now.
+
+# Customer hits the API directly with no env-var edit:
+curl https://api.example.com/reports/latest \
+  -H "Authorization: Bearer <api_key>"
+
+# Revoke (preferred — no raw key needed):
+python -m trading_bot.api.keys revoke \
+  --key-hash <hash from issuance> \
+  --reason "user-requested rotation"
+
+# Revoke when only the raw key is on hand: hashed in-process,
+# never written to disk:
+python -m trading_bot.api.keys revoke \
+  --api-key "<the raw key>" \
+  --reason "leaked"
+```
+
+**Privacy invariants (every one tested)**
+
+* The raw `api_key` is **never** persisted — not in the manifest,
+  not in the revocation log, not in the audit log, not in the
+  usage log. The `revoke --api-key` path hashes in-process and
+  writes only the hash. Pinned by
+  `tests/test_api_server.py::TestPhase62NoRawKeyOnDisk` and
+  `tests/test_keys.py::TestPhase62RevokeCli::test_subprocess_revoke_by_raw_key_does_not_leak`.
+* The raw `label` is **never** persisted (carry-over from
+  Phase 6.0).
+* Revocation always stores the hash only — `key_store.append_revocation`
+  refuses to accept a raw key as input. Hashing happens at the CLI
+  layer before the helper is called.
+* `key_store` imports nothing from FastAPI, structlog, or the rest
+  of the trading-bot package — the operator CLI continues to run
+  in dependency-light environments. Pinned by
+  `tests/test_keys.py::TestPhase62NoCoreImports`.
+* No HTTP signup endpoint, no form, no JSON API. The entire
+  Phase 6.2 surface is the same operator-only shell that Phase 6.0
+  introduced, plus one new `revoke` subcommand.
+
+**Module boundary** — `trading_bot/api/key_store.py` is a leaf
+module. `trading_bot.api.keys` and `trading_bot.api.server` both
+import from it; `key_store` itself imports only from the Python
+stdlib.
 
 
 ## Phase 2.7 — dataset rotation (reference)
