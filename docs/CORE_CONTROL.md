@@ -2441,6 +2441,83 @@ worked CLI examples, three deployment options, and the local-vs-
 production warning — lives in [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 
+### Phase 7.0 — Stripe → key activation bridge
+
+Phase 7.0 closes the loop between the Phase 6 issuance model and the
+Phase 4.7 Stripe billing cache. A paid subscription now activates
+premium access **automatically** on `customer.subscription.created`
+without the operator editing env vars or touching the manifest.
+
+Two hardening changes ship together:
+
+**1. Hash-only premium cache.** `data/stripe_premium_keys.json` now
+stores SHA-256[:32] hashes exclusively. `add_premium_key` hashes its
+input in-process; the raw api_key never reaches disk. Legacy cache
+files that still contain raw keys are transparently re-hashed and
+rewritten on the next load — no operator intervention required.
+
+**2. Manifest verification gate.** Before adding an api_key to the
+cache, the webhook handler calls
+`trading_bot.api.key_store.verify_api_key(api_key)`. A hit means
+the key is in the issuance manifest AND has not been revoked. A
+miss — unknown hash, or revoked hash — causes the webhook to return
+
+```
+{ "action": "ignored", "reason": "key_not_in_manifest_or_revoked" }
+```
+
+No cache mutation, no conversion-log row, no side effects. The
+revoked-key path is the important one: a key rotated off the
+manifest can never be re-promoted by a Stripe replay. Cancellation
+(`customer.subscription.deleted`) and payment failure
+(`invoice.payment_failed`) still flow through without the gate so a
+cancelled customer immediately loses premium even if their manifest
+row was already deleted.
+
+**Auth precedence (Phase 7.0, unchanged from Phase 6.2)**
+
+```
+1. revoked hash             → 403 (kill switch)
+2. Stripe cache (premium)    → premium   ← webhook-driven
+3. TRADING_API_PREMIUM_KEYS  → premium   (operator override)
+4. manifest tier="premium"   → premium   (CLI-issued)
+5. manifest tier="free"      → free      (CLI-issued)
+6. TRADING_API_KEY exact     → free      (legacy single-tenant)
+7. otherwise                 → 403
+```
+
+Stripe always overrides the manifest tier. A key issued as free
+(step 5) is promoted to premium (step 2) the moment the webhook
+fires. A cancellation drops the key out of step 2 and the next
+request resolves via step 5 again — free access restored.
+
+**Privacy invariants (pinned by tests)**
+
+* Raw `api_key` never reaches disk (Phase 7.0 migration of the
+  Stripe cache). Pinned by
+  `tests/test_billing.py::TestPhase70HashOnlyPersistence` and
+  `tests/test_api_server.py::TestPhase70NoRawKeyInStripeCache`.
+* The webhook NEVER mutates the issuance manifest. Pinned by
+  `tests/test_billing.py::TestPhase70ManifestNotMutated` —
+  manifest bytes compare equal before/after a
+  `subscription.created` delivery.
+* Customer email, customer name, PAN, CVV, and payment-method
+  fields are never persisted — the webhook handler only reads
+  `object.metadata.api_key`. Pinned by
+  `tests/test_billing.py::TestNoSensitiveDataStored`.
+* Revoked keys cannot be re-promoted by a Stripe replay. Pinned by
+  `tests/test_billing.py::TestPhase70ManifestGate::test_revoked_key_webhook_ignored`.
+
+**No new public surface, no Core imports.** `billing.py` still
+imports nothing from `trading_bot.core.*`, `trading_bot.execution`,
+`trading_bot.portfolio`, `trading_bot.risk`, `trading_bot.scanners`,
+`trading_bot.strategies`, or `trading_bot.main`. `key_store` is
+lazy-imported inside the webhook handler so the billing module
+remains loadable in environments where the manifest file is not
+configured. No new HTTP endpoint is added — the Stripe webhook
+already existed (`POST /webhook/stripe`, Phase 4.7).
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

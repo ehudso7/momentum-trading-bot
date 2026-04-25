@@ -1,11 +1,18 @@
 """
-Phase 4.7 — Stripe billing integration.
+Phase 4.7 + Phase 7.0 — Stripe billing integration.
 
 Maps an **active Stripe subscription → premium API tier** without ever
 storing card data, PAN, CVV, full names, emails, or any other
-sensitive payment metadata. The only thing persisted locally is a
-list of opaque API-key strings whose owners currently have an
-active subscription.
+sensitive payment metadata.
+
+Phase 7.0 hardens the persistence model: the local premium cache
+now stores **only SHA-256[:32] hashes** of API keys, never the raw
+values. The webhook handler additionally requires the subscription's
+``metadata[api_key]`` to already be present in the issuance manifest
+before any cache mutation — a webhook with an unissued key is
+rejected without side effects. Legacy caches that still contain raw
+keys are transparently migrated to the hash-only format on the next
+load.
 
 This module is pure integration: it neither imports nor is imported
 by any Core trading module (scanner / strategy / risk / execution /
@@ -62,12 +69,48 @@ _ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset({"active", "trialing"}
 
 
 # ---------------------------------------------------------------------------
-# Persistent premium-key cache — only stores opaque api-key strings
+# Persistent premium-hash cache (Phase 7.0)
 # ---------------------------------------------------------------------------
+#
+# Historically this module persisted raw api_key strings (Phase 4.7).
+# Phase 7.0 moves the cache to SHA-256[:32] hashes only — the raw key
+# is hashed on the way in and never touches disk. The migration is
+# seamless: legacy cache files whose entries look like raw keys are
+# re-hashed on load and the file is re-saved in the new format.
 
 _cache_lock = threading.Lock()
+# In-memory set of SHA-256[:32] hashes of premium-subscriber api_keys.
 _cache: set[str] = set()
 _cache_loaded_from: Optional[Path] = None
+
+# A 32-char lowercase hex string is the canonical hash shape.
+_HASH_CHARS = frozenset("0123456789abcdef")
+
+
+def _looks_like_hash(value: str) -> bool:
+    """True iff ``value`` is a 32-char lowercase hex string."""
+    if len(value) != 32:
+        return False
+    return all(c in _HASH_CHARS for c in value.lower())
+
+
+def _normalize_cache_entry(value: object) -> str:
+    """
+    Phase 7.0 migration helper.
+
+    32-char hex → treat as already-hashed.
+    Anything else → treat as a legacy raw api_key and hash it.
+
+    Empty / None → "".
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    if _looks_like_hash(s):
+        return s.lower()
+    return _hash_api_key(s)
 
 
 def _cache_path() -> Path:
@@ -78,28 +121,69 @@ def _cache_path() -> Path:
     )
 
 
-def _load_cache(path: Path) -> set[str]:
-    """Load the persisted key set. Returns empty set on any failure."""
+def _read_raw_cache_entries(path: Path) -> Optional[list]:
+    """
+    Return the raw JSON list exactly as it appears on disk, or
+    ``None`` on any failure (missing file, bad JSON, wrong shape).
+    ``None`` is distinguishable from an empty-but-valid cache.
+    """
     try:
         if not path.exists():
-            return set()
+            return None
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         log.debug("billing.cache_load_error", path=str(path), error=str(exc))
-        return set()
+        return None
     if not isinstance(data, list):
-        return set()
-    return {str(k) for k in data if k}
+        return None
+    return data
 
 
-def _save_cache(path: Path, keys: set[str]) -> None:
-    """Persist the key set. Best-effort — any failure is logged and swallowed."""
+def _save_cache(path: Path, hashes: set[str]) -> None:
+    """Persist the hash set. Best-effort — any failure is logged and swallowed."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(sorted(keys))
+        payload = json.dumps(sorted(hashes))
         path.write_text(payload + "\n", encoding="utf-8")
     except Exception as exc:
         log.debug("billing.cache_save_error", path=str(path), error=str(exc))
+
+
+def _load_and_migrate_cache(path: Path) -> set[str]:
+    """
+    Load the cache file, migrating any legacy raw-key entries to the
+    Phase 7.0 hash-only format. If the migration changed any entry,
+    the file is re-saved before we return.
+    """
+    raw = _read_raw_cache_entries(path)
+    if raw is None:
+        return set()
+
+    hashes: set[str] = set()
+    needs_migration = False
+    for v in raw:
+        if not v:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if _looks_like_hash(s):
+            hashes.add(s.lower())
+        else:
+            # Legacy raw api_key entry — hash it on the fly.
+            hashed = _hash_api_key(s)
+            if hashed:
+                hashes.add(hashed)
+            needs_migration = True
+
+    if needs_migration:
+        _save_cache(path, hashes)
+        log.info(
+            "billing.cache_migrated_to_hashes",
+            path=str(path),
+            entries=len(hashes),
+        )
+    return hashes
 
 
 def _ensure_cache_loaded() -> None:
@@ -112,7 +196,7 @@ def _ensure_cache_loaded() -> None:
     with _cache_lock:
         if _cache_loaded_from != path:
             _cache.clear()
-            _cache.update(_load_cache(path))
+            _cache.update(_load_and_migrate_cache(path))
             _cache_loaded_from = path
 
 
@@ -125,35 +209,63 @@ def reset_cache_for_tests() -> None:
 
 
 def add_premium_key(api_key: str) -> None:
-    """Add ``api_key`` to the persistent premium set."""
+    """
+    Add ``api_key`` to the persistent premium set.
+
+    The raw ``api_key`` is hashed in-process and only the hash
+    (SHA-256[:32]) is persisted. The raw value never reaches disk.
+    """
     if not api_key:
+        return
+    key_hash = _hash_api_key(api_key)
+    if not key_hash:
         return
     _ensure_cache_loaded()
     path = _cache_path()
     with _cache_lock:
-        _cache.add(str(api_key))
+        _cache.add(key_hash)
         _save_cache(path, set(_cache))
 
 
 def remove_premium_key(api_key: str) -> None:
-    """Remove ``api_key`` from the persistent premium set. Idempotent."""
+    """
+    Remove ``api_key`` from the persistent premium set. Idempotent.
+
+    Like ``add_premium_key``, the raw value is hashed in-process
+    before any disk operation.
+    """
     if not api_key:
+        return
+    key_hash = _hash_api_key(api_key)
+    if not key_hash:
         return
     _ensure_cache_loaded()
     path = _cache_path()
     with _cache_lock:
-        _cache.discard(str(api_key))
+        _cache.discard(key_hash)
         _save_cache(path, set(_cache))
 
 
-def current_premium_keys() -> set[str]:
+def current_premium_key_hashes() -> set[str]:
     """
-    Read-only snapshot of the currently-cached premium key set.
-    Returns a copy — callers can mutate freely without affecting state.
+    Read-only snapshot of the currently-cached premium-hash set.
+
+    Phase 7.0 renamed the public API from ``current_premium_keys``
+    (which historically returned raw keys) to
+    ``current_premium_key_hashes`` so callers cannot accidentally
+    treat the return value as raw keys. The old name is preserved as
+    a deprecated alias that returns the same hash set.
     """
     _ensure_cache_loaded()
     with _cache_lock:
         return set(_cache)
+
+
+# Backwards-compat alias. The name suggests raw keys, but Phase 7.0
+# guarantees only hashes ever live in the set. New code should call
+# ``current_premium_key_hashes`` for clarity.
+def current_premium_keys() -> set[str]:  # noqa: D401 — alias
+    return current_premium_key_hashes()
 
 
 # ---------------------------------------------------------------------------
@@ -188,17 +300,35 @@ def _hash_api_key(api_key: Optional[str]) -> str:
 def is_premium_via_stripe(api_key: Optional[str]) -> bool:
     """
     Return True iff ``api_key`` has an active subscription recorded in
-    the local premium-key cache. Empty / None input → False.
+    the local premium-hash cache. Empty / None input → False.
 
+    Phase 7.0: the cache holds only SHA-256[:32] hashes, so the
+    presented ``api_key`` is hashed in-process before any lookup.
     This function performs no network I/O: the cache is updated only
     by the Stripe webhook handler, so it reflects whatever events
     Stripe has already delivered.
     """
     if not api_key:
         return False
+    key_hash = _hash_api_key(api_key)
+    if not key_hash:
+        return False
     _ensure_cache_loaded()
     with _cache_lock:
-        return str(api_key) in _cache
+        return key_hash in _cache
+
+
+def is_premium_hash(key_hash: Optional[str]) -> bool:
+    """
+    Hash-input variant of ``is_premium_via_stripe`` for callers that
+    already computed the SHA-256[:32] hash. Avoids re-hashing on the
+    request hot path.
+    """
+    if not key_hash or not isinstance(key_hash, str):
+        return False
+    _ensure_cache_loaded()
+    with _cache_lock:
+        return key_hash in _cache
 
 
 # ---------------------------------------------------------------------------
@@ -349,16 +479,39 @@ def _extract_price_id_from_event_object(obj) -> Optional[str]:
     return None
 
 
+def _verify_against_manifest(api_key: str) -> bool:
+    """
+    Phase 7.0 — return True iff ``api_key`` hashes to a row that
+    exists in the issuance manifest AND has not been revoked.
+
+    Lazy-import of ``trading_bot.api.key_store`` so a Stripe-only
+    deployment that has not yet pointed ``TRADING_API_KEYS_MANIFEST_PATH``
+    at a valid file still loads this module without error. A missing
+    / empty manifest correctly returns False here — unissued keys
+    must not be promoted to premium by a Stripe webhook.
+    """
+    try:
+        from trading_bot.api import key_store  # noqa: WPS433
+    except Exception as exc:
+        log.debug("billing.key_store_import_error", error=str(exc))
+        return False
+    return key_store.verify_api_key(api_key) is not None
+
+
 def handle_webhook_event(event) -> dict:
     """
     Dispatch a parsed Stripe event to the cache.
 
     Recognized event types:
       - ``customer.subscription.created`` — add api_key iff status
-        is ``active`` or ``trialing``.
-      - ``customer.subscription.deleted`` — remove api_key.
+        is ``active`` or ``trialing`` AND the key's hash is in the
+        issuance manifest (Phase 7.0 gate).
+      - ``customer.subscription.deleted`` — remove api_key. No
+        manifest check — deletions always flow through so a
+        cancelled subscription immediately loses premium access,
+        even if the corresponding manifest row was later deleted.
       - ``invoice.payment_failed`` — remove api_key immediately
-        (fail-closed on billing failures).
+        (fail-closed on billing failures). No manifest check.
 
     Returns a small diagnostics dict — never raises, never echoes
     the api_key back to the caller.
@@ -379,26 +532,36 @@ def handle_webhook_event(event) -> dict:
 
     if event_type == "customer.subscription.created":
         status = (isinstance(obj, dict) and str(obj.get("status") or "")).lower()
-        if status in _ACTIVE_SUBSCRIPTION_STATUSES:
-            add_premium_key(api_key)
-            # Phase 4.9 — fire-and-forget free→premium conversion
-            # tracking. Any failure is caught so the webhook still
-            # returns a success action to the caller.
-            try:
-                from trading_bot.api.conversion import record_conversion
-                record_conversion(
-                    api_key,
-                    source="stripe",
-                    price_id=_extract_price_id_from_event_object(obj),
-                )
-            except Exception as exc:
-                log.debug("billing.conversion_error", error=str(exc))
-            return {"type": event_type, "action": "added"}
-        return {
-            "type": event_type,
-            "action": "ignored",
-            "reason": f"status={status or 'unknown'}",
-        }
+        if status not in _ACTIVE_SUBSCRIPTION_STATUSES:
+            return {
+                "type": event_type,
+                "action": "ignored",
+                "reason": f"status={status or 'unknown'}",
+            }
+        # Phase 7.0 — manifest verification gate. A webhook with an
+        # api_key we did not issue (or whose hash has been revoked)
+        # is rejected before any cache mutation. The raw api_key
+        # never leaves local scope.
+        if not _verify_against_manifest(api_key):
+            return {
+                "type": event_type,
+                "action": "ignored",
+                "reason": "key_not_in_manifest_or_revoked",
+            }
+        add_premium_key(api_key)
+        # Phase 4.9 — fire-and-forget free→premium conversion
+        # tracking. Any failure is caught so the webhook still
+        # returns a success action to the caller.
+        try:
+            from trading_bot.api.conversion import record_conversion
+            record_conversion(
+                api_key,
+                source="stripe",
+                price_id=_extract_price_id_from_event_object(obj),
+            )
+        except Exception as exc:
+            log.debug("billing.conversion_error", error=str(exc))
+        return {"type": event_type, "action": "added"}
 
     if event_type == "customer.subscription.deleted":
         remove_premium_key(api_key)

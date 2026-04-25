@@ -50,6 +50,8 @@ def clean_conversion_env(monkeypatch, tmp_path: Path):
       - env vars pointing at tmp files (never touches real data/).
       - in-memory dedup set cleared before AND after.
       - Stripe env cleared so fixtures can opt in.
+      - Phase 7.0: manifest + revocation paths redirected to tmp so
+        the webhook's manifest-gate has a clean surface.
     """
     for name in (
         CONVERSION_LOG_ENV_VAR,
@@ -58,17 +60,52 @@ def clean_conversion_env(monkeypatch, tmp_path: Path):
         "STRIPE_WEBHOOK_SECRET",
         "STRIPE_PRICE_ID_PREMIUM",
         "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        "TRADING_API_KEYS_MANIFEST_PATH",
+        "TRADING_API_KEYS_REVOKED_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     conv_file = tmp_path / "conversions.jsonl"
     usage_file = tmp_path / "usage.jsonl"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
     monkeypatch.setenv(CONVERSION_LOG_ENV_VAR, str(conv_file))
     monkeypatch.setenv(USAGE_LOG_ENV_VAR, str(usage_file))
+    monkeypatch.setenv("TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest))
+    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked))
     reset_cache_for_tests()
     billing.reset_cache_for_tests()
-    yield {"conversion_file": conv_file, "usage_file": usage_file}
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
+    yield {
+        "conversion_file": conv_file,
+        "usage_file": usage_file,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
     reset_cache_for_tests()
     billing.reset_cache_for_tests()
+    key_store.reset_caches_for_tests()
+
+
+def _pre_issue_manifest_row(
+    clean_conversion_env: dict, api_key: str, *, tier: str = "free",
+) -> None:
+    """Phase 7.0 — append a manifest row so the webhook's
+    manifest gate accepts ``api_key`` during the test."""
+    import hashlib as _hl
+    path = clean_conversion_env["keys_manifest"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "created_at": "2026-04-25T00:00:00.000000Z",
+        "key_hash": _hl.sha256(api_key.encode("utf-8")).hexdigest()[:32],
+        "label_hash": "f" * 32,
+        "tier": tier,
+        "checkout_session_id": None,
+    }
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -397,6 +434,7 @@ class TestFailureSafety:
         # billing imports record_conversion lazily inside the handler,
         # so monkey-patching the module reference before invocation works.
 
+        _pre_issue_manifest_row(clean_conversion_env, "user-ok")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -420,6 +458,7 @@ class TestBillingIntegration:
     def test_handle_webhook_event_records_conversion(
         self, clean_conversion_env
     ):
+        _pre_issue_manifest_row(clean_conversion_env, "user-end-to-end")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -444,6 +483,7 @@ class TestBillingIntegration:
     ):
         """Same customer subscribes, cancels, subscribes again: one
         conversion record total."""
+        _pre_issue_manifest_row(clean_conversion_env, "user-restart-again")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -462,6 +502,7 @@ class TestBillingIntegration:
         assert len(records) == 1
 
     def test_trialing_counts_as_conversion(self, clean_conversion_env):
+        _pre_issue_manifest_row(clean_conversion_env, "user-trialing")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -512,6 +553,7 @@ class TestBillingIntegration:
         assert _read_jsonl(clean_conversion_env["conversion_file"]) == []
 
     def test_missing_price_id_leaves_null(self, clean_conversion_env):
+        _pre_issue_manifest_row(clean_conversion_env, "user-no-price")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -528,6 +570,7 @@ class TestBillingIntegration:
     ):
         """Older Stripe API versions expose ``plan.id`` at the top
         level; the extractor falls back to it."""
+        _pre_issue_manifest_row(clean_conversion_env, "user-legacy")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -553,6 +596,7 @@ class TestNoSensitiveDataPersisted:
         """Mirror of the Phase 4.7 PII-leak test — planted card /
         email / name fields in the webhook object must NOT land in
         the conversion log."""
+        _pre_issue_manifest_row(clean_conversion_env, "user-pii-guard")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -607,6 +651,7 @@ class TestEndToEndThroughHttpWebhook:
         _reset_rate_limit_bucket()
         billing.reset_cache_for_tests()
         reset_cache_for_tests()
+        _pre_issue_manifest_row(clean_conversion_env, "user-http-e2e")
 
         body = json.dumps({
             "type": "customer.subscription.created",
