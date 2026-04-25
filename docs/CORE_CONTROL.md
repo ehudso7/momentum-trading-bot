@@ -2044,6 +2044,90 @@ block with:
 * The `/` route still accepts only `GET / HEAD / OPTIONS`.
 
 
+### Phase 6.0 — operator-only API key issuance CLI
+
+`trading_bot.api.keys` ships a single `issue` subcommand that
+generates one new API key (free or premium) and appends one row
+to an operator-only manifest. There is **no** public sign-up
+endpoint, no form, no JSON API for any of this — the entire
+surface is invoked by hand from a deployment shell.
+
+**Command**
+
+    python -m trading_bot.api.keys issue \
+        --tier free|premium \
+        --label "<operator-supplied label>" \
+        [--checkout \
+         --success-url <https://...> \
+         --cancel-url  <https://...>] \
+        [--manifest-path <path>]
+
+**Manifest** — `data/api_keys_manifest.jsonl` (override via
+`TRADING_API_KEYS_MANIFEST_PATH`). Append-only, thread-safe,
+schema:
+
+    {
+      "created_at":           "2026-04-24T12:00:00.000000Z",
+      "key_hash":             "<SHA-256(api_key)[:32]>",
+      "label_hash":           "<SHA-256(label)[:32]>",
+      "tier":                 "free" | "premium",
+      "checkout_session_id":  "cs_..." | null
+    }
+
+**Stdout** prints the raw `api_key` exactly once (the operator
+delivers it to the user) plus the same five hash/metadata
+fields, and — when `--checkout` is used — `checkout_session_id`
+and `checkout_url` for the operator to forward to the customer.
+
+**Privacy invariants (every one tested)**
+
+* Raw `api_key` is **never** persisted. Only `SHA-256(...)[:32]`,
+  byte-identical to the hash used by server / billing /
+  conversion / growth / upgrade_events so the manifest joins
+  cleanly with every other Phase 4/5 log on a single column.
+* Raw `label` is **never** persisted. Only its SHA-256 prefix.
+  An operator who issues a key for `alice@example.com` cannot
+  reverse the manifest into a list of customer emails — the
+  hash is one-way.
+* The Stripe Checkout `url` is **never** persisted. Only the
+  short-lived `checkout_session_id` is. URLs contain redirect
+  state we don't need to retain.
+* No customer email / name / IP / payment field is ever stored.
+
+**Atomicity contract.** If `--checkout` is requested and Stripe
+fails (network error, missing `STRIPE_API_KEY`, missing
+`STRIPE_PRICE_ID_PREMIUM`, etc.), the manifest row is NOT
+written and the CLI exits with code 3. So a manifest row implies
+"issuance + checkout-session-creation succeeded end-to-end" —
+operators can retry cleanly without leaving phantom keys behind.
+Pinned by `test_stripe_failure_does_not_write_manifest` and
+`TestCheckoutInProcessViaPatch::test_checkout_failure_returns_three`.
+
+**CLI exit codes**
+
+| Code | Meaning |
+|---|---|
+| 0 | Success — key issued, manifest row written |
+| 2 | Argument validation failure (bad tier, missing URLs, blank label, …) |
+| 3 | Stripe / billing failure during `--checkout` (no manifest row written) |
+
+**Generation parameters**
+
+* Key body: `secrets.token_urlsafe(32)` → 43 URL-safe characters
+  drawn from `[A-Za-z0-9\-_]`. Far above the 32-byte minimum
+  the spec asks for; all randomness from the OS CSPRNG.
+* Hash: `SHA-256(api_key)[:32]` — 128 bits of grouping
+  precision, identical to every other Phase 4/5 log.
+
+**Boundary** — the keys module imports nothing from
+`trading_bot.core.*`, `trading_bot.execution`,
+`trading_bot.portfolio`, `trading_bot.risk`,
+`trading_bot.scanners`, `trading_bot.strategies`, or
+`trading_bot.main`. Only the lazy import of
+`trading_bot.api.billing.create_checkout_session` for the
+`--checkout` path. Pinned by source-grep test.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
