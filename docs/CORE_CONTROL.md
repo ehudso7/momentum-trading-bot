@@ -3483,6 +3483,158 @@ does not return ``None``)
   ``tests/test_daily_hook.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
+### Phase 9.3 — stickiness loop
+
+Two retention signals derived from the same daily report data:
+
+  * **streak** — consecutive passing days from
+    ``promotion_readiness.consecutive_passing_days``. Surfaces as
+    a positive-reinforcement banner / JSON field whenever the
+    streak is ≥ 1 day.
+  * **nudge (missed_day)** — gap > 1 day between the latest two
+    report dates. Surfaces as a re-engagement banner / JSON field
+    when a returning user has missed at least one day.
+
+**Module**
+
+``trading_bot/api/stickiness.py`` — pure stdlib, imports nothing
+from FastAPI / structlog / the rest of ``trading_bot``. Four
+public entry points:
+
+```python
+build_streak(report, prev_report=None)        -> dict | None
+build_nudge(report, prev_report)              -> dict | None
+truncate_streak_for_free(streak)              -> dict | None
+truncate_nudge_for_free(nudge)                -> dict | None
+```
+
+**Streak schema**
+
+| Field | Type | Notes |
+|---|---|---|
+| ``days``           | ``int``  | ``promotion_readiness.consecutive_passing_days`` |
+| ``label``          | ``str``  | "5-day passing streak" |
+| ``milestone``      | ``bool`` | True iff ``days`` is in ``MILESTONE_DAYS`` |
+| ``next_milestone`` | ``int``  | next ladder rung (premium only) |
+
+The milestone ladder is fixed: ``(3, 5, 7, 10, 14, 21, 30, 60, 90,
+180, 365)``. Past 365 the helper extends by 30-day rungs so the
+streak always has a target to chase.
+
+**Nudge schema**
+
+| Field | Type | Notes |
+|---|---|---|
+| ``kind``         | ``"missed_day"``                  | only kind in 9.3 |
+| ``headline``     | ``str``                           | "You missed 2 days of reports." |
+| ``days_missed``  | ``int``                           | gap − 1 |
+| ``since``        | ``str``                           | ISO date of the prior report |
+| ``cta``          | ``str``                           | stable re-engagement prompt |
+
+**Source rules**
+
+* Streak fires from the current report alone — no prev needed.
+  Returns ``None`` when ``consecutive_passing_days`` is missing,
+  not an int, zero, or negative.
+* Nudge fires only when both reports have parseable
+  ``report_date`` strings AND the gap is ≥ 2 days. Same-day or
+  out-of-order dates return ``None``.
+* Both helpers are pure functions — same inputs always produce
+  the same outputs.
+
+**Tier-aware projection**
+
+* Streak: free callers get ``days`` / ``label`` / ``milestone``;
+  the forward-looking ``next_milestone`` stays premium.
+* Nudge: every field is user-facing, so free callers see the
+  full schema. The ``truncate_nudge_for_free`` helper still
+  exists as a defensive copy so a future premium-only field can
+  be added without churning the call sites.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — both fields attached when present.
+  Either field may be absent independently (e.g. a returning
+  user mid-streak: both present; a single-day deployment with
+  a streak: only ``streak``; a returning user whose run reset:
+  only ``nudge``).
+* ``GET /dashboard`` — two new ``<aside>`` banners. Render order
+  (top → bottom):
+  1. **nudge** — re-engagement message comes first when present.
+  2. **streak** — positive reinforcement.
+  3. **daily_hook** — yesterday-vs-today (Phase 9.2).
+  4. existing free-tier upgrade banner / report / insights /
+     experiments.
+
+  Banners are omitted entirely when the underlying signal is
+  ``None``. Both tiers see the same markup; the underlying
+  truncation is what differs.
+
+**Sample free response excerpt**
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "streak": {
+    "days": 5,
+    "label": "5-day passing streak",
+    "milestone": true
+  },
+  "nudge": {
+    "kind": "missed_day",
+    "headline": "You missed 2 days of reports.",
+    "days_missed": 2,
+    "since": "2026-04-22",
+    "cta": "Open the dashboard to see what changed while you were away"
+  },
+  "daily_hook": {...},
+  "insights": [...],
+  "upgrade": {...}
+}
+```
+
+**Sample premium response excerpt** — same fields plus
+``next_milestone`` on the streak.
+
+**Sample dashboard banner HTML**
+
+```html
+<aside class="nudge nudge-missed_day">
+  <strong>You missed 2 days of reports.</strong>
+  <span class="nudge-since">since 2026-04-22</span>
+  <span class="nudge-cta">Open the dashboard to see what changed while you were away</span>
+</aside>
+<aside class="streak streak-milestone">
+  <strong>5-day passing streak</strong>
+  <span class="streak-next">next milestone: 7 days</span>
+</aside>
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any streak / nudge field or rendered HTML.
+  Pinned by ``TestPhase93NoLeak`` (2 tests).
+* Both signals fail soft: missing data → ``None`` → field omitted
+  cleanly. No synthetic zeros, no fabricated dates.
+* Free truncation is mechanical via the per-helper allow-list
+  set, so any new field added to either schema stays premium-only
+  until its allow-list entry is added.
+
+**Boundary**
+
+* No new HTTP route. Phase 9.3 is helper code wired into existing
+  routes / renderer. Pinned by
+  ``TestPhase93CrossCutting::test_no_new_mutating_route``.
+* No new persistence — both signals are computed per request from
+  the same files Phase 9.1 / 9.2 already read.
+* No new env vars.
+* ``trading_bot/api/stickiness.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_stickiness.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

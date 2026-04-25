@@ -9443,3 +9443,333 @@ class TestPhase92CrossCutting:
             if e["id"] == "trend.buy_delta"
         ][0]
         assert trend["evidence"]["direction"] == body["daily_hook"]["change"]
+
+
+# ===========================================================================
+# Phase 9.3 — stickiness loop (streak + missed-day nudge)
+# ===========================================================================
+
+
+class TestPhase93ReportsLatestStreak:
+    """The streak field surfaces from promotion_readiness on both
+    tiers; premium gets next_milestone, free does not."""
+
+    def test_premium_response_includes_full_streak(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Promotion readiness in _phase91_full_report_dict is
+        # consecutive_passing_days=5 → milestone, next=7.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "streak" in body
+        streak = body["streak"]
+        assert set(streak.keys()) == {
+            "days", "label", "milestone", "next_milestone",
+        }
+        assert streak["days"] == 5
+        assert streak["milestone"] is True
+        assert streak["next_milestone"] == 7
+
+    def test_free_response_drops_next_milestone(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body["tier"] == "free"
+        streak = body["streak"]
+        assert set(streak.keys()) == {"days", "label", "milestone"}
+        assert "next_milestone" not in streak
+        assert streak["days"] == 5
+
+    def test_zero_consecutive_days_omits_streak(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Override the standard fixture with a zero-streak report.
+        body = _phase91_full_report_dict("2026-04-25", buy_rows=30)
+        body["promotion_readiness"]["consecutive_passing_days"] = 0
+        target = phase91_env["reports_dir"] / "alpha_report_2026-04-25.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(body), encoding="utf-8")
+        out = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "streak" not in out
+
+
+class TestPhase93ReportsLatestNudge:
+    """The missed-day nudge fires only when there's a gap > 1 day
+    between the latest two reports on disk."""
+
+    def test_two_day_gap_emits_nudge(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # 2026-04-22 and 2026-04-25 → gap of 3 days → days_missed=2.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "nudge" in body
+        nudge = body["nudge"]
+        assert nudge["kind"] == "missed_day"
+        assert nudge["days_missed"] == 2
+        assert nudge["since"] == "2026-04-22"
+        assert "missed 2 days" in nudge["headline"]
+
+    def test_consecutive_days_omits_nudge(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "nudge" not in body
+
+    def test_no_prev_omits_nudge(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Only one report planted — nudge needs a prior to compute.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "nudge" not in body
+        # Streak still present (it's a function of the current
+        # report alone, doesn't need a prev).
+        assert "streak" in body
+
+    def test_free_nudge_carries_full_user_facing_fields(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        nudge = body["nudge"]
+        # The current Phase 9.3 nudge schema is entirely user-facing
+        # so free callers see every field — but the helper still
+        # passes through the projector defensively.
+        assert set(nudge.keys()) == {
+            "kind", "headline", "days_missed", "since", "cta",
+        }
+
+
+class TestPhase93DashboardBanners:
+    def test_premium_dashboard_renders_streak_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="streak streak-milestone"' in html
+        assert "5-day passing streak" in html
+        assert "next milestone: 7 days" in html
+
+    def test_free_dashboard_streak_omits_next_milestone(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="streak streak-milestone"' in html
+        assert "5-day passing streak" in html
+        # Free tier does NOT see the forward-looking next-milestone
+        # hint.
+        assert "next milestone" not in html
+
+    def test_dashboard_renders_missed_day_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="nudge nudge-missed_day"' in html
+        assert "missed 2 days of reports" in html
+        assert "since 2026-04-22" in html
+
+    def test_dashboard_omits_streak_banner_when_no_streak(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        body = _phase91_full_report_dict("2026-04-25", buy_rows=30)
+        body["promotion_readiness"]["consecutive_passing_days"] = 0
+        target = phase91_env["reports_dir"] / "alpha_report_2026-04-25.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(body), encoding="utf-8")
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="streak' not in html
+
+    def test_dashboard_omits_nudge_banner_when_no_gap(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="nudge' not in html
+
+    def test_nudge_banner_renders_above_streak_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        """When a re-engaging user has both signals, the missed-day
+        nudge sits ABOVE the streak so the re-engagement message
+        comes first."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        nudge_pos = html.index('class="nudge')
+        streak_pos = html.index('class="streak')
+        assert nudge_pos < streak_pos
+
+
+class TestPhase93NoLeak:
+    def test_raw_key_absent_from_json_response(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in body_text
+
+    def test_raw_key_absent_from_dashboard_html(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in html
+
+
+class TestPhase93CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 9.3 leaked a mutating route: {m} {path}"
+                )
+
+    def test_streak_and_nudge_coexist_with_existing_fields(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        # Phase 9.1 + 9.2 + 9.3 fields all present together.
+        assert "insights" in body
+        assert "daily_hook" in body
+        assert "streak" in body
+        assert "nudge" in body

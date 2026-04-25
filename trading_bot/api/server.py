@@ -73,6 +73,12 @@ from trading_bot.api.daily_hook import (
     build_daily_hook,
     truncate_for_free as _truncate_hook_for_free,
 )
+from trading_bot.api.stickiness import (
+    build_nudge,
+    build_streak,
+    truncate_nudge_for_free,
+    truncate_streak_for_free,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -2620,17 +2626,34 @@ def latest_report(
     # no prior report or both signal sources miss; the response
     # then simply omits the ``daily_hook`` field.
     daily_hook = build_daily_hook(data, prev, insights)
+    # Phase 9.3 — stickiness loop: streak (consecutive passing
+    # days) + missed-day nudge. Both are derived from the same
+    # report data; both omit themselves when there's nothing to
+    # say. Streak is a function of the current report alone;
+    # nudge needs the prior report too.
+    streak = build_streak(data, prev)
+    nudge = build_nudge(data, prev)
 
     if _is_premium_user(request):
         data["insights"] = insights
         if daily_hook is not None:
             data["daily_hook"] = daily_hook
+        if streak is not None:
+            data["streak"] = streak
+        if nudge is not None:
+            data["nudge"] = nudge
         return data
     free_body = _project_report_for_free(data)
     free_body["insights"] = truncate_for_free(insights)
     free_hook = _truncate_hook_for_free(daily_hook)
     if free_hook is not None:
         free_body["daily_hook"] = free_hook
+    free_streak = truncate_streak_for_free(streak)
+    if free_streak is not None:
+        free_body["streak"] = free_streak
+    free_nudge = truncate_nudge_for_free(nudge)
+    if free_nudge is not None:
+        free_body["nudge"] = free_nudge
     upgrade = _build_upgrade_payload(
         request, reason="limited_access", required=False, is_premium=False,
     )
@@ -3061,6 +3084,66 @@ def _render_daily_hook_banner(hook: Optional[dict]) -> str:
     )
 
 
+def _render_streak_banner(streak: Optional[dict]) -> str:
+    """
+    Phase 9.3 — passing-streak banner. Renders nothing when the
+    streak is absent. Adds a ``streak-milestone`` modifier class
+    when the current day count hits a known milestone so a
+    custom stylesheet can celebrate without parsing markup.
+    """
+    if not isinstance(streak, dict):
+        return ""
+    label = _esc(str(streak.get("label", "")))
+    if not label:
+        return ""
+    milestone = bool(streak.get("milestone"))
+    next_target = streak.get("next_milestone")
+    cls = "streak"
+    if milestone:
+        cls += " streak-milestone"
+    next_block = ""
+    if isinstance(next_target, int) and next_target > 0:
+        next_block = (
+            f'<span class="streak-next">next milestone: '
+            f"{next_target} days</span>"
+        )
+    return (
+        f'<aside class="{cls}">'
+        f'<strong>{label}</strong>'
+        f"{next_block}"
+        "</aside>"
+    )
+
+
+def _render_nudge_banner(nudge: Optional[dict]) -> str:
+    """
+    Phase 9.3 — missed-day nudge banner. Renders nothing when
+    there's no nudge (normal daily cadence or first visit).
+    """
+    if not isinstance(nudge, dict):
+        return ""
+    headline = _esc(str(nudge.get("headline", "")))
+    if not headline:
+        return ""
+    cta = _esc(str(nudge.get("cta", "")))
+    since = _esc(str(nudge.get("since") or ""))
+    kind = _esc(str(nudge.get("kind", "missed_day")))
+    since_block = (
+        f'<span class="nudge-since">since {since}</span>'
+        if since else ""
+    )
+    cta_block = (
+        f'<span class="nudge-cta">{cta}</span>' if cta else ""
+    )
+    return (
+        f'<aside class="nudge nudge-{kind}">'
+        f'<strong>{headline}</strong>'
+        f"{since_block}"
+        f"{cta_block}"
+        "</aside>"
+    )
+
+
 def render_dashboard_html(
     report: Optional[dict],
     experiments: list[dict],
@@ -3069,6 +3152,8 @@ def render_dashboard_html(
     banner_copy: Optional[str] = None,
     insights: Optional[list[dict]] = None,
     daily_hook: Optional[dict] = None,
+    streak: Optional[dict] = None,
+    nudge: Optional[dict] = None,
 ) -> str:
     """
     Build the dashboard HTML from sanitized inputs.
@@ -3167,6 +3252,8 @@ def render_dashboard_html(
 
     insights_block = _render_insights_block(insights)
     daily_hook_block = _render_daily_hook_banner(daily_hook)
+    streak_block = _render_streak_banner(streak)
+    nudge_block = _render_nudge_banner(nudge)
 
     return (
         "<!DOCTYPE html>"
@@ -3177,6 +3264,11 @@ def render_dashboard_html(
         "</head><body>"
         "<h1>Momentum Trading Bot — Analytics Dashboard</h1>"
         f'<p class="meta">Read-only view. Generated at {generated_at}.</p>'
+        # Phase 9.3 — nudge first (re-engagement signal trumps
+        # everything when the user has been away), then streak
+        # (positive reinforcement), then daily-hook (yesterday-vs-today).
+        f"{nudge_block}"
+        f"{streak_block}"
         f"{daily_hook_block}"
         f"{free_tier_banner}"
         f"{report_block}"
@@ -3267,6 +3359,11 @@ def dashboard(
         build_daily_hook(report, prev_report, insights)
         if report is not None else None
     )
+    # Phase 9.3 — streak + missed-day nudge. Same compute-then-
+    # truncate pattern; both omit themselves cleanly when the
+    # signal isn't there.
+    streak = build_streak(report, prev_report) if report is not None else None
+    nudge = build_nudge(report, prev_report) if report is not None else None
     # Phase 8.2 — when the caller is on the free tier, pass the
     # report through the same allow-list that gates /reports/latest
     # so the dashboard cannot accidentally surface the deep tier /
@@ -3277,6 +3374,8 @@ def dashboard(
     if not is_premium:
         insights = truncate_for_free(insights)
         daily_hook = _truncate_hook_for_free(daily_hook)
+        streak = truncate_streak_for_free(streak)
+        nudge = truncate_nudge_for_free(nudge)
     # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
     # string rendered to the user is also the one we hash into the
     # telemetry row. Premium users skip the resolver entirely (no
@@ -3285,6 +3384,7 @@ def dashboard(
     html = render_dashboard_html(
         report, experiments, tier=tier, banner_copy=banner_copy,
         insights=insights, daily_hook=daily_hook,
+        streak=streak, nudge=nudge,
     )
     if tier == TIER_FREE:
         # Phase 5.5 + 5.8 — the banner is rendered in the HTML
