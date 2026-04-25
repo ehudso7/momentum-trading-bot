@@ -7554,3 +7554,453 @@ class TestPhase81DoesNotIntroduceMutatingRoute:
                 assert (m, path) in allowed, (
                     f"Phase 8.1 leaked a mutating route: {m} {path}"
                 )
+
+
+# ===========================================================================
+# Phase 8.2 — feature-level tier differentiation
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    PREMIUM_FEATURE_DETAIL,
+    PREMIUM_FEATURE_HINT,
+    _FREE_REPORT_ALLOWED_FIELDS,
+    _is_premium_user,
+    _project_report_for_free,
+)
+
+
+# Fields that the FULL sanitised report carries but should be ABSENT
+# from the free-tier projection — used as leak-guard markers.
+_PREMIUM_REPORT_FIELDS: tuple[str, ...] = (
+    "tier_stats", "reason_stats", "regime_stats",
+    "decile_stats", "shadow_filter_simulation", "guardrails",
+    "sources",
+)
+
+
+def _write_full_report(reports_dir: Path, date: str) -> Path:
+    """A daily report with every premium-tier deep field populated
+    so leak-guard tests can detect what the free projection drops."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    body = {
+        "report_type": "daily_alpha_validation",
+        "report_date": date,
+        "scorer_fingerprint": "f" * 64,
+        "totals": {
+            "alpha_rows": 100, "buy_rows": 25, "skip_rows": 75,
+        },
+        "promotion_readiness": {
+            "ready": True, "consecutive_passing_days": 21,
+        },
+        "tier_stats": {"A": {"count": 5}, "B": {"count": 7}},
+        "reason_stats": {"alpha_filter_blocked:tier=D:min=B": 3},
+        "regime_stats": {"trending": {"hits": 12}},
+        "decile_stats": [{"decile": 1, "n": 10}],
+        "shadow_filter_simulation": [{"row_id": "x", "would_block": False}],
+        "guardrails": {"any_critical": False, "warnings": []},
+        "sources": {
+            "alpha_scores": {
+                "exists": True, "rows": 100, "resolved_files": 1,
+            },
+        },
+    }
+    target = reports_dir / f"alpha_report_{date}.json"
+    target.write_text(json.dumps(body), encoding="utf-8")
+    return target
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82PureHelpers:
+    def test_is_premium_user_reads_cached_tier_premium(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(api_key_tier="premium"))
+        # Headers needed by _extract_bearer_token in the fallback path —
+        # not reached because the cached value is honoured first.
+        req.headers = {}
+        assert _is_premium_user(req) is True
+
+    def test_is_premium_user_reads_cached_tier_free(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(
+            state=SimpleNamespace(api_key_tier="free"),
+            headers={},
+        )
+        assert _is_premium_user(req) is False
+
+    def test_is_premium_user_unauthenticated_returns_false(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(), headers={})
+        assert _is_premium_user(req) is False
+
+    def test_project_report_for_free_keeps_only_allow_listed_fields(self):
+        sample = {
+            "report_type": "daily_alpha_validation",
+            "report_date": "2026-04-25",
+            "scorer_fingerprint": "f" * 64,
+            "totals": {"alpha_rows": 100},
+            "promotion_readiness": {"ready": True},
+            # All of these are premium-only — must be dropped.
+            "tier_stats": {"A": 1}, "reason_stats": {"x": 1},
+            "regime_stats": {"y": 2}, "decile_stats": [1, 2],
+            "shadow_filter_simulation": [], "guardrails": {},
+            "sources": {"alpha_scores": {}},
+        }
+        out = _project_report_for_free(sample)
+        for f in _FREE_REPORT_ALLOWED_FIELDS:
+            assert f in out
+        for f in _PREMIUM_REPORT_FIELDS:
+            assert f not in out
+        assert out["tier"] == "free"
+        assert out["upgrade"] == {
+            "detail": PREMIUM_FEATURE_DETAIL,
+            "hint": PREMIUM_FEATURE_HINT,
+        }
+
+    def test_project_report_for_free_input_not_mutated(self):
+        sample = {"report_type": "x", "tier_stats": {"A": 1}}
+        before = dict(sample)
+        _project_report_for_free(sample)
+        assert sample == before
+
+    def test_project_report_for_free_handles_non_dict(self):
+        out = _project_report_for_free(None)  # type: ignore[arg-type]
+        assert out["tier"] == "free"
+        assert out["upgrade"]["detail"] == PREMIUM_FEATURE_DETAIL
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.2 fixture — manifest-backed deployment with one issued key
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def phase82_env(monkeypatch, tmp_path: Path):
+    """Manifest-backed deployment with isolated paths so each Phase
+    8.2 test starts from a known state."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+def _issue_phase82_key(tier: str = "free") -> tuple[str, str]:
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=f"phase82-{tier}")
+    return result["api_key"], result["key_hash"]
+
+
+def _promote_to_premium(raw: str, key_hash: str, monkeypatch, tmp_path: Path):
+    """Use the Phase 7.4 webhook hash path to flip a free key to premium."""
+    from trading_bot.api import billing
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase82")
+    monkeypatch.setenv(
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        str(tmp_path / "stripe_cache_phase82.json"),
+    )
+    billing.reset_cache_for_tests()
+    billing.handle_webhook_event({
+        "type": "customer.subscription.created",
+        "data": {"object": {
+            "status": "active",
+            "metadata": {"key_hash": key_hash},
+        }},
+    })
+    billing.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# /reports/latest — tier-aware projection
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82ReportsLatestFreeUser:
+    def test_free_user_gets_truncated_report(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+
+        # Allow-listed fields are present.
+        assert body["report_type"] == "daily_alpha_validation"
+        assert body["report_date"] == today
+        assert "totals" in body
+        assert body["tier"] == "free"
+        assert body["upgrade"] == {
+            "detail": PREMIUM_FEATURE_DETAIL,
+            "hint": PREMIUM_FEATURE_HINT,
+        }
+        # Premium-only fields are absent.
+        for f in _PREMIUM_REPORT_FIELDS:
+            assert f not in body, (
+                f"Phase 8.2: free-tier response leaked premium field {f!r}"
+            )
+
+
+class TestPhase82ReportsLatestPremiumUser:
+    def test_premium_user_gets_full_report(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase82_key("free")
+        _promote_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # Premium-only fields ARE present.
+        for f in _PREMIUM_REPORT_FIELDS:
+            assert f in body, (
+                f"Phase 8.2: premium response is missing {f!r}"
+            )
+        # The "free upgrade" envelope is NOT present for premium.
+        assert "upgrade" not in body
+        assert body.get("tier") != "free"
+
+
+# ---------------------------------------------------------------------------
+# /reports/history — premium only
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82ReportsHistoryFreeUser:
+    def test_free_user_returns_403(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        assert r.json() == {"detail": PREMIUM_FEATURE_DETAIL}
+        assert r.headers["X-Usage-Tier"] == "free"
+
+
+class TestPhase82ReportsHistoryPremiumUser:
+    def test_premium_user_returns_full_history(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase82_key("free")
+        _promote_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant three reports across different dates.
+        for d in ("2026-04-23", "2026-04-24", "2026-04-25"):
+            _write_full_report(phase82_env["reports_dir"], d)
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["count"] == 3
+        assert body["dates"] == ["2026-04-23", "2026-04-24", "2026-04-25"]
+
+    def test_history_does_not_collide_with_date_route(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        """``/reports/history`` must hit the literal route, not the
+        ``/reports/{date}`` path-param route — even for a free
+        caller. The 403 must say "premium feature", not "invalid date"."""
+        raw, _ = _issue_phase82_key("free")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        assert r.json() == {"detail": PREMIUM_FEATURE_DETAIL}
+
+
+# ---------------------------------------------------------------------------
+# /dashboard — tier-aware projection
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82DashboardFreeUser:
+    def test_free_dashboard_omits_premium_data(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        text = r.text
+        # The free dashboard renders the upgrade banner and limits the
+        # data surface — none of the planted premium-data values
+        # should appear in the HTML.
+        assert "would_block" not in text  # shadow_filter_simulation row
+        assert "alpha_filter_blocked:tier=D:min=B" not in text
+
+
+class TestPhase82DashboardPremiumUser:
+    def test_premium_dashboard_renders_full_data(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase82_key("free")
+        _promote_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting Phase 8.2 invariants
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82UpgradeMessageConsistent:
+    def test_history_403_body_matches_constant(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.json()["detail"] == PREMIUM_FEATURE_DETAIL
+
+    def test_free_reports_latest_envelope_uses_same_constant(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body["upgrade"]["detail"] == PREMIUM_FEATURE_DETAIL
+
+
+class TestPhase82UsageEnforcementStillApplies:
+    def test_gated_403_still_consumes_usage_quota(
+        self, client: TestClient, phase82_env, monkeypatch,
+    ):
+        """A free user whose /reports/history call returns 403
+        (premium feature) must STILL count toward their daily usage
+        quota. Otherwise free users could spam gated endpoints
+        without consequence."""
+        raw, key_hash = _issue_phase82_key("free")
+        # Tighten the cap to 1 so the next request after the 403
+        # observes the quota was consumed.
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "2")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+
+        # Hit /reports/history twice — both 403 (premium-only) but
+        # both should consume usage.
+        h = {"Authorization": f"Bearer {raw}"}
+        r1 = client.get("/reports/history", headers=h)
+        assert r1.status_code == 403
+        r2 = client.get("/reports/history", headers=h)
+        assert r2.status_code == 403
+        # Third call exceeds the daily cap → 429.
+        r3 = client.get("/reports/history", headers=h)
+        assert r3.status_code == 429
+
+    def test_gated_403_carries_usage_headers(
+        self, client: TestClient, phase82_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "10")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        assert r.headers["X-Usage-Tier"] == "free"
+        # Phase 8.1 headers are added by the enforcement middleware
+        # on every non-exempt response (including 403s from gated
+        # routes).
+        assert "X-Usage-Limit" in r.headers
+        assert "X-Usage-Remaining" in r.headers
+
+
+class TestPhase82NoRawKeyInResponses:
+    def test_raw_key_absent_from_history_response(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert raw not in r.text
+        for header_value in r.headers.values():
+            assert raw not in header_value
+
+    def test_raw_key_absent_from_reports_latest_free_response(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert raw not in r.text
+
+
+class TestPhase82DoesNotIntroduceMutatingRoute:
+    def test_no_new_mutating_route(self):
+        """Phase 8.2 only adds a GET route — the single-mutating-route
+        invariant remains POST /webhook/stripe + POST /billing/checkout."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 8.2 leaked a mutating route: {m} {path}"
+                )
+
+    def test_history_route_only_safe_verbs(self):
+        for route in app.routes:
+            if getattr(route, "path", "") == "/reports/history":
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"})
+                break
+        else:
+            raise AssertionError("/reports/history not registered")

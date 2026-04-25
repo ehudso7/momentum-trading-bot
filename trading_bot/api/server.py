@@ -945,6 +945,105 @@ def _enforce_free_limits(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Phase 8.2 — feature-level tier differentiation
+# ---------------------------------------------------------------------------
+#
+# Free-tier callers receive a curated subset of each tier-gated
+# response; premium callers receive the full response. The split is
+# defined here once and used consistently across /reports/latest,
+# /reports/history, and /dashboard so a single allow-list change
+# propagates everywhere.
+
+PREMIUM_FEATURE_DETAIL = "premium feature — upgrade required"
+PREMIUM_FEATURE_HINT = "upgrade for full access"
+
+# Fields that survive the free-tier projection on a daily report.
+# Anything outside this allow-list is dropped before the response is
+# emitted. The allow-list keeps the high-level summary an integrator
+# needs to render a "did the bot work today?" view, while hiding the
+# deep per-tier / per-reason / per-regime breakdowns that are part
+# of the premium offering.
+_FREE_REPORT_ALLOWED_FIELDS: tuple[str, ...] = (
+    "report_type",
+    "report_date",
+    "scorer_fingerprint",
+    "totals",
+    "promotion_readiness",
+)
+
+
+def _is_premium_user(request: Request) -> bool:
+    """
+    Phase 8.2 — fast path for tier classification inside route
+    handlers and middleware.
+
+    Prefers the value cached on ``request.state.api_key_tier`` by
+    ``require_api_key`` (Phase 6.2). When that's missing — e.g. a
+    test calls a helper directly without going through the auth
+    dependency — falls back to extracting the bearer and consulting
+    ``_is_premium``.
+
+    Returns False on any unauthenticated request, so callers can use
+    this in /-style public handlers without a separate guard.
+    """
+    cached = getattr(
+        getattr(request, "state", None), "api_key_tier", None,
+    )
+    if cached == TIER_PREMIUM:
+        return True
+    if cached == TIER_FREE:
+        return False
+    api_key = _extract_bearer_token(request)
+    if not api_key:
+        return False
+    return _is_premium(api_key, request=request)
+
+
+def _project_report_for_free(report: dict) -> dict:
+    """
+    Project a sanitised daily report through the Phase 8.2 free-tier
+    allow-list. Returns a NEW dict; the input is not mutated.
+
+    Adds an ``upgrade`` hint object so an integrator's UI can render
+    the call-to-action consistently with the gated 403 from
+    /reports/history.
+    """
+    if not isinstance(report, dict):
+        return {
+            "tier": TIER_FREE,
+            "upgrade": {
+                "detail": PREMIUM_FEATURE_DETAIL,
+                "hint": PREMIUM_FEATURE_HINT,
+            },
+        }
+    out: dict[str, Any] = {
+        f: report[f] for f in _FREE_REPORT_ALLOWED_FIELDS if f in report
+    }
+    out["tier"] = TIER_FREE
+    out["upgrade"] = {
+        "detail": PREMIUM_FEATURE_DETAIL,
+        "hint": PREMIUM_FEATURE_HINT,
+    }
+    return out
+
+
+def _premium_required(tier: str) -> HTTPException:
+    """
+    Phase 8.2 — uniform 403 for every premium-only feature.
+
+    The response body is the documented constant
+    ``PREMIUM_FEATURE_DETAIL``; the ``X-Usage-Tier`` header carries
+    the caller's actual tier so an integrator's client can branch
+    on it without parsing the body.
+    """
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=PREMIUM_FEATURE_DETAIL,
+        headers={USAGE_TIER_HEADER: tier},
+    )
+
+
 def _sanitize_report(data: dict) -> dict:
     """
     Strip Core internals from a daily report dict before returning it.
@@ -1363,17 +1462,21 @@ async def usage_enforcement_middleware(request: Request, call_next):
         )
 
     response: Response = await call_next(request)
-    # Decorate every response from this caller — even 4xx — with
-    # the usage counters so the client always knows where they
-    # stand. Skip 401/403/503 (auth never succeeded → no row will
-    # be added) so we don't lie about the count.
-    if response.status_code not in {401, 403, 503}:
+    # Decorate every response from this caller — including Phase 8.2
+    # premium-feature 403s, which DO consume usage quota because
+    # auth succeeded. Skip only 401/503 (the auth dependency
+    # rejected the request after we let it through, so no usage
+    # row will be written and we shouldn't lie about the count).
+    if response.status_code not in {401, 503}:
         new_total = total_today + 1
         response.headers[USAGE_LIMIT_HEADER] = str(limit)
         response.headers[USAGE_REMAINING_HEADER] = str(
             max(0, limit - new_total),
         )
-        response.headers[USAGE_TIER_HEADER] = tier
+        # Honour an explicit X-Usage-Tier set by the route handler
+        # (e.g. the Phase 8.2 premium-feature 403). Otherwise apply
+        # the middleware's classification.
+        response.headers.setdefault(USAGE_TIER_HEADER, tier)
     return response
 
 
@@ -2290,13 +2393,20 @@ def billing_checkout(
     }
 
 
-@app.get(
-    "/reports/latest",
-    tags=["reports"],
-    dependencies=[Depends(require_api_key)],
-)
-def latest_report() -> dict[str, Any]:
-    """Return the most recent daily alpha validation report."""
+@app.get("/reports/latest", tags=["reports"])
+def latest_report(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Return the most recent daily alpha validation report.
+
+    Phase 8.2 — premium callers receive the full sanitised report;
+    free callers receive a curated subset (high-level summary +
+    upgrade hint). The per-row stats, decile breakdowns, and
+    shadow-filter simulation rows are part of the premium
+    offering.
+    """
     reports = _reports_dir()
     if not reports.is_dir():
         raise HTTPException(
@@ -2309,8 +2419,40 @@ def latest_report() -> dict[str, Any]:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no daily reports available",
         )
-    data = _parse_report_file(candidates[-1])
-    return _sanitize_report(data)
+    data = _sanitize_report(_parse_report_file(candidates[-1]))
+    if _is_premium_user(request):
+        return data
+    return _project_report_for_free(data)
+
+
+@app.get("/reports/history", tags=["reports"])
+def reports_history(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Phase 8.2 — premium-only listing of every daily report on disk.
+
+    Returns ``{"count": N, "dates": [...]}`` sorted oldest →
+    newest. Free callers receive the documented 403 with
+    ``X-Usage-Tier: free``.
+
+    Registered BEFORE ``/reports/{date}`` so FastAPI's path matcher
+    treats "history" as a literal segment, not a date path-param.
+    """
+    if not _is_premium_user(request):
+        raise _premium_required(TIER_FREE)
+
+    reports = _reports_dir()
+    dates: list[str] = []
+    if reports.is_dir():
+        for p in sorted(reports.glob("alpha_report_*.json")):
+            stem = p.stem  # alpha_report_2026-04-25
+            if stem.startswith("alpha_report_"):
+                candidate = stem[len("alpha_report_"):]
+                if _DATE_RE.match(candidate):
+                    dates.append(candidate)
+    return {"count": len(dates), "dates": dates}
 
 
 @app.get("/reports/{date}", tags=["reports"])
@@ -2806,9 +2948,15 @@ def dashboard(
     records = _read_manifest_records(_manifest_path())
     experiments = [_sanitize_manifest(r) for r in records[-10:]] if records else []
 
-    tier = (
-        TIER_PREMIUM if _is_premium(api_key, request=request) else TIER_FREE
-    )
+    is_premium = _is_premium_user(request)
+    tier = TIER_PREMIUM if is_premium else TIER_FREE
+    # Phase 8.2 — when the caller is on the free tier, pass the
+    # report through the same allow-list that gates /reports/latest
+    # so the dashboard cannot accidentally surface the deep tier /
+    # decile / shadow-filter sections that are part of the premium
+    # offering. Premium callers see the full sanitised report.
+    if not is_premium and report is not None:
+        report = _project_report_for_free(report)
     # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
     # string rendered to the user is also the one we hash into the
     # telemetry row. Premium users skip the resolver entirely (no

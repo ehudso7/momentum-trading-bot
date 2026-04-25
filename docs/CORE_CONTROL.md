@@ -2869,6 +2869,100 @@ conflicting responses on the same request.
   `TestPhase81DoesNotIntroduceMutatingRoute`.
 
 
+### Phase 8.2 — feature-level tier differentiation
+
+Free vs premium are now meaningfully differentiated at the
+response level. The tier resolution path (Phase 6.2 / 7.0 / 7.4)
+is unchanged; Phase 8.2 only changes what tier-gated routes return
+once the caller is classified.
+
+**New helper**
+
+`_is_premium_user(request) -> bool` — fast tier classifier for
+route handlers. Reads ``request.state.api_key_tier`` (cached by
+``require_api_key``) first; falls back to extracting the bearer
+and consulting `_is_premium`. Returns False on any unauthenticated
+request, so callers can use it without a separate guard.
+
+**Differentiated endpoints**
+
+| Route | Free | Premium |
+|---|---|---|
+| `GET /reports/latest` | curated subset (high-level summary + upgrade hint) | full sanitised report |
+| `GET /reports/history` (new) | 403 with the documented gated response | `{"count": N, "dates": [...]}` |
+| `GET /dashboard` | banner + projected report (premium-only fields hidden) | full HTML dashboard |
+
+The free `/reports/latest` projection is driven by a fixed
+allow-list (``_FREE_REPORT_ALLOWED_FIELDS``):
+
+```
+report_type, report_date, scorer_fingerprint, totals,
+promotion_readiness
+```
+
+Anything outside that allow-list is dropped — a future schema
+addition cannot accidentally surface to free users. The free
+response also carries a small ``upgrade`` envelope so client UIs
+can render a consistent call-to-action:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "scorer_fingerprint": "...",
+  "totals": {"alpha_rows": 100, "buy_rows": 25, "skip_rows": 75},
+  "promotion_readiness": {"ready": true, "consecutive_passing_days": 21},
+  "tier": "free",
+  "upgrade": {
+    "detail": "premium feature — upgrade required",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+**Uniform 403 contract**
+
+Every premium-only feature uses the same helper:
+
+```
+HTTP/1.1 403 Forbidden
+X-Usage-Tier: free
+X-Usage-Limit: 50
+X-Usage-Remaining: 47
+Content-Type: application/json
+
+{"detail": "premium feature — upgrade required"}
+```
+
+The body string is the constant ``PREMIUM_FEATURE_DETAIL``;
+``X-Usage-Tier`` reflects the caller's actual tier so a client can
+branch without parsing the body. The Phase 8.1 usage headers ride
+along because the request DID authenticate — premium-feature 403s
+consume the caller's daily quota (otherwise free users could spam
+gated endpoints for free).
+
+**`/reports/history` route ordering**
+
+Registered BEFORE ``/reports/{date}`` so FastAPI's path matcher
+treats "history" as a literal segment, not a date path-param. A
+free caller hitting `/reports/history` gets the documented 403,
+not "invalid date". Pinned by
+`TestPhase82ReportsHistoryPremiumUser::test_history_does_not_collide_with_date_route`.
+
+**Boundary**
+
+* No new mutating routes — `/reports/history` is GET-only. Pinned
+  by `TestPhase82DoesNotIntroduceMutatingRoute`.
+* No new persistence — Phase 8.2 is read-only logic on top of
+  existing data files.
+* Raw API keys never appear in any Phase 8.2 response body or
+  header. Pinned by `TestPhase82NoRawKeyInResponses` (2 tests).
+* Phase 8.1 enforcement layer's 403/429 skip rule narrowed to
+  {401, 503} so Phase 8.2 gated 403s carry the usage headers
+  too — auth-failure responses still don't leak count to
+  unauthenticated callers.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

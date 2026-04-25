@@ -373,6 +373,48 @@ Content-Type: application/json
 {"detail":"usage limit reached — upgrade for higher limits"}
 ```
 
+#### Phase 8.2 feature differentiation at a glance
+
+| Feature | Free | Premium |
+|---|---|---|
+| `GET /reports/latest` | curated subset (`report_type`, `report_date`, `scorer_fingerprint`, `totals`, `promotion_readiness`) plus an `upgrade` envelope. Premium-only deep stats (tier / reason / regime / decile / shadow-filter / guardrails / sources) are dropped. | full sanitised report. |
+| `GET /reports/history` | `403 {"detail": "premium feature — upgrade required"}` with `X-Usage-Tier: free` | `{"count": N, "dates": ["YYYY-MM-DD", ...]}` |
+| `GET /dashboard` | banner + projected report (deep-stat sections hidden) | full HTML dashboard |
+
+Worked example — free response to `GET /reports/latest`:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "scorer_fingerprint": "f0b2…",
+  "totals": {"alpha_rows": 100, "buy_rows": 25, "skip_rows": 75},
+  "promotion_readiness": {"ready": true, "consecutive_passing_days": 21},
+  "tier": "free",
+  "upgrade": {
+    "detail": "premium feature — upgrade required",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+Worked example — free `GET /reports/history` (premium-only):
+
+```
+$ curl -i https://your-host.example.com/reports/history \
+       -H "Authorization: Bearer <free-key>"
+HTTP/1.1 403 Forbidden
+X-Usage-Tier: free
+X-Usage-Limit: 50
+X-Usage-Remaining: 46
+Content-Type: application/json
+
+{"detail":"premium feature — upgrade required"}
+```
+
+Note that the 403 still consumes the caller's daily usage quota
+(Phase 8.1) — gated requests count.
+
 A premium user (promoted via Stripe Checkout / webhook) gets the
 higher cap automatically — no env edits, no restart:
 
