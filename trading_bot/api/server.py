@@ -1121,6 +1121,28 @@ def _build_upgrade_payload(
         )
         return None
 
+    # Phase 8.4 — funnel: stage 1 of 3 (`upgrade_shown`). Best-
+    # effort: any failure inside the writer is swallowed so the
+    # caller's response is unaffected.
+    try:
+        from trading_bot.api.upgrade_events import (
+            EVENT_UPGRADE_SHOWN, record_upgrade_funnel_event,
+        )
+        request_id = getattr(
+            getattr(request, "state", None), "request_id", None,
+        )
+        endpoint = ""
+        try:
+            endpoint = request.url.path
+        except Exception:
+            endpoint = ""
+        record_upgrade_funnel_event(
+            key_hash, EVENT_UPGRADE_SHOWN,
+            reason=reason, endpoint=endpoint, request_id=request_id,
+        )
+    except Exception as exc:
+        log.debug("upgrade_funnel.shown_emit_error", error=str(exc))
+
     return {
         "required": bool(required),
         "reason": reason,
@@ -2515,6 +2537,24 @@ def billing_checkout(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"checkout not configured: {exc}",
         )
+
+    # Phase 8.4 — funnel: stage 2 of 3 (`upgrade_clicked`).
+    # Best-effort; never blocks the response.
+    try:
+        from trading_bot.api.upgrade_events import (
+            EVENT_UPGRADE_CLICKED, record_upgrade_funnel_event,
+        )
+        request_id = getattr(
+            getattr(request, "state", None), "request_id", None,
+        )
+        record_upgrade_funnel_event(
+            result["key_hash"], EVENT_UPGRADE_CLICKED,
+            reason="checkout_initiated",
+            endpoint="/billing/checkout",
+            request_id=request_id,
+        )
+    except Exception as exc:
+        log.debug("upgrade_funnel.clicked_emit_error", error=str(exc))
 
     return {
         "checkout_session_id": result["checkout_session_id"],

@@ -85,12 +85,33 @@ EVENT_REPORT_LIMIT_HIT = "report_limit_hit"
 EVENT_OLD_REPORT_BLOCKED = "old_report_blocked"
 EVENT_EXPERIMENT_LIMIT_BLOCKED = "experiment_limit_blocked"
 
+# Phase 8.4 — three-stage upgrade-pressure funnel:
+#   shown      → upgrade payload was attached to a response
+#   clicked    → caller hit POST /billing/checkout
+#   completed  → Stripe webhook flipped the key to premium
+EVENT_UPGRADE_SHOWN = "upgrade_shown"
+EVENT_UPGRADE_CLICKED = "upgrade_clicked"
+EVENT_UPGRADE_COMPLETED = "upgrade_completed"
+
 VALID_EVENTS: frozenset[str] = frozenset({
     EVENT_DASHBOARD_BANNER_SEEN,
     EVENT_DAILY_REQUEST_LIMIT_HIT,
     EVENT_REPORT_LIMIT_HIT,
     EVENT_OLD_REPORT_BLOCKED,
     EVENT_EXPERIMENT_LIMIT_BLOCKED,
+    EVENT_UPGRADE_SHOWN,
+    EVENT_UPGRADE_CLICKED,
+    EVENT_UPGRADE_COMPLETED,
+})
+
+# Phase 8.4 — events that travel with the new ``reason`` /
+# ``endpoint`` shape rather than the legacy
+# ``copy_variant`` / ``ref_code`` shape. Both shapes share the
+# same JSONL file; readers branch on ``event``.
+_PHASE_84_FUNNEL_EVENTS: frozenset[str] = frozenset({
+    EVENT_UPGRADE_SHOWN,
+    EVENT_UPGRADE_CLICKED,
+    EVENT_UPGRADE_COMPLETED,
 })
 
 # The recorded tier is always "free" — premium users never reach an
@@ -240,6 +261,102 @@ def record_upgrade_event(
     }
     _append_record(record)
     return {"action": "recorded", "event": event, "api_key_hash": hashed}
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.4 — three-stage upgrade funnel
+# ---------------------------------------------------------------------------
+
+# Bound on the operator-supplied ``reason`` / ``endpoint`` strings so
+# a malformed caller can't blow up the JSONL file size.
+_PHASE_84_REASON_MAX_LENGTH = 64
+_PHASE_84_ENDPOINT_MAX_LENGTH = 128
+
+
+def _sanitize_short_str(value: Optional[str], cap: int) -> Optional[str]:
+    """Strip + cap; reject empties. Returns None on bad input so the
+    caller can omit the field cleanly."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s[:cap]
+
+
+def record_upgrade_funnel_event(
+    key_hash: Optional[str],
+    event: str,
+    *,
+    reason: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    request_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """
+    Phase 8.4 — append one upgrade-funnel record.
+
+    Three valid event values track the conversion funnel:
+
+      * ``upgrade_shown``     — a Phase 8.3 upgrade payload was
+        attached to a response. Fired from inside
+        ``server._build_upgrade_payload`` after a successful
+        Stripe Checkout creation.
+      * ``upgrade_clicked``   — caller hit ``POST /billing/checkout``.
+        Fired from the route handler after the Stripe Session is
+        successfully created.
+      * ``upgrade_completed`` — Stripe webhook flipped the key to
+        premium. Fired from ``billing.handle_webhook_event`` after
+        the premium-cache mutation lands.
+
+    The record schema mirrors the Phase 5.5 base schema and adds
+    two operator-facing columns:
+
+    ::
+
+        {
+          "timestamp":     "...Z",
+          "api_key_hash":  "<SHA-256[:32]>",
+          "event":         "upgrade_shown" | "upgrade_clicked" | "upgrade_completed",
+          "tier":          "free",
+          "request_id":    "<32-hex>" | null,
+          "reason":        "usage_limit" | "feature_locked" | "limited_access" | ...,
+          "endpoint":      "/reports/latest" | "/billing/checkout" | "/webhook/stripe" | ...,
+        }
+
+    The ``api_key_hash`` is taken AS-IS — callers MUST pre-hash;
+    this function refuses raw keys (signature documents
+    ``key_hash``, not ``api_key``). Any I/O failure is best-effort:
+    the caller's request must NEVER fail because the funnel writer
+    hit disk trouble.
+
+    Returns a small status dict for tests:
+
+      - ``{"action": "recorded", "event": "...", "api_key_hash": "..."}``
+      - ``{"action": "skipped", "reason": "no_key_hash"}``
+      - ``{"action": "skipped", "reason": "unknown_event"}``
+    """
+    if event not in _PHASE_84_FUNNEL_EVENTS:
+        return {"action": "skipped", "reason": "unknown_event"}
+    if not key_hash or not isinstance(key_hash, str) or not key_hash.strip():
+        return {"action": "skipped", "reason": "no_key_hash"}
+    h = key_hash.strip()
+
+    record = {
+        "timestamp": _now_iso_utc(now),
+        "api_key_hash": h,
+        "event": str(event),
+        "tier": TIER_FREE,
+        "request_id": (
+            _sanitize_short_str(request_id, _PHASE_84_REASON_MAX_LENGTH)
+        ),
+        "reason": _sanitize_short_str(reason, _PHASE_84_REASON_MAX_LENGTH),
+        "endpoint": _sanitize_short_str(
+            endpoint, _PHASE_84_ENDPOINT_MAX_LENGTH,
+        ),
+    }
+    _append_record(record)
+    return {"action": "recorded", "event": event, "api_key_hash": h}
 
 
 # ---------------------------------------------------------------------------

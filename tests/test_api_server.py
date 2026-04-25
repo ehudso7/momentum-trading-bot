@@ -8506,3 +8506,366 @@ class TestPhase83CrossCutting:
                 assert (m, path) in allowed, (
                     f"Phase 8.3 leaked a mutating route: {m} {path}"
                 )
+
+
+# ===========================================================================
+# Phase 8.4 — three-stage upgrade funnel (integration)
+# ===========================================================================
+
+
+def _read_funnel_rows() -> list[dict]:
+    """Load every row from the upgrade-events log configured by
+    the autouse fixture."""
+    path = Path(os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"])
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text("utf-8").splitlines():
+        s = line.strip()
+        if s:
+            out.append(json.loads(s))
+    return out
+
+
+class TestPhase84FunnelShownEvent:
+    """upgrade_shown fires from inside _build_upgrade_payload after a
+    successful Stripe Checkout creation."""
+
+    def test_429_emits_shown(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        assert rows[0]["reason"] == "usage_limit"
+        assert rows[0]["endpoint"] == "/reports/latest"
+        assert rows[0]["tier"] == "free"
+
+    def test_403_emits_shown(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(rows) == 1
+        assert rows[0]["reason"] == "feature_locked"
+        assert rows[0]["endpoint"] == "/reports/history"
+
+    def test_free_reports_latest_emits_shown(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(rows) == 1
+        assert rows[0]["reason"] == "limited_access"
+        assert rows[0]["endpoint"] == "/reports/latest"
+
+    def test_premium_does_not_emit_shown(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _promote_phase83_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Patch Stripe to fail loudly if invoked — premium must NOT
+        # trigger a checkout call OR a funnel event.
+        from trading_bot.api import billing as _billing_mod
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium")
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert rows == []
+        assert called["n"] == 0
+
+    def test_no_dedupe_spam_on_single_response(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """A single request must produce AT MOST one upgrade_shown
+        row — even though the response goes through middleware,
+        handler, and renderer. The sources don't overlap, so the
+        natural flow gives us one per request automatically."""
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        shown = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(shown) == 1
+
+
+class TestPhase84FunnelClickedEvent:
+    """upgrade_clicked fires from POST /billing/checkout after the
+    Stripe Session is created."""
+
+    def test_checkout_emits_clicked(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_clicked"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        assert rows[0]["endpoint"] == "/billing/checkout"
+        assert rows[0]["reason"] == "checkout_initiated"
+
+    def test_checkout_failure_does_not_emit_clicked(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_free_for_checkout()
+        _patch_stripe_poster(
+            monkeypatch,
+            _CheckoutFakePoster(raise_exc=BillingAPIError("boom")),
+        )
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 502
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_clicked"]
+        assert rows == []
+
+
+class TestPhase84FunnelCompletedEvent:
+    """upgrade_completed fires from billing.handle_webhook_event on
+    customer.subscription.created success."""
+
+    def test_webhook_hash_path_emits_completed(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase83_key("free")
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        assert result["action"] == "added"
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        assert rows[0]["reason"] == "stripe_webhook"
+        assert rows[0]["endpoint"] == "/webhook/stripe"
+
+    def test_webhook_legacy_api_key_path_emits_completed_with_hash(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """The legacy metadata[api_key] path must hash the raw key
+        before logging the funnel row — the funnel log is
+        hash-only."""
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase83_key("free")
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        # Raw key absent from the funnel log.
+        body = Path(
+            os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]
+        ).read_text("utf-8")
+        assert raw not in body
+
+    def test_webhook_ignored_event_emits_no_completed(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        # Unissued key → webhook ignored → no funnel row.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": "z" * 32},
+            }},
+        })
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        assert rows == []
+
+    def test_cancellation_does_not_emit_completed(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase83_key("free")
+        # Promote first.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        # Cancellation must NOT emit a "completed" event.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {"metadata": {"key_hash": key_hash}}},
+        })
+        completed = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        # Exactly one — from the created, not the deleted.
+        assert len(completed) == 1
+
+
+class TestPhase84FunnelEndToEnd:
+    """All three stages firing in one realistic scenario."""
+
+    def test_full_funnel_shown_clicked_completed(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+
+        # Stage 1: free user hits /reports/latest → upgrade_shown.
+        r1 = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r1.status_code == 200
+
+        # Stage 2: user clicks the checkout URL → POST /billing/checkout.
+        r2 = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r2.status_code == 200
+
+        # Stage 3: Stripe fires the webhook → upgrade_completed.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+
+        events = [r["event"] for r in _read_funnel_rows()
+                  if r.get("event") in {
+                      "upgrade_shown", "upgrade_clicked", "upgrade_completed",
+                  }]
+        # All three appear in the documented order.
+        assert events == [
+            "upgrade_shown", "upgrade_clicked", "upgrade_completed",
+        ]
+
+
+class TestPhase84FunnelLeakGuard:
+    """No raw API key may appear in the upgrade-events log on any
+    Phase 8.4 trigger path."""
+
+    def test_no_raw_key_after_full_funnel(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+
+        body = Path(
+            os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]
+        ).read_text("utf-8")
+        assert raw not in body
+        # The hash IS present (3x — once per event).
+        assert body.count(key_hash) == 3
+
+
+class TestPhase84FunnelLoggingFailureDoesNotBreakRequest:
+    def test_429_still_returns_when_funnel_writer_explodes(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """If the funnel writer raises, the 429 (or 200 / 403) MUST
+        still come back. The funnel layer is best-effort."""
+        from trading_bot.api import upgrade_events as _ue
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated funnel writer failure")
+        monkeypatch.setattr(_ue, "record_upgrade_funnel_event", boom)
+
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # The 429 still comes back even though the funnel writer raised.
+        assert r.status_code == 429
+        assert r.json()["detail"]

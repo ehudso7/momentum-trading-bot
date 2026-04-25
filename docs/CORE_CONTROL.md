@@ -3116,6 +3116,136 @@ trade-off can disable specific trigger points by:
   `test_usage_enforcement_still_applies_after_payload_attached`.
 
 
+### Phase 8.4 — conversion-funnel tracking
+
+Three-stage upgrade funnel logged into the existing
+``data/api_upgrade_events.jsonl`` file (Phase 5.5/5.8 path,
+backward-compatible schema). One row per stage per user per
+trigger so an operator can answer:
+
+  * how many free users **saw** an upgrade prompt today
+  * how many of those **clicked** through to Checkout
+  * how many of those **completed** the subscription
+
+The funnel reuses the Phase 5.5 file but adds two operator-facing
+columns (``reason``, ``endpoint``); legacy Phase 5.5 events
+continue to use ``copy_variant_hash`` / ``ref_code``. Readers
+branch on ``event``.
+
+**Three new event constants**
+
+| Event | Fired from | When |
+|---|---|---|
+| ``upgrade_shown`` | ``server._build_upgrade_payload`` | a Phase 8.3 upgrade payload was attached to a response (one row per response, never duplicated). |
+| ``upgrade_clicked`` | ``server.billing_checkout`` handler | the caller successfully created a Stripe Checkout Session via ``POST /billing/checkout``. |
+| ``upgrade_completed`` | ``billing.handle_webhook_event`` | Stripe ``customer.subscription.created`` event flipped the key to premium. |
+
+**Helper signature**
+
+```python
+record_upgrade_funnel_event(
+    key_hash: str,                          # SHA-256[:32], hash-only
+    event: str,                             # one of the three constants
+    *,
+    reason:     Optional[str] = None,       # e.g. "usage_limit"
+    endpoint:   Optional[str] = None,       # e.g. "/reports/latest"
+    request_id: Optional[str] = None,
+    now:        Optional[datetime] = None,
+) -> dict
+```
+
+The helper accepts ONLY ``key_hash`` (the signature documents
+``key_hash``, not ``api_key``) — every call site in the codebase
+pre-hashes via Phase 7.4's ``_hash_api_key``. Operators MUST do
+the same. Reasons / endpoints are stripped + capped (64 / 128
+chars respectively) before persistence; blank values become
+``None``.
+
+**Persisted row shape**
+
+```json
+{
+  "timestamp":    "2026-04-25T14:30:00.000000Z",
+  "api_key_hash": "<SHA-256[:32]>",
+  "event":        "upgrade_shown",
+  "tier":         "free",
+  "request_id":   "<32-hex>" | null,
+  "reason":       "usage_limit" | "feature_locked" | "limited_access" | "checkout_initiated" | "stripe_webhook" | null,
+  "endpoint":     "/reports/latest" | "/reports/history" | "/billing/checkout" | "/webhook/stripe" | null
+}
+```
+
+**Sample funnel reads**
+
+A single free user hitting their daily cap, clicking the upgrade
+URL, paying through Stripe:
+
+```jsonl
+{"event":"upgrade_shown","reason":"usage_limit","endpoint":"/reports/latest","api_key_hash":"bcd5...","tier":"free",...}
+{"event":"upgrade_clicked","reason":"checkout_initiated","endpoint":"/billing/checkout","api_key_hash":"bcd5...","tier":"free",...}
+{"event":"upgrade_completed","reason":"stripe_webhook","endpoint":"/webhook/stripe","api_key_hash":"bcd5...","tier":"free",...}
+```
+
+**Funnel math**
+
+```
+shown    = count(distinct api_key_hash) where event = "upgrade_shown"
+clicked  = count(distinct api_key_hash) where event = "upgrade_clicked"
+completed= count(distinct api_key_hash) where event = "upgrade_completed"
+
+clickthrough_rate   = clicked   / shown
+conversion_rate     = completed / clicked
+overall_funnel_rate = completed / shown
+```
+
+Filter by ``reason`` to compare which trigger ("usage_limit",
+"feature_locked", "limited_access") drives the most upgrades, or
+by ``endpoint`` to see which gated route is the strongest funnel
+entrypoint.
+
+**Privacy invariants (every one tested)**
+
+* Raw API key never in the funnel log — pinned by
+  ``TestPhase84FunnelLeakGuard::test_no_raw_key_after_full_funnel``.
+* Legacy ``metadata[api_key]`` webhook path hashes the raw key
+  before logging — pinned by
+  ``test_webhook_legacy_api_key_path_emits_completed_with_hash``.
+* The funnel helper's signature is hash-only (``key_hash``, not
+  ``api_key``) — pinned by
+  ``TestPhase84RecordUpgradeFunnelEventSchema::test_records_documented_fields``.
+
+**Failure / dedup posture**
+
+* Funnel writer failures are best-effort — wrapped in try/except
+  at every call site so a disk failure NEVER breaks the user's
+  request. Pinned by
+  ``TestPhase84FunnelLoggingFailureDoesNotBreakRequest`` and
+  ``TestPhase84RecordUpgradeFunnelEventNoLeak::test_disk_failure_does_not_raise``.
+* Premium callers never emit any of the three events because the
+  Phase 8.3 helper short-circuits BEFORE the Stripe call AND
+  before the funnel write. Pinned by
+  ``test_premium_does_not_emit_shown``.
+* "No duplicate spam events in same request" is structurally
+  guaranteed — each event has exactly one call site per response
+  flow, so a single request produces at most one row per stage.
+  Pinned by ``test_no_dedupe_spam_on_single_response``.
+* Cancellation / payment-failure webhook events do NOT emit
+  ``upgrade_completed`` — pinned by
+  ``test_cancellation_does_not_emit_completed``.
+
+**Boundary**
+
+* No new HTTP route. Phase 8.4 is helper code wired into existing
+  routes / middleware / webhook.
+* The three new event constants extend the Phase 5.5
+  ``VALID_EVENTS`` set; the legacy ``record_upgrade_event`` and
+  the new ``record_upgrade_funnel_event`` share the same JSONL
+  file. Readers branch on ``event``.
+* No new operator log file. The default path
+  (``data/api_upgrade_events.jsonl``) and env var
+  (``TRADING_API_UPGRADE_EVENTS_LOG_PATH``) are unchanged.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

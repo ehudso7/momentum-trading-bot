@@ -705,6 +705,24 @@ def handle_webhook_event(event) -> dict:
                 )
         except Exception as exc:
             log.debug("billing.conversion_error", error=str(exc))
+        # Phase 8.4 — funnel: stage 3 of 3 (`upgrade_completed`).
+        # Best-effort. Compute the hash for the legacy api_key path
+        # so the funnel row is hash-only.
+        try:
+            from trading_bot.api.upgrade_events import (
+                EVENT_UPGRADE_COMPLETED,
+                record_upgrade_funnel_event,
+            )
+            funnel_hash = (
+                key_hash if use_hash else _hash_api_key(api_key)
+            )
+            record_upgrade_funnel_event(
+                funnel_hash, EVENT_UPGRADE_COMPLETED,
+                reason="stripe_webhook",
+                endpoint="/webhook/stripe",
+            )
+        except Exception as exc:
+            log.debug("billing.upgrade_funnel_error", error=str(exc))
         return {
             "type": event_type,
             "action": "added",
