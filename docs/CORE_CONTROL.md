@@ -3679,6 +3679,82 @@ default, override via ``TRADING_API_SHARE_EVENTS_LOG_PATH``)::
       python -m trading_bot.api.share_events --summary --json
 
 
+### Phase 10.4 — growth intelligence layer
+
+Phase 10.4 turns the existing JSONL telemetry (Phase 8.4 upgrade
+events + Phase 10.3 share events) into operator-facing growth
+insights. It is **read-only**: no new endpoint, no new file
+written, no schema changes. It joins the two logs on the shared
+``api_key_hash`` column to surface conversion + viral metrics.
+
+**The headlines** surfaced by ``summarize`` and the CLI:
+
+| Headline                  | Definition                                                   |
+|---------------------------|--------------------------------------------------------------|
+| ``top_converting_trigger``| The Phase 8.4 ``reason`` value with the highest shown→completed rate (subject to ``min_impressions`` floor). |
+| ``top_performing_insight``| The ``endpoint`` with the highest shown→completed rate. Each Phase 9.1/9.2/9.3 insight surface is hosted at a known endpoint, so endpoint stands in as the operator-facing insight identifier. |
+| ``best_source``           | The inbound ``src`` token whose visitors converted at the highest rate, attributed via ``api_key_hash``. |
+| ``overall_conversion_rate``| ``upgrade_completed`` / ``upgrade_shown`` across the whole funnel. |
+
+**Public API**
+
+::
+
+    from trading_bot.api.growth_intel import (
+        load_upgrade_events,
+        load_share_events,
+        summarize,
+        format_summary_text,
+    )
+
+    summary = summarize()                       # default paths
+    summary = summarize(
+        upgrade_path="...",                     # explicit override
+        share_path="...",
+        min_impressions=5,                      # noise floor
+        min_inbound=3,
+    )
+
+The summary dict is JSON-serialisable and stable: ``conversion_funnel``,
+``by_reason``, ``by_insight``, ``share_funnel``, ``by_src``,
+``attribution_by_src``, ``headlines``, ``totals``.
+
+**CLI**
+
+::
+
+    python -m trading_bot.api.growth_intel --summary
+    python -m trading_bot.api.growth_intel --summary --json
+    python -m trading_bot.api.growth_intel --summary \
+        --upgrade-path path/to/upgrade.jsonl \
+        --share-path  path/to/share.jsonl \
+        --min-impressions 5 --min-inbound 3
+
+**Privacy posture**
+
+* Only aggregated dimensions reach the summary — no
+  ``api_key_hash`` column appears in the output, even though
+  the loaders read it for the cross-funnel join.
+* The leak-guard test plants a unique marker as the would-be raw
+  key, hashes it, and asserts neither the raw marker nor the
+  individual hash appears in the rendered summary.
+* Loaders are tolerant of missing / blank / malformed rows;
+  summary always succeeds even on an empty pair of logs.
+
+**Boundary**
+
+* ``trading_bot/api/growth_intel.py`` imports only stdlib +
+  structlog (DEBUG-only) + the ``share_events`` / ``upgrade_events``
+  sibling modules for their event constants. No FastAPI / Stripe /
+  Core import. Pinned by
+  ``tests/test_growth_intel.py::TestBoundary::test_module_does_not_import_core``.
+* No new HTTP route, no new mutating endpoint, no new persistence —
+  the module is invoked offline (CLI, notebook, or BI pipeline).
+* No new env vars beyond the existing
+  ``TRADING_API_UPGRADE_EVENTS_LOG_PATH`` and
+  ``TRADING_API_SHARE_EVENTS_LOG_PATH``.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
