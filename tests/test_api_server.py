@@ -81,6 +81,11 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         # Phase 6.2 — manifest-backed key store paths.
         "TRADING_API_KEYS_MANIFEST_PATH",
         "TRADING_API_KEYS_REVOKED_PATH",
+        # Phase 8.1 — tier-aware usage enforcement knobs.
+        "TRADING_USAGE_ENFORCEMENT_ENABLED",
+        "TRADING_FREE_DAILY_REQUEST_LIMIT",
+        "TRADING_PREMIUM_DAILY_REQUEST_LIMIT",
+        "TRADING_USAGE_LIMIT_EXEMPT_PATHS",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
@@ -7094,3 +7099,458 @@ class TestPhase74CheckoutWebhookEndToEnd:
             headers={"Authorization": f"Bearer {phantom_hash}"},
         )
         assert r.status_code == 403
+
+
+# ===========================================================================
+# Phase 8.1 — tier-aware usage enforcement
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    DEFAULT_FREE_DAILY_REQUEST_LIMIT,
+    DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT,
+    FREE_DAILY_REQUEST_LIMIT_ENV_VAR,
+    PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR,
+    RETRY_AFTER_HEADER,
+    USAGE_ENFORCEMENT_ENABLED_ENV_VAR,
+    USAGE_LIMIT_DETAIL,
+    USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR,
+    USAGE_LIMIT_HEADER,
+    USAGE_REMAINING_HEADER,
+    USAGE_TIER_HEADER,
+    _free_daily_request_limit,
+    _premium_daily_request_limit,
+    _usage_enforcement_enabled,
+    _usage_limit_exempt_paths,
+)
+
+
+def _seed_usage_today(
+    usage_path: Path, *, key_hash: str, tier: str, n: int,
+    method: str = "GET", path: str = "/reports/latest",
+) -> None:
+    """Append ``n`` minimal Phase 4.6-style usage rows for ``key_hash``
+    dated today (UTC). Used to fast-forward the enforcement counter."""
+    usage_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with open(usage_path, "a", encoding="utf-8") as fh:
+        for _ in range(n):
+            fh.write(json.dumps({
+                "timestamp": today,
+                "key_hash": key_hash,
+                "tier": tier,
+                "method": method,
+                "path": path,
+                "status_code": 200,
+                "duration_ms": 1.0,
+            }) + "\n")
+
+
+class TestPhase81Helpers:
+    def test_default_free_limit_is_50(self, monkeypatch):
+        monkeypatch.delenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, raising=False)
+        assert _free_daily_request_limit() == DEFAULT_FREE_DAILY_REQUEST_LIMIT
+        assert DEFAULT_FREE_DAILY_REQUEST_LIMIT == 50
+
+    def test_default_premium_limit_is_1000(self, monkeypatch):
+        monkeypatch.delenv(
+            PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR, raising=False,
+        )
+        assert (
+            _premium_daily_request_limit()
+            == DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT
+        )
+        assert DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT == 1000
+
+    def test_invalid_free_limit_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "not-an-int")
+        assert _free_daily_request_limit() == 50
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "-5")
+        assert _free_daily_request_limit() == 50
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "")
+        assert _free_daily_request_limit() == 50
+
+    def test_invalid_premium_limit_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR, "garbage")
+        assert _premium_daily_request_limit() == 1000
+
+    def test_enforcement_enabled_default_true(self, monkeypatch):
+        monkeypatch.delenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, raising=False)
+        assert _usage_enforcement_enabled() is True
+
+    def test_enforcement_disabled_by_explicit_false(self, monkeypatch):
+        for value in ("false", "0", "no", "off", "False", "NO"):
+            monkeypatch.setenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, value)
+            assert _usage_enforcement_enabled() is False
+
+    def test_enforcement_enabled_by_truthy(self, monkeypatch):
+        for value in ("true", "1", "yes", "on", "True", "YES"):
+            monkeypatch.setenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, value)
+            assert _usage_enforcement_enabled() is True
+
+    def test_exempt_paths_default_set(self, monkeypatch):
+        monkeypatch.delenv(USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR, raising=False)
+        exempt = _usage_limit_exempt_paths()
+        for p in ("/", "/health", "/webhook/stripe",
+                  "/favicon.ico", "/apple-touch-icon.png",
+                  "/apple-touch-icon-precomposed.png"):
+            assert p in exempt
+
+    def test_exempt_paths_extended_via_env(self, monkeypatch):
+        monkeypatch.setenv(
+            USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR,
+            "/foo, bar , ,/baz",
+        )
+        exempt = _usage_limit_exempt_paths()
+        assert "/foo" in exempt
+        assert "/bar" in exempt
+        assert "/baz" in exempt
+        # Defaults still present.
+        assert "/health" in exempt
+
+
+@pytest.fixture
+def phase81_env(monkeypatch, tmp_path: Path):
+    """Set up a manifest-backed deployment with an isolated usage log
+    so the Phase 8.1 enforcement counter starts at zero."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    usage_log = tmp_path / "usage_phase81.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    monkeypatch.setenv("TRADING_API_USAGE_LOG_PATH", str(usage_log))
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+        "usage_log": usage_log,
+    }
+
+
+def _issue_phase81_key(tier: str, label: str) -> tuple[str, str]:
+    """Issue a key in-process and return (raw, hash)."""
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=label)
+    return result["api_key"], result["key_hash"]
+
+
+class TestPhase81FreeUserUnderLimit:
+    def test_under_limit_succeeds_with_headers(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-under")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "10")
+        # Seed 3 prior calls so we expect remaining = 6 after this one.
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free", n=3,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        assert r.headers[USAGE_LIMIT_HEADER] == "10"
+        # Pre-call total was 3; this call would make it 4 → remaining = 6.
+        assert r.headers[USAGE_REMAINING_HEADER] == "6"
+        assert r.headers[USAGE_TIER_HEADER] == "free"
+
+
+class TestPhase81FreeUserAtLimit:
+    def test_at_limit_returns_429_with_documented_body(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-at")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "10")
+        # Seed exactly the limit so the next call is rejected.
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free", n=10,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        assert r.json() == {"detail": USAGE_LIMIT_DETAIL}
+        assert r.headers[USAGE_LIMIT_HEADER] == "10"
+        assert r.headers[USAGE_REMAINING_HEADER] == "0"
+        assert r.headers[USAGE_TIER_HEADER] == "free"
+        # Retry-After must be a positive integer in seconds (≤ 86400).
+        ra = int(r.headers[RETRY_AFTER_HEADER])
+        assert 1 <= ra <= 86400
+
+
+class TestPhase81PremiumUserExceedsFreeButUnderPremium:
+    def test_premium_passes_when_over_free_cap(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase81_key("free", "phase81-premium-bypass")
+        # Promote via Phase 7.4 hash path so the key is premium.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        # Seed 60 prior calls — well over the free 50/day default,
+        # well under the premium 1000/day default.
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash,
+            tier="premium", n=60,
+        )
+        # Make sure Stripe is "configured" so _is_premium routes
+        # through the cache.
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase81")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(phase81_env["usage_log"].parent / "stripe_cache.json"),
+        )
+        billing.reset_cache_for_tests()
+        # Re-promote because we just reset the cache + re-pointed it.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.headers[USAGE_TIER_HEADER] == "premium"
+        # Premium cap is 1000; we seeded 60; this call → 61 → remaining 939.
+        assert r.headers[USAGE_LIMIT_HEADER] == "1000"
+        assert int(r.headers[USAGE_REMAINING_HEADER]) >= 900
+
+
+class TestPhase81PremiumUserAtPremiumLimit:
+    def test_premium_at_premium_limit_returns_429(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase81_key("free", "phase81-premium-cap")
+        monkeypatch.setenv(PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR, "5")
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase81_atcap")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(phase81_env["usage_log"].parent / "stripe_cache_atcap.json"),
+        )
+        billing.reset_cache_for_tests()
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash,
+            tier="premium", n=5,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        assert r.headers[USAGE_TIER_HEADER] == "premium"
+        assert r.headers[USAGE_LIMIT_HEADER] == "5"
+        assert r.headers[USAGE_REMAINING_HEADER] == "0"
+
+
+class TestPhase81PublicPathsExempt:
+    @pytest.mark.parametrize("path", [
+        "/", "/health", "/favicon.ico",
+        "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
+    ])
+    def test_public_path_never_429s(
+        self, client: TestClient, phase81_env, monkeypatch, path: str,
+    ):
+        raw, key_hash = _issue_phase81_key("free", f"phase81-public-{path}")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "1")
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free",
+            n=10000,
+        )
+        # Even with the counter way over the cap, public paths must
+        # NEVER 429. (No auth header on purpose — these paths don't
+        # need it.)
+        r = client.get(path)
+        assert r.status_code != 429
+
+    def test_webhook_stripe_never_429s(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        # Webhook is exempt regardless of auth state. Stripe doesn't
+        # send Authorization. The endpoint will 503 (no
+        # STRIPE_WEBHOOK_SECRET configured) or 400 (bad signature),
+        # but it must NEVER 429 from the usage layer.
+        r = client.post("/webhook/stripe", content=b"{}")
+        assert r.status_code != 429
+
+
+class TestPhase81OperatorExtendsExempt:
+    def test_extra_exempt_path_skips_enforcement(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-extra-exempt")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "1")
+        # Operator-supplied extra exempt path; /reports/latest is
+        # absurd as an exempt route but it's a clear test signal.
+        monkeypatch.setenv(
+            USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR, "/reports/latest",
+        )
+        # Lift Phase 5.4's older free-tier cap out of the way so the
+        # only enforcement under test is Phase 8.1.
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash,
+            tier="free", n=10000,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Even though the counter is way over, the operator
+        # exempted this path → no 429.
+        assert r.status_code == 200
+
+
+class TestPhase81NoCountForUnauthenticated:
+    def test_missing_auth_does_not_write_usage(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        # Issue a key so the deployment is "configured" (not 503).
+        _issue_phase81_key("free", "phase81-noauth-shape")
+        r = client.get("/reports/latest")
+        assert r.status_code == 401
+        # Usage log should be empty / non-existent — no row written
+        # for an unauthenticated request.
+        if phase81_env["usage_log"].exists():
+            body = phase81_env["usage_log"].read_text("utf-8").strip()
+            assert body == "", (
+                f"Phase 8.1: unauthenticated request leaked into usage log: "
+                f"{body!r}"
+            )
+
+    def test_bogus_key_does_not_write_usage(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        _issue_phase81_key("free", "phase81-bogus-shape")
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert r.status_code == 403
+        if phase81_env["usage_log"].exists():
+            body = phase81_env["usage_log"].read_text("utf-8").strip()
+            assert body == ""
+
+
+class TestPhase81UsageLogStoresHashOnly:
+    def test_usage_log_after_request_contains_only_hash(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-hash-only")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = phase81_env["usage_log"].read_text("utf-8")
+        assert raw not in body, "Phase 8.1: raw key leaked into usage log"
+        assert key_hash in body
+
+
+class TestPhase81EnforcementCanBeDisabled:
+    def test_disabled_lets_through_over_limit_traffic(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-disabled")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "1")
+        monkeypatch.setenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, "false")
+        # Phase 5.4's older free-tier cap is independent of the
+        # Phase 8.1 toggle — lift it so this test isolates Phase 8.1.
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free",
+            n=10000,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Under-limit semantics restored: request goes through and
+        # no Phase-8.1 headers are added.
+        assert r.status_code == 200
+        assert USAGE_LIMIT_HEADER not in r.headers
+        assert USAGE_REMAINING_HEADER not in r.headers
+
+
+class TestPhase81MissingUsageLogFailsOpen:
+    def test_no_usage_log_means_count_zero(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase81_key("free", "phase81-failopen")
+        # Don't seed anything → usage log file does not exist.
+        assert not phase81_env["usage_log"].exists()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        # Headers are still present and reflect "this is the first
+        # request today" (count=1 → remaining = 49).
+        assert r.headers[USAGE_LIMIT_HEADER] == "50"
+        assert r.headers[USAGE_REMAINING_HEADER] == "49"
+
+
+class TestPhase81DoesNotIntroduceMutatingRoute:
+    def test_no_new_mutating_route(self):
+        """Phase 8.1 is middleware — it must not register any new
+        HTTP route. The single-mutating-route invariant remains
+        POST /webhook/stripe + POST /billing/checkout."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 8.1 leaked a mutating route: {m} {path}"
+                )

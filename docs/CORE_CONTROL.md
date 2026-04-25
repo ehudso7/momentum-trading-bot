@@ -2778,6 +2778,97 @@ wire to Stripe; no raw key in the cache file; no raw key in any
 operator log.
 
 
+### Phase 8.1 — tier-aware usage enforcement
+
+Turns the product from "authenticated API" into "metered SaaS".
+A new `usage_enforcement_middleware` reads the existing Phase 4.6
+per-key usage log and rejects calls that would push the caller
+above their tier's daily request cap.
+
+**Env vars (all optional with sane defaults)**
+
+| Env var | Default | What it does |
+|---|---|---|
+| `TRADING_USAGE_ENFORCEMENT_ENABLED` | `true` | Disable the entire layer with `false`/`0`/`no`/`off`. |
+| `TRADING_FREE_DAILY_REQUEST_LIMIT` | `50` | Per-key per-UTC-day cap for free tier. Invalid → default. |
+| `TRADING_PREMIUM_DAILY_REQUEST_LIMIT` | `1000` | Per-key per-UTC-day cap for premium tier. Invalid → default. |
+| `TRADING_USAGE_LIMIT_EXEMPT_PATHS` | unset | Comma-separated extra exempt paths (joined with the default exempt set). |
+
+**Default exempt paths (no enforcement, no headers)**
+
+```
+/                                      (public landing)
+/health                                (liveness probe)
+/favicon.ico                           (Phase 7.1 browser noise)
+/apple-touch-icon.png                  (Phase 7.1 browser noise)
+/apple-touch-icon-precomposed.png      (Phase 7.1 browser noise)
+/webhook/stripe                        (Stripe → server webhook)
+```
+
+**Response headers (added on every non-exempt response from
+authenticated callers — both 2xx and 4xx route responses)**
+
+| Header | Value |
+|---|---|
+| `X-Usage-Limit` | the active tier cap |
+| `X-Usage-Remaining` | `max(0, limit - count_after_this_request)` |
+| `X-Usage-Tier` | `"free"` or `"premium"` |
+| `Retry-After` | (429 only) seconds until next UTC midnight |
+
+**Rejection contract**
+
+```
+HTTP/1.1 429 Too Many Requests
+X-Usage-Limit: 50
+X-Usage-Remaining: 0
+X-Usage-Tier: free
+Retry-After: 27384
+Content-Type: application/json
+
+{"detail": "usage limit reached — upgrade for higher limits"}
+```
+
+**Tier resolution & precedence (unchanged from Phase 7.4)**
+
+The middleware uses the same `_is_premium` resolver everything
+else uses, so a key that was promoted by the Stripe webhook (Phase
+7.0/7.4) is automatically billed against the premium cap on the
+very next request — no restart, no env edits.
+
+**Layering with Phase 5.4**
+
+The Phase 5.4 free-tier middleware (per-`/reports/*` sub-cap +
+older free-only daily cap with `X-Free-Tier-*` headers) is kept
+intact for backward compatibility. Phase 8.1 is registered to fire
+FIRST in the request pipeline so its 429 short-circuits when both
+would otherwise reject the same call. The two never produce
+conflicting responses on the same request.
+
+**Failure posture (best-effort, fail-open)**
+
+* Missing/empty/malformed usage log → `_count_free_tier_usage_today`
+  returns `(0, 0)` → enforcement treats the caller as having made
+  zero requests today (lets them through). Pinned by
+  `TestPhase81MissingUsageLogFailsOpen`.
+* Disabled toggle → middleware passes every request through with
+  no headers added. Pinned by
+  `TestPhase81EnforcementCanBeDisabled`.
+
+**Privacy invariants (every one tested)**
+
+* The usage log schema is unchanged — Phase 4.6 already stored
+  `key_hash` only, never the raw api_key. Pinned by
+  `TestPhase81UsageLogStoresHashOnly`.
+* Unauthenticated requests do NOT count against any user — the
+  middleware exits early when the bearer is missing or unknown.
+  Pinned by `TestPhase81NoCountForUnauthenticated`.
+* Stripe webhooks are exempt by path, even when called with a
+  forged `Authorization` header. Pinned by
+  `TestPhase81PublicPathsExempt::test_webhook_stripe_never_429s`.
+* No new mutating route added. Pinned by
+  `TestPhase81DoesNotIntroduceMutatingRoute`.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

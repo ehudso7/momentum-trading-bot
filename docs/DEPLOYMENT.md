@@ -48,6 +48,10 @@ The same files also need to be:
 | `STRIPE_CHECKOUT_CANCEL_PATH` | optional | Override the cancel-redirect path. Default: `/dashboard?checkout=cancel`. (Phase 7.3) |
 | `STRIPE_WEBHOOK_SECRET` | premium subscriptions | Required for `POST /webhook/stripe`. |
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH` | premium subscriptions | Recommended Railway path: `/data/stripe_premium_keys.json` (same volume as the manifests). |
+| `TRADING_USAGE_ENFORCEMENT_ENABLED` | optional | Phase 8.1 — flip the tier-aware daily-cap layer off with `false`/`0`/`no`/`off`. Default ON. |
+| `TRADING_FREE_DAILY_REQUEST_LIMIT` | optional | Phase 8.1 — per-key per-UTC-day cap for free tier. Default `50`. Invalid values fall back to `50`. |
+| `TRADING_PREMIUM_DAILY_REQUEST_LIMIT` | optional | Phase 8.1 — per-key per-UTC-day cap for premium tier. Default `1000`. Invalid values fall back to `1000`. |
+| `TRADING_USAGE_LIMIT_EXEMPT_PATHS` | optional | Phase 8.1 — comma-separated extra exempt paths joined with the default exempt set (`/`, `/health`, the Phase 7.1 icons, `/webhook/stripe`). |
 
 
 ## Recommended Railway layout
@@ -329,6 +333,64 @@ TRADING_API_UPGRADE_EVENTS_LOG_PATH=/app/data/api_upgrade_events.jsonl
 STRIPE_API_KEY=sk_live_…           # only when ready to accept payments
 STRIPE_WEBHOOK_SECRET=whsec_…       # only when Stripe is wired
 TRADING_LOG_JSON=true
+
+# Phase 8.1 — tier-aware usage enforcement (defaults shown; all
+# four are optional). Tighten before launching, loosen as the
+# product matures.
+TRADING_USAGE_ENFORCEMENT_ENABLED=true
+TRADING_FREE_DAILY_REQUEST_LIMIT=50
+TRADING_PREMIUM_DAILY_REQUEST_LIMIT=1000
+# TRADING_USAGE_LIMIT_EXEMPT_PATHS=/some/extra/path
+```
+
+#### Phase 8.1 metering behaviour at a glance
+
+A free user under the cap sees their headroom on every response:
+
+```
+$ curl -i https://your-host.example.com/reports/latest \
+       -H "Authorization: Bearer <free-key>"
+HTTP/1.1 200 OK
+X-Usage-Limit: 50
+X-Usage-Remaining: 47
+X-Usage-Tier: free
+…
+```
+
+A free user that hits the cap is rejected with a documented body
+plus `Retry-After`:
+
+```
+$ curl -i https://your-host.example.com/reports/latest \
+       -H "Authorization: Bearer <free-key>"
+HTTP/1.1 429 Too Many Requests
+X-Usage-Limit: 50
+X-Usage-Remaining: 0
+X-Usage-Tier: free
+Retry-After: 27384
+Content-Type: application/json
+
+{"detail":"usage limit reached — upgrade for higher limits"}
+```
+
+A premium user (promoted via Stripe Checkout / webhook) gets the
+higher cap automatically — no env edits, no restart:
+
+```
+$ curl -i https://your-host.example.com/reports/latest \
+       -H "Authorization: Bearer <same-key-after-upgrade>"
+HTTP/1.1 200 OK
+X-Usage-Limit: 1000
+X-Usage-Remaining: 939
+X-Usage-Tier: premium
+```
+
+To temporarily disable the entire metering layer (e.g., during an
+incident or migration):
+
+```
+$ railway variables --set TRADING_USAGE_ENFORCEMENT_ENABLED=false
+$ railway redeploy
 ```
 
 ### 3 — Issue the real user keys (Railway shell only)

@@ -47,7 +47,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import date as _date_type, datetime, timezone
+from datetime import date as _date_type, datetime, timedelta, timezone
 from html import escape as _esc
 from pathlib import Path
 from typing import Any, Optional
@@ -119,6 +119,37 @@ _FREE_TIER_EXEMPT_PATHS: frozenset[str] = frozenset(
         "/apple-touch-icon.png",
         "/apple-touch-icon-precomposed.png",
     }
+)
+
+# Phase 8.1 — tier-aware daily usage enforcement.
+#
+# Phase 5.4 caps free-tier callers only and uses /reports/* as a
+# tighter sub-cap. Phase 8.1 layers a UNIFIED tier-aware daily
+# request cap on top: free callers get TRADING_FREE_DAILY_REQUEST_LIMIT,
+# premium callers get TRADING_PREMIUM_DAILY_REQUEST_LIMIT. Both
+# caps read the same usage JSONL log (Phase 4.6 schema unchanged).
+#
+# Registered LAST so it sits OUTERMOST in the middleware stack and
+# fires FIRST on every request — its 429 short-circuits the older
+# Phase 5.4 layer when both would otherwise reject the same call.
+USAGE_ENFORCEMENT_ENABLED_ENV_VAR = "TRADING_USAGE_ENFORCEMENT_ENABLED"
+FREE_DAILY_REQUEST_LIMIT_ENV_VAR = "TRADING_FREE_DAILY_REQUEST_LIMIT"
+PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR = "TRADING_PREMIUM_DAILY_REQUEST_LIMIT"
+USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR = "TRADING_USAGE_LIMIT_EXEMPT_PATHS"
+DEFAULT_FREE_DAILY_REQUEST_LIMIT = 50
+DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT = 1000
+USAGE_LIMIT_HEADER = "X-Usage-Limit"
+USAGE_REMAINING_HEADER = "X-Usage-Remaining"
+USAGE_TIER_HEADER = "X-Usage-Tier"
+RETRY_AFTER_HEADER = "Retry-After"
+USAGE_LIMIT_DETAIL = "usage limit reached — upgrade for higher limits"
+# Default exempt set for Phase 8.1 — same as Phase 5.4's. Operators
+# can extend via TRADING_USAGE_LIMIT_EXEMPT_PATHS=,/foo,/bar.
+_PHASE_81_DEFAULT_EXEMPT_PATHS: frozenset[str] = _FREE_TIER_EXEMPT_PATHS
+# Truthy-ish strings for the toggle. Anything else (including unset,
+# empty, "false", "0", "no") disables enforcement.
+_TRUTHY_STRINGS: frozenset[str] = frozenset(
+    {"1", "true", "yes", "on", "y", "t"},
 )
 
 # Phase 5.7 — dynamic free-tier nudge copy (reversible via env vars).
@@ -275,6 +306,66 @@ def _free_max_report_calls() -> int:
     return _parse_positive_int_env(
         FREE_MAX_REPORT_CALLS_ENV_VAR, DEFAULT_FREE_MAX_REPORT_CALLS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.1 — tier-aware usage enforcement helpers
+# ---------------------------------------------------------------------------
+
+
+def _usage_enforcement_enabled() -> bool:
+    """
+    Phase 8.1 — read the feature toggle. Default ON.
+
+    Anything in ``_TRUTHY_STRINGS`` enables; everything else
+    (including unset / blank / "false" / "0") disables. The default
+    when the env var is not set is ON, matching the spec.
+    """
+    raw = os.getenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR)
+    if raw is None:
+        return True
+    s = str(raw).strip().lower()
+    if not s:
+        # Explicitly-set blank disables, matching every other
+        # "blank == default-off" toggle in the codebase.
+        return False
+    return s in _TRUTHY_STRINGS
+
+
+def _free_daily_request_limit() -> int:
+    """Phase 8.1 — tier-aware free cap (default 50)."""
+    return _parse_positive_int_env(
+        FREE_DAILY_REQUEST_LIMIT_ENV_VAR, DEFAULT_FREE_DAILY_REQUEST_LIMIT,
+    )
+
+
+def _premium_daily_request_limit() -> int:
+    """Phase 8.1 — tier-aware premium cap (default 1000)."""
+    return _parse_positive_int_env(
+        PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR,
+        DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT,
+    )
+
+
+def _usage_limit_exempt_paths() -> frozenset[str]:
+    """
+    Phase 8.1 — union of the documented default exempt set with any
+    operator-supplied additions via TRADING_USAGE_LIMIT_EXEMPT_PATHS
+    (comma-separated). Blank entries are ignored. Paths without a
+    leading slash are normalised to one.
+    """
+    raw = (os.getenv(USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR, "") or "").strip()
+    if not raw:
+        return _PHASE_81_DEFAULT_EXEMPT_PATHS
+    extra: set[str] = set()
+    for piece in raw.split(","):
+        p = piece.strip()
+        if not p:
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        extra.add(p)
+    return _PHASE_81_DEFAULT_EXEMPT_PATHS | frozenset(extra)
 
 
 def _resolve_nudge_copy(env_var: str, default: str) -> str:
@@ -1171,6 +1262,118 @@ async def request_logging_middleware(request: Request, call_next):
         client_ip=client_ip,
         request_id=request_id,
     )
+    return response
+
+
+@app.middleware("http")
+async def usage_enforcement_middleware(request: Request, call_next):
+    """
+    Phase 8.1 — tier-aware daily usage enforcement.
+
+    Layered ABOVE Phase 5.4's free-tier middleware in the request
+    pipeline so its 429 short-circuits when both would otherwise
+    reject the same call. Layered BELOW the audit + usage + growth
+    + cors + security-headers middlewares so 429 responses still
+    get audited and security-decorated.
+
+    Skipped for:
+      * the documented exempt paths (``/``, ``/health``,
+        ``/webhook/stripe``, the three browser icon routes) plus
+        anything operators add via
+        ``TRADING_USAGE_LIMIT_EXEMPT_PATHS``;
+      * unauthenticated requests (``_extract_bearer_token`` returns
+        None) — let ``require_api_key`` handle 401/403/503;
+      * unknown / bogus keys (``_is_known_key`` returns False) —
+        same: do not count failed auth against any user;
+      * the entire enforcement layer when
+        ``TRADING_USAGE_ENFORCEMENT_ENABLED`` is set to a non-truthy
+        value.
+
+    For authenticated callers the middleware:
+      1. Classifies the tier (premium vs free) using the existing
+         ``_is_premium`` helper.
+      2. Reads the per-key request count for the current UTC date
+         from the existing usage JSONL log (Phase 4.6 schema —
+         ``key_hash`` is already SHA-256, never the raw key).
+      3. Compares against the tier-appropriate cap:
+         * free → ``TRADING_FREE_DAILY_REQUEST_LIMIT`` (default 50)
+         * premium → ``TRADING_PREMIUM_DAILY_REQUEST_LIMIT`` (default 1000)
+      4. If at-or-above cap → 429 with the documented body and the
+         ``X-Usage-Limit`` / ``X-Usage-Remaining`` / ``X-Usage-Tier``
+         / ``Retry-After`` headers.
+      5. Otherwise calls ``call_next`` and decorates the response
+         with the same headers (so callers always know where they
+         stand). The headers reflect the *post-request* count when
+         we know the call will succeed.
+
+    Best-effort: any failure reading the usage log degrades to
+    "no counts yet" (Phase 4.6's ``_count_free_tier_usage_today``
+    already returns ``(0, 0)`` on disk trouble) so a partial outage
+    NEVER blocks an authenticated user.
+    """
+    if not _usage_enforcement_enabled():
+        return await call_next(request)
+
+    path = request.url.path
+    if path in _usage_limit_exempt_paths():
+        return await call_next(request)
+
+    api_key = _extract_bearer_token(request)
+    if not api_key:
+        # Anonymous: let require_api_key reject with 401.
+        return await call_next(request)
+    if not _is_known_key(api_key):
+        # Unknown / bogus / revoked: let require_api_key reject
+        # with 403. Do NOT count this against any user.
+        return await call_next(request)
+
+    is_premium = _is_premium(api_key)
+    tier = TIER_PREMIUM if is_premium else TIER_FREE
+    limit = (
+        _premium_daily_request_limit() if is_premium
+        else _free_daily_request_limit()
+    )
+    key_hash = _hash_api_key(api_key)
+    total_today, _ = _count_free_tier_usage_today(key_hash)
+
+    usage_headers = {
+        USAGE_LIMIT_HEADER: str(limit),
+        USAGE_REMAINING_HEADER: str(max(0, limit - total_today)),
+        USAGE_TIER_HEADER: tier,
+    }
+
+    if total_today >= limit:
+        # 429 with the same usage headers + Retry-After. The header
+        # value is the number of seconds until the next UTC midnight,
+        # since the cap is daily.
+        now_utc = datetime.now(timezone.utc)
+        midnight_utc = (
+            now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            + timedelta(days=1)
+        )
+        retry_after = max(1, int((midnight_utc - now_utc).total_seconds()))
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": USAGE_LIMIT_DETAIL},
+            headers={
+                **usage_headers,
+                USAGE_REMAINING_HEADER: "0",
+                RETRY_AFTER_HEADER: str(retry_after),
+            },
+        )
+
+    response: Response = await call_next(request)
+    # Decorate every response from this caller — even 4xx — with
+    # the usage counters so the client always knows where they
+    # stand. Skip 401/403/503 (auth never succeeded → no row will
+    # be added) so we don't lie about the count.
+    if response.status_code not in {401, 403, 503}:
+        new_total = total_today + 1
+        response.headers[USAGE_LIMIT_HEADER] = str(limit)
+        response.headers[USAGE_REMAINING_HEADER] = str(
+            max(0, limit - new_total),
+        )
+        response.headers[USAGE_TIER_HEADER] = tier
     return response
 
 
