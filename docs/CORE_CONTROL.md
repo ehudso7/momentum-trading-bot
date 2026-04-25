@@ -2288,6 +2288,180 @@ API, no env var added. The dispatcher's "available commands"
 help text now lists both `issue` and `list`.
 
 
+### Phase 6.3 — key manifest inspection CLI
+
+Three read-only subcommands on the existing operator CLI let an
+operator audit issued and revoked keys without ever surfacing a
+raw secret. No HTTP endpoint, no public surface — same shell-only
+posture as the rest of Phase 6.
+
+```
+python -m trading_bot.api.keys list
+python -m trading_bot.api.keys list --tier free|premium
+python -m trading_bot.api.keys list --ref <ref_code>
+python -m trading_bot.api.keys list --include-revoked
+python -m trading_bot.api.keys list --json
+
+python -m trading_bot.api.keys show --key-hash <hash>
+python -m trading_bot.api.keys show --key-hash <hash> --json
+
+python -m trading_bot.api.keys stats
+python -m trading_bot.api.keys stats --json
+```
+
+**Output surface (pinned allow-list)**
+
+Every inspection command projects manifest rows into the same
+fixed field set before printing. Anything outside the allow-list
+— including fields that a future `issue_key` schema bump might
+quietly add — is dropped:
+
+| Field                   | Source                         |
+|---|---|
+| `created_at`            | manifest row                    |
+| `key_hash`              | manifest row                    |
+| `tier`                  | manifest row                    |
+| `ref_code`              | manifest row                    |
+| `checkout_session_id`   | manifest row (may be `null`)    |
+| `revoked`               | derived from the revocation log |
+| `revoked_at`            | revocation row (if revoked)     |
+| `revoked_reason`        | revocation row (if present)     |
+
+**Never printed** — `api_key`, `label`, `label_hash`,
+`checkout_url`. The first three are never persisted to begin with
+(Phase 6.0/6.2); the last is never persisted to begin with
+(Phase 6.0). `label_hash` is on disk but the inspection surface
+omits it — operators who need it grep the manifest directly.
+
+**Behaviour**
+
+* `list` sorts newest first by `created_at`; unparseable
+  timestamps fall to the bottom.
+* Filters (`--tier`, `--ref`) are ANDed. `--ref` runs through
+  the Phase 5.1 growth sanitiser first so it matches whatever
+  the manifest actually stored (i.e. the same transformation
+  the live `?ref=` middleware applies).
+* Revoked rows are hidden by default; `--include-revoked`
+  shows them alongside active rows and adds a `revoked` column.
+* Missing files (manifest or revocation log) produce a clean
+  "0 active" report rather than a crash.
+* Malformed JSONL rows, rows missing `key_hash`, and rows with
+  an unrecognised `tier` are silently skipped — same posture
+  as the auth-path reader.
+* `show` looks a single manifest row up by `key_hash` and
+  returns exit-code 2 with a stderr message if no row matches.
+* `stats` counts `total_issued`, `active`, `revoked`, plus
+  per-tier / per-ref_code / per-created-date breakdowns. The
+  `revoked` counter counts manifest rows that have been revoked
+  — stray revocation rows for hashes never issued are ignored.
+
+**Boundary** — Phase 6.3 adds no new module and no new import
+into Core. The commands live in `trading_bot.api.keys` alongside
+`issue` and `revoke`, so the dependency-light CLI posture
+(no `structlog`, no `fastapi`) is preserved. Pinned by
+`tests/test_keys.py::TestPhase63NoCoreImports`.
+
+
+### Phase 6.4 — Railway persistent manifest strategy
+
+Phase 6.0 / 6.2 / 6.3 added the issuance / auth / inspection
+plumbing. Phase 6.4 covers the production deployment story:
+where the manifest and revocation log **actually live** on the
+Railway side so issued keys survive restarts and re-deploys.
+
+There is no new code in Phase 6.4 — every flag (`--manifest-path`,
+`--revoked-path`) and every env var (`TRADING_API_KEYS_MANIFEST_PATH`,
+`TRADING_API_KEYS_REVOKED_PATH`) was already shipped in 6.2 / 6.3.
+The contribution is operational guidance:
+
+* point both env vars at a persistent volume (`/data/...` on Railway);
+* issue / revoke / inspect from a Railway shell against that volume;
+* keep the manifest out of git;
+* never confuse a *local* manifest with the *production* manifest
+  — a key issued locally has never reached Railway and will 403.
+
+Full operator runbook — production env vars, Railway volume layout,
+worked CLI examples, three deployment options, and the local-vs-
+production warning — lives in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+
+### Phase 7.0 — Stripe → key activation bridge
+
+Phase 7.0 closes the loop between the Phase 6 issuance model and the
+Phase 4.7 Stripe billing cache. A paid subscription now activates
+premium access **automatically** on `customer.subscription.created`
+without the operator editing env vars or touching the manifest.
+
+Two hardening changes ship together:
+
+**1. Hash-only premium cache.** `data/stripe_premium_keys.json` now
+stores SHA-256[:32] hashes exclusively. `add_premium_key` hashes its
+input in-process; the raw api_key never reaches disk. Legacy cache
+files that still contain raw keys are transparently re-hashed and
+rewritten on the next load — no operator intervention required.
+
+**2. Manifest verification gate.** Before adding an api_key to the
+cache, the webhook handler calls
+`trading_bot.api.key_store.verify_api_key(api_key)`. A hit means
+the key is in the issuance manifest AND has not been revoked. A
+miss — unknown hash, or revoked hash — causes the webhook to return
+
+```
+{ "action": "ignored", "reason": "key_not_in_manifest_or_revoked" }
+```
+
+No cache mutation, no conversion-log row, no side effects. The
+revoked-key path is the important one: a key rotated off the
+manifest can never be re-promoted by a Stripe replay. Cancellation
+(`customer.subscription.deleted`) and payment failure
+(`invoice.payment_failed`) still flow through without the gate so a
+cancelled customer immediately loses premium even if their manifest
+row was already deleted.
+
+**Auth precedence (Phase 7.0, unchanged from Phase 6.2)**
+
+```
+1. revoked hash             → 403 (kill switch)
+2. Stripe cache (premium)    → premium   ← webhook-driven
+3. TRADING_API_PREMIUM_KEYS  → premium   (operator override)
+4. manifest tier="premium"   → premium   (CLI-issued)
+5. manifest tier="free"      → free      (CLI-issued)
+6. TRADING_API_KEY exact     → free      (legacy single-tenant)
+7. otherwise                 → 403
+```
+
+Stripe always overrides the manifest tier. A key issued as free
+(step 5) is promoted to premium (step 2) the moment the webhook
+fires. A cancellation drops the key out of step 2 and the next
+request resolves via step 5 again — free access restored.
+
+**Privacy invariants (pinned by tests)**
+
+* Raw `api_key` never reaches disk (Phase 7.0 migration of the
+  Stripe cache). Pinned by
+  `tests/test_billing.py::TestPhase70HashOnlyPersistence` and
+  `tests/test_api_server.py::TestPhase70NoRawKeyInStripeCache`.
+* The webhook NEVER mutates the issuance manifest. Pinned by
+  `tests/test_billing.py::TestPhase70ManifestNotMutated` —
+  manifest bytes compare equal before/after a
+  `subscription.created` delivery.
+* Customer email, customer name, PAN, CVV, and payment-method
+  fields are never persisted — the webhook handler only reads
+  `object.metadata.api_key`. Pinned by
+  `tests/test_billing.py::TestNoSensitiveDataStored`.
+* Revoked keys cannot be re-promoted by a Stripe replay. Pinned by
+  `tests/test_billing.py::TestPhase70ManifestGate::test_revoked_key_webhook_ignored`.
+
+**No new public surface, no Core imports.** `billing.py` still
+imports nothing from `trading_bot.core.*`, `trading_bot.execution`,
+`trading_bot.portfolio`, `trading_bot.risk`, `trading_bot.scanners`,
+`trading_bot.strategies`, or `trading_bot.main`. `key_store` is
+lazy-imported inside the webhook handler so the billing module
+remains loadable in environments where the manifest file is not
+configured. No new HTTP endpoint is added — the Stripe webhook
+already existed (`POST /webhook/stripe`, Phase 4.7).
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

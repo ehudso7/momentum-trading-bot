@@ -3345,11 +3345,35 @@ def stripe_env(monkeypatch, tmp_path: Path):
     manifest = tmp_path / "manifest.jsonl"
     monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
     monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
+
+    # Phase 7.0 — pre-issue the fixture api_key into the issuance
+    # manifest so the webhook's manifest-gate accepts Stripe events
+    # for this customer. The autouse clean_api_env fixture already
+    # redirected TRADING_API_KEYS_MANIFEST_PATH to a tmp file.
+    import hashlib as _hl
+    keys_manifest = Path(os.environ["TRADING_API_KEYS_MANIFEST_PATH"])
+    keys_manifest.parent.mkdir(parents=True, exist_ok=True)
+    key_hash = _hl.sha256(
+        b"stripe-customer-api-key",
+    ).hexdigest()[:32]
+    row = {
+        "created_at": "2026-04-25T00:00:00.000000Z",
+        "key_hash": key_hash,
+        "label_hash": "f" * 32,
+        "tier": "free",
+        "checkout_session_id": None,
+    }
+    with open(keys_manifest, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
+
     return {
         "cache_file": cache_file,
         "reports_dir": reports_dir,
         "manifest": manifest,
         "api_key": "stripe-customer-api-key",
+        "api_key_hash": key_hash,
     }
 
 
@@ -3684,10 +3708,12 @@ class TestWebhookNeverPersistsSensitiveData:
             "LEAKED_CARDHOLDER",
             "4242424242424242",
             "999",
+            # Phase 7.0 — the raw api_key itself no longer lands on disk.
+            api_key,
         ):
             assert leak not in raw, f"leaked {leak!r} to {stripe_env['cache_file']}"
-        # The opaque api_key is the ONLY thing persisted.
-        assert api_key in raw
+        # The hash IS expected — Phase 7.0 persisted form.
+        assert stripe_env["api_key_hash"] in raw
 
     def test_webhook_response_body_never_echoes_sensitive_fields(
         self, client: TestClient, stripe_env
@@ -6212,3 +6238,210 @@ class TestPhase62NoRawKeyOnDisk:
             assert raw not in usage_body
         else:
             raise AssertionError("/ route not registered")
+
+
+# ===========================================================================
+# Phase 7.0 — Stripe → key activation bridge (end-to-end via live server)
+# ===========================================================================
+
+
+class TestPhase70StripeActivationFlow:
+    """End-to-end: operator issues a free manifest key, Stripe fires
+    subscription.created (via handle_webhook_event), the SAME key now
+    resolves as premium against the live FastAPI app — no env-var
+    edits, no manifest mutation."""
+
+    def test_issue_free_then_webhook_upgrade_grants_premium(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        from trading_bot.api import billing, key_store
+        from trading_bot.api.keys import issue_key
+
+        # Stripe must be "configured" for is_premium_via_stripe to
+        # count in _is_premium's precedence order.
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        # Billing cache on its own tmp path.
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(manifest_auth_env.keys_manifest.parent / "stripe_cache.json"),
+        )
+        billing.reset_cache_for_tests()
+
+        issued = issue_key(tier="free", label="phase7-stripe")
+        raw = issued["api_key"]
+        key_hash = issued["key_hash"]
+        manifest_bytes_before = manifest_auth_env.keys_manifest.read_bytes()
+
+        # Write a report so /reports/latest can return 200.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+
+        # Before the Stripe event, the key authenticates but is FREE.
+        # Tighten the free cap so we can observe the tier.
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        h = {"Authorization": f"Bearer {raw}"}
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        # Second /reports/* request should now 403 (free-tier cap hit).
+        assert client.get("/reports/latest", headers=h).status_code == 403
+
+        # Now fire the Stripe subscription.created webhook.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        # Reset server-side caches so _is_premium / is_premium_via_stripe
+        # re-read the premium cache.
+        billing.reset_cache_for_tests()
+        key_store.reset_caches_for_tests()
+
+        # Premium now. Issue several /reports/latest calls; premium
+        # is exempt from the free cap.
+        for _ in range(5):
+            r = client.get("/reports/latest", headers=h)
+            assert r.status_code == 200
+
+        # The issuance manifest was NEVER mutated.
+        assert manifest_auth_env.keys_manifest.read_bytes() == manifest_bytes_before
+        # And the manifest row still says tier=free (unchanged).
+        import json as _json
+        rows = [
+            _json.loads(line)
+            for line in manifest_auth_env.keys_manifest.read_text().splitlines()
+            if line.strip()
+        ]
+        assert any(r["key_hash"] == key_hash and r["tier"] == "free" for r in rows)
+
+    def test_cancellation_reverts_to_manifest_tier(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        from trading_bot.api import billing, key_store
+        from trading_bot.api.keys import issue_key
+
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(manifest_auth_env.keys_manifest.parent / "stripe_cache.json"),
+        )
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        billing.reset_cache_for_tests()
+
+        issued = issue_key(tier="free", label="phase7-cancel")
+        raw = issued["api_key"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Promote to premium.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        key_store.reset_caches_for_tests()
+        # Premium bypasses the free cap.
+        for _ in range(3):
+            assert client.get("/reports/latest", headers=h).status_code == 200
+
+        # Cancel.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": raw},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        key_store.reset_caches_for_tests()
+
+        # Back to the manifest's tier (free). Cap should kick in.
+        # First call consumes the remaining quota; we may already be
+        # near the cap from the promotion window, so just assert the
+        # eventual 403 lands.
+        statuses = [
+            client.get("/reports/latest", headers=h).status_code
+            for _ in range(3)
+        ]
+        assert 403 in statuses, (
+            f"expected at least one 403 after cancellation; got {statuses!r}"
+        )
+
+    def test_unissued_key_webhook_is_rejected_server_side(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        """A Stripe event for an api_key we never issued must NOT
+        grant the bearer any access. The server still 403s because
+        the key is not in env, Stripe cache (webhook gate refused),
+        or manifest."""
+        from trading_bot.api import billing
+
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(manifest_auth_env.keys_manifest.parent / "stripe_cache.json"),
+        )
+        billing.reset_cache_for_tests()
+        # Pre-issue a DIFFERENT key so the server is configured (manifest
+        # non-empty) and the unknown-key path returns 403 rather than 503.
+        from trading_bot.api.keys import issue_key
+        issue_key(tier="free", label="some-other-user")
+
+        phantom = "stripe-phantom-key-never-issued"
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": phantom},
+            }},
+        })
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {phantom}"},
+        )
+        assert r.status_code == 403
+
+
+class TestPhase70NoRawKeyInStripeCache:
+    """End-to-end: a raw api_key promoted via the Stripe webhook
+    must NOT appear in the premium cache file — only its hash."""
+
+    def test_cache_file_has_only_hash_after_webhook(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        from trading_bot.api.keys import issue_key
+
+        cache_path = tmp_path / "stripe_cache_phase7.json"
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_path),
+        )
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        billing.reset_cache_for_tests()
+
+        issued = issue_key(tier="free", label="phase7-leak-test")
+        raw = issued["api_key"]
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+
+        assert cache_path.exists()
+        body = cache_path.read_text(encoding="utf-8")
+        assert raw not in body, (
+            "Phase 7.0: raw api_key must never appear in the Stripe cache"
+        )
+        assert issued["key_hash"] in body

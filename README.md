@@ -113,6 +113,10 @@ TRADING_LOG_JSON=true
 
 Railway auto-detects the Dockerfile and deploys. The dashboard is accessible on the assigned Railway URL.
 
+For the SaaS API surface (issuing API keys, mounting a persistent
+manifest volume, the production env-var set), see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 ## Configuration
 
 All settings are in `trading_bot/config/config.yaml`. Override via environment variables with prefix `TRADING_`:
