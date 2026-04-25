@@ -1766,3 +1766,243 @@ class TestPhase63NoCoreImports:
 # time import for sort-order tests
 # ---------------------------------------------------------------------------
 import time  # noqa: E402  — kept at the bottom so it stays scoped to Phase 6.3
+
+
+# ===========================================================================
+# Phase 6.4 — explicit --manifest-path / --revoked-path override tests
+# ===========================================================================
+#
+# Phase 6.2 / 6.3 already added the flags to every relevant subcommand;
+# Phase 6.4's deployment story (operator points the CLI at a persistent
+# Railway-volume path) depends on those flags overriding both the env
+# vars AND the default paths. These tests pin that contract so a future
+# refactor cannot silently regress production-shell ergonomics.
+
+
+@pytest.fixture
+def isolated_env_paths(tmp_path: Path, monkeypatch):
+    """
+    Force the env vars to point at one tmp location while the CLI
+    is invoked with --manifest-path / --revoked-path pointing at a
+    DIFFERENT tmp location. The CLI flags must win.
+    """
+    env_manifest = tmp_path / "env_manifest.jsonl"
+    env_revoked = tmp_path / "env_revoked.jsonl"
+    flag_manifest = tmp_path / "flag_manifest.jsonl"
+    flag_revoked = tmp_path / "flag_revoked.jsonl"
+    monkeypatch.setenv(KEYS_MANIFEST_ENV_VAR, str(env_manifest))
+    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(env_revoked))
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
+    yield {
+        "env_manifest": env_manifest,
+        "env_revoked": env_revoked,
+        "flag_manifest": flag_manifest,
+        "flag_revoked": flag_revoked,
+    }
+    key_store.reset_caches_for_tests()
+
+
+class TestPhase64IssueManifestPathFlag:
+    def test_issue_writes_to_flag_path_not_env_path(
+        self, isolated_env_paths,
+    ):
+        result = issue_key(
+            tier="free", label="alice",
+            manifest_path=isolated_env_paths["flag_manifest"],
+        )
+        # The issue_key API path mirrors the CLI's --manifest-path
+        # plumbing — assert the row landed at the flag path, not env.
+        assert isolated_env_paths["flag_manifest"].exists()
+        assert not isolated_env_paths["env_manifest"].exists()
+        body = isolated_env_paths["flag_manifest"].read_text(
+            encoding="utf-8",
+        )
+        assert result["key_hash"] in body
+
+    def test_cli_issue_manifest_path_flag(
+        self, isolated_env_paths, capsys,
+    ):
+        rc = keys_main([
+            "issue", "--tier", "free", "--label", "alice",
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+        ])
+        assert rc == 0
+        assert isolated_env_paths["flag_manifest"].exists()
+        assert not isolated_env_paths["env_manifest"].exists()
+
+
+class TestPhase64RevokeRevokedPathFlag:
+    def test_cli_revoke_revoked_path_flag(
+        self, isolated_env_paths, capsys,
+    ):
+        rc = keys_main([
+            "revoke", "--key-hash", "a" * 32,
+            "--revoked-path", str(isolated_env_paths["flag_revoked"]),
+            "--reason", "phase64-test",
+        ])
+        assert rc == 0
+        assert isolated_env_paths["flag_revoked"].exists()
+        assert not isolated_env_paths["env_revoked"].exists()
+        body = isolated_env_paths["flag_revoked"].read_text(
+            encoding="utf-8",
+        )
+        assert "a" * 32 in body
+        assert "phase64-test" in body
+
+
+class TestPhase64ListPathFlags:
+    def test_list_uses_flag_paths_not_env_paths(
+        self, isolated_env_paths, capsys,
+    ):
+        # Issue against the FLAG manifest, not the env one.
+        result = issue_key(
+            tier="free", label="alice", ref_code="phase64",
+            manifest_path=isolated_env_paths["flag_manifest"],
+        )
+        # Sanity — env manifest is empty.
+        assert not isolated_env_paths["env_manifest"].exists()
+
+        rc = keys_main([
+            "list",
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert result["key_hash"] in out
+        assert "phase64" in out
+
+    def test_list_flag_paths_isolate_revocation_index(
+        self, isolated_env_paths, capsys,
+    ):
+        """A revocation row in the FLAG revoked file should be
+        honoured by list, while a row in the ENV revoked file should
+        not bleed through."""
+        result = issue_key(
+            tier="free", label="alice",
+            manifest_path=isolated_env_paths["flag_manifest"],
+        )
+        # Revoke against the FLAG revoked path.
+        rc = keys_main([
+            "revoke", "--key-hash", result["key_hash"],
+            "--revoked-path", str(isolated_env_paths["flag_revoked"]),
+        ])
+        assert rc == 0
+        capsys.readouterr()  # drain
+
+        rc = keys_main([
+            "list", "--include-revoked",
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The hash is present and marked revoked.
+        assert result["key_hash"] in out
+        assert "0 active, 1 revoked" in out
+        # Sanity — without --include-revoked it disappears.
+        capsys.readouterr()
+        keys_main([
+            "list",
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
+        ])
+        out2 = capsys.readouterr().out
+        assert result["key_hash"] not in out2
+
+
+class TestPhase64ShowPathFlags:
+    def test_show_uses_flag_paths(self, isolated_env_paths, capsys):
+        result = issue_key(
+            tier="premium", label="bob", ref_code="hn-launch",
+            manifest_path=isolated_env_paths["flag_manifest"],
+        )
+        rc = keys_main([
+            "show", "--key-hash", result["key_hash"],
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert result["key_hash"] in out
+        assert "tier                : premium" in out
+        assert "ref_code            : hn-launch" in out
+
+    def test_show_flag_path_isolation(self, isolated_env_paths, capsys):
+        """A row in the env-pointed manifest is NOT visible when the
+        show command targets a different path."""
+        # Write to env manifest.
+        env_result = issue_key(
+            tier="free", label="alice",
+            manifest_path=isolated_env_paths["env_manifest"],
+        )
+        # show against the FLAG manifest (empty) — should miss.
+        rc = keys_main([
+            "show", "--key-hash", env_result["key_hash"],
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+        ])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "no manifest row" in err
+
+
+class TestPhase64StatsPathFlags:
+    def test_stats_uses_flag_paths(self, isolated_env_paths, capsys):
+        # Two rows in the FLAG manifest.
+        issue_key(
+            tier="free", label="alice",
+            manifest_path=isolated_env_paths["flag_manifest"],
+        )
+        issue_key(
+            tier="premium", label="bob",
+            manifest_path=isolated_env_paths["flag_manifest"],
+        )
+        # One row in the ENV manifest — must NOT count toward stats.
+        issue_key(
+            tier="free", label="env-only",
+            manifest_path=isolated_env_paths["env_manifest"],
+        )
+
+        rc = keys_main([
+            "stats", "--json",
+            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
+            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
+        ])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["total_issued"] == 2
+        assert payload["by_tier"] == {"free": 1, "premium": 1}
+
+
+class TestPhase64DeploymentDocsExist:
+    """The deployment story is operator-facing — pin the docs file
+    so a future refactor that moves the runbook can't silently
+    delete it."""
+
+    def test_deployment_md_exists_and_mentions_railway_volume(self):
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "docs" / "DEPLOYMENT.md"
+        )
+        assert path.exists(), "docs/DEPLOYMENT.md is required for Phase 6.4"
+        body = path.read_text(encoding="utf-8")
+        # Must document the recommended Railway volume paths.
+        assert "/data/api_keys_manifest.jsonl" in body
+        assert "/data/api_keys_revoked.jsonl" in body
+        # Must mention the env vars by name.
+        assert "TRADING_API_KEYS_MANIFEST_PATH" in body
+        assert "TRADING_API_KEYS_REVOKED_PATH" in body
+        # Must include the local-vs-production warning so the most
+        # common operator mistake is loud.
+        assert "does NOT authenticate" in body
+
+    def test_core_control_md_links_to_deployment_md(self):
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "docs" / "CORE_CONTROL.md"
+        )
+        body = path.read_text(encoding="utf-8")
+        assert "DEPLOYMENT.md" in body, (
+            "CORE_CONTROL.md must point operators at DEPLOYMENT.md"
+        )

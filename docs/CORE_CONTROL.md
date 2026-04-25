@@ -2418,6 +2418,29 @@ into Core. The commands live in `trading_bot.api.keys` alongside
 `tests/test_keys.py::TestPhase63NoCoreImports`.
 
 
+### Phase 6.4 — Railway persistent manifest strategy
+
+Phase 6.0 / 6.2 / 6.3 added the issuance / auth / inspection
+plumbing. Phase 6.4 covers the production deployment story:
+where the manifest and revocation log **actually live** on the
+Railway side so issued keys survive restarts and re-deploys.
+
+There is no new code in Phase 6.4 — every flag (`--manifest-path`,
+`--revoked-path`) and every env var (`TRADING_API_KEYS_MANIFEST_PATH`,
+`TRADING_API_KEYS_REVOKED_PATH`) was already shipped in 6.2 / 6.3.
+The contribution is operational guidance:
+
+* point both env vars at a persistent volume (`/data/...` on Railway);
+* issue / revoke / inspect from a Railway shell against that volume;
+* keep the manifest out of git;
+* never confuse a *local* manifest with the *production* manifest
+  — a key issued locally has never reached Railway and will 403.
+
+Full operator runbook — production env vars, Railway volume layout,
+worked CLI examples, three deployment options, and the local-vs-
+production warning — lives in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
