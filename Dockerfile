@@ -1,38 +1,42 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Install dumb-init for proper signal forwarding (SIGTERM to bot process)
-# and curl for health checks
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends dumb-init curl && \
-    rm -rf /var/lib/apt/lists/*
+# System dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        dumb-init \
+        build-essential \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies first (cache layer)
-# Python 3.11+ has tomllib built-in — extract deps and install separately
-COPY pyproject.toml ./
-RUN python -c "import tomllib; deps=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print('\n'.join(deps))" > /tmp/requirements.txt && \
-    pip install --no-cache-dir -r /tmp/requirements.txt && \
-    rm /tmp/requirements.txt
+# Install Python dependencies first for better Docker layer caching
+COPY pyproject.toml README.md ./
+COPY trading_bot ./trading_bot
 
-# Copy source and install the package (deps already cached)
-COPY trading_bot/ trading_bot/
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir ".[dev]" \
+    && pip install --no-cache-dir --no-deps .
 
-# Create data directory for journal
-RUN mkdir -p data
+# Create runtime data directory.
+# Railway volume mounted at /app/data may be owned by root at runtime,
+# so permissions must allow the non-root botuser to write logs/manifests.
+RUN mkdir -p /app/data \
+    && chmod -R 777 /app/data
 
-# Non-root user for safety
-RUN useradd -m botuser && chown -R botuser:botuser /app
+# Create non-root user and ensure app is writable where needed
+RUN useradd -m botuser \
+    && chown -R botuser:botuser /app \
+    && chmod -R 777 /app/data
+
 USER botuser
 
 EXPOSE 8080
 
-# Health check: verify the dashboard is responsive
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["curl", "-f", "http://localhost:8080/healthz"]
-
-# Use dumb-init as PID 1 for proper signal forwarding
-# This ensures SIGTERM from Docker/Railway reaches the Python process
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["trading-bot", "--mode", "paper"]
+
+CMD ["uvicorn", "trading_bot.api.server:app", "--host", "0.0.0.0", "--port", "8080"]
