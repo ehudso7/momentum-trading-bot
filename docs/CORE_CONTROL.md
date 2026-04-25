@@ -2219,129 +2219,73 @@ the existing operator-only `python -m trading_bot.api.keys issue`
 shell command.
 
 
-### Phase 6.2 — manifest-backed API key authentication
+### Phase 6.2 — manifest inspection CLI (`keys list`)
 
-Keys issued by `python -m trading_bot.api.keys issue` (Phase 6.0/6.1)
-are now accepted by the live API server **without** editing
-`TRADING_API_KEY` or `TRADING_API_PREMIUM_KEYS`. The server hashes
-the presented bearer token (`SHA-256(api_key)[:32]`) and looks the
-hash up in the issuance manifest. The raw key is never persisted —
-the manifest only stores the hash, the same posture as Phase 6.0.
+A new operator-only `list` subcommand on the existing keys CLI
+lets the operator safely inspect the issuance manifest without
+ever revealing a raw key, raw label, or checkout URL.
 
-**Files**
+**Command**
 
-| File | Default | Env var | Written by | Read by |
-|---|---|---|---|---|
-| Issuance manifest | `data/api_keys_manifest.jsonl` | `TRADING_API_KEYS_MANIFEST_PATH` | `keys issue` | server auth |
-| Revocation log | `data/api_keys_revoked.jsonl` | `TRADING_API_KEYS_REVOKED_PATH` | `keys revoke` | server auth |
+    python -m trading_bot.api.keys list                  # all rows
+    python -m trading_bot.api.keys list --tier free      # filter by tier
+    python -m trading_bot.api.keys list --tier premium
+    python -m trading_bot.api.keys list --ref hn-launch  # filter by ref_code
+    python -m trading_bot.api.keys list --tier free --ref hn-launch   # AND
+    python -m trading_bot.api.keys list --json           # machine output
+    python -m trading_bot.api.keys list --manifest-path <path>
 
-The manifest schema is unchanged from Phase 6.0/6.1 — `key_hash`,
-`tier`, `created_at`, `label_hash`, `ref_code`,
-`checkout_session_id`. The server only consults `key_hash` and
-`tier`; the other fields stay for operator forensics.
+**Public field set** — the only fields ever emitted, by either
+the text or JSON formatter:
 
-The revocation log is also append-only JSONL:
+    LIST_OUTPUT_FIELDS = (
+        "created_at",
+        "key_hash",
+        "tier",
+        "ref_code",
+        "checkout_session_id",
+    )
 
-```json
-{
-  "timestamp":  "2026-04-25T12:34:56.789012Z",
-  "key_hash":   "<SHA-256(api_key)[:32]>",
-  "reason":     "<operator free text — capped at 200 chars>"
-}
-```
+`label_hash` is in the manifest (Phase 6.0) but **not** in the
+list output. Operators who need it can read the file directly;
+the public CLI surface stays as small as possible.
 
-**Authentication precedence** (top to bottom — first match wins):
+**Defense-in-depth contract.** The reader projects every row
+to `LIST_OUTPUT_FIELDS` BEFORE rendering. Even if the manifest
+were hand-edited (or mis-written by some future code path) and
+contained stray fields like `api_key`, `label`, or
+`checkout_url`, the `list` view would silently drop them.
+Pinned by `TestPhase62OutputProjection`.
 
-```
-1. revoked hash             → 403 (kill switch beats every source)
-2. Stripe-cache premium      → premium  (Phase 4.7 contract preserved)
-3. TRADING_API_PREMIUM_KEYS  → premium  (operator override)
-4. manifest tier="premium"   → premium  (CLI-issued, hash lookup)
-5. manifest tier="free"      → free     (CLI-issued, hash lookup)
-6. TRADING_API_KEY exact     → free     (legacy single-tenant)
-7. otherwise                 → 403
-```
+**Tolerance**
 
-A revoked manifest hash is rejected even when the same raw key is
-also listed in `TRADING_API_PREMIUM_KEYS` or cached by Stripe —
-revocation is the unambiguous kill switch. Manifest-premium does
-**not** override a Stripe cancellation: if Stripe drops a key from
-its cache (cancellation / payment failure) and that key only
-appears in the manifest as premium, the request resolves through
-the manifest. If the manifest does NOT list it, the key falls back
-to whatever the next applicable source returns.
+* Missing manifest → empty output (text: `(no records)`; JSON: `[]`).
+* Blank lines → skipped.
+* Malformed JSON → skipped.
+* Non-dict JSON values → skipped.
+* Unreadable file → empty (no exception).
 
-**Fail-closed config**
+**Filter semantics**
 
-Protected endpoints return `503` only when the deployment is
-not configured for any auth source:
+* `--tier`: case-insensitive exact match on `tier`.
+* `--ref`: the operator-supplied value is run through the same
+  Phase 5.1 growth sanitiser used at write time, then compared
+  by exact equality. So `--ref "<script>xss</script>"` matches
+  rows whose stored `ref_code == "scriptxssscript"`. A filter
+  value that sanitises to the empty string (e.g. `"!@#"`) is
+  treated as **no filter** — better than silently filtering to
+  zero rows.
+* Combined filters AND together; a row must pass every supplied
+  filter.
 
-```
-TRADING_API_KEY unset
-  AND TRADING_API_PREMIUM_KEYS unset
-  AND issuance manifest empty (no parseable rows)
-```
+**Sort** — newest first by `created_at` (ISO-8601 with `Z`
+suffix sorts lexicographically the same as chronologically).
 
-If at least one of those is configured, an unknown bearer token
-gets `403 Invalid API key` — never `503`. A revoked-only manifest
-still counts as configured (revocation does not unconfigure the
-deployment back to 503).
-
-**Hot reload**
-
-`trading_bot.api.key_store` caches both files in process memory
-keyed on `(path, mtime)`. When a new key is issued or revoked, the
-next request picks up the change automatically — no server
-restart required.
-
-**Operator workflow**
-
-```bash
-# Issue a free-tier key (Phase 6.0)
-python -m trading_bot.api.keys issue --tier free --label "alice"
-# → prints raw api_key ONCE; record it now.
-
-# Customer hits the API directly with no env-var edit:
-curl https://api.example.com/reports/latest \
-  -H "Authorization: Bearer <api_key>"
-
-# Revoke (preferred — no raw key needed):
-python -m trading_bot.api.keys revoke \
-  --key-hash <hash from issuance> \
-  --reason "user-requested rotation"
-
-# Revoke when only the raw key is on hand: hashed in-process,
-# never written to disk:
-python -m trading_bot.api.keys revoke \
-  --api-key "<the raw key>" \
-  --reason "leaked"
-```
-
-**Privacy invariants (every one tested)**
-
-* The raw `api_key` is **never** persisted — not in the manifest,
-  not in the revocation log, not in the audit log, not in the
-  usage log. The `revoke --api-key` path hashes in-process and
-  writes only the hash. Pinned by
-  `tests/test_api_server.py::TestPhase62NoRawKeyOnDisk` and
-  `tests/test_keys.py::TestPhase62RevokeCli::test_subprocess_revoke_by_raw_key_does_not_leak`.
-* The raw `label` is **never** persisted (carry-over from
-  Phase 6.0).
-* Revocation always stores the hash only — `key_store.append_revocation`
-  refuses to accept a raw key as input. Hashing happens at the CLI
-  layer before the helper is called.
-* `key_store` imports nothing from FastAPI, structlog, or the rest
-  of the trading-bot package — the operator CLI continues to run
-  in dependency-light environments. Pinned by
-  `tests/test_keys.py::TestPhase62NoCoreImports`.
-* No HTTP signup endpoint, no form, no JSON API. The entire
-  Phase 6.2 surface is the same operator-only shell that Phase 6.0
-  introduced, plus one new `revoke` subcommand.
-
-**Module boundary** — `trading_bot/api/key_store.py` is a leaf
-module. `trading_bot.api.keys` and `trading_bot.api.server` both
-import from it; `key_store` itself imports only from the Python
-stdlib.
+**No new public surface.** The `list` command lives behind the
+existing operator-only `python -m trading_bot.api.keys` shell
+entry-point. There is still no HTTP endpoint, no form, no JSON
+API, no env var added. The dispatcher's "available commands"
+help text now lists both `issue` and `list`.
 
 
 ### Phase 6.3 — key manifest inspection CLI

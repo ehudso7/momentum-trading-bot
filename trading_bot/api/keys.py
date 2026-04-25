@@ -455,100 +455,196 @@ def _issue_cli(argv: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Phase 6.2 — revoke subcommand
+# Phase 6.2 — manifest inspection
 # ---------------------------------------------------------------------------
 
 
-def _build_revoke_parser() -> argparse.ArgumentParser:
+# The complete public field-set the ``list`` view is allowed to
+# emit. Anything outside this set is dropped on read — so even a
+# poisoned / hand-edited manifest with stray secret-looking fields
+# (``api_key``, ``label``, ``checkout_url``, …) cannot leak through
+# this code path.
+LIST_OUTPUT_FIELDS: tuple[str, ...] = (
+    "created_at",
+    "key_hash",
+    "tier",
+    "ref_code",
+    "checkout_session_id",
+)
+
+
+def _read_manifest_records(path: Path) -> list[dict]:
+    """
+    Load the manifest into a list of dicts. Tolerant of:
+
+      * missing file → ``[]``
+      * unreadable file → ``[]``
+      * blank lines → skipped
+      * malformed JSON → skipped
+      * non-dict JSON values → skipped
+    """
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    out: list[dict] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            out.append(parsed)
+    return out
+
+
+def list_keys(
+    *,
+    tier_filter: Optional[str] = None,
+    ref_filter: Optional[str] = None,
+    manifest_path: Optional[Path] = None,
+) -> list[dict]:
+    """
+    Return manifest rows projected to ``LIST_OUTPUT_FIELDS`` only,
+    optionally filtered by tier and/or ref_code, sorted newest
+    first by ``created_at``.
+
+    Filters are AND-combined: a row must pass every supplied
+    filter to be included.
+
+    The ``ref_filter`` value is run through the same Phase 5.1
+    growth sanitiser used at write time so the operator's
+    ``--ref twitter-launch_2026`` matches the byte-identical value
+    that landed in the file. A filter value that sanitises to the
+    empty string (e.g. ``"!@#"``) is treated as "no filter
+    supplied" — the operator's intent there is ambiguous and we
+    prefer not to silently filter to zero rows.
+    """
+    target = manifest_path if manifest_path is not None else _manifest_path()
+    records = _read_manifest_records(target)
+
+    tier_norm: Optional[str] = None
+    if tier_filter is not None:
+        t = str(tier_filter).strip().lower()
+        if t:
+            tier_norm = t
+
+    ref_norm: Optional[str] = None
+    if ref_filter is not None:
+        cleaned = _sanitize_ref_code(ref_filter)
+        if cleaned:
+            ref_norm = cleaned
+
+    out: list[dict] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if tier_norm is not None:
+            row_tier = rec.get("tier")
+            if not isinstance(row_tier, str) or row_tier.lower() != tier_norm:
+                continue
+        if ref_norm is not None:
+            row_ref = rec.get("ref_code")
+            if not isinstance(row_ref, str) or row_ref != ref_norm:
+                continue
+        # Project to allowed fields ONLY. Anything else is dropped.
+        out.append({k: rec.get(k) for k in LIST_OUTPUT_FIELDS})
+
+    # ISO-8601 with Z suffix sorts lexicographically the same as
+    # chronologically, so newest-first is just reverse=True.
+    out.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return out
+
+
+def _format_list_text(rows: list[dict]) -> str:
+    """Pretty-print ``list_keys`` output as a fixed-width table."""
+    if not rows:
+        return "(no records)"
+    header = (
+        f"{'created_at':<27} "
+        f"{'key_hash':<32} "
+        f"{'tier':<8} "
+        f"{'ref_code':<24} "
+        f"{'checkout_session_id'}"
+    )
+    lines = [header, "-" * len(header)]
+    for r in rows:
+        ref = r.get("ref_code") or "-"
+        cs = r.get("checkout_session_id") or "-"
+        lines.append(
+            f"{str(r.get('created_at') or ''):<27} "
+            f"{str(r.get('key_hash') or ''):<32} "
+            f"{str(r.get('tier') or ''):<8} "
+            f"{str(ref)[:24]:<24} "
+            f"{cs}"
+        )
+    return "\n".join(lines)
+
+
+def _format_list_json(rows: list[dict]) -> str:
+    return json.dumps(rows, indent=2, sort_keys=False, default=str)
+
+
+def _build_list_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m trading_bot.api.keys revoke",
+        prog="python -m trading_bot.api.keys list",
         description=(
-            "Append a revocation row for an issued API key. The "
-            "revoked hash is rejected on the next request — no "
-            "server restart needed. Operators may provide either the "
-            "key_hash directly (preferred) or the raw api_key (which "
-            "is hashed in-process and discarded immediately — never "
-            "persisted)."
-        ),
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--key-hash", default=None,
-        help="SHA-256(api_key)[:32] hash to revoke (preferred).",
-    )
-    group.add_argument(
-        "--api-key", default=None,
-        help=(
-            "Raw API key to revoke. Hashed in-process; the raw value "
-            "is NEVER written to the revocation log."
+            "Inspect the operator-only API-key manifest. Emits ONLY "
+            "the documented public fields (created_at, key_hash, "
+            "tier, ref_code, checkout_session_id). Raw API keys, "
+            "raw labels, and Stripe checkout URLs are never present "
+            "in the manifest by Phase 6.0/6.1 design and never in "
+            "this output."
         ),
     )
     parser.add_argument(
-        "--reason", default=None,
+        "--tier", default=None, choices=sorted(VALID_TIERS),
+        help="Restrict to a single tier (free | premium).",
+    )
+    parser.add_argument(
+        "--ref", default=None,
         help=(
-            "Optional operator-facing free-text reason for revocation "
-            f"(capped at {key_store.REVOCATION_REASON_MAX_LENGTH} chars)."
+            "Restrict to rows whose ref_code equals the supplied "
+            "value (after sanitising through the Phase 5.1 growth "
+            "helper). A value that sanitises to empty is ignored."
         ),
     )
     parser.add_argument(
-        "--revoked-path", default=None,
+        "--json", action="store_true",
+        help="Emit JSON instead of the plain-text table.",
+    )
+    parser.add_argument(
+        "--manifest-path", default=None,
         help=(
-            "Override the revocation log path "
-            f"(default: ${key_store.KEYS_REVOKED_ENV_VAR} or "
-            f"{key_store.DEFAULT_KEYS_REVOKED_PATH})."
+            "Override the manifest path "
+            f"(default: ${KEYS_MANIFEST_ENV_VAR} or "
+            f"{DEFAULT_KEYS_MANIFEST_PATH})."
         ),
     )
     return parser
 
 
-def _revoke_cli(argv: list[str]) -> int:
-    args = _build_revoke_parser().parse_args(argv)
+def _list_cli(argv: list[str]) -> int:
+    args = _build_list_parser().parse_args(argv)
+    manifest_path = (
+        Path(args.manifest_path) if args.manifest_path else None
+    )
 
-    if args.key_hash:
-        key_hash = str(args.key_hash).strip()
-        if not key_hash:
-            print("error: --key-hash must not be blank", file=sys.stderr)
-            return 2
+    rows = list_keys(
+        tier_filter=args.tier,
+        ref_filter=args.ref,
+        manifest_path=manifest_path,
+    )
+
+    if args.json:
+        print(_format_list_json(rows))
     else:
-        raw = str(args.api_key or "").strip()
-        if not raw:
-            print("error: --api-key must not be blank", file=sys.stderr)
-            return 2
-        key_hash = key_store.hash_api_key(raw)
-        # Drop the raw value from the local frame as soon as possible.
-        # Python can't truly zero-out the string, but we can at least
-        # avoid keeping the binding around for any longer than needed.
-        del raw
-
-    target = (
-        Path(args.revoked_path) if args.revoked_path else None
-    )
-
-    try:
-        record = key_store.append_revocation(
-            key_hash=key_hash,
-            reason=args.reason,
-            target=target,
-        )
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:  # noqa: BLE001 — operator-facing CLI
-        print(
-            f"error: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        return 3
-
-    final_path = (
-        target if target is not None else key_store.revoked_path()
-    )
-    print("API key revoked (revocation row appended):")
-    print(f"  key_hash      : {record['key_hash']}")
-    print(f"  timestamp     : {record['timestamp']}")
-    if record.get("reason"):
-        print(f"  reason        : {record['reason']}")
-    print(f"  revoked_path  : {final_path}")
+        print(_format_list_text(rows))
     return 0
 
 
@@ -1090,8 +1186,8 @@ def _build_top_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     subparsers.add_parser(
-        "revoke",
-        help="Append a revocation row for an issued API key.",
+        "list",
+        help="Inspect the manifest with optional tier / ref filters.",
         add_help=False,
     )
     subparsers.add_parser(
@@ -1126,24 +1222,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     command, rest = argv[0], argv[1:]
     if command == "issue":
         return _issue_cli(rest)
-    if command == "revoke":
-        return _revoke_cli(rest)
-    if command == "revoke-many":
-        return _revoke_many_cli(rest)
     if command == "list":
         return _list_cli(rest)
-    if command == "show":
-        return _show_cli(rest)
-    if command == "stats":
-        return _stats_cli(rest)
     if command in ("-h", "--help"):
         _build_top_parser().print_help()
         return 0
     print(f"error: unknown command '{command}'", file=sys.stderr)
-    print(
-        "available commands: issue, revoke, revoke-many, list, show, stats",
-        file=sys.stderr,
-    )
+    print("available commands: issue, list", file=sys.stderr)
     return 2
 
 
