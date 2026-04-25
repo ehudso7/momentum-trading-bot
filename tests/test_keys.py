@@ -1067,942 +1067,495 @@ class TestPhase61Cli:
 
 
 # ===========================================================================
-# Phase 6.2 — revoke subcommand
+# Phase 6.2 — manifest inspection (``keys list``)
 # ===========================================================================
 
 
-@pytest.fixture
-def revoked_path(tmp_path: Path, monkeypatch) -> Path:
-    p = tmp_path / "api_keys_revoked.jsonl"
-    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(p))
-    # Reset key_store caches so a previous test's revoked file
-    # doesn't leak into this one.
-    from trading_bot.api import key_store
-    key_store.reset_caches_for_tests()
-    yield p
-    key_store.reset_caches_for_tests()
+from trading_bot.api.keys import (  # noqa: E402
+    LIST_OUTPUT_FIELDS,
+    _format_list_json,
+    _format_list_text,
+    list_keys,
+)
 
 
-def _read_revocations(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if s:
-            rows.append(json.loads(s))
-    return rows
-
-
-class TestPhase62RevokeApi:
-    """In-process invocation of ``main`` with ``revoke`` argv."""
-
-    def test_revoke_by_hash_writes_row(self, revoked_path: Path):
-        h = "a" * 32
-        rc = keys_main([
-            "revoke", "--key-hash", h, "--reason", "leaked",
-        ])
-        assert rc == 0
-        (row,) = _read_revocations(revoked_path)
-        assert row["key_hash"] == h
-        assert row["reason"] == "leaked"
-        assert "timestamp" in row
-
-    def test_revoke_by_raw_key_stores_only_hash(
-        self, revoked_path: Path,
-    ):
-        marker = "RAW_KEY_REVOKE_DO_NOT_LEAK_ABCXYZ"
-        expected_hash = _hash_api_key(marker)
-
-        rc = keys_main(["revoke", "--api-key", marker, "--reason", "rotation"])
-        assert rc == 0
-
-        (row,) = _read_revocations(revoked_path)
-        assert row["key_hash"] == expected_hash
-        body = revoked_path.read_text(encoding="utf-8")
-        assert marker not in body
-        # Sanity — the hash is present.
-        assert expected_hash in body
-
-    def test_revoke_blank_hash_rejected(self, revoked_path: Path):
-        rc = keys_main(["revoke", "--key-hash", "   "])
-        assert rc == 2
-        assert _read_revocations(revoked_path) == []
-
-    def test_revoke_blank_raw_key_rejected(self, revoked_path: Path):
-        rc = keys_main(["revoke", "--api-key", "   "])
-        assert rc == 2
-        assert _read_revocations(revoked_path) == []
-
-    def test_revoke_requires_one_of_two_inputs(
-        self, revoked_path: Path,
-    ):
-        # argparse calls sys.exit(2) on a missing required group.
-        with pytest.raises(SystemExit) as exc:
-            keys_main(["revoke"])
-        assert exc.value.code == 2
-        assert _read_revocations(revoked_path) == []
-
-    def test_revoke_rejects_both_inputs(
-        self, revoked_path: Path,
-    ):
-        with pytest.raises(SystemExit) as exc:
-            keys_main([
-                "revoke",
-                "--api-key", "k",
-                "--key-hash", "h" * 32,
-            ])
-        assert exc.value.code == 2
-        assert _read_revocations(revoked_path) == []
-
-    def test_revoke_reason_optional(self, revoked_path: Path):
-        rc = keys_main(["revoke", "--key-hash", "b" * 32])
-        assert rc == 0
-        (row,) = _read_revocations(revoked_path)
-        assert "reason" not in row
-
-    def test_revoke_path_override(self, tmp_path: Path):
-        custom = tmp_path / "alt_revoked.jsonl"
-        rc = keys_main([
-            "revoke",
-            "--key-hash", "c" * 32,
-            "--revoked-path", str(custom),
-        ])
-        assert rc == 0
-        assert custom.exists()
-
-
-class TestPhase62RevokeCli:
-    """Subprocess-level CLI test — verifies argv parsing & exit codes."""
-
-    def test_subprocess_revoke_by_hash(self, tmp_path: Path):
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        h = "d" * 32
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "trading_bot.api.keys",
-                "revoke", "--key-hash", h, "--reason", "test",
-            ],
-            capture_output=True, text=True,
-            env={
-                **__import__("os").environ,
-                "TRADING_API_KEYS_REVOKED_PATH": str(revoked),
-            },
-        )
-        assert result.returncode == 0, result.stderr
-        assert "revoked" in result.stdout.lower()
-        rows = _read_revocations(revoked)
-        assert len(rows) == 1
-        assert rows[0]["key_hash"] == h
-
-    def test_subprocess_revoke_by_raw_key_does_not_leak(
-        self, tmp_path: Path,
-    ):
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        marker = "RAW_KEY_SUBPROC_DO_NOT_LEAK"
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "trading_bot.api.keys",
-                "revoke", "--api-key", marker,
-            ],
-            capture_output=True, text=True,
-            env={
-                **__import__("os").environ,
-                "TRADING_API_KEYS_REVOKED_PATH": str(revoked),
-            },
-        )
-        assert result.returncode == 0, result.stderr
-        body = revoked.read_text(encoding="utf-8")
-        assert marker not in body
-        assert marker not in result.stdout
-
-    def test_subprocess_unknown_command_exits_nonzero(self):
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "trading_bot.api.keys",
-                "no-such-command",
-            ],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 2
-        assert "available commands" in result.stderr
-        assert "revoke" in result.stderr
-
-
-class TestPhase62IssueRevokeRoundTrip:
-    """Issue a key, revoke it via the CLI, and assert the manifest +
-    revocation log together describe the lifecycle correctly."""
-
-    def test_issue_then_revoke_by_hash(
-        self, manifest_path: Path, tmp_path: Path,
-    ):
-        issued = issue_key(tier="free", label="alice")
-        api_key = issued["api_key"]
-        key_hash = issued["key_hash"]
-
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        rc = keys_main([
-            "revoke", "--key-hash", key_hash,
-            "--revoked-path", str(revoked),
-            "--reason", "user-requested",
-        ])
-        assert rc == 0
-
-        # Manifest still has the original row …
-        manifest_rows = _read(manifest_path)
-        assert any(r["key_hash"] == key_hash for r in manifest_rows)
-
-        # … and the revocation log records exactly the hash.
-        (rev,) = _read_revocations(revoked)
-        assert rev["key_hash"] == key_hash
-        assert rev["reason"] == "user-requested"
-        # Raw issued api_key never landed on disk.
-        body = revoked.read_text(encoding="utf-8")
-        assert api_key not in body
-
-    def test_issue_then_revoke_by_raw_key(
-        self, manifest_path: Path, tmp_path: Path,
-    ):
-        issued = issue_key(tier="premium", label="bob")
-        api_key = issued["api_key"]
-        key_hash = issued["key_hash"]
-
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        rc = keys_main([
-            "revoke", "--api-key", api_key,
-            "--revoked-path", str(revoked),
-        ])
-        assert rc == 0
-
-        (rev,) = _read_revocations(revoked)
-        assert rev["key_hash"] == key_hash
-        body = revoked.read_text(encoding="utf-8")
-        assert api_key not in body
-
-
-class TestPhase62NoCoreImports:
-    """The Phase 6.0 boundary still holds after Phase 6.2."""
-
-    def test_keys_module_does_not_reach_into_core(self):
-        src = (
-            Path(__file__).resolve().parent.parent
-            / "trading_bot" / "api" / "keys.py"
-        ).read_text()
-        for forbidden in (
-            "from trading_bot.core.alpha",
-            "from trading_bot.execution",
-            "from trading_bot.portfolio",
-            "from trading_bot.risk",
-            "from trading_bot.scanners",
-            "from trading_bot.strategies",
-            "from trading_bot.main",
-            "from trading_bot.api.server",
-        ):
-            assert forbidden not in src, (
-                f"keys.py imports restricted surface: {forbidden!r}"
-            )
-
-
-# ===========================================================================
-# Phase 6.3 — manifest inspection (list / show / stats)
-# ===========================================================================
-
-
-@pytest.fixture
-def inspect_env(tmp_path: Path, monkeypatch) -> dict[str, Path]:
-    """
-    Two empty append-only files plus monkeypatched env vars so
-    inspection tests share the issuance + revocation paths every
-    other Phase 6 surface uses.
-    """
-    manifest = tmp_path / "api_keys_manifest.jsonl"
-    revoked = tmp_path / "api_keys_revoked.jsonl"
-    monkeypatch.setenv(KEYS_MANIFEST_ENV_VAR, str(manifest))
-    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(revoked))
-    from trading_bot.api import key_store
-    key_store.reset_caches_for_tests()
-    yield {"manifest": manifest, "revoked": revoked}
-    key_store.reset_caches_for_tests()
-
-
-def _issue(label: str, *, tier: str = "free", ref: str | None = None) -> dict:
-    """Issue one key via the in-process API (uses the env-var paths)."""
-    return issue_key(tier=tier, label=label, ref_code=ref)
-
-
-def _revoke(key_hash: str, *, reason: str | None = None) -> int:
-    return keys_main(
-        ["revoke", "--key-hash", key_hash]
-        + (["--reason", reason] if reason else [])
+def _seed_manifest(
+    path: Path,
+    rows: list[dict],
+) -> None:
+    """Write a manifest file directly so we control the exact rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""),
+        encoding="utf-8",
     )
 
 
-class TestPhase63ListBasic:
-    def test_default_excludes_revoked(self, inspect_env, capsys):
-        a = _issue("alice", ref="twitter")
-        b = _issue("bob", tier="premium", ref="hn-launch")
-        c = _issue("carol")
-        _revoke(c["key_hash"])
-        capsys.readouterr()  # drain prior command output
-
-        rc = keys_main(["list"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert a["key_hash"] in out
-        assert b["key_hash"] in out
-        assert c["key_hash"] not in out
-        assert "2 active" in out
-
-    def test_include_revoked_flag(self, inspect_env, capsys):
-        a = _issue("alice")
-        b = _issue("bob")
-        _revoke(a["key_hash"], reason="leaked")
-        capsys.readouterr()  # drain prior command output
-
-        rc = keys_main(["list", "--include-revoked"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert a["key_hash"] in out
-        assert b["key_hash"] in out
-        assert "1 active, 1 revoked" in out
-
-    def test_filter_by_tier(self, inspect_env, capsys):
-        f = _issue("alice", tier="free")
-        p = _issue("bob", tier="premium")
-
-        rc = keys_main(["list", "--tier", "premium"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert p["key_hash"] in out
-        assert f["key_hash"] not in out
-
-    def test_filter_by_ref(self, inspect_env, capsys):
-        a = _issue("alice", ref="twitter")
-        b = _issue("bob", ref="hn-launch")
-
-        rc = keys_main(["list", "--ref", "twitter"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert a["key_hash"] in out
-        assert b["key_hash"] not in out
-
-    def test_filters_are_anded(self, inspect_env, capsys):
-        match = _issue("alice", tier="premium", ref="hn-launch")
-        miss_tier = _issue("bob", tier="free", ref="hn-launch")
-        miss_ref = _issue("carol", tier="premium", ref="twitter")
-
-        rc = keys_main(["list", "--tier", "premium", "--ref", "hn-launch"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert match["key_hash"] in out
-        assert miss_tier["key_hash"] not in out
-        assert miss_ref["key_hash"] not in out
-
-    def test_unsafe_ref_filter_sanitised(self, inspect_env, capsys):
-        """``--ref <script>`` collapses through the same Phase 5.1
-        sanitiser the live middleware uses, so it matches whatever the
-        manifest stored — never the raw payload."""
-        target = _issue("alice", ref="<script>xss</script>")
-        # Manifest stores the sanitised form already.
-        assert target["ref_code"] == "scriptxssscript"
-
-        rc = keys_main(["list", "--ref", "<script>xss</script>"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert target["key_hash"] in out
-
-    def test_sort_newest_first(self, inspect_env, capsys):
-        a = _issue("alice")
-        time.sleep(0.001)  # ensure ordering
-        b = _issue("bob")
-        time.sleep(0.001)
-        c = _issue("carol")
-
-        rc = keys_main(["list"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        # The hashes must appear in c, b, a order.
-        idx_a = out.index(a["key_hash"])
-        idx_b = out.index(b["key_hash"])
-        idx_c = out.index(c["key_hash"])
-        assert idx_c < idx_b < idx_a
+def _row(
+    *,
+    created_at: str,
+    key_hash: str,
+    label_hash: str = "0" * 32,
+    tier: str = "free",
+    ref_code=None,
+    checkout_session_id=None,
+    **extra: object,
+) -> dict:
+    """Build a manifest-style row, with any extra fields the test
+    wants to plant for leak-guard purposes."""
+    base = {
+        "created_at": created_at,
+        "key_hash": key_hash,
+        "label_hash": label_hash,
+        "tier": tier,
+        "ref_code": ref_code,
+        "checkout_session_id": checkout_session_id,
+    }
+    base.update(extra)
+    return base
 
 
-class TestPhase63ListJson:
-    def test_json_output_is_valid_array(self, inspect_env, capsys):
-        a = _issue("alice", ref="twitter")
-        rc = keys_main(["list", "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert isinstance(payload, list)
-        assert len(payload) == 1
-        row = payload[0]
-        assert row["key_hash"] == a["key_hash"]
-        assert row["tier"] == "free"
-        assert row["ref_code"] == "twitter"
-        assert row["revoked"] is False
-        # Field allow-list pinned by Phase 6.3 — never label_hash.
-        for forbidden in ("api_key", "label", "label_hash", "checkout_url"):
-            assert forbidden not in row
-
-    def test_json_includes_revocation_metadata(self, inspect_env, capsys):
-        a = _issue("alice")
-        _revoke(a["key_hash"], reason="rotation")
-        capsys.readouterr()  # drain prior command output
-
-        rc = keys_main(["list", "--include-revoked", "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert len(payload) == 1
-        row = payload[0]
-        assert row["revoked"] is True
-        assert row["revoked_at"]
-        assert row["revoked_reason"] == "rotation"
+# ---------------------------------------------------------------------------
+# list_keys — plain reads + filters + sort
+# ---------------------------------------------------------------------------
 
 
-class TestPhase63ListRobustness:
-    def test_missing_manifest_no_crash(self, inspect_env, capsys):
-        # Don't issue anything → manifest file does not exist.
-        rc = keys_main(["list"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "0 active" in out
-        assert "no manifest rows" in out
+class TestPhase62ListKeys:
+    def test_missing_manifest_returns_empty(self, tmp_path: Path):
+        # Manifest path explicitly set to a file that does NOT exist.
+        out = list_keys(manifest_path=tmp_path / "absent.jsonl")
+        assert out == []
 
-    def test_malformed_lines_skipped(self, inspect_env, capsys):
-        a = _issue("alice")
-        path = inspect_env["manifest"]
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write("\n")                            # blank
-            fh.write("not-json\n")                    # not JSON
-            fh.write(json.dumps([1, 2, 3]) + "\n")    # not a dict
-            fh.write(
-                json.dumps({"key_hash": "x" * 32, "tier": "bogus"}) + "\n"
-            )                                          # bogus tier
-        rc = keys_main(["list"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert a["key_hash"] in out
-        # Bogus tier did not slip through.
-        assert "bogus" not in out
+    def test_empty_manifest_returns_empty(self, manifest_path: Path):
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("", encoding="utf-8")
+        assert list_keys(manifest_path=manifest_path) == []
 
-    def test_empty_after_filter(self, inspect_env, capsys):
-        _issue("alice", tier="free")
-        rc = keys_main(["list", "--tier", "premium"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "no manifest rows match" in out
-        assert "0 active" in out
+    def test_lists_all_rows(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T10:00:00.000000Z",
+                 key_hash="aaaa", tier="free"),
+            _row(created_at="2026-04-21T10:00:00.000000Z",
+                 key_hash="bbbb", tier="premium"),
+            _row(created_at="2026-04-22T10:00:00.000000Z",
+                 key_hash="cccc", tier="free"),
+        ])
+        out = list_keys(manifest_path=manifest_path)
+        assert len(out) == 3
 
+    def test_sorted_newest_first(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T10:00:00.000000Z",
+                 key_hash="oldest"),
+            _row(created_at="2026-04-22T10:00:00.000000Z",
+                 key_hash="newest"),
+            _row(created_at="2026-04-21T10:00:00.000000Z",
+                 key_hash="middle"),
+        ])
+        out = list_keys(manifest_path=manifest_path)
+        assert [r["key_hash"] for r in out] == [
+            "newest", "middle", "oldest",
+        ]
 
-class TestPhase63Show:
-    def test_show_active_key(self, inspect_env, capsys):
-        a = _issue("alice", ref="twitter")
-        rc = keys_main(["show", "--key-hash", a["key_hash"]])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert a["key_hash"] in out
-        assert "tier                : free" in out
-        assert "ref_code            : twitter" in out
-        assert "revoked             : no" in out
+    def test_filter_by_tier(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="f1", tier="free"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="p1", tier="premium"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="f2", tier="free"),
+        ])
+        free = list_keys(
+            manifest_path=manifest_path, tier_filter="free",
+        )
+        assert {r["key_hash"] for r in free} == {"f1", "f2"}
+        prem = list_keys(
+            manifest_path=manifest_path, tier_filter="premium",
+        )
+        assert {r["key_hash"] for r in prem} == {"p1"}
 
-    def test_show_revoked_key_includes_reason(self, inspect_env, capsys):
-        a = _issue("alice")
-        _revoke(a["key_hash"], reason="leaked-on-twitter")
-        capsys.readouterr()
-        rc = keys_main(["show", "--key-hash", a["key_hash"]])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "revoked             : yes" in out
-        assert "revoked_reason      : leaked-on-twitter" in out
-        assert "revoked_at          :" in out
-
-    def test_show_unknown_returns_2_with_stderr(self, inspect_env, capsys):
-        rc = keys_main(["show", "--key-hash", "0" * 32])
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "no manifest row" in err
-
-    def test_show_blank_hash_rejected(self, inspect_env, capsys):
-        rc = keys_main(["show", "--key-hash", "   "])
-        assert rc == 2
-
-    def test_show_json_output(self, inspect_env, capsys):
-        a = _issue("alice", tier="premium", ref="hn-launch")
-        rc = keys_main(["show", "--key-hash", a["key_hash"], "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["key_hash"] == a["key_hash"]
-        assert payload["tier"] == "premium"
-        assert payload["ref_code"] == "hn-launch"
-        assert payload["revoked"] is False
-        for forbidden in ("api_key", "label", "label_hash", "checkout_url"):
-            assert forbidden not in payload
-
-
-class TestPhase63Stats:
-    def test_zero_counts_when_empty(self, inspect_env, capsys):
-        rc = keys_main(["stats"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "total issued      : 0" in out
-        assert "active            : 0" in out
-        assert "revoked           : 0" in out
-
-    def test_counts_after_issuance_and_revocation(
-        self, inspect_env, capsys,
+    def test_filter_by_tier_case_insensitive(
+        self, manifest_path: Path,
     ):
-        _issue("alice", tier="free", ref="twitter")
-        _issue("bob", tier="premium", ref="hn-launch")
-        c = _issue("carol", tier="free", ref="twitter")
-        _revoke(c["key_hash"])
-        capsys.readouterr()
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="f1", tier="free"),
+        ])
+        # "FREE" / " Free " all normalise to "free".
+        out = list_keys(
+            manifest_path=manifest_path, tier_filter="FREE",
+        )
+        assert {r["key_hash"] for r in out} == {"f1"}
 
-        rc = keys_main(["stats"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "total issued      : 3" in out
-        assert "active            : 2" in out
-        assert "revoked           : 1" in out
+    def test_filter_by_ref(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="t1", ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="h1", ref_code="hn-launch"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="n1", ref_code=None),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            ref_filter="twitter-launch_2026",
+        )
+        assert {r["key_hash"] for r in out} == {"t1"}
 
-    def test_by_tier_breakdown(self, inspect_env, capsys):
-        _issue("a", tier="free")
-        _issue("b", tier="free")
-        _issue("c", tier="premium")
-        rc = keys_main(["stats", "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["by_tier"] == {"free": 2, "premium": 1}
+    def test_filter_by_ref_runs_through_sanitiser(
+        self, manifest_path: Path,
+    ):
+        """An operator typing ``--ref "twitter launch"`` (with a
+        space) sanitises to ``twitterlaunch`` — no row matches in
+        this case, but an operator pasting an XSS payload sanitises
+        to its safe substring and matches the row that was
+        sanitised at write time."""
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="x1", ref_code="scriptxssscript"),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            ref_filter="<script>xss</script>",
+        )
+        assert {r["key_hash"] for r in out} == {"x1"}
 
-    def test_by_ref_breakdown(self, inspect_env, capsys):
-        _issue("a", ref="twitter")
-        _issue("b", ref="twitter")
-        _issue("c", ref="hn-launch")
-        _issue("d")  # no ref
-        rc = keys_main(["stats", "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["by_ref_code"] == {
-            "(none)": 1, "hn-launch": 1, "twitter": 2,
+    def test_empty_ref_filter_after_sanitise_is_treated_as_no_filter(
+        self, manifest_path: Path,
+    ):
+        """``--ref "!@#"`` sanitises to "" and we treat that as
+        "no filter" — better than silently filtering to zero rows."""
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="a", ref_code=None),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="b", ref_code="hn-launch"),
+        ])
+        out = list_keys(manifest_path=manifest_path, ref_filter="!@#")
+        assert {r["key_hash"] for r in out} == {"a", "b"}
+
+    def test_filters_are_anded(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="ft", tier="free", ref_code="twitter"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="pt", tier="premium", ref_code="twitter"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="fh", tier="free", ref_code="hn"),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            tier_filter="free",
+            ref_filter="twitter",
+        )
+        assert {r["key_hash"] for r in out} == {"ft"}
+
+    def test_malformed_lines_are_skipped(self, manifest_path: Path):
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            "\n".join([
+                "garbage",
+                "",
+                "[\"not a dict\"]",
+                json.dumps(_row(
+                    created_at="2026-04-20T00:00:00.000000Z",
+                    key_hash="ok",
+                )),
+            ])
+            + "\n",
+            encoding="utf-8",
+        )
+        out = list_keys(manifest_path=manifest_path)
+        assert {r["key_hash"] for r in out} == {"ok"}
+
+
+# ---------------------------------------------------------------------------
+# list_keys — output projection (defense in depth)
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62OutputProjection:
+    def test_only_documented_fields_emitted(self, manifest_path: Path):
+        """Even when the row carries extra fields (a poisoned /
+        hand-edited manifest), the output dict must contain ONLY
+        the public field-set."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                # Extra fields a Phase 6.0/6.1 row should NOT have.
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+                random_extra="HOSTILE_EXTRA_DO_NOT_LEAK",
+            ),
+        ])
+        (out,) = list_keys(manifest_path=manifest_path)
+        assert set(out.keys()) == set(LIST_OUTPUT_FIELDS)
+
+    def test_text_output_never_contains_secret_markers(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+            ),
+        ])
+        rendered = _format_list_text(
+            list_keys(manifest_path=manifest_path),
+        )
+        assert "HOSTILE_RAW_KEY_DO_NOT_LEAK" not in rendered
+        assert "HOSTILE_RAW_LABEL_DO_NOT_LEAK" not in rendered
+        assert "stripe.example/leak" not in rendered
+
+    def test_json_output_never_contains_secret_markers(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+            ),
+        ])
+        rendered = _format_list_json(
+            list_keys(manifest_path=manifest_path),
+        )
+        # Re-parse + spot-check.
+        parsed = json.loads(rendered)
+        for row in parsed:
+            assert set(row.keys()) == set(LIST_OUTPUT_FIELDS)
+        assert "HOSTILE_RAW_KEY_DO_NOT_LEAK" not in rendered
+        assert "HOSTILE_RAW_LABEL_DO_NOT_LEAK" not in rendered
+        assert "stripe.example/leak" not in rendered
+
+    def test_label_hash_is_not_emitted(self, manifest_path: Path):
+        """``label_hash`` IS in the manifest (Phase 6.0) but it's
+        not part of the public list-view contract — operators can
+        join elsewhere if they really need it. Keep the public
+        surface tight."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                label_hash="ABCDEF1234567890",
+            ),
+        ])
+        (out,) = list_keys(manifest_path=manifest_path)
+        assert "label_hash" not in out
+
+
+# ---------------------------------------------------------------------------
+# CLI — `keys list`
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62Cli:
+    def _env(self, manifest_path: Path) -> dict:
+        return {
+            **__import__("os").environ,
+            KEYS_MANIFEST_ENV_VAR: str(manifest_path),
         }
 
-    def test_by_created_date_breakdown(self, inspect_env, capsys):
-        _issue("a")
-        _issue("b")
-        rc = keys_main(["stats", "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert len(payload["by_created_date"]) == 1
-        # Date string is YYYY-MM-DD.
-        (day,) = payload["by_created_date"].keys()
-        assert len(day) == 10 and day[4] == "-" and day[7] == "-"
-        assert payload["by_created_date"][day] == 2
-
-    def test_stats_counts_revoked_only_when_in_manifest(
-        self, inspect_env, capsys,
-    ):
-        """A revocation row whose key_hash isn't in the manifest does
-        not inflate the revoked counter — the counter is "manifest
-        rows that have been revoked", not "revocation rows"."""
-        a = _issue("a")
-        # Append a stray revocation for a hash that was never issued.
-        with open(inspect_env["revoked"], "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "timestamp": "2026-04-25T00:00:00.000000Z",
-                "key_hash": "ffffffffffffffffffffffffffffffff",
-            }) + "\n")
-        rc = keys_main(["stats", "--json"])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["total_issued"] == 1
-        assert payload["active"] == 1
-        assert payload["revoked"] == 0
-
-
-class TestPhase63NoLeaks:
-    """Inspection output may NEVER expose the raw api_key, raw label,
-    or checkout_url. Even if a future schema bump quietly adds a new
-    field, the inspection allow-list drops it."""
-
-    def test_raw_key_never_in_list_output(self, inspect_env, capsys):
-        result = _issue("alice")
-        raw = result["api_key"]
-        for argv in (
-            ["list"],
-            ["list", "--include-revoked"],
-            ["list", "--json"],
-            ["stats"],
-            ["stats", "--json"],
-            ["show", "--key-hash", result["key_hash"]],
-            ["show", "--key-hash", result["key_hash"], "--json"],
-        ):
-            keys_main(argv)
-            captured = capsys.readouterr()
-            assert raw not in captured.out, (
-                f"raw key leaked via {argv!r}: {captured.out!r}"
-            )
-            assert raw not in captured.err
-
-    def test_raw_label_never_in_output(self, inspect_env, capsys):
-        marker = "RAW_LABEL_LEAK_GUARD_alice@example.com"
-        result = issue_key(tier="free", label=marker)
-        for argv in (
-            ["list"], ["list", "--json"],
-            ["show", "--key-hash", result["key_hash"]],
-            ["show", "--key-hash", result["key_hash"], "--json"],
-            ["stats"], ["stats", "--json"],
-        ):
-            keys_main(argv)
-            captured = capsys.readouterr()
-            assert marker not in captured.out, (
-                f"raw label leaked via {argv!r}"
-            )
-
-    def test_label_hash_not_in_inspection_surface(
-        self, inspect_env, capsys,
-    ):
-        """label_hash is on disk but the Phase 6.3 inspection surface
-        deliberately omits it — operators who need it grep the
-        manifest file directly."""
-        result = _issue("alice")
-        # Sanity — the manifest does store label_hash.
-        body = inspect_env["manifest"].read_text(encoding="utf-8")
-        assert result["label_hash"] in body
-
-        keys_main(["list", "--json"])
-        out = capsys.readouterr().out
-        assert "label_hash" not in out
-
-        keys_main(["show", "--key-hash", result["key_hash"], "--json"])
-        out = capsys.readouterr().out
-        assert "label_hash" not in out
-
-    def test_checkout_url_never_in_output(self, inspect_env, capsys):
-        """checkout_url is never persisted; assert that even an
-        accidentally-injected row containing one would not surface."""
-        # Hand-craft a row that smuggles a checkout_url field — the
-        # inspection allow-list must drop it.
-        url = "https://checkout.example.com/SECRET-URL"
-        path = inspect_env["manifest"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "created_at": "2026-04-25T00:00:00.000000Z",
-                "key_hash": "a" * 32,
-                "label_hash": "b" * 32,
-                "tier": "free",
-                "checkout_url": url,            # ← must NOT survive
-                "checkout_session_id": "cs_xyz",
-            }) + "\n")
-
-        for argv in (
-            ["list"], ["list", "--json"],
-            ["show", "--key-hash", "a" * 32],
-            ["show", "--key-hash", "a" * 32, "--json"],
-        ):
-            keys_main(argv)
-            out = capsys.readouterr().out
-            assert url not in out, (
-                f"checkout_url leaked via {argv!r}"
-            )
-
-    def test_stats_does_not_print_any_per_row_field(
-        self, inspect_env, capsys,
-    ):
-        """stats is aggregate-only — the raw per-row metadata never
-        flows into its output."""
-        result = _issue(
-            "alice", tier="premium", ref="twitter",
+    def test_cli_list_all_text(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="aaaa1111", tier="free",
+                 ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="bbbb2222", tier="premium"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
         )
-        keys_main(["stats"])
-        out = capsys.readouterr().out
-        assert result["api_key"] not in out
-        assert result["key_hash"] not in out
-        assert result["label_hash"] not in out
+        assert result.returncode == 0, result.stderr
+        # Newest first.
+        out = result.stdout
+        assert out.find("bbbb2222") < out.find("aaaa1111")
+        assert "twitter-launch_2026" in out
+        assert "premium" in out
 
+    def test_cli_filter_by_tier(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="freekey", tier="free"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="premkey", tier="premium"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "premium",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "premkey" in result.stdout
+        assert "freekey" not in result.stdout
 
-class TestPhase63CliDispatch:
-    def test_unknown_command_lists_all_six(self, capsys):
-        rc = keys_main(["no-such-thing"])
+    def test_cli_filter_by_ref(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="thash", ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="hhash", ref_code="hn-launch"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--ref", "hn-launch",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "hhash" in result.stdout
+        assert "thash" not in result.stdout
+
+    def test_cli_combined_filters_anded(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="ft", tier="free", ref_code="twitter"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="pt", tier="premium", ref_code="twitter"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="fh", tier="free", ref_code="hn"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "free", "--ref", "twitter",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ft" in result.stdout
+        assert "pt" not in result.stdout
+        assert "fh" not in result.stdout
+
+    def test_cli_json_flag_emits_json_array(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="abcd1234", tier="premium",
+                 ref_code="hn-launch",
+                 checkout_session_id="cs_test_abc"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--json",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        row = rows[0]
+        assert set(row.keys()) == set(LIST_OUTPUT_FIELDS)
+        assert row["key_hash"] == "abcd1234"
+        assert row["tier"] == "premium"
+        assert row["ref_code"] == "hn-launch"
+        assert row["checkout_session_id"] == "cs_test_abc"
+
+    def test_cli_missing_manifest_text_fallback(
+        self, manifest_path: Path,
+    ):
+        # Don't write the file at all.
+        assert not manifest_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "(no records)" in result.stdout
+
+    def test_cli_missing_manifest_json_emits_empty_array(
+        self, manifest_path: Path,
+    ):
+        assert not manifest_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--json",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == []
+
+    def test_cli_invalid_tier_rejected(self, manifest_path: Path):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "enterprise",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 2
+
+    def test_cli_unknown_command_lists_both(self, capsys):
+        from trading_bot.api.keys import main as keys_main
+        rc = keys_main(["bogus"])
         assert rc == 2
         err = capsys.readouterr().err
-        for cmd in ("issue", "revoke", "list", "show", "stats"):
-            assert cmd in err
+        # Phase 6.2: the error message should mention BOTH commands.
+        assert "issue" in err
+        assert "list" in err
 
-    def test_help_lists_all_subcommands(self, capsys):
-        rc = keys_main(["--help"])
-        assert rc == 0
-        out = capsys.readouterr().out
-        for cmd in ("issue", "revoke", "list", "show", "stats"):
-            assert cmd in out
-
-
-class TestPhase63NoCoreImports:
-    """Phase 6.0/6.2 boundary still holds after Phase 6.3."""
-
-    def test_keys_module_still_dependency_light(self):
-        src = (
-            Path(__file__).resolve().parent.parent
-            / "trading_bot" / "api" / "keys.py"
-        ).read_text()
-        for forbidden in (
-            "from trading_bot.core.alpha",
-            "from trading_bot.execution",
-            "from trading_bot.portfolio",
-            "from trading_bot.risk",
-            "from trading_bot.scanners",
-            "from trading_bot.strategies",
-            "from trading_bot.main",
-            "from trading_bot.api.server",
-            "import structlog",
-            "import fastapi",
-        ):
-            assert forbidden not in src, (
-                f"keys.py imports restricted surface: {forbidden!r}"
+    def test_cli_list_never_outputs_secret_markers(
+        self, manifest_path: Path,
+    ):
+        """End-to-end: a poisoned manifest with stray secret-looking
+        fields must not leak through the CLI."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-21T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/HOSTILE_LEAK",
+            ),
+        ])
+        # Both text and JSON CLI paths.
+        for json_flag in ([], ["--json"]):
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "trading_bot.api.keys",
+                    "list", *json_flag,
+                ],
+                capture_output=True, text=True,
+                env=self._env(manifest_path),
             )
-
-
-# ---------------------------------------------------------------------------
-# time import for sort-order tests
-# ---------------------------------------------------------------------------
-import time  # noqa: E402  — kept at the bottom so it stays scoped to Phase 6.3
-
-
-# ===========================================================================
-# Phase 6.4 — explicit --manifest-path / --revoked-path override tests
-# ===========================================================================
-#
-# Phase 6.2 / 6.3 already added the flags to every relevant subcommand;
-# Phase 6.4's deployment story (operator points the CLI at a persistent
-# Railway-volume path) depends on those flags overriding both the env
-# vars AND the default paths. These tests pin that contract so a future
-# refactor cannot silently regress production-shell ergonomics.
-
-
-@pytest.fixture
-def isolated_env_paths(tmp_path: Path, monkeypatch):
-    """
-    Force the env vars to point at one tmp location while the CLI
-    is invoked with --manifest-path / --revoked-path pointing at a
-    DIFFERENT tmp location. The CLI flags must win.
-    """
-    env_manifest = tmp_path / "env_manifest.jsonl"
-    env_revoked = tmp_path / "env_revoked.jsonl"
-    flag_manifest = tmp_path / "flag_manifest.jsonl"
-    flag_revoked = tmp_path / "flag_revoked.jsonl"
-    monkeypatch.setenv(KEYS_MANIFEST_ENV_VAR, str(env_manifest))
-    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(env_revoked))
-    from trading_bot.api import key_store
-    key_store.reset_caches_for_tests()
-    yield {
-        "env_manifest": env_manifest,
-        "env_revoked": env_revoked,
-        "flag_manifest": flag_manifest,
-        "flag_revoked": flag_revoked,
-    }
-    key_store.reset_caches_for_tests()
-
-
-class TestPhase64IssueManifestPathFlag:
-    def test_issue_writes_to_flag_path_not_env_path(
-        self, isolated_env_paths,
-    ):
-        result = issue_key(
-            tier="free", label="alice",
-            manifest_path=isolated_env_paths["flag_manifest"],
-        )
-        # The issue_key API path mirrors the CLI's --manifest-path
-        # plumbing — assert the row landed at the flag path, not env.
-        assert isolated_env_paths["flag_manifest"].exists()
-        assert not isolated_env_paths["env_manifest"].exists()
-        body = isolated_env_paths["flag_manifest"].read_text(
-            encoding="utf-8",
-        )
-        assert result["key_hash"] in body
-
-    def test_cli_issue_manifest_path_flag(
-        self, isolated_env_paths, capsys,
-    ):
-        rc = keys_main([
-            "issue", "--tier", "free", "--label", "alice",
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-        ])
-        assert rc == 0
-        assert isolated_env_paths["flag_manifest"].exists()
-        assert not isolated_env_paths["env_manifest"].exists()
-
-
-class TestPhase64RevokeRevokedPathFlag:
-    def test_cli_revoke_revoked_path_flag(
-        self, isolated_env_paths, capsys,
-    ):
-        rc = keys_main([
-            "revoke", "--key-hash", "a" * 32,
-            "--revoked-path", str(isolated_env_paths["flag_revoked"]),
-            "--reason", "phase64-test",
-        ])
-        assert rc == 0
-        assert isolated_env_paths["flag_revoked"].exists()
-        assert not isolated_env_paths["env_revoked"].exists()
-        body = isolated_env_paths["flag_revoked"].read_text(
-            encoding="utf-8",
-        )
-        assert "a" * 32 in body
-        assert "phase64-test" in body
-
-
-class TestPhase64ListPathFlags:
-    def test_list_uses_flag_paths_not_env_paths(
-        self, isolated_env_paths, capsys,
-    ):
-        # Issue against the FLAG manifest, not the env one.
-        result = issue_key(
-            tier="free", label="alice", ref_code="phase64",
-            manifest_path=isolated_env_paths["flag_manifest"],
-        )
-        # Sanity — env manifest is empty.
-        assert not isolated_env_paths["env_manifest"].exists()
-
-        rc = keys_main([
-            "list",
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
-        ])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert result["key_hash"] in out
-        assert "phase64" in out
-
-    def test_list_flag_paths_isolate_revocation_index(
-        self, isolated_env_paths, capsys,
-    ):
-        """A revocation row in the FLAG revoked file should be
-        honoured by list, while a row in the ENV revoked file should
-        not bleed through."""
-        result = issue_key(
-            tier="free", label="alice",
-            manifest_path=isolated_env_paths["flag_manifest"],
-        )
-        # Revoke against the FLAG revoked path.
-        rc = keys_main([
-            "revoke", "--key-hash", result["key_hash"],
-            "--revoked-path", str(isolated_env_paths["flag_revoked"]),
-        ])
-        assert rc == 0
-        capsys.readouterr()  # drain
-
-        rc = keys_main([
-            "list", "--include-revoked",
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
-        ])
-        assert rc == 0
-        out = capsys.readouterr().out
-        # The hash is present and marked revoked.
-        assert result["key_hash"] in out
-        assert "0 active, 1 revoked" in out
-        # Sanity — without --include-revoked it disappears.
-        capsys.readouterr()
-        keys_main([
-            "list",
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
-        ])
-        out2 = capsys.readouterr().out
-        assert result["key_hash"] not in out2
-
-
-class TestPhase64ShowPathFlags:
-    def test_show_uses_flag_paths(self, isolated_env_paths, capsys):
-        result = issue_key(
-            tier="premium", label="bob", ref_code="hn-launch",
-            manifest_path=isolated_env_paths["flag_manifest"],
-        )
-        rc = keys_main([
-            "show", "--key-hash", result["key_hash"],
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
-        ])
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert result["key_hash"] in out
-        assert "tier                : premium" in out
-        assert "ref_code            : hn-launch" in out
-
-    def test_show_flag_path_isolation(self, isolated_env_paths, capsys):
-        """A row in the env-pointed manifest is NOT visible when the
-        show command targets a different path."""
-        # Write to env manifest.
-        env_result = issue_key(
-            tier="free", label="alice",
-            manifest_path=isolated_env_paths["env_manifest"],
-        )
-        # show against the FLAG manifest (empty) — should miss.
-        rc = keys_main([
-            "show", "--key-hash", env_result["key_hash"],
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-        ])
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "no manifest row" in err
-
-
-class TestPhase64StatsPathFlags:
-    def test_stats_uses_flag_paths(self, isolated_env_paths, capsys):
-        # Two rows in the FLAG manifest.
-        issue_key(
-            tier="free", label="alice",
-            manifest_path=isolated_env_paths["flag_manifest"],
-        )
-        issue_key(
-            tier="premium", label="bob",
-            manifest_path=isolated_env_paths["flag_manifest"],
-        )
-        # One row in the ENV manifest — must NOT count toward stats.
-        issue_key(
-            tier="free", label="env-only",
-            manifest_path=isolated_env_paths["env_manifest"],
-        )
-
-        rc = keys_main([
-            "stats", "--json",
-            "--manifest-path", str(isolated_env_paths["flag_manifest"]),
-            "--revoked-path",  str(isolated_env_paths["flag_revoked"]),
-        ])
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["total_issued"] == 2
-        assert payload["by_tier"] == {"free": 1, "premium": 1}
-
-
-class TestPhase64DeploymentDocsExist:
-    """The deployment story is operator-facing — pin the docs file
-    so a future refactor that moves the runbook can't silently
-    delete it."""
-
-    def test_deployment_md_exists_and_mentions_railway_volume(self):
-        path = (
-            Path(__file__).resolve().parent.parent
-            / "docs" / "DEPLOYMENT.md"
-        )
-        assert path.exists(), "docs/DEPLOYMENT.md is required for Phase 6.4"
-        body = path.read_text(encoding="utf-8")
-        # Must document the recommended Railway volume paths.
-        assert "/data/api_keys_manifest.jsonl" in body
-        assert "/data/api_keys_revoked.jsonl" in body
-        # Must mention the env vars by name.
-        assert "TRADING_API_KEYS_MANIFEST_PATH" in body
-        assert "TRADING_API_KEYS_REVOKED_PATH" in body
-        # Must include the local-vs-production warning so the most
-        # common operator mistake is loud.
-        assert "does NOT authenticate" in body
-
-    def test_core_control_md_links_to_deployment_md(self):
-        path = (
-            Path(__file__).resolve().parent.parent
-            / "docs" / "CORE_CONTROL.md"
-        )
-        body = path.read_text(encoding="utf-8")
-        assert "DEPLOYMENT.md" in body, (
-            "CORE_CONTROL.md must point operators at DEPLOYMENT.md"
-        )
+            assert result.returncode == 0, result.stderr
+            for marker in (
+                "HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                "HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                "HOSTILE_LEAK",
+                "checkout_url",
+            ):
+                assert marker not in result.stdout, (
+                    f"CLI {json_flag} leaked: {marker!r}"
+                )
