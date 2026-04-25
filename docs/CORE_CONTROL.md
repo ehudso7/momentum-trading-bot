@@ -3843,6 +3843,103 @@ JSON shape rules (preserves the Phase 10.4 contract):
   revert criteria.
 
 
+### Phase 11 — execution layer
+
+Phase 11 closes the optimisation loop by **safely** applying the
+highest-priority Phase 10.5 recommendation under deterministic
+bounds. Today only one recommendation kind is mechanically
+actionable — ``tighten_free_limit`` — and even that change happens
+via an in-process ``os.environ`` mutation: nothing on disk
+changes except a single audit row in
+``data/api_execution_log.jsonl``.
+
+**Operator workflow**
+
+::
+
+    # Read-only dry-run.
+    python -m trading_bot.api.execution --apply
+
+    # Mutate the env var in this process + append one audit row.
+    python -m trading_bot.api.execution --apply --force
+
+    # JSON envelope for scripts.
+    python -m trading_bot.api.execution --apply --force --json
+
+The mutation is **transient**: it survives only the lifetime of
+the Python process. A rolling-restart-safe rollout requires the
+operator to update the deployment env file separately. This
+keeps the CLI's blast radius bounded — a misclick reverts the
+moment the shell exits.
+
+**Guardrails** (hard-coded; cannot be overridden by env vars)
+
+| Bound                     | Value                                  |
+|---------------------------|----------------------------------------|
+| ``FREE_LIMIT_MIN``        | 10  (free tier never collapses)         |
+| ``FREE_LIMIT_MAX``        | 200 (free tier never exceeds premium)   |
+| ``MAX_CHANGE_PCT``        | 0.30 (per-apply blast radius cap)       |
+| ``TIGHTEN_REDUCTION_PCT`` | 0.25 (default 25 % reduction step)      |
+
+The validation order (most-specific-first):
+
+1. ``rejected_no_change``         — proposed value equals current
+2. ``rejected_out_of_bounds``     — outside ``[10, 200]``
+3. ``rejected_change_too_large``  — relative change > 0.30
+
+A rejected plan never mutates ``os.environ``. In ``--force``
+mode the rejected attempt is still appended to the audit log
+(with ``outcome="rejected_..."``) so the audit trail captures
+every attempted change. In ``--apply`` (dry-run) mode the audit
+log is never touched, even on rejection.
+
+**Action log schema** — one row per ``--force`` invocation
+(default path: ``data/api_execution_log.jsonl``, override via
+``$TRADING_API_EXECUTION_LOG_PATH``)::
+
+    {
+      "timestamp":          "...Z",
+      "recommendation_id":  "tighten_free_limit",
+      "priority":           "high" | "medium" | "low",
+      "action":             "set_free_limit",
+      "env_var":            "TRADING_FREE_DAILY_REQUEST_LIMIT",
+      "previous_value":     int,
+      "new_value":          int,
+      "delta":              int,
+      "delta_pct":          float (signed),
+      "outcome":            "applied" | "rejected_..." | ...,
+      "rejection_reason":   str (only on rejected outcomes)
+    }
+
+  * No ``api_key_hash`` field — the execution layer operates on
+    aggregated metrics, not per-user data. A leak-guard test
+    plants would-be raw markers and asserts the row contains no
+    32-char hex token.
+
+**Exit codes** (so CI / scripts can branch deterministically)
+
+* ``0`` — applied / dry_run / no_actionable_recommendation
+* ``2`` — usage error (``--apply`` not provided)
+* ``3`` — rejected_* (operator must investigate)
+
+**Boundary**
+
+* No new HTTP route, no new mutating endpoint, no new persistence
+  surface beyond the audit log.
+* ``trading_bot/api/execution.py`` imports only stdlib +
+  structlog (DEBUG-only) + ``growth_intel`` for its public API;
+  pinned by
+  ``tests/test_api_execution.py::TestBoundary::test_module_does_not_import_core``.
+* No raw API key is ever read or written; the layer's only inputs
+  are aggregated Phase 10.4 metrics.
+* The set of applicable recommendations is gated by the private
+  ``_APPLICABLE_REC_IDS`` frozenset. Marketing / copy /
+  dashboard recommendations (``amplify_top_trigger``,
+  ``feature_top_insight``, ``double_down_best_source``,
+  ``insufficient_data``) are surfaced to the operator without
+  any automatic action.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
