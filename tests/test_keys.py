@@ -1064,3 +1064,498 @@ class TestPhase61Cli:
         assert "<script>" not in result.stdout
         body = manifest_path.read_text(encoding="utf-8")
         assert "<script>" not in body
+
+
+# ===========================================================================
+# Phase 6.2 — manifest inspection (``keys list``)
+# ===========================================================================
+
+
+from trading_bot.api.keys import (  # noqa: E402
+    LIST_OUTPUT_FIELDS,
+    _format_list_json,
+    _format_list_text,
+    list_keys,
+)
+
+
+def _seed_manifest(
+    path: Path,
+    rows: list[dict],
+) -> None:
+    """Write a manifest file directly so we control the exact rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""),
+        encoding="utf-8",
+    )
+
+
+def _row(
+    *,
+    created_at: str,
+    key_hash: str,
+    label_hash: str = "0" * 32,
+    tier: str = "free",
+    ref_code=None,
+    checkout_session_id=None,
+    **extra: object,
+) -> dict:
+    """Build a manifest-style row, with any extra fields the test
+    wants to plant for leak-guard purposes."""
+    base = {
+        "created_at": created_at,
+        "key_hash": key_hash,
+        "label_hash": label_hash,
+        "tier": tier,
+        "ref_code": ref_code,
+        "checkout_session_id": checkout_session_id,
+    }
+    base.update(extra)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# list_keys — plain reads + filters + sort
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62ListKeys:
+    def test_missing_manifest_returns_empty(self, tmp_path: Path):
+        # Manifest path explicitly set to a file that does NOT exist.
+        out = list_keys(manifest_path=tmp_path / "absent.jsonl")
+        assert out == []
+
+    def test_empty_manifest_returns_empty(self, manifest_path: Path):
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("", encoding="utf-8")
+        assert list_keys(manifest_path=manifest_path) == []
+
+    def test_lists_all_rows(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T10:00:00.000000Z",
+                 key_hash="aaaa", tier="free"),
+            _row(created_at="2026-04-21T10:00:00.000000Z",
+                 key_hash="bbbb", tier="premium"),
+            _row(created_at="2026-04-22T10:00:00.000000Z",
+                 key_hash="cccc", tier="free"),
+        ])
+        out = list_keys(manifest_path=manifest_path)
+        assert len(out) == 3
+
+    def test_sorted_newest_first(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T10:00:00.000000Z",
+                 key_hash="oldest"),
+            _row(created_at="2026-04-22T10:00:00.000000Z",
+                 key_hash="newest"),
+            _row(created_at="2026-04-21T10:00:00.000000Z",
+                 key_hash="middle"),
+        ])
+        out = list_keys(manifest_path=manifest_path)
+        assert [r["key_hash"] for r in out] == [
+            "newest", "middle", "oldest",
+        ]
+
+    def test_filter_by_tier(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="f1", tier="free"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="p1", tier="premium"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="f2", tier="free"),
+        ])
+        free = list_keys(
+            manifest_path=manifest_path, tier_filter="free",
+        )
+        assert {r["key_hash"] for r in free} == {"f1", "f2"}
+        prem = list_keys(
+            manifest_path=manifest_path, tier_filter="premium",
+        )
+        assert {r["key_hash"] for r in prem} == {"p1"}
+
+    def test_filter_by_tier_case_insensitive(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="f1", tier="free"),
+        ])
+        # "FREE" / " Free " all normalise to "free".
+        out = list_keys(
+            manifest_path=manifest_path, tier_filter="FREE",
+        )
+        assert {r["key_hash"] for r in out} == {"f1"}
+
+    def test_filter_by_ref(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="t1", ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="h1", ref_code="hn-launch"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="n1", ref_code=None),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            ref_filter="twitter-launch_2026",
+        )
+        assert {r["key_hash"] for r in out} == {"t1"}
+
+    def test_filter_by_ref_runs_through_sanitiser(
+        self, manifest_path: Path,
+    ):
+        """An operator typing ``--ref "twitter launch"`` (with a
+        space) sanitises to ``twitterlaunch`` — no row matches in
+        this case, but an operator pasting an XSS payload sanitises
+        to its safe substring and matches the row that was
+        sanitised at write time."""
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="x1", ref_code="scriptxssscript"),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            ref_filter="<script>xss</script>",
+        )
+        assert {r["key_hash"] for r in out} == {"x1"}
+
+    def test_empty_ref_filter_after_sanitise_is_treated_as_no_filter(
+        self, manifest_path: Path,
+    ):
+        """``--ref "!@#"`` sanitises to "" and we treat that as
+        "no filter" — better than silently filtering to zero rows."""
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="a", ref_code=None),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="b", ref_code="hn-launch"),
+        ])
+        out = list_keys(manifest_path=manifest_path, ref_filter="!@#")
+        assert {r["key_hash"] for r in out} == {"a", "b"}
+
+    def test_filters_are_anded(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="ft", tier="free", ref_code="twitter"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="pt", tier="premium", ref_code="twitter"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="fh", tier="free", ref_code="hn"),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            tier_filter="free",
+            ref_filter="twitter",
+        )
+        assert {r["key_hash"] for r in out} == {"ft"}
+
+    def test_malformed_lines_are_skipped(self, manifest_path: Path):
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            "\n".join([
+                "garbage",
+                "",
+                "[\"not a dict\"]",
+                json.dumps(_row(
+                    created_at="2026-04-20T00:00:00.000000Z",
+                    key_hash="ok",
+                )),
+            ])
+            + "\n",
+            encoding="utf-8",
+        )
+        out = list_keys(manifest_path=manifest_path)
+        assert {r["key_hash"] for r in out} == {"ok"}
+
+
+# ---------------------------------------------------------------------------
+# list_keys — output projection (defense in depth)
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62OutputProjection:
+    def test_only_documented_fields_emitted(self, manifest_path: Path):
+        """Even when the row carries extra fields (a poisoned /
+        hand-edited manifest), the output dict must contain ONLY
+        the public field-set."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                # Extra fields a Phase 6.0/6.1 row should NOT have.
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+                random_extra="HOSTILE_EXTRA_DO_NOT_LEAK",
+            ),
+        ])
+        (out,) = list_keys(manifest_path=manifest_path)
+        assert set(out.keys()) == set(LIST_OUTPUT_FIELDS)
+
+    def test_text_output_never_contains_secret_markers(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+            ),
+        ])
+        rendered = _format_list_text(
+            list_keys(manifest_path=manifest_path),
+        )
+        assert "HOSTILE_RAW_KEY_DO_NOT_LEAK" not in rendered
+        assert "HOSTILE_RAW_LABEL_DO_NOT_LEAK" not in rendered
+        assert "stripe.example/leak" not in rendered
+
+    def test_json_output_never_contains_secret_markers(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+            ),
+        ])
+        rendered = _format_list_json(
+            list_keys(manifest_path=manifest_path),
+        )
+        # Re-parse + spot-check.
+        parsed = json.loads(rendered)
+        for row in parsed:
+            assert set(row.keys()) == set(LIST_OUTPUT_FIELDS)
+        assert "HOSTILE_RAW_KEY_DO_NOT_LEAK" not in rendered
+        assert "HOSTILE_RAW_LABEL_DO_NOT_LEAK" not in rendered
+        assert "stripe.example/leak" not in rendered
+
+    def test_label_hash_is_not_emitted(self, manifest_path: Path):
+        """``label_hash`` IS in the manifest (Phase 6.0) but it's
+        not part of the public list-view contract — operators can
+        join elsewhere if they really need it. Keep the public
+        surface tight."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                label_hash="ABCDEF1234567890",
+            ),
+        ])
+        (out,) = list_keys(manifest_path=manifest_path)
+        assert "label_hash" not in out
+
+
+# ---------------------------------------------------------------------------
+# CLI — `keys list`
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62Cli:
+    def _env(self, manifest_path: Path) -> dict:
+        return {
+            **__import__("os").environ,
+            KEYS_MANIFEST_ENV_VAR: str(manifest_path),
+        }
+
+    def test_cli_list_all_text(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="aaaa1111", tier="free",
+                 ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="bbbb2222", tier="premium"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        # Newest first.
+        out = result.stdout
+        assert out.find("bbbb2222") < out.find("aaaa1111")
+        assert "twitter-launch_2026" in out
+        assert "premium" in out
+
+    def test_cli_filter_by_tier(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="freekey", tier="free"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="premkey", tier="premium"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "premium",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "premkey" in result.stdout
+        assert "freekey" not in result.stdout
+
+    def test_cli_filter_by_ref(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="thash", ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="hhash", ref_code="hn-launch"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--ref", "hn-launch",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "hhash" in result.stdout
+        assert "thash" not in result.stdout
+
+    def test_cli_combined_filters_anded(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="ft", tier="free", ref_code="twitter"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="pt", tier="premium", ref_code="twitter"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="fh", tier="free", ref_code="hn"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "free", "--ref", "twitter",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ft" in result.stdout
+        assert "pt" not in result.stdout
+        assert "fh" not in result.stdout
+
+    def test_cli_json_flag_emits_json_array(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="abcd1234", tier="premium",
+                 ref_code="hn-launch",
+                 checkout_session_id="cs_test_abc"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--json",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        row = rows[0]
+        assert set(row.keys()) == set(LIST_OUTPUT_FIELDS)
+        assert row["key_hash"] == "abcd1234"
+        assert row["tier"] == "premium"
+        assert row["ref_code"] == "hn-launch"
+        assert row["checkout_session_id"] == "cs_test_abc"
+
+    def test_cli_missing_manifest_text_fallback(
+        self, manifest_path: Path,
+    ):
+        # Don't write the file at all.
+        assert not manifest_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "(no records)" in result.stdout
+
+    def test_cli_missing_manifest_json_emits_empty_array(
+        self, manifest_path: Path,
+    ):
+        assert not manifest_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--json",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == []
+
+    def test_cli_invalid_tier_rejected(self, manifest_path: Path):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "enterprise",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 2
+
+    def test_cli_unknown_command_lists_both(self, capsys):
+        from trading_bot.api.keys import main as keys_main
+        rc = keys_main(["bogus"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        # Phase 6.2: the error message should mention BOTH commands.
+        assert "issue" in err
+        assert "list" in err
+
+    def test_cli_list_never_outputs_secret_markers(
+        self, manifest_path: Path,
+    ):
+        """End-to-end: a poisoned manifest with stray secret-looking
+        fields must not leak through the CLI."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-21T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/HOSTILE_LEAK",
+            ),
+        ])
+        # Both text and JSON CLI paths.
+        for json_flag in ([], ["--json"]):
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "trading_bot.api.keys",
+                    "list", *json_flag,
+                ],
+                capture_output=True, text=True,
+                env=self._env(manifest_path),
+            )
+            assert result.returncode == 0, result.stderr
+            for marker in (
+                "HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                "HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                "HOSTILE_LEAK",
+                "checkout_url",
+            ):
+                assert marker not in result.stdout, (
+                    f"CLI {json_flag} leaked: {marker!r}"
+                )
