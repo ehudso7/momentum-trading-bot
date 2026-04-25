@@ -3579,454 +3579,327 @@ streak always has a target to chase.
   ``tests/test_stickiness.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
-### Phase 10.3 — viral loop optimization
+### Phase 10.1 — shareability layer
 
-Phase 10.3 closes the growth loop by tracking **what we send out**
-(``share_generated``) and **what comes back in** (``inbound_visit``).
-Both events are written to a new JSONL log that follows the same
-schema, hashing, and best-effort failure posture as the Phase 5.1 /
-5.5 / 8.4 logs, so BI pipelines can join all five files on
-``api_key_hash``.
+A small, stable copy-paste-ready ``share`` payload attached to
+each Phase 9.1 insight and to the Phase 9.2 daily hook so any
+caller can drop the text into a tweet, Slack, email, or any
+short-form channel without doing string-stitching of their own.
 
-**The two events**
+**Module**
 
-| Event              | Emitted when                                         |
-|--------------------|------------------------------------------------------|
-| ``share_generated``| ``server._build_share_payload`` attached a share envelope to a response (one row per response, never duplicated). |
-| ``inbound_visit``  | A request arrived with a non-empty ``?src=<token>`` query parameter; first-touch source captured. |
+``trading_bot/api/share.py`` — pure stdlib, imports nothing from
+FastAPI / structlog / the rest of ``trading_bot``. Two public
+entry points:
 
-**The on-the-wire share envelope** (attached to ``/reports/latest``
-for both tiers — sharing is a viral-loop signal, not a tier
-gate)::
+```python
+build_insight_share(insight, *, is_premium, base_url)   -> dict | None
+build_daily_hook_share(hook,  *, is_premium, base_url)  -> dict | None
+```
 
+**Share schema** (every entry conforms when the helpers do not
+return ``None``)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``text`` | ``str`` | short, human-readable, copy-paste-ready |
+| ``cta``  | ``str`` | stable ``"Try it yourself"`` |
+| ``url``  | ``str`` | the deployment's public URL (Phase 7.3 ``TRADING_PUBLIC_BASE_URL``), with trailing slashes stripped |
+
+**Source rules**
+
+* Insight share: keyed on the insight's ``id``. Three rule IDs
+  have copy:
+  * ``trend.buy_delta``
+  * ``promotion.readiness``
+  * ``regime.dominant``
+
+  Insights with an unrecognised ``id`` get no ``share`` field
+  (fail-closed for future rules without copy).
+* Daily-hook share: every hook with a ``change`` value gets copy.
+* Both helpers return ``None`` when ``TRADING_PUBLIC_BASE_URL`` is
+  unset / blank — without a public URL the share field can't link
+  anywhere, so the field is omitted entirely. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Tier-aware copy**
+
+Both tiers receive a ``share`` field with the same SHAPE; the
+``text`` is what differs:
+
+| Insight / hook | Free copy | Premium copy |
+|---|---|---|
+| ``trend.buy_delta`` (up 10, +50%) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%)." |
+| ``promotion.readiness`` (ready, 25 days) | "Momentum Trading Bot promotion gate is GREEN after 25 consecutive passing day(s)." | "Momentum Trading Bot: promotion gate READY after 25 consecutive passing day(s)." |
+| ``promotion.readiness`` (blocked, 0 days) | "Momentum Trading Bot promotion gate is currently blocked." | "Momentum Trading Bot: promotion gate BLOCKED — no passing streak yet." |
+| ``regime.dominant`` (trending, 12 hits, 80% share) | "Momentum Trading Bot: 'trending' regime led today's signals." | "Momentum Trading Bot: 'trending' regime dominated with 12 hits (80.0% share)." |
+| ``daily_hook`` (up 10) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: Buys up 10 vs prior day (trending up)." |
+
+Premium copy carries the percent / share / streak figures so the
+text stands on its own as a social hook; free copy is the plain
+plain-language equivalent. The CTA and URL are identical.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — every insight returned in the
+  ``insights`` list is decorated via
+  ``_decorate_insights_with_share`` AFTER tier truncation, and
+  the daily hook is decorated via ``_decorate_daily_hook_with_share``.
+  The decoration helpers return a NEW list / dict (no mutation)
+  so a future serialiser can't accidentally see a share field on
+  a re-fetched insight.
+
+  Free callers see the share text matching what they receive in
+  the rest of the body (e.g. they don't see the percent figure
+  in their truncated trend insight, so the share text doesn't
+  include it either).
+* ``GET /dashboard`` — share is a JSON-payload concept; the HTML
+  dashboard does not surface it. (A future Phase 10.x can wire
+  share text into rendered banners if needed.)
+
+**Sample free response excerpt**
+
+```json
+{
+  "insights": [
     {
+      "id": "trend.buy_delta",
+      "title": "Buy volume up vs prior day",
+      "summary": "Buys advanced 10 → 30 (was 20).",
+      "confidence": 0.5,
+      "severity": "info",
+      "evidence": {"delta": 10, "direction": "up"},
+      "action": "monitor for sustained improvement",
       "share": {
-        "share_url": "https://example/.../reports/latest?src=<key_hash>",
-        "hint":      "Share this preview",
-        "src":       "<sanitised inbound src>" | null,
-        "endpoint":  "/reports/latest"
+        "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
       }
     }
-
-  * ``share_url`` carries the caller's own ``key_hash`` as the
-    outbound ``?src=`` token so an inbound visit triggered by the
-    share can be attributed back to the originator without ever
-    leaking the raw API key. The hash is the same SHA-256[:32] used
-    by every other API log.
-  * When ``TRADING_PUBLIC_BASE_URL`` is unset the URL falls back
-    to a relative form; the payload is still attached and the event
-    still fires so the operator gets the same telemetry
-    in development.
-
-**The recorded JSONL row** (``data/api_share_events.jsonl`` by
-default, override via ``TRADING_API_SHARE_EVENTS_LOG_PATH``)::
-
-    {
-      "timestamp":    "2026-04-25T12:34:56.000000Z",
-      "api_key_hash": "<SHA-256[:32]>",
-      "event":        "share_generated" | "inbound_visit",
-      "endpoint":     "/reports/latest",
-      "src":          "<sanitised src>" | null,
-      "request_id":   "<32-hex>" | null
+  ],
+  "daily_hook": {
+    "headline":   "Buys up 10 vs prior day",
+    "change":     "up",
+    "magnitude":  10,
+    "since":      "2026-04-24",
+    "cta":        "Open the dashboard for the full breakdown",
+    "share": {
+      "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+      "cta":  "Try it yourself",
+      "url":  "https://momentum-trading-bot-production.up.railway.app"
     }
+  }
+}
+```
 
-  * ``record_share_event(key_hash, type, endpoint, *, src=None, request_id=None)``
-    is the single public helper. Like Phase 8.4's funnel writer, it
-    refuses raw API keys: callers MUST pre-hash. Unknown event
-    types and empty hashes are dropped silently with a structured
-    DEBUG log; the helper never raises.
-  * ``src`` is sanitised to the same charset as the Phase 5.1
-    growth ``ref_code`` (``[A-Za-z0-9\-_:.]``, capped at 64 chars)
-    so the share log and the growth log can be joined cleanly on
-    ``(api_key_hash, src)`` ↔ ``(api_key_hash, ref_code)``.
+**Sample premium response excerpt**
 
-**Privacy posture**
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "evidence": {
+        "delta": 10, "direction": "up",
+        "curr_buy_rows": 30, "prev_buy_rows": 20,
+        "percent_change": 50.0
+      },
+      "share": {
+        "text": "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%).",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      },
+      "...": "..."
+    }
+  ]
+}
+```
 
-  * Raw API keys are **never** persisted — only the SHA-256[:32]
-    hash that already appears in
-    server / billing / conversion / growth / upgrade-events logs.
-  * No IP, no User-Agent, no email, no name, no payment field
-    ever enters a record. The only inputs are the opaque key hash,
-    the event name, the request endpoint, the (sanitised) src
-    token, and the Phase 4.4 request_id.
-  * A leak-guard test plants unique markers in every input slot
-    and asserts they never appear in the persisted JSONL.
+**Privacy invariants (every one tested)**
 
-**Failure posture**
-
-  * The share-events writer is best-effort: every exception path
-    is caught and logged at DEBUG. A disk failure inside the
-    writer must NEVER fail the underlying ``/reports/latest``
-    response. Pinned by
-    ``tests/test_share_events.py::TestServerIntegration::test_logging_failure_does_not_break_response``.
-  * Thread-safe via a module-level ``threading.Lock``; concurrent
-    callers cannot interleave a single JSONL line.
+* No raw API key in any ``share`` field. Pinned by
+  ``TestPhase101NoLeak::test_raw_key_absent_from_share_text``.
+* Share text never includes evidence the caller doesn't already
+  see — a free caller's trend share never carries the
+  percent-change figure that Phase 8.2 trims from their evidence.
+  Pinned by ``TestPhase101InsightShareFreeUser::test_free_share_text_uses_plain_copy``.
+* Share is omitted entirely when ``TRADING_PUBLIC_BASE_URL`` is
+  unset, so a misconfigured deployment can't surface a dangling
+  URL or a placeholder string. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
 
 **Boundary**
 
-* No new HTTP route. Phase 10.3 is helper code wired into the
-  existing ``/reports/latest`` route. Existing tests that assert
-  the route inventory continue to pass unchanged.
-* No new mutating endpoint — both events are side-effects of a
-  GET request.
-* No new env vars are required to enable the feature; the only
-  knob is ``TRADING_API_SHARE_EVENTS_LOG_PATH`` for relocating the
-  JSONL file.
-* ``trading_bot/api/share_events.py`` is a sibling of
-  ``upgrade_events.py`` and shares its CLI shape::
-
-      python -m trading_bot.api.share_events --summary
-      python -m trading_bot.api.share_events --summary --json
+* No new HTTP route. Phase 10.1 is helper code wired into
+  existing routes. Pinned by
+  ``TestPhase101CrossCutting::test_no_new_mutating_route``.
+* No new persistence — share text is computed per request from
+  data the caller is already receiving.
+* No new env vars. ``TRADING_PUBLIC_BASE_URL`` is the same env
+  var Phase 7.3 / 8.3 already use.
+* ``trading_bot/api/share.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_share.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
-### Phase 10.4 — growth intelligence layer
+### Phase 10.2 — public entry layer
 
-Phase 10.4 turns the existing JSONL telemetry (Phase 8.4 upgrade
-events + Phase 10.3 share events) into operator-facing growth
-insights. It is **read-only**: no new endpoint, no new file
-written, no schema changes. It joins the two logs on the shared
-``api_key_hash`` column to surface conversion + viral metrics.
+Lets unauthenticated callers experience the product instantly,
+without a key. Two surfaces are widened:
 
-**The headlines** surfaced by ``summarize`` and the CLI:
+  * ``GET /`` — content-negotiated. HTML by default (Phase 5.2
+    landing page unchanged); JSON preview when the caller
+    explicitly sends ``Accept: application/json``.
+  * ``GET /reports/latest`` — when no ``Authorization`` header is
+    present, returns the same free-tier projection an
+    authenticated free user would get, plus ``preview: True`` and
+    a ``get_started`` block.
 
-| Headline                  | Definition                                                   |
-|---------------------------|--------------------------------------------------------------|
-| ``top_converting_trigger``| The Phase 8.4 ``reason`` value with the highest shown→completed rate (subject to ``min_impressions`` floor). |
-| ``top_performing_insight``| The ``endpoint`` with the highest shown→completed rate. Each Phase 9.1/9.2/9.3 insight surface is hosted at a known endpoint, so endpoint stands in as the operator-facing insight identifier. |
-| ``best_source``           | The inbound ``src`` token whose visitors converted at the highest rate, attributed via ``api_key_hash``. |
-| ``overall_conversion_rate``| ``upgrade_completed`` / ``upgrade_shown`` across the whole funnel. |
+A new soft-auth dependency drives both surfaces:
 
-**Public API**
+```python
+optional_api_key(request, creds=Depends(_security)) -> Optional[str]
+```
 
-::
+* ``creds is None`` (no header) → returns ``None``; route handler
+  branches into preview mode.
+* Header present → delegates to ``require_api_key``, which
+  preserves every existing failure mode unchanged (401 for a
+  non-Bearer scheme handled at the FastAPI layer; 403 for an
+  invalid / revoked token; 503 when the deployment isn't
+  configured for any auth source).
 
-    from trading_bot.api.growth_intel import (
-        load_upgrade_events,
-        load_share_events,
-        summarize,
-        format_summary_text,
-    )
+The asymmetry is deliberate: an invalid header still rejects
+loudly. Preview mode is reserved for genuine "I'm just looking"
+traffic that doesn't try to authenticate at all.
 
-    summary = summarize()                       # default paths
-    summary = summarize(
-        upgrade_path="...",                     # explicit override
-        share_path="...",
-        min_impressions=5,                      # noise floor
-        min_inbound=3,
-    )
+**`get_started` block**
 
-The summary dict is JSON-serialisable and stable: ``conversion_funnel``,
-``by_reason``, ``by_insight``, ``share_funnel``, ``by_src``,
-``attribution_by_src``, ``headlines``, ``totals``.
+Stable shape returned alongside every preview surface:
 
-**CLI**
+```json
+{
+  "label": "Get a free API key from the operator to unlock the full report.",
+  "endpoint": "/reports/latest",
+  "command": "python -m trading_bot.api.keys issue --tier free --label <your-label>"
+}
+```
 
-::
+**Sample `GET /` JSON response**
 
-    python -m trading_bot.api.growth_intel --summary
-    python -m trading_bot.api.growth_intel --summary --json
-    python -m trading_bot.api.growth_intel --summary \
-        --upgrade-path path/to/upgrade.jsonl \
-        --share-path  path/to/share.jsonl \
-        --min-impressions 5 --min-inbound 3
+```bash
+curl -H "Accept: application/json" https://your-host.example.com/
+```
 
-**Privacy posture**
+```json
+{
+  "preview": true,
+  "get_started": {...},
+  "daily_hook": {
+    "headline":  "Buys up 10 vs prior day",
+    "change":    "up",
+    "magnitude": 10,
+    "since":     "2026-04-24",
+    "cta":       "Open the dashboard for the full breakdown",
+    "share":     {...}
+  },
+  "top_insight": {
+    "id":         "trend.buy_delta",
+    "title":      "Buy volume up vs prior day",
+    "summary":    "Buys advanced 10 → 30 (was 20).",
+    "evidence":   {"delta": 10, "direction": "up"},
+    "confidence": 0.5,
+    "severity":   "info",
+    "action":     "monitor for sustained improvement",
+    "share":      {...}
+  }
+}
+```
 
-* Only aggregated dimensions reach the summary — no
-  ``api_key_hash`` column appears in the output, even though
-  the loaders read it for the cross-funnel join.
-* The leak-guard test plants a unique marker as the would-be raw
-  key, hashes it, and asserts neither the raw marker nor the
-  individual hash appears in the rendered summary.
-* Loaders are tolerant of missing / blank / malformed rows;
-  summary always succeeds even on an empty pair of logs.
+The shape is deliberately tighter than ``/reports/latest`` —
+only the daily hook + the single top-priority insight, both
+through the free-tier projection. The full insight list and the
+Phase 9.3 streak / nudge fields stay on ``/reports/latest`` so
+``GET /`` remains a teaser.
 
-**Boundary**
+**Sample `GET /reports/latest` unauthenticated response**
 
-* ``trading_bot/api/growth_intel.py`` imports only stdlib +
-  structlog (DEBUG-only) + the ``share_events`` / ``upgrade_events``
-  sibling modules for their event constants. No FastAPI / Stripe /
-  Core import. Pinned by
-  ``tests/test_growth_intel.py::TestBoundary::test_module_does_not_import_core``.
-* No new HTTP route, no new mutating endpoint, no new persistence —
-  the module is invoked offline (CLI, notebook, or BI pipeline).
-* No new env vars beyond the existing
-  ``TRADING_API_UPGRADE_EVENTS_LOG_PATH`` and
-  ``TRADING_API_SHARE_EVENTS_LOG_PATH``.
+Same shape as the authenticated free response (Phase 8.2 / 9.x
+projections), with two additional fields:
 
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "totals": {...},
+  "promotion_readiness": {...},
+  "insights": [...],
+  "daily_hook": {...},
+  "streak": {...},
+  "nudge": {...},
+  "preview": true,
+  "get_started": {...}
+}
+```
 
-### Phase 10.5 — optimization loop
+The ``upgrade`` envelope (Phase 8.3 Stripe Checkout URL) is
+deliberately absent on the preview path — a caller without a key
+can't be promoted via Stripe Checkout yet (no key for the
+metadata). They first need to issue a key via the operator CLI;
+the ``get_started.command`` carries that exact instruction.
 
-Phase 10.5 turns the Phase 10.4 ``summarize`` output into a
-deterministic, ordered list of operator-facing recommendations.
-Same summary in ⇒ same numbered output. No clock reads, no disk
-reads, no network — all rules are pure functions of the
-``summary`` dict.
+**Authenticated callers**
 
-**Public API**
+Authenticated free and authenticated premium responses are
+UNCHANGED. They never carry the ``preview`` / ``get_started``
+markers — those are exclusive to the public-entry surface.
+Pinned by ``test_authenticated_free_does_not_get_preview_marker``
+and ``test_authenticated_premium_does_not_get_preview_marker``.
 
-::
+**Auth matrix**
 
-    from trading_bot.api.growth_intel import (
-        generate_recommendations,
-        format_recommendations_text,
-        summarize,
-    )
+| Header | Result |
+|---|---|
+| (none) | 200 + preview + ``get_started`` |
+| ``Authorization: Basic …`` | 200 + preview (HTTPBearer treats non-Bearer as ``creds=None``) |
+| ``Authorization: Bearer <invalid>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <revoked>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <valid free>`` | 200 + free body (no preview marker) |
+| ``Authorization: Bearer <valid premium>`` | 200 + full body (no preview marker) |
 
-    recs = generate_recommendations(summarize())
-    print(format_recommendations_text(recs))
+**Privacy invariants (every one tested)**
 
-**Recommendation schema** — every entry on the returned list::
-
-    {
-      "id":        str,   # stable identifier (see VALID_RECOMMENDATION_IDS)
-      "priority":  str,   # "high" | "medium" | "low"
-      "title":     str,   # short headline
-      "rationale": str,   # cites concrete metrics from the summary
-      "action":    str,   # concrete next step
-    }
-
-**Rules** (deterministic; each rule is a pure function of the
-summary):
-
-| Rule id                     | Fires when                                                                                                           |
-|-----------------------------|----------------------------------------------------------------------------------------------------------------------|
-| ``amplify_top_trigger``     | ``headlines.top_converting_trigger`` is non-null. Priority scales with the trigger's shown→completed rate.           |
-| ``feature_top_insight``     | ``headlines.top_performing_insight`` is non-null. Priority scales with the endpoint's shown→completed rate.          |
-| ``double_down_best_source`` | ``headlines.best_source`` is non-null. Priority scales with the source's completion rate.                            |
-| ``tighten_free_limit``      | ``by_reason.usage_limit`` exists, its absolute rate ≥ 10 %, and the rate is ≥ 1.5× the overall conversion rate.      |
-| ``insufficient_data``       | Fallback when no other rule fires. Priority is always ``low``.                                                       |
-
-Priority bands::
-
-    rate >= 25 %  →  "high"
-    rate >= 10 %  →  "medium"
-    otherwise     →  "low"
-
-The returned list is ordered HIGH → MEDIUM → LOW, with stable
-rule order preserved within each priority bucket so the numbered
-CLI output is repeatable.
-
-**CLI**
-
-::
-
-    python -m trading_bot.api.growth_intel --recommend
-    python -m trading_bot.api.growth_intel --recommend --json
-    python -m trading_bot.api.growth_intel --summary --recommend
-
-JSON shape rules (preserves the Phase 10.4 contract):
-
-* ``--summary --json`` alone   → bare summary dict.
-* ``--recommend --json`` alone → bare list of recommendations.
-* ``--summary --recommend --json`` → ``{summary, recommendations}``.
-
-**Privacy posture**
-
-* The summary surface already strips ``api_key_hash`` columns
-  (Phase 10.4); the recommendation surface inherits that and
-  cites only aggregated dimensions (reason, endpoint, src) plus
-  rate / count integers. A leak-guard test plants a unique raw-
-  key marker, hashes it, and asserts neither the marker nor the
-  individual hash appears in the rendered recommendations.
-* No raw API key ever flows into a recommendation field — pinned
-  by ``tests/test_growth_intel.py::TestRecommendationsLeakGuard``.
+* No raw API key in any preview body. Pinned by
+  ``TestPhase102NoLeak`` (2 tests).
+* Preview never surfaces premium-only fields (``tier_stats``,
+  ``reason_stats``, ``regime_stats``, ``decile_stats``,
+  ``shadow_filter_simulation``, ``guardrails``, ``sources``).
+  Pinned by ``test_preview_omits_premium_only_fields``.
+* Preview insight evidence uses the Phase 9.1 free allow-list
+  exactly. Pinned by
+  ``test_preview_insight_evidence_uses_free_allowlist``.
+* Preview never writes a usage-log row — the Phase 4.6
+  ``usage_middleware`` short-circuits when
+  ``request.state.api_key`` is unset, which it stays for unauth
+  requests. Pinned by
+  ``test_preview_does_not_count_against_usage``.
+* The Phase 4.2 per-IP rate limiter still applies to preview
+  traffic (60 req/min default), so a misbehaving client cannot
+  hammer the public surface without consequence.
 
 **Boundary**
 
-* No new HTTP route, no new persistence, no new env vars.
-* ``generate_recommendations`` is pure: deterministic, side-effect
-  free, never raises (defensive ``try`` wraps each rule).
-* The "tighten free limit" rule references reversible Phase 5.4 /
-  8.1 knobs; it never recommends raising bounds beyond their
-  hard-coded safety ceilings, and the action text spells out the
-  revert criteria.
-
-
-### Phase 11 — execution layer
-
-Phase 11 closes the optimisation loop by **safely** applying the
-highest-priority Phase 10.5 recommendation under deterministic
-bounds. Today only one recommendation kind is mechanically
-actionable — ``tighten_free_limit`` — and even that change happens
-via an in-process ``os.environ`` mutation: nothing on disk
-changes except a single audit row in
-``data/api_execution_log.jsonl``.
-
-**Operator workflow**
-
-::
-
-    # Read-only dry-run.
-    python -m trading_bot.api.execution --apply
-
-    # Mutate the env var in this process + append one audit row.
-    python -m trading_bot.api.execution --apply --force
-
-    # JSON envelope for scripts.
-    python -m trading_bot.api.execution --apply --force --json
-
-The mutation is **transient**: it survives only the lifetime of
-the Python process. A rolling-restart-safe rollout requires the
-operator to update the deployment env file separately. This
-keeps the CLI's blast radius bounded — a misclick reverts the
-moment the shell exits.
-
-**Guardrails** (hard-coded; cannot be overridden by env vars)
-
-| Bound                     | Value                                  |
-|---------------------------|----------------------------------------|
-| ``FREE_LIMIT_MIN``        | 10  (free tier never collapses)         |
-| ``FREE_LIMIT_MAX``        | 200 (free tier never exceeds premium)   |
-| ``MAX_CHANGE_PCT``        | 0.30 (per-apply blast radius cap)       |
-| ``TIGHTEN_REDUCTION_PCT`` | 0.25 (default 25 % reduction step)      |
-
-The validation order (most-specific-first):
-
-1. ``rejected_no_change``         — proposed value equals current
-2. ``rejected_out_of_bounds``     — outside ``[10, 200]``
-3. ``rejected_change_too_large``  — relative change > 0.30
-
-A rejected plan never mutates ``os.environ``. In ``--force``
-mode the rejected attempt is still appended to the audit log
-(with ``outcome="rejected_..."``) so the audit trail captures
-every attempted change. In ``--apply`` (dry-run) mode the audit
-log is never touched, even on rejection.
-
-**Action log schema** — one row per ``--force`` invocation
-(default path: ``data/api_execution_log.jsonl``, override via
-``$TRADING_API_EXECUTION_LOG_PATH``)::
-
-    {
-      "timestamp":          "...Z",
-      "recommendation_id":  "tighten_free_limit",
-      "priority":           "high" | "medium" | "low",
-      "action":             "set_free_limit",
-      "env_var":            "TRADING_FREE_DAILY_REQUEST_LIMIT",
-      "previous_value":     int,
-      "new_value":          int,
-      "delta":              int,
-      "delta_pct":          float (signed),
-      "outcome":            "applied" | "rejected_..." | ...,
-      "rejection_reason":   str (only on rejected outcomes)
-    }
-
-  * No ``api_key_hash`` field — the execution layer operates on
-    aggregated metrics, not per-user data. A leak-guard test
-    plants would-be raw markers and asserts the row contains no
-    32-char hex token.
-
-**Exit codes** (so CI / scripts can branch deterministically)
-
-* ``0`` — applied / dry_run / no_actionable_recommendation
-* ``2`` — usage error (``--apply`` not provided)
-* ``3`` — rejected_* (operator must investigate)
-
-**Boundary**
-
-* No new HTTP route, no new mutating endpoint, no new persistence
-  surface beyond the audit log.
-* ``trading_bot/api/execution.py`` imports only stdlib +
-  structlog (DEBUG-only) + ``growth_intel`` for its public API;
-  pinned by
-  ``tests/test_api_execution.py::TestBoundary::test_module_does_not_import_core``.
-* No raw API key is ever read or written; the layer's only inputs
-  are aggregated Phase 10.4 metrics.
-* The set of applicable recommendations is gated by the private
-  ``_APPLICABLE_REC_IDS`` frozenset. Marketing / copy /
-  dashboard recommendations (``amplify_top_trigger``,
-  ``feature_top_insight``, ``double_down_best_source``,
-  ``insufficient_data``) are surfaced to the operator without
-  any automatic action.
-
-
-### Phase 11.1 — operator rollout plan
-
-Phase 11 mutates the live ``os.environ`` only inside the calling
-Python process — convenient for testing, useless for a rolling
-restart. Phase 11.1 makes the same execution layer **operationally
-usable** by adding three CLI surfaces that emit shell-pasteable
-operator artifacts. None of them touch Railway, mutate
-infrastructure, write the action log, or change ``os.environ``.
-
-**The three modes**
-
-| Flag              | Stdout (text)                                                        | JSON envelope mode  |
-|-------------------|----------------------------------------------------------------------|---------------------|
-| ``--export-env``  | ``KEY=VALUE`` for the planned new value (one line, copy/paste).      | ``"export_env"``    |
-| ``--rollback``    | ``KEY=VALUE`` for the previous value (one line, copy/paste).         | ``"rollback"``      |
-| ``--rollout-plan``| Numbered 6-step operator checklist + shell helpers.                  | ``"rollout_plan"``  |
-
-When no actionable recommendation is available, ``--export-env``
-and ``--rollback`` print a ``# no actionable recommendation`` shell
-comment so the line is still safe to paste into a script.
-``--rollout-plan`` prints a human-readable explanation under the
-same banner header.
-
-**Operator workflow**
-
-::
-
-    # 1. Inspect what would change (no side effects).
-    python -m trading_bot.api.execution --rollout-plan
-
-    # 2. Grab the env assignment for the deploy.
-    NEW=$(python -m trading_bot.api.execution --export-env)
-    echo "$NEW"
-    # → TRADING_FREE_DAILY_REQUEST_LIMIT=38
-
-    # 3. Set the var on Railway (or your deployment env file)
-    #    and redeploy.
-
-    # 4. Smoke the deployed URL.
-    python -m trading_bot.api.launch_check --smoke
-
-    # 5. Monitor for 7 days.
-    python -m trading_bot.api.growth_intel --summary --recommend
-
-    # 6. If click-through or conversion drops, paste the rollback:
-    python -m trading_bot.api.execution --rollback
-    # → TRADING_FREE_DAILY_REQUEST_LIMIT=50
-    # … then redeploy.
-
-**JSON envelope** (used by ``--export-env --json``,
-``--rollback --json``, and ``--rollout-plan --json``)::
-
-    {
-      "mode":                  "export_env" | "rollback" | "rollout_plan",
-      "recommendation_id":     "tighten_free_limit" | null,
-      "priority":              "high" | "medium" | "low" | null,
-      "action":                "set_free_limit" | null,
-      "env_var":               "TRADING_FREE_DAILY_REQUEST_LIMIT" | null,
-      "previous_value":        int | null,
-      "new_value":             int | null,
-      "rollback_value":        int | null,
-      "export_command":        "export KEY=VALUE" | null,
-      "rollback_command":      "export KEY=VALUE" | null,
-      "rollout_steps":         [str, ...],
-      "monitoring_window_days": 7,
-      "actionable":            bool
-    }
-
-The shape is **stable across all three modes** — only ``mode``
-varies — so a downstream consumer can branch on the discriminator
-and read the same fields. ``actionable=False`` indicates the
-no-op shape (every plan-derived field is ``null`` and
-``rollout_steps`` is ``[]``).
-
-**Boundary** (Phase 11 invariants preserved)
-
-* No new HTTP route, no Railway / Stripe / network call.
-* ``--export-env`` / ``--rollback`` / ``--rollout-plan`` are
-  mutually exclusive with each other AND with ``--apply``;
-  argparse rejects any combination.
-* ``--force`` is ignored by the rollout modes.
-* No ``api_key_hash`` field on any rollout artifact, even when
-  the underlying funnel data was driven by hashed users; pinned
-  by ``tests/test_api_execution.py::TestRolloutArtifactNoLeak``.
-* Existing Phase 11 ``--apply`` / ``--apply --force`` behaviour
-  is byte-identical; pinned by
-  ``test_existing_apply_force_path_unchanged``.
+* No new HTTP route. ``GET /`` and ``GET /reports/latest``
+  are both pre-existing routes whose behaviour was widened.
+  Pinned by ``TestPhase102CrossCutting::test_no_new_mutating_route``.
+* No new persistence — preview is computed per request from the
+  same files Phase 9.x already reads.
+* No new env vars.
+* The ``optional_api_key`` dependency lives in ``server.py``
+  alongside ``require_api_key``; both delegate to the same
+  validation chain, only differing in their fail-OPEN-on-missing
+  posture.
 
 
 ## Phase 2.7 — dataset rotation (reference)
