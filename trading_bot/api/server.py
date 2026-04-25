@@ -1162,6 +1162,193 @@ def _build_upgrade_payload(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 10.3 — Viral loop (share + first-touch source)
+# ---------------------------------------------------------------------------
+
+#: Static hint copy attached to every share payload. Lives in one
+#: place so dashboards / integrators can pin against a stable string
+#: for A/B testing.
+SHARE_HINT = "Share this preview"
+
+#: Sentinel value used by clients that want to surface a share
+#: payload without exposing a public URL (e.g. when
+#: ``TRADING_PUBLIC_BASE_URL`` is unset). The payload is still
+#: attached so the caller can render an in-app share UI and the
+#: ``share_generated`` event still fires.
+_SHARE_FALLBACK_PATH = "/"
+
+
+def _build_share_url(base_url: str, endpoint: str, src: str) -> str:
+    """
+    Compose a public share URL that preserves the caller's
+    attribution token. The ``src`` value is already sanitised by
+    ``share_events.sanitize_src`` before it reaches this helper.
+
+    Pure; never hits the network.
+    """
+    base = (base_url or "").rstrip("/")
+    path = endpoint if endpoint.startswith("/") else "/" + (endpoint or "")
+    qs = f"?src={src}" if src else ""
+    return base + path + qs
+
+
+def _build_share_payload(
+    request: Request,
+    *,
+    endpoint: str,
+    key_hash: Optional[str] = None,
+    src: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Phase 10.3 — share-payload builder.
+
+    Returns the documented dict shape::
+
+        {
+          "share_url": "<public URL with ?src=<key-hash>>",
+          "hint":      "Share this preview",
+          "src":       "<sanitised inbound src>" | null,
+          "endpoint":  "/reports/latest"
+        }
+
+    The ``src`` token used in the outbound ``share_url`` is the
+    caller's own ``key_hash`` so an inbound visit triggered by the
+    share can be attributed back to the originating user without
+    ever leaking the raw API key. The inbound ``?src=`` value (if
+    any) is echoed back in the ``src`` field so a client can render
+    "you arrived via …" context — same value that was logged.
+
+    Returns ``None`` only when no key hash is available — there is
+    nothing to attribute, so the payload is omitted rather than
+    fabricated. Stripe / network never touched.
+    """
+    # Find the caller's hash. Prefer the cached one set by
+    # require_api_key (Phase 6.2); otherwise re-extract the bearer
+    # so this helper works from middleware that fires BEFORE the
+    # auth dependency.
+    if not key_hash:
+        cached = getattr(
+            getattr(request, "state", None), "api_key_hash", None,
+        )
+        if cached:
+            key_hash = cached
+    if not key_hash:
+        api_key = _extract_bearer_token(request)
+        if api_key:
+            try:
+                key_hash = key_store.hash_api_key(api_key)
+            except Exception:
+                key_hash = None
+    if not key_hash:
+        return None
+
+    base = (os.getenv(PUBLIC_BASE_URL_ENV_VAR, "") or "").strip()
+    share_path = endpoint or _SHARE_FALLBACK_PATH
+    share_url = _build_share_url(base, share_path, key_hash)
+
+    # Lazy import — keeps the SaaS boundary explicitly clean and
+    # mirrors the pattern used by ``_emit_upgrade_event``.
+    try:
+        from trading_bot.api.share_events import (
+            EVENT_SHARE_GENERATED, record_share_event, sanitize_src,
+        )
+        cleaned_src = sanitize_src(src) if src else ""
+        request_id = getattr(
+            getattr(request, "state", None), "request_id", None,
+        )
+        record_share_event(
+            key_hash=key_hash,
+            type=EVENT_SHARE_GENERATED,
+            endpoint=share_path,
+            src=cleaned_src or None,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        # Telemetry must NEVER affect the outgoing response or the
+        # caller's latency.
+        log.debug("share_events.share_generated_emit_error", error=str(exc))
+        cleaned_src = ""
+
+    return {
+        "share_url": share_url,
+        "hint": SHARE_HINT,
+        "src": cleaned_src or None,
+        "endpoint": share_path,
+    }
+
+
+def _emit_inbound_visit_event(
+    request: Request,
+    *,
+    endpoint: str,
+    key_hash: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Phase 10.3 — first-touch capture.
+
+    Reads ``?src=`` from the request, sanitises it via the
+    share-events sanitiser, and (if non-empty) appends one
+    ``inbound_visit`` row to the share-events JSONL. Returns the
+    sanitised src on success or ``None`` when no src is present /
+    no key_hash is available.
+
+    Best-effort: every failure path is caught and logged at DEBUG.
+    """
+    try:
+        raw_src = request.query_params.get("src")
+    except Exception:
+        return None
+    if not raw_src:
+        return None
+
+    try:
+        from trading_bot.api.share_events import (
+            EVENT_INBOUND_VISIT, record_share_event, sanitize_src,
+        )
+        cleaned = sanitize_src(raw_src)
+    except Exception as exc:
+        log.debug("share_events.inbound_sanitize_error", error=str(exc))
+        return None
+    if not cleaned:
+        return None
+
+    if not key_hash:
+        cached = getattr(
+            getattr(request, "state", None), "api_key_hash", None,
+        )
+        if cached:
+            key_hash = cached
+    if not key_hash:
+        api_key = _extract_bearer_token(request)
+        if api_key:
+            try:
+                key_hash = key_store.hash_api_key(api_key)
+            except Exception:
+                key_hash = None
+    if not key_hash:
+        # Anonymous inbound visit — nothing to attribute, so we
+        # echo the cleaned src back to the caller but do not log a
+        # row (the JSONL has no useful columns to fill).
+        return cleaned
+
+    try:
+        request_id = getattr(
+            getattr(request, "state", None), "request_id", None,
+        )
+        record_share_event(
+            key_hash=key_hash,
+            type=EVENT_INBOUND_VISIT,
+            endpoint=endpoint,
+            src=cleaned,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        log.debug("share_events.inbound_visit_emit_error", error=str(exc))
+
+    return cleaned
+
+
 def _premium_required_response(
     request: Request,
     tier: str,
@@ -2634,6 +2821,20 @@ def latest_report(
     streak = build_streak(data, prev)
     nudge = build_nudge(data, prev)
 
+    # Phase 10.3 — first-touch capture: read ``?src=`` once and
+    # log a single ``inbound_visit`` row before the response is
+    # built. Returns the sanitised src so the share payload can
+    # echo it back to the caller.
+    inbound_src = _emit_inbound_visit_event(
+        request, endpoint="/reports/latest",
+    )
+    # Phase 10.3 — share payload. Attached to BOTH tiers (the
+    # viral loop is desirable from any tier). Logs one
+    # ``share_generated`` row.
+    share = _build_share_payload(
+        request, endpoint="/reports/latest", src=inbound_src,
+    )
+
     if _is_premium_user(request):
         data["insights"] = insights
         if daily_hook is not None:
@@ -2642,6 +2843,8 @@ def latest_report(
             data["streak"] = streak
         if nudge is not None:
             data["nudge"] = nudge
+        if share is not None:
+            data["share"] = share
         return data
     free_body = _project_report_for_free(data)
     free_body["insights"] = truncate_for_free(insights)
@@ -2659,6 +2862,8 @@ def latest_report(
     )
     if upgrade is not None:
         free_body["upgrade"] = upgrade
+    if share is not None:
+        free_body["share"] = share
     return free_body
 
 

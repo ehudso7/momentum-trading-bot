@@ -3579,6 +3579,106 @@ streak always has a target to chase.
   ``tests/test_stickiness.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
+### Phase 10.3 — viral loop optimization
+
+Phase 10.3 closes the growth loop by tracking **what we send out**
+(``share_generated``) and **what comes back in** (``inbound_visit``).
+Both events are written to a new JSONL log that follows the same
+schema, hashing, and best-effort failure posture as the Phase 5.1 /
+5.5 / 8.4 logs, so BI pipelines can join all five files on
+``api_key_hash``.
+
+**The two events**
+
+| Event              | Emitted when                                         |
+|--------------------|------------------------------------------------------|
+| ``share_generated``| ``server._build_share_payload`` attached a share envelope to a response (one row per response, never duplicated). |
+| ``inbound_visit``  | A request arrived with a non-empty ``?src=<token>`` query parameter; first-touch source captured. |
+
+**The on-the-wire share envelope** (attached to ``/reports/latest``
+for both tiers — sharing is a viral-loop signal, not a tier
+gate)::
+
+    {
+      "share": {
+        "share_url": "https://example/.../reports/latest?src=<key_hash>",
+        "hint":      "Share this preview",
+        "src":       "<sanitised inbound src>" | null,
+        "endpoint":  "/reports/latest"
+      }
+    }
+
+  * ``share_url`` carries the caller's own ``key_hash`` as the
+    outbound ``?src=`` token so an inbound visit triggered by the
+    share can be attributed back to the originator without ever
+    leaking the raw API key. The hash is the same SHA-256[:32] used
+    by every other API log.
+  * When ``TRADING_PUBLIC_BASE_URL`` is unset the URL falls back
+    to a relative form; the payload is still attached and the event
+    still fires so the operator gets the same telemetry
+    in development.
+
+**The recorded JSONL row** (``data/api_share_events.jsonl`` by
+default, override via ``TRADING_API_SHARE_EVENTS_LOG_PATH``)::
+
+    {
+      "timestamp":    "2026-04-25T12:34:56.000000Z",
+      "api_key_hash": "<SHA-256[:32]>",
+      "event":        "share_generated" | "inbound_visit",
+      "endpoint":     "/reports/latest",
+      "src":          "<sanitised src>" | null,
+      "request_id":   "<32-hex>" | null
+    }
+
+  * ``record_share_event(key_hash, type, endpoint, *, src=None, request_id=None)``
+    is the single public helper. Like Phase 8.4's funnel writer, it
+    refuses raw API keys: callers MUST pre-hash. Unknown event
+    types and empty hashes are dropped silently with a structured
+    DEBUG log; the helper never raises.
+  * ``src`` is sanitised to the same charset as the Phase 5.1
+    growth ``ref_code`` (``[A-Za-z0-9\-_:.]``, capped at 64 chars)
+    so the share log and the growth log can be joined cleanly on
+    ``(api_key_hash, src)`` ↔ ``(api_key_hash, ref_code)``.
+
+**Privacy posture**
+
+  * Raw API keys are **never** persisted — only the SHA-256[:32]
+    hash that already appears in
+    server / billing / conversion / growth / upgrade-events logs.
+  * No IP, no User-Agent, no email, no name, no payment field
+    ever enters a record. The only inputs are the opaque key hash,
+    the event name, the request endpoint, the (sanitised) src
+    token, and the Phase 4.4 request_id.
+  * A leak-guard test plants unique markers in every input slot
+    and asserts they never appear in the persisted JSONL.
+
+**Failure posture**
+
+  * The share-events writer is best-effort: every exception path
+    is caught and logged at DEBUG. A disk failure inside the
+    writer must NEVER fail the underlying ``/reports/latest``
+    response. Pinned by
+    ``tests/test_share_events.py::TestServerIntegration::test_logging_failure_does_not_break_response``.
+  * Thread-safe via a module-level ``threading.Lock``; concurrent
+    callers cannot interleave a single JSONL line.
+
+**Boundary**
+
+* No new HTTP route. Phase 10.3 is helper code wired into the
+  existing ``/reports/latest`` route. Existing tests that assert
+  the route inventory continue to pass unchanged.
+* No new mutating endpoint — both events are side-effects of a
+  GET request.
+* No new env vars are required to enable the feature; the only
+  knob is ``TRADING_API_SHARE_EVENTS_LOG_PATH`` for relocating the
+  JSONL file.
+* ``trading_bot/api/share_events.py`` is a sibling of
+  ``upgrade_events.py`` and shares its CLI shape::
+
+      python -m trading_bot.api.share_events --summary
+      python -m trading_bot.api.share_events --summary --json
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
