@@ -560,6 +560,308 @@ def _fmt_rate(value: float) -> str:
     return f"{(value * 100):.1f}%"
 
 
+# ---------------------------------------------------------------------------
+# Phase 10.5 — Optimization loop: recommendations
+# ---------------------------------------------------------------------------
+
+#: Stable recommendation identifiers. Operators / dashboards can
+#: pin these strings for filtering or A/B comparison; renaming any
+#: of them is a breaking change.
+REC_AMPLIFY_TOP_TRIGGER = "amplify_top_trigger"
+REC_FEATURE_TOP_INSIGHT = "feature_top_insight"
+REC_DOUBLE_DOWN_SOURCE = "double_down_best_source"
+REC_TIGHTEN_FREE_LIMIT = "tighten_free_limit"
+REC_INSUFFICIENT_DATA = "insufficient_data"
+
+VALID_RECOMMENDATION_IDS: frozenset[str] = frozenset({
+    REC_AMPLIFY_TOP_TRIGGER,
+    REC_FEATURE_TOP_INSIGHT,
+    REC_DOUBLE_DOWN_SOURCE,
+    REC_TIGHTEN_FREE_LIMIT,
+    REC_INSUFFICIENT_DATA,
+})
+
+PRIORITY_HIGH = "high"
+PRIORITY_MEDIUM = "medium"
+PRIORITY_LOW = "low"
+VALID_PRIORITIES: frozenset[str] = frozenset({
+    PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW,
+})
+
+#: A trigger / insight / source whose conversion rate clears this
+#: bar gets a HIGH-priority recommendation. Below it, MEDIUM.
+_HIGH_PRIORITY_RATE = 0.25
+_MEDIUM_PRIORITY_RATE = 0.10
+
+#: Lift threshold: ``usage_limit`` only earns the
+#: ``tighten_free_limit`` recommendation when its conversion rate
+#: is at least 1.5x the overall conversion rate. Prevents recommending
+#: a tighter limit when usage_limit is no better than the baseline.
+_TIGHTEN_LIMIT_LIFT = 1.5
+
+#: Floor on absolute conversion rate before "tighten the free limit"
+#: ever fires. Even with a 100x lift, a trigger that converts at
+#: 0.1% absolute isn't a strong-enough signal to act on.
+_TIGHTEN_LIMIT_RATE_FLOOR = 0.10
+
+
+def _priority_for_rate(rate: float) -> str:
+    if rate >= _HIGH_PRIORITY_RATE:
+        return PRIORITY_HIGH
+    if rate >= _MEDIUM_PRIORITY_RATE:
+        return PRIORITY_MEDIUM
+    return PRIORITY_LOW
+
+
+def _recommend_amplify_trigger(summary: dict) -> Optional[dict]:
+    headlines = summary.get("headlines", {}) or {}
+    trigger = headlines.get("top_converting_trigger")
+    if not trigger or not isinstance(trigger, dict):
+        return None
+    rate = float(trigger.get("shown_to_completed", 0.0) or 0.0)
+    return {
+        "id": REC_AMPLIFY_TOP_TRIGGER,
+        "priority": _priority_for_rate(rate),
+        "title": (
+            f"Amplify the top converting trigger: "
+            f"'{trigger.get('value', '?')}'"
+        ),
+        "rationale": (
+            f"reason='{trigger.get('value', '?')}' converts at "
+            f"{_fmt_rate(rate)} (shown={trigger.get('shown', 0)}, "
+            f"completed={trigger.get('completed', 0)}), the highest "
+            f"of any reason on the upgrade-events log."
+        ),
+        "action": (
+            f"Surface the '{trigger.get('value', '?')}' upgrade "
+            f"prompt earlier and on more endpoints. Verify the "
+            f"copy variant currently rendered for that reason and "
+            f"hold it constant while you scale impressions."
+        ),
+    }
+
+
+def _recommend_feature_insight(summary: dict) -> Optional[dict]:
+    headlines = summary.get("headlines", {}) or {}
+    insight = headlines.get("top_performing_insight")
+    if not insight or not isinstance(insight, dict):
+        return None
+    rate = float(insight.get("shown_to_completed", 0.0) or 0.0)
+    return {
+        "id": REC_FEATURE_TOP_INSIGHT,
+        "priority": _priority_for_rate(rate),
+        "title": (
+            f"Feature the top performing insight surface: "
+            f"'{insight.get('value', '?')}'"
+        ),
+        "rationale": (
+            f"endpoint='{insight.get('value', '?')}' converts at "
+            f"{_fmt_rate(rate)} (shown={insight.get('shown', 0)}, "
+            f"completed={insight.get('completed', 0)}), the highest "
+            f"of any insight surface on the upgrade-events log."
+        ),
+        "action": (
+            f"Promote '{insight.get('value', '?')}' in the "
+            f"dashboard navigation and email-digest links. Audit "
+            f"the Phase 9.x insights rendered there and keep the "
+            f"top performer pinned."
+        ),
+    }
+
+
+def _recommend_double_down_source(summary: dict) -> Optional[dict]:
+    headlines = summary.get("headlines", {}) or {}
+    source = headlines.get("best_source")
+    if not source or not isinstance(source, dict):
+        return None
+    rate = float(source.get("completion_rate", 0.0) or 0.0)
+    return {
+        "id": REC_DOUBLE_DOWN_SOURCE,
+        "priority": _priority_for_rate(rate),
+        "title": (
+            f"Double down on the best inbound source: "
+            f"'{source.get('src', '?')}'"
+        ),
+        "rationale": (
+            f"src='{source.get('src', '?')}' delivered "
+            f"{source.get('inbound_users', 0)} inbound visitor(s) "
+            f"of whom {source.get('completed_users', 0)} converted "
+            f"({_fmt_rate(rate)}), the highest completion rate of "
+            f"any attributed source."
+        ),
+        "action": (
+            f"Concentrate share-channel effort on "
+            f"'{source.get('src', '?')}': add more share buttons "
+            f"that pre-fill ?src={source.get('src', '?')}, and "
+            f"deprioritise sources with weaker attribution."
+        ),
+    }
+
+
+def _recommend_tighten_free_limit(summary: dict) -> Optional[dict]:
+    """
+    Fires when ``usage_limit`` is a strong-enough conversion driver
+    that it makes sense to widen its impression footprint by
+    LOWERING the free-tier daily request cap (more callers hit the
+    cap, more upgrade prompts get shown, the funnel scales).
+
+    Three guards keep this from firing on noise:
+
+      1. ``usage_limit`` must appear in ``by_reason`` with at
+         least the documented ``min_impressions`` floor (already
+         enforced upstream when computing the headline);
+      2. its absolute shown→completed rate must exceed
+         ``_TIGHTEN_LIMIT_RATE_FLOOR``;
+      3. its conversion rate must be at least
+         ``_TIGHTEN_LIMIT_LIFT`` × the overall conversion rate.
+    """
+    by_reason = summary.get("by_reason", {}) or {}
+    stats = by_reason.get("usage_limit")
+    if not stats or not isinstance(stats, dict):
+        return None
+    rate = float(stats.get("shown_to_completed", 0.0) or 0.0)
+    if rate < _TIGHTEN_LIMIT_RATE_FLOOR:
+        return None
+
+    funnel = summary.get("conversion_funnel", {}) or {}
+    overall = float(funnel.get("shown_to_completed", 0.0) or 0.0)
+    if overall <= 0.0:
+        # No baseline to compare against — don't make a blind
+        # recommendation to weaken the free tier.
+        return None
+    if rate < overall * _TIGHTEN_LIMIT_LIFT:
+        return None
+
+    return {
+        "id": REC_TIGHTEN_FREE_LIMIT,
+        "priority": PRIORITY_HIGH,
+        "title": "Tighten the free-tier daily request limit",
+        "rationale": (
+            f"reason='usage_limit' converts at {_fmt_rate(rate)} "
+            f"versus an overall {_fmt_rate(overall)} — a "
+            f"{(rate / overall):.1f}x lift. Each daily-cap hit is "
+            f"a high-leverage upgrade prompt."
+        ),
+        "action": (
+            "Lower TRADING_FREE_DAILY_REQUEST_LIMIT (or "
+            "TRADING_FREE_MAX_REQUESTS_PER_DAY) by 20-30% and "
+            "watch the funnel for one week. The Phase 8.1 / 5.4 "
+            "knobs are reversible — revert if click-through "
+            "drops or churn spikes."
+        ),
+    }
+
+
+_RECOMMENDATION_RULES = (
+    _recommend_amplify_trigger,
+    _recommend_feature_insight,
+    _recommend_double_down_source,
+    _recommend_tighten_free_limit,
+)
+
+
+def generate_recommendations(summary: dict) -> list[dict]:
+    """
+    Phase 10.5 — turn a Phase 10.4 ``summarize`` dict into a stable,
+    ordered list of operator-facing recommendations.
+
+    Deterministic: same input ⇒ same output. The rules are pure
+    functions of the summary shape; they don't read the clock,
+    don't read disk, don't talk to the network.
+
+    Each recommendation has the documented schema::
+
+        {
+          "id":        str,   # stable identifier (see VALID_RECOMMENDATION_IDS)
+          "priority":  str,   # "high" | "medium" | "low"
+          "title":     str,   # short headline
+          "rationale": str,   # why this fires (cites concrete metrics)
+          "action":    str,   # what to do next
+        }
+
+    When the summary is empty / supports no rule, returns a single
+    ``insufficient_data`` recommendation so the CLI never prints a
+    bare "(no recommendations)" footer.
+    """
+    if not isinstance(summary, dict):
+        summary = {}
+
+    out: list[dict] = []
+    for rule in _RECOMMENDATION_RULES:
+        try:
+            rec = rule(summary)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            log.debug(
+                "growth_intel.rule_error",
+                rule=getattr(rule, "__name__", "?"),
+                error=str(exc),
+            )
+            rec = None
+        if rec is None:
+            continue
+        # Order recommendations by priority within the stable rule
+        # order. ``priority_rank`` is a private sort key — the
+        # rule order is what makes the same summary always render
+        # the same numbered list.
+        out.append(rec)
+
+    if not out:
+        out.append({
+            "id": REC_INSUFFICIENT_DATA,
+            "priority": PRIORITY_LOW,
+            "title": "Gather more telemetry before optimising",
+            "rationale": (
+                "No reason / endpoint / src cleared the noise floor "
+                "needed to make a confident recommendation."
+            ),
+            "action": (
+                "Wait until the conversion funnel has at least 5 "
+                "impressions per reason and 3 inbound visitors per "
+                "src, then re-run --recommend."
+            ),
+        })
+
+    # Stable sort: high → medium → low while preserving rule order
+    # within each priority bucket so the numbering is repeatable.
+    priority_rank = {
+        PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2,
+    }
+    out.sort(key=lambda r: priority_rank.get(r.get("priority"), 9))
+    return out
+
+
+def format_recommendations_text(recommendations: list[dict]) -> str:
+    """Render ``generate_recommendations`` output as a numbered list."""
+    bar = "=" * 72
+    lines: list[str] = []
+    lines.append(bar)
+    lines.append("GROWTH OPTIMIZATION RECOMMENDATIONS")
+    lines.append(bar)
+    if not recommendations:
+        lines.append("(no recommendations)")
+        lines.append(bar)
+        return "\n".join(lines)
+    for idx, rec in enumerate(recommendations, start=1):
+        lines.append(
+            f"{idx}. [{str(rec.get('priority', '?')).upper()}] "
+            f"{rec.get('title', '?')}"
+        )
+        lines.append(f"   id        : {rec.get('id', '?')}")
+        lines.append(f"   rationale : {rec.get('rationale', '')}")
+        lines.append(f"   action    : {rec.get('action', '')}")
+        lines.append("")
+    # Trim the trailing blank line before the bar.
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Pretty-printing (continued)
+# ---------------------------------------------------------------------------
+
+
 def format_summary_text(summary: dict) -> str:
     """Render ``summarize()`` output as plain text for the CLI."""
     bar = "=" * 72
@@ -674,6 +976,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the growth-intel summary.",
     )
     parser.add_argument(
+        "--recommend", action="store_true",
+        help=(
+            "Print Phase 10.5 numbered recommendations derived from "
+            "the same summary. May be combined with --summary."
+        ),
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Emit JSON instead of plain text.",
     )
@@ -715,7 +1024,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if not args.summary:
+    if not (args.summary or args.recommend):
         parser.print_help()
         return 2
 
@@ -727,9 +1036,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     if args.json:
-        print(json.dumps(summary, indent=2, sort_keys=False, default=str))
-    else:
-        print(format_summary_text(summary))
+        # JSON shape rules:
+        #   --summary alone   → bare summary dict (Phase 10.4 contract).
+        #   --recommend alone → bare list of recommendations.
+        #   both              → envelope ``{summary, recommendations}``.
+        if args.summary and args.recommend:
+            payload: object = {
+                "summary": summary,
+                "recommendations": generate_recommendations(summary),
+            }
+        elif args.recommend:
+            payload = generate_recommendations(summary)
+        else:
+            payload = summary
+        print(json.dumps(payload, indent=2, sort_keys=False, default=str))
+        return 0
+
+    rendered: list[str] = []
+    if args.summary:
+        rendered.append(format_summary_text(summary))
+    if args.recommend:
+        rendered.append(
+            format_recommendations_text(
+                generate_recommendations(summary),
+            )
+        )
+    print("\n\n".join(rendered))
     return 0
 
 

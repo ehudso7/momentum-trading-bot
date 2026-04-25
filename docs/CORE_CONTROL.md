@@ -3755,6 +3755,94 @@ The summary dict is JSON-serialisable and stable: ``conversion_funnel``,
   ``TRADING_API_SHARE_EVENTS_LOG_PATH``.
 
 
+### Phase 10.5 — optimization loop
+
+Phase 10.5 turns the Phase 10.4 ``summarize`` output into a
+deterministic, ordered list of operator-facing recommendations.
+Same summary in ⇒ same numbered output. No clock reads, no disk
+reads, no network — all rules are pure functions of the
+``summary`` dict.
+
+**Public API**
+
+::
+
+    from trading_bot.api.growth_intel import (
+        generate_recommendations,
+        format_recommendations_text,
+        summarize,
+    )
+
+    recs = generate_recommendations(summarize())
+    print(format_recommendations_text(recs))
+
+**Recommendation schema** — every entry on the returned list::
+
+    {
+      "id":        str,   # stable identifier (see VALID_RECOMMENDATION_IDS)
+      "priority":  str,   # "high" | "medium" | "low"
+      "title":     str,   # short headline
+      "rationale": str,   # cites concrete metrics from the summary
+      "action":    str,   # concrete next step
+    }
+
+**Rules** (deterministic; each rule is a pure function of the
+summary):
+
+| Rule id                     | Fires when                                                                                                           |
+|-----------------------------|----------------------------------------------------------------------------------------------------------------------|
+| ``amplify_top_trigger``     | ``headlines.top_converting_trigger`` is non-null. Priority scales with the trigger's shown→completed rate.           |
+| ``feature_top_insight``     | ``headlines.top_performing_insight`` is non-null. Priority scales with the endpoint's shown→completed rate.          |
+| ``double_down_best_source`` | ``headlines.best_source`` is non-null. Priority scales with the source's completion rate.                            |
+| ``tighten_free_limit``      | ``by_reason.usage_limit`` exists, its absolute rate ≥ 10 %, and the rate is ≥ 1.5× the overall conversion rate.      |
+| ``insufficient_data``       | Fallback when no other rule fires. Priority is always ``low``.                                                       |
+
+Priority bands::
+
+    rate >= 25 %  →  "high"
+    rate >= 10 %  →  "medium"
+    otherwise     →  "low"
+
+The returned list is ordered HIGH → MEDIUM → LOW, with stable
+rule order preserved within each priority bucket so the numbered
+CLI output is repeatable.
+
+**CLI**
+
+::
+
+    python -m trading_bot.api.growth_intel --recommend
+    python -m trading_bot.api.growth_intel --recommend --json
+    python -m trading_bot.api.growth_intel --summary --recommend
+
+JSON shape rules (preserves the Phase 10.4 contract):
+
+* ``--summary --json`` alone   → bare summary dict.
+* ``--recommend --json`` alone → bare list of recommendations.
+* ``--summary --recommend --json`` → ``{summary, recommendations}``.
+
+**Privacy posture**
+
+* The summary surface already strips ``api_key_hash`` columns
+  (Phase 10.4); the recommendation surface inherits that and
+  cites only aggregated dimensions (reason, endpoint, src) plus
+  rate / count integers. A leak-guard test plants a unique raw-
+  key marker, hashes it, and asserts neither the marker nor the
+  individual hash appears in the rendered recommendations.
+* No raw API key ever flows into a recommendation field — pinned
+  by ``tests/test_growth_intel.py::TestRecommendationsLeakGuard``.
+
+**Boundary**
+
+* No new HTTP route, no new persistence, no new env vars.
+* ``generate_recommendations`` is pure: deterministic, side-effect
+  free, never raises (defensive ``try`` wraps each rule).
+* The "tighten free limit" rule references reversible Phase 5.4 /
+  8.1 knobs; it never recommends raising bounds beyond their
+  hard-coded safety ceilings, and the action text spells out the
+  revert criteria.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

@@ -28,7 +28,19 @@ from trading_bot.api import growth_intel as gi
 from trading_bot.api.growth_intel import (
     DEFAULT_MIN_IMPRESSIONS,
     DEFAULT_MIN_INBOUND,
+    PRIORITY_HIGH,
+    PRIORITY_LOW,
+    PRIORITY_MEDIUM,
+    REC_AMPLIFY_TOP_TRIGGER,
+    REC_DOUBLE_DOWN_SOURCE,
+    REC_FEATURE_TOP_INSIGHT,
+    REC_INSUFFICIENT_DATA,
+    REC_TIGHTEN_FREE_LIMIT,
+    VALID_PRIORITIES,
+    VALID_RECOMMENDATION_IDS,
+    format_recommendations_text,
     format_summary_text,
+    generate_recommendations,
     load_share_events,
     load_upgrade_events,
     summarize,
@@ -693,3 +705,376 @@ class TestBoundary:
             assert forbidden not in src, (
                 f"growth_intel.py reaches into Core: {forbidden!r}"
             )
+
+
+# ===========================================================================
+# Phase 10.5 — Optimization loop: recommendations
+# ===========================================================================
+
+
+def _seed_strong_funnel(
+    upgrade_log: Path, share_log: Path, *,
+    usage_lift: bool = True,
+    top_endpoint: str = "/reports/latest",
+    best_src: str = "twitter",
+) -> None:
+    """
+    Seed a synthetic dataset that reliably triggers the four
+    primary recommendation rules.
+
+      * usage_limit converts at ~50 % (10/20 if lift, else 4/20)
+      * limited_access converts at ~10 % (2/20)
+      * top endpoint matches ``top_endpoint``
+      * best source has 5 inbound + 3 conversions
+    """
+    completed_for_usage = 10 if usage_lift else 4
+
+    rows = []
+    for i in range(20):
+        u = _hash(f"usage_{i}")
+        rows.append(_funnel_row(
+            event=EVENT_UPGRADE_SHOWN, api_key_hash=u,
+            reason="usage_limit", endpoint=top_endpoint,
+        ))
+    for i in range(completed_for_usage):
+        u = _hash(f"usage_{i}")
+        rows.append(_funnel_row(
+            event=EVENT_UPGRADE_COMPLETED, api_key_hash=u,
+            reason="usage_limit", endpoint=top_endpoint,
+        ))
+    for i in range(20):
+        u = _hash(f"limited_{i}")
+        rows.append(_funnel_row(
+            event=EVENT_UPGRADE_SHOWN, api_key_hash=u,
+            reason="limited_access", endpoint=top_endpoint,
+        ))
+    for i in range(2):
+        u = _hash(f"limited_{i}")
+        rows.append(_funnel_row(
+            event=EVENT_UPGRADE_COMPLETED, api_key_hash=u,
+            reason="limited_access", endpoint=top_endpoint,
+        ))
+    # A second, lower-converting endpoint so the headline isn't
+    # the only one in the by_insight grouping.
+    for i in range(8):
+        u = _hash(f"hist_{i}")
+        rows.append(_funnel_row(
+            event=EVENT_UPGRADE_SHOWN, api_key_hash=u,
+            reason="feature_locked", endpoint="/reports/history",
+        ))
+
+    # Inbound visitors to attribute conversions back to.
+    src_users = [_hash(f"{best_src}_v{i}") for i in range(5)]
+    share_rows = [
+        _share_row(
+            event=EVENT_INBOUND_VISIT, api_key_hash=u, src=best_src,
+        )
+        for u in src_users
+    ]
+    # 3 of the inbound users complete the funnel.
+    for u in src_users[:3]:
+        rows.append(_funnel_row(
+            event=EVENT_UPGRADE_COMPLETED, api_key_hash=u,
+            reason="usage_limit", endpoint=top_endpoint,
+        ))
+
+    _write_jsonl(upgrade_log, rows)
+    _write_jsonl(share_log, share_rows)
+
+
+class TestRecommendationsBasics:
+    def test_id_and_priority_constants_pinned(self):
+        """Public constants are stable identifiers operators / dashboards
+        can pin against; renaming any of them is a breaking change."""
+        assert REC_AMPLIFY_TOP_TRIGGER == "amplify_top_trigger"
+        assert REC_FEATURE_TOP_INSIGHT == "feature_top_insight"
+        assert REC_DOUBLE_DOWN_SOURCE == "double_down_best_source"
+        assert REC_TIGHTEN_FREE_LIMIT == "tighten_free_limit"
+        assert REC_INSUFFICIENT_DATA == "insufficient_data"
+        assert VALID_RECOMMENDATION_IDS == {
+            REC_AMPLIFY_TOP_TRIGGER,
+            REC_FEATURE_TOP_INSIGHT,
+            REC_DOUBLE_DOWN_SOURCE,
+            REC_TIGHTEN_FREE_LIMIT,
+            REC_INSUFFICIENT_DATA,
+        }
+        assert VALID_PRIORITIES == {
+            PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW,
+        }
+
+    def test_each_recommendation_has_documented_schema(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        recs = generate_recommendations(summarize())
+        assert recs, "expected at least one recommendation"
+        for rec in recs:
+            assert set(rec.keys()) == {
+                "id", "priority", "title", "rationale", "action",
+            }
+            assert rec["id"] in VALID_RECOMMENDATION_IDS
+            assert rec["priority"] in VALID_PRIORITIES
+            for field in ("title", "rationale", "action"):
+                assert isinstance(rec[field], str)
+                assert rec[field].strip() != ""
+
+    def test_deterministic_repeated_calls(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        s = summarize()
+        first = generate_recommendations(s)
+        second = generate_recommendations(s)
+        assert first == second
+
+
+class TestRecommendationRules:
+    def test_strong_funnel_emits_all_four_rules(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log, usage_lift=True)
+        ids = {r["id"] for r in generate_recommendations(summarize())}
+        assert REC_AMPLIFY_TOP_TRIGGER in ids
+        assert REC_FEATURE_TOP_INSIGHT in ids
+        assert REC_DOUBLE_DOWN_SOURCE in ids
+        assert REC_TIGHTEN_FREE_LIMIT in ids
+        # The "insufficient data" fallback must NOT appear when other
+        # rules fired.
+        assert REC_INSUFFICIENT_DATA not in ids
+
+    def test_amplify_trigger_cites_top_reason(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rec = next(
+            r for r in generate_recommendations(summarize())
+            if r["id"] == REC_AMPLIFY_TOP_TRIGGER
+        )
+        assert "usage_limit" in rec["title"]
+        assert "usage_limit" in rec["rationale"]
+        # High priority because rate >= 25%.
+        assert rec["priority"] == PRIORITY_HIGH
+
+    def test_top_insight_cites_endpoint(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(
+            upgrade_log, share_log, top_endpoint="/reports/latest",
+        )
+        rec = next(
+            r for r in generate_recommendations(summarize())
+            if r["id"] == REC_FEATURE_TOP_INSIGHT
+        )
+        assert "/reports/latest" in rec["title"]
+        assert "/reports/latest" in rec["rationale"]
+
+    def test_best_source_cites_src(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(
+            upgrade_log, share_log, best_src="hn-launch",
+        )
+        rec = next(
+            r for r in generate_recommendations(summarize())
+            if r["id"] == REC_DOUBLE_DOWN_SOURCE
+        )
+        assert "hn-launch" in rec["title"]
+        assert "hn-launch" in rec["rationale"]
+        assert "?src=hn-launch" in rec["action"]
+
+    def test_tighten_free_limit_only_when_usage_lift_present(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        # usage_limit at the same baseline rate as the overall funnel
+        # → no tightening recommendation (the rule needs a lift).
+        rows = []
+        for i in range(20):
+            u = _hash(f"u{i}")
+            rows.append(_funnel_row(
+                event=EVENT_UPGRADE_SHOWN, api_key_hash=u,
+                reason="usage_limit", endpoint="/reports/latest",
+            ))
+        for i in range(4):  # 20 % rate
+            u = _hash(f"u{i}")
+            rows.append(_funnel_row(
+                event=EVENT_UPGRADE_COMPLETED, api_key_hash=u,
+                reason="usage_limit", endpoint="/reports/latest",
+            ))
+        # Every other reason converts at the same 20 %, so there's
+        # no lift on usage_limit specifically.
+        for i in range(20):
+            u = _hash(f"v{i}")
+            rows.append(_funnel_row(
+                event=EVENT_UPGRADE_SHOWN, api_key_hash=u,
+                reason="feature_locked", endpoint="/reports/latest",
+            ))
+        for i in range(4):
+            u = _hash(f"v{i}")
+            rows.append(_funnel_row(
+                event=EVENT_UPGRADE_COMPLETED, api_key_hash=u,
+                reason="feature_locked", endpoint="/reports/latest",
+            ))
+        _write_jsonl(upgrade_log, rows)
+
+        ids = {r["id"] for r in generate_recommendations(summarize())}
+        assert REC_TIGHTEN_FREE_LIMIT not in ids
+        # Other rules still fire on the same data.
+        assert REC_AMPLIFY_TOP_TRIGGER in ids
+
+    def test_tighten_free_limit_skipped_when_overall_zero(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        """No completions anywhere → no baseline → no recommendation."""
+        rows = [
+            _funnel_row(
+                event=EVENT_UPGRADE_SHOWN,
+                api_key_hash=_hash(f"u{i}"),
+                reason="usage_limit",
+                endpoint="/reports/latest",
+            )
+            for i in range(10)
+        ]
+        _write_jsonl(upgrade_log, rows)
+        ids = {r["id"] for r in generate_recommendations(summarize())}
+        assert REC_TIGHTEN_FREE_LIMIT not in ids
+
+
+class TestEmptyLogs:
+    def test_empty_logs_emit_insufficient_data(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        recs = generate_recommendations(summarize())
+        assert len(recs) == 1
+        assert recs[0]["id"] == REC_INSUFFICIENT_DATA
+        assert recs[0]["priority"] == PRIORITY_LOW
+
+    def test_non_dict_input_does_not_raise(self):
+        # Defensive: pure function should never raise on bad input.
+        recs = generate_recommendations(None)  # type: ignore[arg-type]
+        assert len(recs) == 1
+        assert recs[0]["id"] == REC_INSUFFICIENT_DATA
+
+
+class TestRecommendationOrdering:
+    def test_high_priority_recommendations_come_first(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        recs = generate_recommendations(summarize())
+        priorities = [r["priority"] for r in recs]
+        # HIGH must come before MEDIUM must come before LOW. We
+        # assert via an index check rather than equality so the
+        # specific mix of priorities can change without breaking
+        # the contract.
+        rank = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2}
+        ranks = [rank[p] for p in priorities]
+        assert ranks == sorted(ranks)
+
+
+class TestRecommendationsLeakGuard:
+    def test_no_raw_api_key_in_recommendations(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        marker = "RAW_API_KEY_PHASE_10_5_DO_NOT_LEAK"
+        h = _hash(marker)
+        _write_jsonl(upgrade_log, [
+            _funnel_row(
+                event=EVENT_UPGRADE_SHOWN, api_key_hash=h,
+                reason="usage_limit", endpoint="/reports/latest",
+            ),
+            _funnel_row(
+                event=EVENT_UPGRADE_COMPLETED, api_key_hash=h,
+                reason="usage_limit", endpoint="/reports/latest",
+            ),
+        ])
+        _write_jsonl(share_log, [
+            _share_row(
+                event=EVENT_INBOUND_VISIT, api_key_hash=h, src="hn",
+            ),
+        ])
+        recs = generate_recommendations(summarize())
+        rendered = json.dumps(recs, default=str)
+        assert marker not in rendered
+        text = format_recommendations_text(recs)
+        assert marker not in text
+        # Individual hashes also stay out of the recommendation text.
+        assert h not in rendered
+        assert h not in text
+
+
+class TestRecommendationsRendering:
+    def test_format_recommendations_numbers_them(
+        self, upgrade_log: Path, share_log: Path,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        recs = generate_recommendations(summarize())
+        out = format_recommendations_text(recs)
+        for idx in range(1, len(recs) + 1):
+            assert f"{idx}. [" in out
+        assert "GROWTH OPTIMIZATION RECOMMENDATIONS" in out
+
+    def test_format_handles_empty_input(self):
+        out = format_recommendations_text([])
+        assert "(no recommendations)" in out
+
+
+class TestRecommendCli:
+    def test_cli_recommend_text(
+        self, upgrade_log: Path, share_log: Path, capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = gi.main(["--recommend"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "GROWTH OPTIMIZATION RECOMMENDATIONS" in out
+        # At least one numbered item was rendered.
+        assert "1. [" in out
+
+    def test_cli_recommend_json_emits_bare_list(
+        self, upgrade_log: Path, share_log: Path, capsys,
+    ):
+        """``--recommend --json`` alone emits a bare JSON array of
+        recommendations (the Phase 10.5 surface). Combine with
+        ``--summary`` to get the documented envelope shape."""
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = gi.main(["--recommend", "--json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert isinstance(parsed, list)
+        assert parsed
+        for rec in parsed:
+            assert set(rec.keys()) == {
+                "id", "priority", "title", "rationale", "action",
+            }
+
+    def test_cli_summary_and_recommend_combined(
+        self, upgrade_log: Path, share_log: Path, capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = gi.main(["--summary", "--recommend"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "GROWTH INTELLIGENCE SUMMARY" in out
+        assert "GROWTH OPTIMIZATION RECOMMENDATIONS" in out
+
+    def test_cli_summary_and_recommend_combined_json(
+        self, upgrade_log: Path, share_log: Path, capsys,
+    ):
+        _seed_strong_funnel(upgrade_log, share_log)
+        rc = gi.main(["--summary", "--recommend", "--json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert "summary" in parsed
+        assert "recommendations" in parsed
+
+    def test_cli_recommend_on_empty_logs_returns_zero(
+        self, tmp_path: Path, capsys,
+    ):
+        rc = gi.main([
+            "--recommend",
+            "--upgrade-path", str(tmp_path / "absent.jsonl"),
+            "--share-path", str(tmp_path / "absent.jsonl"),
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "insufficient_data" in out
