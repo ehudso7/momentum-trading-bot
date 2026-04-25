@@ -1003,43 +1003,161 @@ def _is_premium_user(request: Request) -> bool:
 def _project_report_for_free(report: dict) -> dict:
     """
     Project a sanitised daily report through the Phase 8.2 free-tier
-    allow-list. Returns a NEW dict; the input is not mutated.
+    allow-list. Returns a NEW dict; the input is not mutated. Pure
+    function — no I/O.
 
-    Adds an ``upgrade`` hint object so an integrator's UI can render
-    the call-to-action consistently with the gated 403 from
-    /reports/history.
+    The Phase 8.3 upgrade payload is attached by the route handler
+    via ``_build_upgrade_payload`` (which makes a Stripe call), so
+    this helper stays cheap to call in tests and from the dashboard
+    renderer.
     """
     if not isinstance(report, dict):
-        return {
-            "tier": TIER_FREE,
-            "upgrade": {
-                "detail": PREMIUM_FEATURE_DETAIL,
-                "hint": PREMIUM_FEATURE_HINT,
-            },
-        }
+        return {"tier": TIER_FREE}
     out: dict[str, Any] = {
         f: report[f] for f in _FREE_REPORT_ALLOWED_FIELDS if f in report
     }
     out["tier"] = TIER_FREE
-    out["upgrade"] = {
-        "detail": PREMIUM_FEATURE_DETAIL,
-        "hint": PREMIUM_FEATURE_HINT,
-    }
     return out
 
 
-def _premium_required(tier: str) -> HTTPException:
+def _build_upgrade_payload(
+    request: Request,
+    *,
+    reason: str,
+    required: bool,
+    is_premium: Optional[bool] = None,
+    key_hash: Optional[str] = None,
+) -> Optional[dict]:
     """
-    Phase 8.2 — uniform 403 for every premium-only feature.
+    Phase 8.3 — upgrade-pressure payload builder.
 
-    The response body is the documented constant
-    ``PREMIUM_FEATURE_DETAIL``; the ``X-Usage-Tier`` header carries
-    the caller's actual tier so an integrator's client can branch
-    on it without parsing the body.
+    Returns the documented dict shape::
+
+        {
+          "required":     bool,
+          "reason":       str,
+          "checkout_url": str,
+          "hint":         str,
+        }
+
+    …for free-tier callers, or ``None`` for premium callers and on
+    any Stripe-side failure. The caller is expected to attach the
+    payload to its response under an ``upgrade`` key when present
+    and emit the base response unchanged otherwise.
+
+    The ``checkout_url`` is freshly minted via
+    ``billing.create_checkout_session_for_hash`` and is NEVER
+    persisted — neither this function nor any caller writes the
+    URL to the operator logs, manifest, premium cache, or
+    revocation log. The Stripe-side metadata follows the Phase 7.3
+    hash-only contract (``metadata[key_hash]`` only, never
+    ``metadata[api_key]``).
+
+    Performance note: this helper makes one outbound Stripe
+    request per call. The caller is responsible for ensuring the
+    helper fires only on responses where the upgrade prompt
+    matters (free-tier 429 / 403 / limited-access body); premium
+    callers exit early and never trigger the network call.
+
+    Failure posture: any exception inside the Stripe call is
+    caught, logged at DEBUG, and produces a ``None`` return — so
+    a transient Stripe outage degrades to "no upgrade prompt
+    attached" rather than crashing the underlying response.
     """
-    return HTTPException(
+    # Premium short-circuit — never call Stripe for an existing
+    # subscriber.
+    if is_premium is None:
+        is_premium = _is_premium_user(request)
+    if is_premium:
+        return None
+
+    # Find the caller's hash. Prefer the cached one set by
+    # require_api_key (Phase 6.2); otherwise re-extract the bearer
+    # so this helper works from middleware that fires BEFORE the
+    # auth dependency.
+    if not key_hash:
+        cached = getattr(
+            getattr(request, "state", None), "api_key_hash", None,
+        )
+        if cached:
+            key_hash = cached
+    if not key_hash:
+        api_key = _extract_bearer_token(request)
+        if not api_key:
+            return None
+        try:
+            key_hash = key_store.hash_api_key(api_key)
+        except Exception:
+            return None
+    if not key_hash:
+        return None
+
+    try:
+        success_url, cancel_url = _build_checkout_redirect_urls()
+    except HTTPException as exc:
+        # Public-base-url not configured → no checkout possible.
+        log.debug(
+            "upgrade_payload.config_missing",
+            reason=reason, status=int(exc.status_code),
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "upgrade_payload.url_build_error",
+            reason=reason, error=str(exc),
+        )
+        return None
+
+    try:
+        result = create_checkout_session_for_hash(
+            key_hash=key_hash,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive on Stripe path
+        log.debug(
+            "upgrade_payload.checkout_failed",
+            reason=reason, error=str(exc),
+        )
+        return None
+
+    return {
+        "required": bool(required),
+        "reason": reason,
+        "checkout_url": result["checkout_url"],
+        "hint": PREMIUM_FEATURE_HINT,
+    }
+
+
+def _premium_required_response(
+    request: Request,
+    tier: str,
+) -> JSONResponse:
+    """
+    Phase 8.3 — uniform 403 builder for every premium-only feature.
+
+    Returns a ``JSONResponse`` (rather than raising
+    ``HTTPException``) so we can attach the Phase 8.3 upgrade
+    payload to the body. The body schema is::
+
+        {
+          "detail":  "premium feature — upgrade required",
+          "upgrade": <Phase 8.3 payload, or absent if Stripe failed>
+        }
+
+    Phase 8.2 contract preserved: ``detail`` is still the documented
+    constant, ``X-Usage-Tier`` still carries the caller's tier so a
+    client can branch without parsing the body.
+    """
+    body: dict[str, Any] = {"detail": PREMIUM_FEATURE_DETAIL}
+    upgrade = _build_upgrade_payload(
+        request, reason="feature_locked", required=True,
+    )
+    if upgrade is not None:
+        body["upgrade"] = upgrade
+    return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail=PREMIUM_FEATURE_DETAIL,
+        content=body,
         headers={USAGE_TIER_HEADER: tier},
     )
 
@@ -1451,9 +1569,22 @@ async def usage_enforcement_middleware(request: Request, call_next):
             + timedelta(days=1)
         )
         retry_after = max(1, int((midnight_utc - now_utc).total_seconds()))
+        body: dict[str, Any] = {"detail": USAGE_LIMIT_DETAIL}
+        # Phase 8.3 — attach the upgrade-pressure payload for free
+        # callers. Pass the already-classified is_premium + key_hash
+        # so the helper does not redundantly re-extract the bearer.
+        upgrade = _build_upgrade_payload(
+            request,
+            reason="usage_limit",
+            required=True,
+            is_premium=is_premium,
+            key_hash=key_hash,
+        )
+        if upgrade is not None:
+            body["upgrade"] = upgrade
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": USAGE_LIMIT_DETAIL},
+            content=body,
             headers={
                 **usage_headers,
                 USAGE_REMAINING_HEADER: "0",
@@ -2422,26 +2553,32 @@ def latest_report(
     data = _sanitize_report(_parse_report_file(candidates[-1]))
     if _is_premium_user(request):
         return data
-    return _project_report_for_free(data)
+    free_body = _project_report_for_free(data)
+    upgrade = _build_upgrade_payload(
+        request, reason="limited_access", required=False, is_premium=False,
+    )
+    if upgrade is not None:
+        free_body["upgrade"] = upgrade
+    return free_body
 
 
 @app.get("/reports/history", tags=["reports"])
 def reports_history(
     request: Request,
     api_key: str = Depends(require_api_key),
-) -> dict[str, Any]:
+):
     """
     Phase 8.2 — premium-only listing of every daily report on disk.
 
-    Returns ``{"count": N, "dates": [...]}`` sorted oldest →
-    newest. Free callers receive the documented 403 with
-    ``X-Usage-Tier: free``.
+    Premium → ``{"count": N, "dates": [...]}`` sorted oldest →
+    newest. Free → 403 with the documented body and the Phase 8.3
+    upgrade payload (when Stripe is configured).
 
     Registered BEFORE ``/reports/{date}`` so FastAPI's path matcher
     treats "history" as a literal segment, not a date path-param.
     """
     if not _is_premium_user(request):
-        raise _premium_required(TIER_FREE)
+        return _premium_required_response(request, TIER_FREE)
 
     reports = _reports_dir()
     dates: list[str] = []

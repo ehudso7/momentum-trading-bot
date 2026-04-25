@@ -7656,10 +7656,10 @@ class TestPhase82PureHelpers:
         for f in _PREMIUM_REPORT_FIELDS:
             assert f not in out
         assert out["tier"] == "free"
-        assert out["upgrade"] == {
-            "detail": PREMIUM_FEATURE_DETAIL,
-            "hint": PREMIUM_FEATURE_HINT,
-        }
+        # Phase 8.3 — the helper is now pure; the upgrade payload
+        # is attached by the route handler (which makes a Stripe
+        # call), not by this projector.
+        assert "upgrade" not in out
 
     def test_project_report_for_free_input_not_mutated(self):
         sample = {"report_type": "x", "tier_stats": {"A": 1}}
@@ -7669,8 +7669,7 @@ class TestPhase82PureHelpers:
 
     def test_project_report_for_free_handles_non_dict(self):
         out = _project_report_for_free(None)  # type: ignore[arg-type]
-        assert out["tier"] == "free"
-        assert out["upgrade"]["detail"] == PREMIUM_FEATURE_DETAIL
+        assert out == {"tier": "free"}
 
 
 # ---------------------------------------------------------------------------
@@ -7752,10 +7751,10 @@ class TestPhase82ReportsLatestFreeUser:
         assert body["report_date"] == today
         assert "totals" in body
         assert body["tier"] == "free"
-        assert body["upgrade"] == {
-            "detail": PREMIUM_FEATURE_DETAIL,
-            "hint": PREMIUM_FEATURE_HINT,
-        }
+        # Phase 8.3 — the upgrade payload requires Stripe config
+        # which this test doesn't provide. The route MUST degrade
+        # to "no upgrade attached" rather than crashing the body.
+        assert "upgrade" not in body
         # Premium-only fields are absent.
         for f in _PREMIUM_REPORT_FIELDS:
             assert f not in body, (
@@ -7898,9 +7897,13 @@ class TestPhase82UpgradeMessageConsistent:
         )
         assert r.json()["detail"] == PREMIUM_FEATURE_DETAIL
 
-    def test_free_reports_latest_envelope_uses_same_constant(
+    def test_free_reports_latest_envelope_marks_tier(
         self, client: TestClient, phase82_env,
     ):
+        # Phase 8.3 moved the user-visible upgrade copy into the
+        # Stripe-backed payload (covered by Phase 8.3 tests). The
+        # body still announces the caller's tier so a client knows
+        # it received a curated subset.
         raw, _ = _issue_phase82_key("free")
         today = datetime.utcnow().strftime("%Y-%m-%d")
         _write_full_report(phase82_env["reports_dir"], today)
@@ -7908,7 +7911,7 @@ class TestPhase82UpgradeMessageConsistent:
             "/reports/latest",
             headers={"Authorization": f"Bearer {raw}"},
         ).json()
-        assert body["upgrade"]["detail"] == PREMIUM_FEATURE_DETAIL
+        assert body["tier"] == "free"
 
 
 class TestPhase82UsageEnforcementStillApplies:
@@ -8004,3 +8007,502 @@ class TestPhase82DoesNotIntroduceMutatingRoute:
                 break
         else:
             raise AssertionError("/reports/history not registered")
+
+
+# ===========================================================================
+# Phase 8.3 — upgrade pressure system
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    _build_upgrade_payload,
+)
+
+
+@pytest.fixture
+def phase83_env(monkeypatch, tmp_path: Path):
+    """Phase 8.2 test base + Stripe checkout env wired so the
+    Phase 8.3 helper can mint checkout URLs end-to-end."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    # Phase 8.3 — Stripe Checkout config so _build_upgrade_payload
+    # can mint a URL.
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_phase83")
+    monkeypatch.setenv("STRIPE_PREMIUM_PRICE_ID", "price_test_phase83")
+    monkeypatch.setenv("TRADING_PUBLIC_BASE_URL", "https://api.example.com")
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+# Distinctive marker so leak tests can grep for it.
+_PHASE83_CHECKOUT_URL = (
+    "https://checkout.stripe.com/c/cs_PHASE83_LEAK_GUARD_xyz"
+)
+
+
+class _Phase83FakePoster:
+    """Deterministic Stripe stub for the Phase 8.3 helper. Records
+    every POST and returns either a configured URL or raises a
+    BillingAPIError."""
+
+    def __init__(self, response=None, raise_exc=None):
+        self.response = response or {
+            "id": "cs_PHASE83_LEAK_GUARD_xyz",
+            "url": _PHASE83_CHECKOUT_URL,
+        }
+        self.raise_exc = raise_exc
+        self.calls: list[dict] = []
+
+    def __call__(self, *, url, data, auth, timeout):
+        self.calls.append({"url": url, "data": dict(data), "auth": auth})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return dict(self.response) if isinstance(self.response, dict) else self.response
+
+
+def _patch_phase83_poster(monkeypatch, fake: _Phase83FakePoster):
+    from trading_bot.api import billing as _billing_mod
+    monkeypatch.setattr(_billing_mod, "_post_to_stripe", fake)
+
+
+def _issue_phase83_key(tier: str = "free") -> tuple[str, str]:
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=f"phase83-{tier}")
+    return result["api_key"], result["key_hash"]
+
+
+def _promote_phase83_to_premium(
+    raw: str, key_hash: str, monkeypatch, tmp_path: Path,
+):
+    from trading_bot.api import billing
+    monkeypatch.setenv(
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        str(tmp_path / "stripe_cache_phase83.json"),
+    )
+    billing.reset_cache_for_tests()
+    billing.handle_webhook_event({
+        "type": "customer.subscription.created",
+        "data": {"object": {
+            "status": "active",
+            "metadata": {"key_hash": key_hash},
+        }},
+    })
+    billing.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Pure helper unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83BuildUpgradePayload:
+    def test_premium_user_returns_none(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(
+            state=SimpleNamespace(api_key_tier="premium"),
+            headers={},
+        )
+        out = _build_upgrade_payload(
+            req, reason="usage_limit", required=True,
+        )
+        assert out is None
+
+    def test_premium_user_explicit_arg_skips_stripe(
+        self, monkeypatch,
+    ):
+        """is_premium=True must short-circuit before Stripe is called.
+        Patch _post_to_stripe to raise — if it's invoked, the test
+        fails."""
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium")
+        from trading_bot.api import billing as _billing_mod
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(), headers={})
+        out = _build_upgrade_payload(
+            req, reason="x", required=False, is_premium=True,
+            key_hash="a" * 32,
+        )
+        assert out is None
+        assert called["n"] == 0
+
+    def test_no_key_hash_no_bearer_returns_none(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(), headers={})
+        out = _build_upgrade_payload(
+            req, reason="x", required=False, is_premium=False,
+        )
+        assert out is None
+
+
+# ---------------------------------------------------------------------------
+# 429 — usage_limit
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83Usage429UpgradePayload:
+    def test_free_429_includes_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        body = r.json()
+        assert body["detail"] == "usage limit reached — upgrade for higher limits"
+        assert body["upgrade"] == {
+            "required": True,
+            "reason": "usage_limit",
+            "checkout_url": _PHASE83_CHECKOUT_URL,
+            "hint": "upgrade for full access",
+        }
+        # Stripe payload uses key_hash only (Phase 7.3 contract).
+        forwarded = fake.calls[0]["data"]
+        assert forwarded["metadata[key_hash]"] == key_hash
+        assert "metadata[api_key]" not in forwarded
+        # The raw key is NEVER in the body or any header.
+        assert raw not in r.text
+        for v in r.headers.values():
+            assert raw not in v
+
+    def test_premium_429_does_not_include_payload(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _promote_phase83_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        monkeypatch.setenv("TRADING_PREMIUM_DAILY_REQUEST_LIMIT", "1")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="premium", n=10,
+        )
+        # Patch Stripe to fail loudly if invoked — premium must NOT
+        # trigger a checkout call on its own 429.
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium 429")
+        from trading_bot.api import billing as _billing_mod
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        body = r.json()
+        assert body["detail"]
+        assert "upgrade" not in body
+        assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 403 — feature_locked
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83Premium403UpgradePayload:
+    def test_free_403_includes_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        body = r.json()
+        assert body["detail"] == "premium feature — upgrade required"
+        assert body["upgrade"] == {
+            "required": True,
+            "reason": "feature_locked",
+            "checkout_url": _PHASE83_CHECKOUT_URL,
+            "hint": "upgrade for full access",
+        }
+        # X-Usage-Tier still set (Phase 8.2 contract).
+        assert r.headers["X-Usage-Tier"] == "free"
+
+
+# ---------------------------------------------------------------------------
+# /reports/latest — limited_access
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83ReportsLatestLimitedAccess:
+    def test_free_reports_latest_includes_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase83_key("free")
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tier"] == "free"
+        assert body["upgrade"] == {
+            "required": False,
+            "reason": "limited_access",
+            "checkout_url": _PHASE83_CHECKOUT_URL,
+            "hint": "upgrade for full access",
+        }
+        assert raw not in r.text
+
+    def test_premium_reports_latest_omits_payload(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _promote_phase83_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Premium must NOT trigger a Stripe call for /reports/latest.
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium")
+        from trading_bot.api import billing as _billing_mod
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "upgrade" not in body
+        assert body.get("tier") != "free"
+        assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stripe failure → graceful degradation
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83StripeFailureGracefulDegradation:
+    def test_429_without_payload_when_stripe_fails(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, key_hash = _issue_phase83_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        # Stripe returns a 5xx — the 429 must still come back.
+        _patch_phase83_poster(
+            monkeypatch,
+            _Phase83FakePoster(
+                raise_exc=BillingAPIError("simulated stripe 500"),
+            ),
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        body = r.json()
+        # Base response intact; upgrade payload absent.
+        assert body["detail"]
+        assert "upgrade" not in body
+
+    def test_403_without_payload_when_stripe_fails(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(
+            monkeypatch,
+            _Phase83FakePoster(
+                raise_exc=BillingAPIError("simulated stripe 500"),
+            ),
+        )
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        body = r.json()
+        assert body["detail"] == "premium feature — upgrade required"
+        assert "upgrade" not in body
+
+    def test_reports_latest_without_payload_when_stripe_fails(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(
+            monkeypatch,
+            _Phase83FakePoster(
+                raise_exc=BillingAPIError("simulated stripe 500"),
+            ),
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tier"] == "free"
+        assert "upgrade" not in body
+
+    def test_no_public_base_url_skips_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase83_key("free")
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "upgrade" not in body
+        # Stripe must not have been invoked (we exit before
+        # attempting to mint the URL).
+        assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# checkout_url not persisted anywhere
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83CheckoutUrlNotPersisted:
+    def test_url_absent_from_every_operator_log(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(tmp_path / "stripe_cache_phase83_persist.json"),
+        )
+        billing.reset_cache_for_tests()
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        # Hit each of the three trigger paths.
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Force a 429 too.
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+
+        logs_to_check: list[Path] = [
+            phase83_env["keys_manifest"],
+            phase83_env["keys_revoked"],
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            Path(os.environ["TRADING_API_AUDIT_LOG_PATH"]),
+            Path(os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]),
+            tmp_path / "stripe_cache_phase83_persist.json",
+        ]
+        for path in logs_to_check:
+            if path.exists():
+                body = path.read_text(encoding="utf-8")
+                assert _PHASE83_CHECKOUT_URL not in body, (
+                    f"Phase 8.3: checkout_url leaked into {path}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting invariants
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83CrossCutting:
+    def test_usage_enforcement_still_applies_after_payload_attached(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """The Phase 8.3 payload MUST NOT silence the Phase 8.1
+        429 enforcement — gated 429s still 429."""
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        h = {"Authorization": f"Bearer {raw}"}
+        # First call: 200.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        # Second call: 429 with usage headers.
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 429
+        assert r.headers["X-Usage-Limit"] == "1"
+        assert r.headers["X-Usage-Remaining"] == "0"
+
+    def test_payload_does_not_introduce_mutating_route(self):
+        """Phase 8.3 is helper code — no new HTTP route."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 8.3 leaked a mutating route: {m} {path}"
+                )

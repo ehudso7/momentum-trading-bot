@@ -415,6 +415,50 @@ Content-Type: application/json
 Note that the 403 still consumes the caller's daily usage quota
 (Phase 8.1) — gated requests count.
 
+#### Phase 8.3 upgrade-pressure payload
+
+When `STRIPE_SECRET_KEY` + `STRIPE_PREMIUM_PRICE_ID` +
+`TRADING_PUBLIC_BASE_URL` are configured (the same env vars that
+power `POST /billing/checkout`), every free-tier rejection or
+curated response carries a Phase 8.3 ``upgrade`` payload with a
+freshly-minted Stripe Checkout URL the client can redirect the
+user to immediately:
+
+```json
+{
+  "detail": "usage limit reached — upgrade for higher limits",
+  "upgrade": {
+    "required": true,
+    "reason": "usage_limit",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+Three `reason` values surface:
+
+| Where | `reason` | `required` |
+|---|---|---|
+| 429 from Phase 8.1 daily-cap exhaustion | `usage_limit` | `true` |
+| 403 from Phase 8.2 premium-only feature | `feature_locked` | `true` |
+| 200 from Phase 8.2 free `/reports/latest` curated body | `limited_access` | `false` |
+
+Premium callers never trigger a Stripe call on these paths, so
+their responses remain identical to the pre-Phase-8.3 shape.
+
+If Stripe is unreachable or `TRADING_PUBLIC_BASE_URL` is unset,
+the payload is dropped silently — the base response (429 / 403 /
+200) is unchanged. Operators can disable the 429 trigger point by
+flipping `TRADING_USAGE_ENFORCEMENT_ENABLED=false`, or disable
+all three Phase 8.3 payloads by unsetting `TRADING_PUBLIC_BASE_URL`.
+
+Performance note: every free-tier 429 / 403 / curated-200 makes
+ONE outbound Stripe POST. The Stripe Session itself is
+short-lived (Stripe expires it after 24h by default) and is NOT
+persisted server-side — checkout_url leak-guard is pinned by
+`tests/test_api_server.py::TestPhase83CheckoutUrlNotPersisted`.
+
 A premium user (promoted via Stripe Checkout / webhook) gets the
 higher cap automatically — no env edits, no restart:
 

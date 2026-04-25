@@ -2963,6 +2963,159 @@ not "invalid date". Pinned by
   unauthenticated callers.
 
 
+### Phase 8.3 — upgrade pressure system
+
+Converts the Phase 8.1 / 8.2 tier signals from passive ("here's
+your limit") into active ("here's a checkout URL — click to
+upgrade now"). One helper, three trigger points, zero new
+mutating routes.
+
+**Helper**
+
+`_build_upgrade_payload(request, *, reason, required, is_premium=None, key_hash=None) -> dict | None`
+
+* Returns ``None`` for premium callers (no upgrade needed) and on
+  any Stripe-side failure (so callers degrade gracefully).
+* Returns the documented dict for free callers when Stripe
+  Checkout creation succeeds:
+
+  ```json
+  {
+    "required":     true,
+    "reason":       "usage_limit",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint":         "upgrade for full access"
+  }
+  ```
+
+* The ``checkout_url`` is freshly minted via
+  ``billing.create_checkout_session_for_hash`` (Phase 7.3 —
+  hash-only metadata). It is **never** persisted by this helper or
+  any caller. Pinned by
+  `TestPhase83CheckoutUrlNotPersisted::test_url_absent_from_every_operator_log`.
+
+**Three trigger points**
+
+| Trigger | Status | `reason` | `required` | Source |
+|---|---|---|---|---|
+| Daily-cap exhausted | 429 | `usage_limit` | `true` | `usage_enforcement_middleware` (Phase 8.1) |
+| Premium-gated feature | 403 | `feature_locked` | `true` | `_premium_required_response` (replaces `_premium_required` from Phase 8.2) |
+| Free-tier curated body | 200 | `limited_access` | `false` | `/reports/latest` handler |
+
+The `required: true | false` flag is a UX hint:
+`true` means "the request was blocked"; `false` means "the
+response is a curated subset — the caller can still use it".
+
+**Body shapes (free user, Stripe configured)**
+
+429 — usage limit exhausted:
+
+```json
+{
+  "detail": "usage limit reached — upgrade for higher limits",
+  "upgrade": {
+    "required": true,
+    "reason": "usage_limit",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+403 — premium-only feature:
+
+```json
+{
+  "detail": "premium feature — upgrade required",
+  "upgrade": {
+    "required": true,
+    "reason": "feature_locked",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+200 — curated `/reports/latest`:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "scorer_fingerprint": "...",
+  "totals": {...},
+  "promotion_readiness": {...},
+  "tier": "free",
+  "upgrade": {
+    "required": false,
+    "reason": "limited_access",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+Premium callers receive the same base response WITHOUT the
+``upgrade`` key — no Stripe call is made on their behalf. Pinned
+by `TestPhase83Usage429UpgradePayload::test_premium_429_does_not_include_payload`
+and `TestPhase83ReportsLatestLimitedAccess::test_premium_reports_latest_omits_payload`.
+
+**Headers (unchanged)**
+
+The Phase 8.1 usage headers (`X-Usage-Limit`, `X-Usage-Remaining`,
+`X-Usage-Tier`, `Retry-After`) and the Phase 8.2 `X-Usage-Tier`
+on 403s ride along verbatim. The upgrade payload is body-only —
+intentionally NOT duplicated into headers.
+
+**Failure posture (every path tested)**
+
+* Stripe API non-2xx → log at DEBUG, return base response WITHOUT
+  the upgrade payload. Pinned by
+  `TestPhase83StripeFailureGracefulDegradation` (3 tests).
+* `TRADING_PUBLIC_BASE_URL` unset → no checkout possible → return
+  base response without the upgrade payload. Pinned by
+  `test_no_public_base_url_skips_payload`.
+* Premium short-circuits BEFORE any Stripe call. Pinned by
+  `test_premium_user_explicit_arg_skips_stripe`.
+
+**Performance posture**
+
+Every free-tier 429 / 403 / curated-200 response triggers ONE
+outbound Stripe POST. Operators uncomfortable with that
+trade-off can disable specific trigger points by:
+
+* `TRADING_USAGE_ENFORCEMENT_ENABLED=false` (kills the 429 path).
+* unsetting `TRADING_PUBLIC_BASE_URL` (skips all three Phase 8.3
+  payloads while preserving Phase 8.1/8.2 base behaviour).
+
+**Privacy invariants (every one tested)**
+
+* Raw API key never sent to Stripe (Phase 7.3 hash-only contract).
+  Pinned by
+  `test_free_429_includes_payload` (asserts
+  `metadata[api_key]` absent and `metadata[key_hash]` present).
+* Raw API key never appears in any Phase 8.3 response body or
+  header.
+* `checkout_url` never persisted to the manifest, revocation log,
+  usage log, audit log, Stripe premium cache, conversion log, or
+  upgrade-events log.
+* Premium callers never trigger a Stripe call from any of the
+  three trigger points.
+
+**Boundary**
+
+* No new HTTP routes — Phase 8.3 is helper code reused by existing
+  routes / middleware. Pinned by
+  `test_payload_does_not_introduce_mutating_route`.
+* `_premium_required` (Phase 8.2 raise-style) replaced by
+  `_premium_required_response` (Phase 8.3 return-style) so the
+  body can carry both `detail` and `upgrade`. The `detail`
+  constant is unchanged.
+* Phase 8.1 enforcement layer still applies to Phase 8.3 responses
+  — gated 429s still 429. Pinned by
+  `test_usage_enforcement_still_applies_after_payload_attached`.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
