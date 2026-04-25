@@ -69,6 +69,10 @@ from trading_bot.api.billing import (
     verify_webhook_signature,
 )
 from trading_bot.api.insights import build_insights, truncate_for_free
+from trading_bot.api.daily_hook import (
+    build_daily_hook,
+    truncate_for_free as _truncate_hook_for_free,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -2612,12 +2616,21 @@ def latest_report(
             )
             prev = None
     insights = build_insights(data, prev)
+    # Phase 9.2 — daily-hook banner. Returns ``None`` when there's
+    # no prior report or both signal sources miss; the response
+    # then simply omits the ``daily_hook`` field.
+    daily_hook = build_daily_hook(data, prev, insights)
 
     if _is_premium_user(request):
         data["insights"] = insights
+        if daily_hook is not None:
+            data["daily_hook"] = daily_hook
         return data
     free_body = _project_report_for_free(data)
     free_body["insights"] = truncate_for_free(insights)
+    free_hook = _truncate_hook_for_free(daily_hook)
+    if free_hook is not None:
+        free_body["daily_hook"] = free_hook
     upgrade = _build_upgrade_payload(
         request, reason="limited_access", required=False, is_premium=False,
     )
@@ -3014,6 +3027,40 @@ def _render_insights_block(insights: Optional[list[dict]]) -> str:
     )
 
 
+def _render_daily_hook_banner(hook: Optional[dict]) -> str:
+    """
+    Phase 9.2 — top-of-page "what changed since yesterday" banner.
+
+    Renders nothing when ``hook`` is ``None`` (e.g. no prior-day
+    report). Otherwise emits a small ``<aside>`` with the headline,
+    a change-direction tag for CSS, and the CTA. The same markup
+    works for both tiers; the underlying data is what differs.
+    """
+    if not isinstance(hook, dict):
+        return ""
+    headline = _esc(str(hook.get("headline", "")))
+    if not headline:
+        return ""
+    change = _esc(str(hook.get("change", "flat")))
+    cta = _esc(str(hook.get("cta", "")))
+    since = _esc(str(hook.get("since") or ""))
+    since_block = (
+        f'<span class="daily-hook-since">since {since}</span>'
+        if since else ""
+    )
+    cta_block = (
+        f'<span class="daily-hook-cta">{cta}</span>'
+        if cta else ""
+    )
+    return (
+        f'<aside class="daily-hook daily-hook-{change}">'
+        f'<strong>{headline}</strong>'
+        f"{since_block}"
+        f"{cta_block}"
+        "</aside>"
+    )
+
+
 def render_dashboard_html(
     report: Optional[dict],
     experiments: list[dict],
@@ -3021,6 +3068,7 @@ def render_dashboard_html(
     tier: str = TIER_PREMIUM,
     banner_copy: Optional[str] = None,
     insights: Optional[list[dict]] = None,
+    daily_hook: Optional[dict] = None,
 ) -> str:
     """
     Build the dashboard HTML from sanitized inputs.
@@ -3118,6 +3166,7 @@ def render_dashboard_html(
         free_tier_banner = ""
 
     insights_block = _render_insights_block(insights)
+    daily_hook_block = _render_daily_hook_banner(daily_hook)
 
     return (
         "<!DOCTYPE html>"
@@ -3128,6 +3177,7 @@ def render_dashboard_html(
         "</head><body>"
         "<h1>Momentum Trading Bot — Analytics Dashboard</h1>"
         f'<p class="meta">Read-only view. Generated at {generated_at}.</p>'
+        f"{daily_hook_block}"
         f"{free_tier_banner}"
         f"{report_block}"
         f"{insights_block}"
@@ -3209,6 +3259,14 @@ def dashboard(
     # free-tier projection trims regime_stats / etc.) so the rules
     # see every signal. Truncation for free callers happens after.
     insights = build_insights(report, prev_report) if report is not None else []
+    # Phase 9.2 — same logic for the daily-hook banner. Compute
+    # before projection / truncation so the trend insight (which
+    # reads totals.buy_rows on both sides) has full data; tier
+    # truncation is applied after.
+    daily_hook = (
+        build_daily_hook(report, prev_report, insights)
+        if report is not None else None
+    )
     # Phase 8.2 — when the caller is on the free tier, pass the
     # report through the same allow-list that gates /reports/latest
     # so the dashboard cannot accidentally surface the deep tier /
@@ -3218,6 +3276,7 @@ def dashboard(
         report = _project_report_for_free(report)
     if not is_premium:
         insights = truncate_for_free(insights)
+        daily_hook = _truncate_hook_for_free(daily_hook)
     # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
     # string rendered to the user is also the one we hash into the
     # telemetry row. Premium users skip the resolver entirely (no
@@ -3225,7 +3284,7 @@ def dashboard(
     banner_copy = _upgrade_banner_copy() if tier == TIER_FREE else None
     html = render_dashboard_html(
         report, experiments, tier=tier, banner_copy=banner_copy,
-        insights=insights,
+        insights=insights, daily_hook=daily_hook,
     )
     if tier == TIER_FREE:
         # Phase 5.5 + 5.8 — the banner is rendered in the HTML

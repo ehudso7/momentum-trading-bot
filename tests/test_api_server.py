@@ -9188,3 +9188,258 @@ class TestPhase91CrossCutting:
             headers={"Authorization": f"Bearer {raw}"},
         )
         assert r.status_code == 429
+
+
+# ===========================================================================
+# Phase 9.2 — daily-hook banner (integration with /reports/latest + /dashboard)
+# ===========================================================================
+
+
+class TestPhase92ReportsLatestHookPresent:
+    def test_premium_response_includes_full_hook(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "daily_hook" in body
+        hook = body["daily_hook"]
+        assert set(hook.keys()) == {
+            "headline", "change", "magnitude", "confidence",
+            "since", "driver", "cta",
+        }
+        assert hook["change"] == "up"
+        assert hook["magnitude"] == 10
+        assert hook["since"] == "2026-04-24"
+        assert hook["driver"] == "trend.buy_delta"
+
+    def test_free_response_includes_simplified_hook(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body["tier"] == "free"
+        assert "daily_hook" in body
+        hook = body["daily_hook"]
+        # Free response carries headline / change / magnitude / since
+        # / cta — but NOT confidence and NOT driver.
+        assert set(hook.keys()) == {
+            "headline", "change", "magnitude", "since", "cta",
+        }
+        assert "confidence" not in hook
+        assert "driver" not in hook
+
+
+class TestPhase92ReportsLatestHookAbsent:
+    def test_no_prev_report_omits_hook(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant ONLY today — no prior-day report, hook must be absent.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "daily_hook" not in body
+
+    def test_free_no_prev_report_omits_hook(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "daily_hook" not in body
+
+
+class TestPhase92DashboardHookBanner:
+    def test_premium_dashboard_renders_hook_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Banner uses a stable CSS class so dashboards / scrapers
+        # can latch onto it.
+        assert 'class="daily-hook daily-hook-up"' in html
+        assert "Buys up 10 vs prior day" in html
+        assert "since 2026-04-24" in html
+        assert "Open the dashboard for the full breakdown" in html
+
+    def test_free_dashboard_renders_hook_banner(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Free dashboard renders the same banner shape — it's the
+        # underlying data that's truncated, not the markup.
+        assert 'class="daily-hook daily-hook-up"' in html
+        assert "Buys up 10 vs prior day" in html
+
+    def test_dashboard_omits_banner_when_no_prev(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="daily-hook' not in html
+
+    def test_dashboard_omits_banner_when_no_reports(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # No reports planted → no hook → no banner.
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="daily-hook' not in html
+
+    def test_dashboard_banner_renders_above_report_section(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        """The banner must appear ABOVE the latest-report section so
+        repeat visitors see the day-over-day signal first."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        banner_pos = html.index('class="daily-hook')
+        # The latest-report heading is either "Latest report" (empty
+        # state) or "Latest report — <date>" when a report exists.
+        # Match either form via the common prefix.
+        report_pos = html.index("<h2>Latest report")
+        assert banner_pos < report_pos
+
+
+class TestPhase92NoLeak:
+    def test_raw_key_absent_from_hook_response(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in body_text
+
+    def test_raw_key_absent_from_dashboard_html(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in html
+
+
+class TestPhase92CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 9.2 leaked a mutating route: {m} {path}"
+                )
+
+    def test_hook_does_not_affect_existing_insights_field(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        """Phase 9.1 insights must continue to surface alongside
+        the new daily_hook field."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "insights" in body
+        assert "daily_hook" in body
+        # The insights list and the hook agree on the trend direction.
+        trend = [
+            e for e in body["insights"]
+            if e["id"] == "trend.buy_delta"
+        ][0]
+        assert trend["evidence"]["direction"] == body["daily_hook"]["change"]

@@ -3345,6 +3345,144 @@ silently drop themselves.
   ``tests/test_insights.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
+### Phase 9.2 — daily hook & retention
+
+A "what changed since yesterday" hook surfaced as a top-of-page
+banner on the dashboard and as a ``daily_hook`` field on the
+``/reports/latest`` JSON. Designed to drive repeat usage by
+making the day-over-day signal the very first thing a returning
+caller sees.
+
+**Module**
+
+``trading_bot/api/daily_hook.py`` — pure stdlib, imports nothing
+from FastAPI / structlog / the rest of ``trading_bot`` (not even
+``insights``; the trend insight is consumed by ID via the
+``insights`` argument). Two public entry points:
+
+```python
+build_daily_hook(report, prev_report, insights=None) -> dict | None
+truncate_for_free(hook) -> dict | None
+```
+
+**Hook schema** (every entry conforms when ``build_daily_hook``
+does not return ``None``)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``headline``   | ``str``                            | human-readable tagline ("Buys up 10 vs prior day") |
+| ``change``     | ``"up"`` / ``"down"`` / ``"flat"`` | direction |
+| ``magnitude``  | ``int``                            | absolute change |
+| ``confidence`` | ``float``                          | clamped to ``[0.0, 1.0]`` (premium only) |
+| ``since``      | ``str`` / ``None``                 | ISO date of the prior report |
+| ``driver``     | ``str``                            | ``"trend.buy_delta"`` or ``"totals.buy_rows"`` (premium only) |
+| ``cta``        | ``str``                            | stable "Open the dashboard for the full breakdown" |
+
+**Source preference order**
+
+1. **Phase 9.1 trend insight** (preferred) — when the ``insights``
+   list contains a ``trend.buy_delta`` entry with valid evidence,
+   the hook borrows its ``delta`` / ``direction`` / ``confidence``.
+   ``driver`` reports ``"trend.buy_delta"``.
+2. **Direct totals fallback** — when the insight is missing or
+   malformed, the hook falls back to a direct
+   ``totals.buy_rows`` delta. Confidence collapses to a fixed
+   ``0.4`` and ``driver`` reports ``"totals.buy_rows"``.
+3. **Hook absent** — when there's no prior-day report, or both
+   sources lack data, ``build_daily_hook`` returns ``None`` and
+   the consumer omits the field entirely.
+
+**Tier-aware projection**
+
+* Premium → full hook with all seven fields.
+* Free → ``confidence`` and ``driver`` dropped; the user-facing
+  fields (``headline``, ``change``, ``magnitude``, ``since``,
+  ``cta``) are kept verbatim.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — best-effort prior-day load (Phase 9.1
+  already does this), then ``build_daily_hook(curr, prev,
+  insights)`` → tier-aware truncation → ``daily_hook`` field on
+  the response. Field is OMITTED when the hook is ``None``.
+* ``GET /dashboard`` — same compute. The renderer adds an
+  ``<aside class="daily-hook daily-hook-{change}">`` block at the
+  top of the page (above the latest-report section). The aside
+  is OMITTED when the hook is ``None``. Both tiers see the same
+  markup; the underlying truncation is what differs.
+
+**Sample free response excerpt**
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "daily_hook": {
+    "headline": "Buys up 10 vs prior day",
+    "change": "up",
+    "magnitude": 10,
+    "since": "2026-04-24",
+    "cta": "Open the dashboard for the full breakdown"
+  },
+  "insights": [...],
+  "upgrade": {...}
+}
+```
+
+**Sample premium response excerpt**
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "daily_hook": {
+    "headline": "Buys up 10 vs prior day",
+    "change": "up",
+    "magnitude": 10,
+    "confidence": 0.5,
+    "since": "2026-04-24",
+    "driver": "trend.buy_delta",
+    "cta": "Open the dashboard for the full breakdown"
+  },
+  "insights": [...]
+}
+```
+
+**Sample dashboard banner HTML**
+
+```html
+<aside class="daily-hook daily-hook-up">
+  <strong>Buys up 10 vs prior day</strong>
+  <span class="daily-hook-since">since 2026-04-24</span>
+  <span class="daily-hook-cta">Open the dashboard for the full breakdown</span>
+</aside>
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any hook field or rendered HTML. Pinned by
+  ``TestPhase92NoLeak`` (2 tests).
+* Hook absent when prior-day report is missing — no synthetic
+  values, no bogus zeros. Pinned by
+  ``TestPhase92ReportsLatestHookAbsent`` (2 tests).
+* Free truncation is mechanical via the ``_FREE_HOOK_ALLOWLIST``
+  set, so any future field added to ``build_daily_hook`` stays
+  premium-only until its allow-list entry is added.
+
+**Boundary**
+
+* No new HTTP route. Phase 9.2 is helper code wired into existing
+  routes / renderer. Pinned by
+  ``TestPhase92CrossCutting::test_no_new_mutating_route``.
+* No new persistence — hook is computed per request from the
+  same files Phase 9.1 already reads.
+* No new env vars.
+* ``trading_bot/api/daily_hook.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_daily_hook.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
