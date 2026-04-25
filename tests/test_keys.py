@@ -1067,237 +1067,495 @@ class TestPhase61Cli:
 
 
 # ===========================================================================
-# Phase 6.2 — revoke subcommand
+# Phase 6.2 — manifest inspection (``keys list``)
 # ===========================================================================
 
 
-@pytest.fixture
-def revoked_path(tmp_path: Path, monkeypatch) -> Path:
-    p = tmp_path / "api_keys_revoked.jsonl"
-    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(p))
-    # Reset key_store caches so a previous test's revoked file
-    # doesn't leak into this one.
-    from trading_bot.api import key_store
-    key_store.reset_caches_for_tests()
-    yield p
-    key_store.reset_caches_for_tests()
+from trading_bot.api.keys import (  # noqa: E402
+    LIST_OUTPUT_FIELDS,
+    _format_list_json,
+    _format_list_text,
+    list_keys,
+)
 
 
-def _read_revocations(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if s:
-            rows.append(json.loads(s))
-    return rows
+def _seed_manifest(
+    path: Path,
+    rows: list[dict],
+) -> None:
+    """Write a manifest file directly so we control the exact rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""),
+        encoding="utf-8",
+    )
 
 
-class TestPhase62RevokeApi:
-    """In-process invocation of ``main`` with ``revoke`` argv."""
+def _row(
+    *,
+    created_at: str,
+    key_hash: str,
+    label_hash: str = "0" * 32,
+    tier: str = "free",
+    ref_code=None,
+    checkout_session_id=None,
+    **extra: object,
+) -> dict:
+    """Build a manifest-style row, with any extra fields the test
+    wants to plant for leak-guard purposes."""
+    base = {
+        "created_at": created_at,
+        "key_hash": key_hash,
+        "label_hash": label_hash,
+        "tier": tier,
+        "ref_code": ref_code,
+        "checkout_session_id": checkout_session_id,
+    }
+    base.update(extra)
+    return base
 
-    def test_revoke_by_hash_writes_row(self, revoked_path: Path):
-        h = "a" * 32
-        rc = keys_main([
-            "revoke", "--key-hash", h, "--reason", "leaked",
+
+# ---------------------------------------------------------------------------
+# list_keys — plain reads + filters + sort
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62ListKeys:
+    def test_missing_manifest_returns_empty(self, tmp_path: Path):
+        # Manifest path explicitly set to a file that does NOT exist.
+        out = list_keys(manifest_path=tmp_path / "absent.jsonl")
+        assert out == []
+
+    def test_empty_manifest_returns_empty(self, manifest_path: Path):
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("", encoding="utf-8")
+        assert list_keys(manifest_path=manifest_path) == []
+
+    def test_lists_all_rows(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T10:00:00.000000Z",
+                 key_hash="aaaa", tier="free"),
+            _row(created_at="2026-04-21T10:00:00.000000Z",
+                 key_hash="bbbb", tier="premium"),
+            _row(created_at="2026-04-22T10:00:00.000000Z",
+                 key_hash="cccc", tier="free"),
         ])
-        assert rc == 0
-        (row,) = _read_revocations(revoked_path)
-        assert row["key_hash"] == h
-        assert row["reason"] == "leaked"
-        assert "timestamp" in row
+        out = list_keys(manifest_path=manifest_path)
+        assert len(out) == 3
 
-    def test_revoke_by_raw_key_stores_only_hash(
-        self, revoked_path: Path,
+    def test_sorted_newest_first(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T10:00:00.000000Z",
+                 key_hash="oldest"),
+            _row(created_at="2026-04-22T10:00:00.000000Z",
+                 key_hash="newest"),
+            _row(created_at="2026-04-21T10:00:00.000000Z",
+                 key_hash="middle"),
+        ])
+        out = list_keys(manifest_path=manifest_path)
+        assert [r["key_hash"] for r in out] == [
+            "newest", "middle", "oldest",
+        ]
+
+    def test_filter_by_tier(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="f1", tier="free"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="p1", tier="premium"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="f2", tier="free"),
+        ])
+        free = list_keys(
+            manifest_path=manifest_path, tier_filter="free",
+        )
+        assert {r["key_hash"] for r in free} == {"f1", "f2"}
+        prem = list_keys(
+            manifest_path=manifest_path, tier_filter="premium",
+        )
+        assert {r["key_hash"] for r in prem} == {"p1"}
+
+    def test_filter_by_tier_case_insensitive(
+        self, manifest_path: Path,
     ):
-        marker = "RAW_KEY_REVOKE_DO_NOT_LEAK_ABCXYZ"
-        expected_hash = _hash_api_key(marker)
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="f1", tier="free"),
+        ])
+        # "FREE" / " Free " all normalise to "free".
+        out = list_keys(
+            manifest_path=manifest_path, tier_filter="FREE",
+        )
+        assert {r["key_hash"] for r in out} == {"f1"}
 
-        rc = keys_main(["revoke", "--api-key", marker, "--reason", "rotation"])
-        assert rc == 0
+    def test_filter_by_ref(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="t1", ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="h1", ref_code="hn-launch"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="n1", ref_code=None),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            ref_filter="twitter-launch_2026",
+        )
+        assert {r["key_hash"] for r in out} == {"t1"}
 
-        (row,) = _read_revocations(revoked_path)
-        assert row["key_hash"] == expected_hash
-        body = revoked_path.read_text(encoding="utf-8")
-        assert marker not in body
-        # Sanity — the hash is present.
-        assert expected_hash in body
-
-    def test_revoke_blank_hash_rejected(self, revoked_path: Path):
-        rc = keys_main(["revoke", "--key-hash", "   "])
-        assert rc == 2
-        assert _read_revocations(revoked_path) == []
-
-    def test_revoke_blank_raw_key_rejected(self, revoked_path: Path):
-        rc = keys_main(["revoke", "--api-key", "   "])
-        assert rc == 2
-        assert _read_revocations(revoked_path) == []
-
-    def test_revoke_requires_one_of_two_inputs(
-        self, revoked_path: Path,
+    def test_filter_by_ref_runs_through_sanitiser(
+        self, manifest_path: Path,
     ):
-        # argparse calls sys.exit(2) on a missing required group.
-        with pytest.raises(SystemExit) as exc:
-            keys_main(["revoke"])
-        assert exc.value.code == 2
-        assert _read_revocations(revoked_path) == []
+        """An operator typing ``--ref "twitter launch"`` (with a
+        space) sanitises to ``twitterlaunch`` — no row matches in
+        this case, but an operator pasting an XSS payload sanitises
+        to its safe substring and matches the row that was
+        sanitised at write time."""
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="x1", ref_code="scriptxssscript"),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            ref_filter="<script>xss</script>",
+        )
+        assert {r["key_hash"] for r in out} == {"x1"}
 
-    def test_revoke_rejects_both_inputs(
-        self, revoked_path: Path,
+    def test_empty_ref_filter_after_sanitise_is_treated_as_no_filter(
+        self, manifest_path: Path,
     ):
-        with pytest.raises(SystemExit) as exc:
-            keys_main([
-                "revoke",
-                "--api-key", "k",
-                "--key-hash", "h" * 32,
+        """``--ref "!@#"`` sanitises to "" and we treat that as
+        "no filter" — better than silently filtering to zero rows."""
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="a", ref_code=None),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="b", ref_code="hn-launch"),
+        ])
+        out = list_keys(manifest_path=manifest_path, ref_filter="!@#")
+        assert {r["key_hash"] for r in out} == {"a", "b"}
+
+    def test_filters_are_anded(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="ft", tier="free", ref_code="twitter"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="pt", tier="premium", ref_code="twitter"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="fh", tier="free", ref_code="hn"),
+        ])
+        out = list_keys(
+            manifest_path=manifest_path,
+            tier_filter="free",
+            ref_filter="twitter",
+        )
+        assert {r["key_hash"] for r in out} == {"ft"}
+
+    def test_malformed_lines_are_skipped(self, manifest_path: Path):
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            "\n".join([
+                "garbage",
+                "",
+                "[\"not a dict\"]",
+                json.dumps(_row(
+                    created_at="2026-04-20T00:00:00.000000Z",
+                    key_hash="ok",
+                )),
             ])
-        assert exc.value.code == 2
-        assert _read_revocations(revoked_path) == []
+            + "\n",
+            encoding="utf-8",
+        )
+        out = list_keys(manifest_path=manifest_path)
+        assert {r["key_hash"] for r in out} == {"ok"}
 
-    def test_revoke_reason_optional(self, revoked_path: Path):
-        rc = keys_main(["revoke", "--key-hash", "b" * 32])
-        assert rc == 0
-        (row,) = _read_revocations(revoked_path)
-        assert "reason" not in row
 
-    def test_revoke_path_override(self, tmp_path: Path):
-        custom = tmp_path / "alt_revoked.jsonl"
-        rc = keys_main([
-            "revoke",
-            "--key-hash", "c" * 32,
-            "--revoked-path", str(custom),
+# ---------------------------------------------------------------------------
+# list_keys — output projection (defense in depth)
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62OutputProjection:
+    def test_only_documented_fields_emitted(self, manifest_path: Path):
+        """Even when the row carries extra fields (a poisoned /
+        hand-edited manifest), the output dict must contain ONLY
+        the public field-set."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                # Extra fields a Phase 6.0/6.1 row should NOT have.
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+                random_extra="HOSTILE_EXTRA_DO_NOT_LEAK",
+            ),
         ])
-        assert rc == 0
-        assert custom.exists()
+        (out,) = list_keys(manifest_path=manifest_path)
+        assert set(out.keys()) == set(LIST_OUTPUT_FIELDS)
 
-
-class TestPhase62RevokeCli:
-    """Subprocess-level CLI test — verifies argv parsing & exit codes."""
-
-    def test_subprocess_revoke_by_hash(self, tmp_path: Path):
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        h = "d" * 32
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "trading_bot.api.keys",
-                "revoke", "--key-hash", h, "--reason", "test",
-            ],
-            capture_output=True, text=True,
-            env={
-                **__import__("os").environ,
-                "TRADING_API_KEYS_REVOKED_PATH": str(revoked),
-            },
-        )
-        assert result.returncode == 0, result.stderr
-        assert "revoked" in result.stdout.lower()
-        rows = _read_revocations(revoked)
-        assert len(rows) == 1
-        assert rows[0]["key_hash"] == h
-
-    def test_subprocess_revoke_by_raw_key_does_not_leak(
-        self, tmp_path: Path,
+    def test_text_output_never_contains_secret_markers(
+        self, manifest_path: Path,
     ):
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        marker = "RAW_KEY_SUBPROC_DO_NOT_LEAK"
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+            ),
+        ])
+        rendered = _format_list_text(
+            list_keys(manifest_path=manifest_path),
+        )
+        assert "HOSTILE_RAW_KEY_DO_NOT_LEAK" not in rendered
+        assert "HOSTILE_RAW_LABEL_DO_NOT_LEAK" not in rendered
+        assert "stripe.example/leak" not in rendered
+
+    def test_json_output_never_contains_secret_markers(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/leak",
+            ),
+        ])
+        rendered = _format_list_json(
+            list_keys(manifest_path=manifest_path),
+        )
+        # Re-parse + spot-check.
+        parsed = json.loads(rendered)
+        for row in parsed:
+            assert set(row.keys()) == set(LIST_OUTPUT_FIELDS)
+        assert "HOSTILE_RAW_KEY_DO_NOT_LEAK" not in rendered
+        assert "HOSTILE_RAW_LABEL_DO_NOT_LEAK" not in rendered
+        assert "stripe.example/leak" not in rendered
+
+    def test_label_hash_is_not_emitted(self, manifest_path: Path):
+        """``label_hash`` IS in the manifest (Phase 6.0) but it's
+        not part of the public list-view contract — operators can
+        join elsewhere if they really need it. Keep the public
+        surface tight."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-20T00:00:00.000000Z",
+                key_hash="ok",
+                label_hash="ABCDEF1234567890",
+            ),
+        ])
+        (out,) = list_keys(manifest_path=manifest_path)
+        assert "label_hash" not in out
+
+
+# ---------------------------------------------------------------------------
+# CLI — `keys list`
+# ---------------------------------------------------------------------------
+
+
+class TestPhase62Cli:
+    def _env(self, manifest_path: Path) -> dict:
+        return {
+            **__import__("os").environ,
+            KEYS_MANIFEST_ENV_VAR: str(manifest_path),
+        }
+
+    def test_cli_list_all_text(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="aaaa1111", tier="free",
+                 ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="bbbb2222", tier="premium"),
+        ])
         result = subprocess.run(
             [
                 sys.executable, "-m", "trading_bot.api.keys",
-                "revoke", "--api-key", marker,
+                "list",
             ],
             capture_output=True, text=True,
-            env={
-                **__import__("os").environ,
-                "TRADING_API_KEYS_REVOKED_PATH": str(revoked),
-            },
+            env=self._env(manifest_path),
         )
         assert result.returncode == 0, result.stderr
-        body = revoked.read_text(encoding="utf-8")
-        assert marker not in body
-        assert marker not in result.stdout
+        # Newest first.
+        out = result.stdout
+        assert out.find("bbbb2222") < out.find("aaaa1111")
+        assert "twitter-launch_2026" in out
+        assert "premium" in out
 
-    def test_subprocess_unknown_command_exits_nonzero(self):
+    def test_cli_filter_by_tier(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="freekey", tier="free"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="premkey", tier="premium"),
+        ])
         result = subprocess.run(
             [
                 sys.executable, "-m", "trading_bot.api.keys",
-                "no-such-command",
+                "list", "--tier", "premium",
             ],
             capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "premkey" in result.stdout
+        assert "freekey" not in result.stdout
+
+    def test_cli_filter_by_ref(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="thash", ref_code="twitter-launch_2026"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="hhash", ref_code="hn-launch"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--ref", "hn-launch",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "hhash" in result.stdout
+        assert "thash" not in result.stdout
+
+    def test_cli_combined_filters_anded(self, manifest_path: Path):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-20T00:00:00.000000Z",
+                 key_hash="ft", tier="free", ref_code="twitter"),
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="pt", tier="premium", ref_code="twitter"),
+            _row(created_at="2026-04-22T00:00:00.000000Z",
+                 key_hash="fh", tier="free", ref_code="hn"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "free", "--ref", "twitter",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ft" in result.stdout
+        assert "pt" not in result.stdout
+        assert "fh" not in result.stdout
+
+    def test_cli_json_flag_emits_json_array(
+        self, manifest_path: Path,
+    ):
+        _seed_manifest(manifest_path, [
+            _row(created_at="2026-04-21T00:00:00.000000Z",
+                 key_hash="abcd1234", tier="premium",
+                 ref_code="hn-launch",
+                 checkout_session_id="cs_test_abc"),
+        ])
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--json",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        row = rows[0]
+        assert set(row.keys()) == set(LIST_OUTPUT_FIELDS)
+        assert row["key_hash"] == "abcd1234"
+        assert row["tier"] == "premium"
+        assert row["ref_code"] == "hn-launch"
+        assert row["checkout_session_id"] == "cs_test_abc"
+
+    def test_cli_missing_manifest_text_fallback(
+        self, manifest_path: Path,
+    ):
+        # Don't write the file at all.
+        assert not manifest_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "(no records)" in result.stdout
+
+    def test_cli_missing_manifest_json_emits_empty_array(
+        self, manifest_path: Path,
+    ):
+        assert not manifest_path.exists()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--json",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == []
+
+    def test_cli_invalid_tier_rejected(self, manifest_path: Path):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "list", "--tier", "enterprise",
+            ],
+            capture_output=True, text=True,
+            env=self._env(manifest_path),
         )
         assert result.returncode == 2
-        assert "available commands" in result.stderr
-        assert "revoke" in result.stderr
 
+    def test_cli_unknown_command_lists_both(self, capsys):
+        from trading_bot.api.keys import main as keys_main
+        rc = keys_main(["bogus"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        # Phase 6.2: the error message should mention BOTH commands.
+        assert "issue" in err
+        assert "list" in err
 
-class TestPhase62IssueRevokeRoundTrip:
-    """Issue a key, revoke it via the CLI, and assert the manifest +
-    revocation log together describe the lifecycle correctly."""
-
-    def test_issue_then_revoke_by_hash(
-        self, manifest_path: Path, tmp_path: Path,
+    def test_cli_list_never_outputs_secret_markers(
+        self, manifest_path: Path,
     ):
-        issued = issue_key(tier="free", label="alice")
-        api_key = issued["api_key"]
-        key_hash = issued["key_hash"]
-
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        rc = keys_main([
-            "revoke", "--key-hash", key_hash,
-            "--revoked-path", str(revoked),
-            "--reason", "user-requested",
+        """End-to-end: a poisoned manifest with stray secret-looking
+        fields must not leak through the CLI."""
+        _seed_manifest(manifest_path, [
+            _row(
+                created_at="2026-04-21T00:00:00.000000Z",
+                key_hash="ok",
+                api_key="HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                label="HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                checkout_url="https://stripe.example/HOSTILE_LEAK",
+            ),
         ])
-        assert rc == 0
-
-        # Manifest still has the original row …
-        manifest_rows = _read(manifest_path)
-        assert any(r["key_hash"] == key_hash for r in manifest_rows)
-
-        # … and the revocation log records exactly the hash.
-        (rev,) = _read_revocations(revoked)
-        assert rev["key_hash"] == key_hash
-        assert rev["reason"] == "user-requested"
-        # Raw issued api_key never landed on disk.
-        body = revoked.read_text(encoding="utf-8")
-        assert api_key not in body
-
-    def test_issue_then_revoke_by_raw_key(
-        self, manifest_path: Path, tmp_path: Path,
-    ):
-        issued = issue_key(tier="premium", label="bob")
-        api_key = issued["api_key"]
-        key_hash = issued["key_hash"]
-
-        revoked = tmp_path / "api_keys_revoked.jsonl"
-        rc = keys_main([
-            "revoke", "--api-key", api_key,
-            "--revoked-path", str(revoked),
-        ])
-        assert rc == 0
-
-        (rev,) = _read_revocations(revoked)
-        assert rev["key_hash"] == key_hash
-        body = revoked.read_text(encoding="utf-8")
-        assert api_key not in body
-
-
-class TestPhase62NoCoreImports:
-    """The Phase 6.0 boundary still holds after Phase 6.2."""
-
-    def test_keys_module_does_not_reach_into_core(self):
-        src = (
-            Path(__file__).resolve().parent.parent
-            / "trading_bot" / "api" / "keys.py"
-        ).read_text()
-        for forbidden in (
-            "from trading_bot.core.alpha",
-            "from trading_bot.execution",
-            "from trading_bot.portfolio",
-            "from trading_bot.risk",
-            "from trading_bot.scanners",
-            "from trading_bot.strategies",
-            "from trading_bot.main",
-            "from trading_bot.api.server",
-        ):
-            assert forbidden not in src, (
-                f"keys.py imports restricted surface: {forbidden!r}"
+        # Both text and JSON CLI paths.
+        for json_flag in ([], ["--json"]):
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "trading_bot.api.keys",
+                    "list", *json_flag,
+                ],
+                capture_output=True, text=True,
+                env=self._env(manifest_path),
             )
+            assert result.returncode == 0, result.stderr
+            for marker in (
+                "HOSTILE_RAW_KEY_DO_NOT_LEAK",
+                "HOSTILE_RAW_LABEL_DO_NOT_LEAK",
+                "HOSTILE_LEAK",
+                "checkout_url",
+            ):
+                assert marker not in result.stdout, (
+                    f"CLI {json_flag} leaked: {marker!r}"
+                )
