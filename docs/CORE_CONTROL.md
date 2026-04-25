@@ -2344,6 +2344,80 @@ import from it; `key_store` itself imports only from the Python
 stdlib.
 
 
+### Phase 6.3 — key manifest inspection CLI
+
+Three read-only subcommands on the existing operator CLI let an
+operator audit issued and revoked keys without ever surfacing a
+raw secret. No HTTP endpoint, no public surface — same shell-only
+posture as the rest of Phase 6.
+
+```
+python -m trading_bot.api.keys list
+python -m trading_bot.api.keys list --tier free|premium
+python -m trading_bot.api.keys list --ref <ref_code>
+python -m trading_bot.api.keys list --include-revoked
+python -m trading_bot.api.keys list --json
+
+python -m trading_bot.api.keys show --key-hash <hash>
+python -m trading_bot.api.keys show --key-hash <hash> --json
+
+python -m trading_bot.api.keys stats
+python -m trading_bot.api.keys stats --json
+```
+
+**Output surface (pinned allow-list)**
+
+Every inspection command projects manifest rows into the same
+fixed field set before printing. Anything outside the allow-list
+— including fields that a future `issue_key` schema bump might
+quietly add — is dropped:
+
+| Field                   | Source                         |
+|---|---|
+| `created_at`            | manifest row                    |
+| `key_hash`              | manifest row                    |
+| `tier`                  | manifest row                    |
+| `ref_code`              | manifest row                    |
+| `checkout_session_id`   | manifest row (may be `null`)    |
+| `revoked`               | derived from the revocation log |
+| `revoked_at`            | revocation row (if revoked)     |
+| `revoked_reason`        | revocation row (if present)     |
+
+**Never printed** — `api_key`, `label`, `label_hash`,
+`checkout_url`. The first three are never persisted to begin with
+(Phase 6.0/6.2); the last is never persisted to begin with
+(Phase 6.0). `label_hash` is on disk but the inspection surface
+omits it — operators who need it grep the manifest directly.
+
+**Behaviour**
+
+* `list` sorts newest first by `created_at`; unparseable
+  timestamps fall to the bottom.
+* Filters (`--tier`, `--ref`) are ANDed. `--ref` runs through
+  the Phase 5.1 growth sanitiser first so it matches whatever
+  the manifest actually stored (i.e. the same transformation
+  the live `?ref=` middleware applies).
+* Revoked rows are hidden by default; `--include-revoked`
+  shows them alongside active rows and adds a `revoked` column.
+* Missing files (manifest or revocation log) produce a clean
+  "0 active" report rather than a crash.
+* Malformed JSONL rows, rows missing `key_hash`, and rows with
+  an unrecognised `tier` are silently skipped — same posture
+  as the auth-path reader.
+* `show` looks a single manifest row up by `key_hash` and
+  returns exit-code 2 with a stderr message if no row matches.
+* `stats` counts `total_issued`, `active`, `revoked`, plus
+  per-tier / per-ref_code / per-created-date breakdowns. The
+  `revoked` counter counts manifest rows that have been revoked
+  — stray revocation rows for hashes never issued are ignored.
+
+**Boundary** — Phase 6.3 adds no new module and no new import
+into Core. The commands live in `trading_bot.api.keys` alongside
+`issue` and `revoke`, so the dependency-light CLI posture
+(no `structlog`, no `fastapi`) is preserved. Pinned by
+`tests/test_keys.py::TestPhase63NoCoreImports`.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

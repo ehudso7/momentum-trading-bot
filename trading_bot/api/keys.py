@@ -552,6 +552,438 @@ def _revoke_cli(argv: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 6.3 — manifest inspection (list / show / stats)
+# ---------------------------------------------------------------------------
+#
+# Read-only operator surface. Reads ``data/api_keys_manifest.jsonl`` and
+# ``data/api_keys_revoked.jsonl`` directly so it can surface fields that
+# the auth-path reader (``key_store``) deliberately drops (``ref_code``,
+# ``checkout_session_id``). Output is curated:
+#
+#   * raw ``api_key`` is never printed (it isn't on disk to begin with);
+#   * raw ``label`` is never printed (only ``label_hash`` is on disk and
+#     even that is omitted from the inspection surface — operators who
+#     want their hashed labels can grep the manifest directly);
+#   * ``checkout_url`` is never printed (it isn't on disk to begin with).
+
+
+# Fields surfaced by ``list`` / ``show`` / JSON output. Anything outside
+# this allow-list is dropped before serialisation, even if a future
+# ``issue_key`` schema bump quietly adds a new field.
+_INSPECT_ALLOWED_FIELDS: tuple[str, ...] = (
+    "created_at",
+    "key_hash",
+    "tier",
+    "ref_code",
+    "checkout_session_id",
+)
+
+
+def _read_jsonl_rows(path: Path) -> list[dict]:
+    """
+    Read a JSONL file into a list of dict rows. Tolerant of missing
+    files, blank lines, malformed JSON, and non-dict payloads — every
+    failure path drops the offending line and continues. Never raises.
+    """
+    rows: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    rec = json.loads(s)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    rows.append(rec)
+    except (FileNotFoundError, OSError):
+        return []
+    except Exception:
+        return []
+    return rows
+
+
+def _build_revocation_index(rows: list[dict]) -> dict[str, dict]:
+    """
+    Map ``key_hash`` → most-recent revocation row. The revocation log
+    is append-only; if an operator revokes the same hash twice, the
+    later row wins (in practice the second revoke is idempotent and
+    differs only in ``reason``). Rows lacking ``key_hash`` are dropped.
+    """
+    index: dict[str, dict] = {}
+    for rec in rows:
+        h = rec.get("key_hash")
+        if not isinstance(h, str) or not h:
+            continue
+        index[h] = rec
+    return index
+
+
+def _inspection_view(
+    manifest_row: dict,
+    revocation_index: dict[str, dict],
+) -> dict:
+    """
+    Project a manifest row into the operator-safe inspection surface,
+    augmented with revocation status pulled from the revocation index.
+    """
+    out: dict = {f: manifest_row.get(f) for f in _INSPECT_ALLOWED_FIELDS}
+    h = manifest_row.get("key_hash") or ""
+    rev = revocation_index.get(h)
+    out["revoked"] = rev is not None
+    if rev is not None:
+        # Revocation timestamp + reason are operator-curated artefacts
+        # already (no PII enters them — the CLI's --reason cap is
+        # enforced before they land on disk in Phase 6.2).
+        out["revoked_at"] = rev.get("timestamp")
+        if rev.get("reason"):
+            out["revoked_reason"] = rev.get("reason")
+    return out
+
+
+def _sort_newest_first(rows: list[dict]) -> list[dict]:
+    """
+    Sort by ``created_at`` descending. Rows lacking a usable
+    timestamp fall to the bottom but are preserved.
+    """
+    def _key(r: dict) -> tuple[int, str]:
+        ts = r.get("created_at")
+        if isinstance(ts, str) and ts:
+            return (0, ts)
+        return (1, "")
+    return sorted(rows, key=_key, reverse=True)
+
+
+def _format_list_table(rows: list[dict], include_revoked: bool) -> str:
+    """
+    Pretty-printed ASCII table for the ``list`` command's text mode.
+    """
+    if not rows:
+        return "(no manifest rows match the supplied filters)\n"
+
+    headers = ["created_at", "key_hash", "tier", "ref_code"]
+    if include_revoked:
+        headers.extend(["revoked", "revoked_at"])
+    headers.append("checkout_session_id")
+
+    def _cell(row: dict, name: str) -> str:
+        value = row.get(name)
+        if value is None:
+            return ""
+        if name == "revoked":
+            return "yes" if value else "no"
+        return str(value)
+
+    widths = {
+        h: max(len(h), max((len(_cell(r, h)) for r in rows), default=0))
+        for h in headers
+    }
+    sep = "  "
+    lines: list[str] = []
+    lines.append(sep.join(h.ljust(widths[h]) for h in headers))
+    lines.append(sep.join("-" * widths[h] for h in headers))
+    for r in rows:
+        lines.append(sep.join(_cell(r, h).ljust(widths[h]) for h in headers))
+    return "\n".join(lines) + "\n"
+
+
+def _build_list_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys list",
+        description=(
+            "List issued API keys from the operator-only manifest. "
+            "By default only active (non-revoked) rows are shown; pass "
+            "--include-revoked to see revoked rows too. The raw key, "
+            "raw label, and checkout URL are never displayed — only "
+            "hashes and operator-supplied metadata."
+        ),
+    )
+    parser.add_argument(
+        "--tier", default=None, choices=sorted(VALID_TIERS),
+        help="Show only rows with the supplied tier.",
+    )
+    parser.add_argument(
+        "--ref", default=None,
+        help=(
+            "Show only rows whose ref_code matches this exact value "
+            "(after the same Phase 5.1 sanitiser the live middleware "
+            "applies)."
+        ),
+    )
+    parser.add_argument(
+        "--include-revoked", action="store_true",
+        help="Include revoked rows. By default they are hidden.",
+    )
+    parser.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit JSON (a list of dicts) instead of the ASCII table.",
+    )
+    parser.add_argument(
+        "--manifest-path", default=None,
+        help=(
+            f"Override the manifest path "
+            f"(default: ${KEYS_MANIFEST_ENV_VAR} or "
+            f"{DEFAULT_KEYS_MANIFEST_PATH})."
+        ),
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help=(
+            f"Override the revocation log path "
+            f"(default: ${key_store.KEYS_REVOKED_ENV_VAR} or "
+            f"{key_store.DEFAULT_KEYS_REVOKED_PATH})."
+        ),
+    )
+    return parser
+
+
+def _list_cli(argv: list[str]) -> int:
+    args = _build_list_parser().parse_args(argv)
+
+    manifest = (
+        Path(args.manifest_path) if args.manifest_path
+        else _manifest_path()
+    )
+    revoked = (
+        Path(args.revoked_path) if args.revoked_path
+        else key_store.revoked_path()
+    )
+
+    manifest_rows = _read_jsonl_rows(manifest)
+    revocation_idx = _build_revocation_index(_read_jsonl_rows(revoked))
+
+    # Filter at the manifest level — tier/ref filters operate on the
+    # raw rows, then we project into the operator-safe surface.
+    filtered: list[dict] = []
+    target_ref = (
+        _sanitize_ref_code(args.ref) if args.ref is not None else None
+    )
+    for rec in manifest_rows:
+        # Only keep rows whose tier is recognisable. Anything else is
+        # dropped — same posture as the auth-path reader.
+        rec_tier = rec.get("tier")
+        if rec_tier not in VALID_TIERS:
+            continue
+        if args.tier is not None and rec_tier != args.tier:
+            continue
+        if target_ref is not None and (rec.get("ref_code") or "") != target_ref:
+            continue
+        filtered.append(rec)
+
+    views = [_inspection_view(r, revocation_idx) for r in filtered]
+    if not args.include_revoked:
+        views = [v for v in views if not v.get("revoked")]
+    views = _sort_newest_first(views)
+
+    if args.as_json:
+        print(json.dumps(views, indent=2, sort_keys=False))
+        return 0
+
+    total_active = sum(1 for v in views if not v.get("revoked"))
+    total_revoked = sum(1 for v in views if v.get("revoked"))
+    if args.include_revoked:
+        header = (
+            f"Issued keys ({total_active} active, "
+            f"{total_revoked} revoked):"
+        )
+    else:
+        header = f"Issued keys ({total_active} active):"
+    print(header)
+    print()
+    print(_format_list_table(views, include_revoked=args.include_revoked))
+    return 0
+
+
+def _build_show_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys show",
+        description=(
+            "Display the manifest row for a single key (looked up by "
+            "key_hash). Includes revocation status and reason if the "
+            "hash has been revoked."
+        ),
+    )
+    parser.add_argument(
+        "--key-hash", required=True,
+        help="SHA-256(api_key)[:32] hash to look up.",
+    )
+    parser.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit a JSON object instead of the human-readable block.",
+    )
+    parser.add_argument(
+        "--manifest-path", default=None,
+        help="Override the manifest path.",
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help="Override the revocation log path.",
+    )
+    return parser
+
+
+def _show_cli(argv: list[str]) -> int:
+    args = _build_show_parser().parse_args(argv)
+
+    target_hash = (args.key_hash or "").strip()
+    if not target_hash:
+        print("error: --key-hash must not be blank", file=sys.stderr)
+        return 2
+
+    manifest = (
+        Path(args.manifest_path) if args.manifest_path
+        else _manifest_path()
+    )
+    revoked = (
+        Path(args.revoked_path) if args.revoked_path
+        else key_store.revoked_path()
+    )
+
+    manifest_rows = _read_jsonl_rows(manifest)
+    revocation_idx = _build_revocation_index(_read_jsonl_rows(revoked))
+
+    matching = [
+        r for r in manifest_rows
+        if r.get("key_hash") == target_hash
+        and r.get("tier") in VALID_TIERS
+    ]
+    if not matching:
+        print(
+            f"error: no manifest row for key_hash {target_hash!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # If the same hash somehow appears twice in the manifest, prefer
+    # the most recent row — same last-row-wins rule key_store uses.
+    matching = _sort_newest_first(matching)
+    view = _inspection_view(matching[0], revocation_idx)
+
+    if args.as_json:
+        print(json.dumps(view, indent=2, sort_keys=False))
+        return 0
+
+    print(f"Key hash: {view['key_hash']}")
+    print(f"  created_at          : {view.get('created_at') or '(none)'}")
+    print(f"  tier                : {view.get('tier')}")
+    print(f"  ref_code            : {view.get('ref_code') or '(none)'}")
+    cs = view.get("checkout_session_id")
+    print(f"  checkout_session_id : {cs if cs else '(none)'}")
+    print(f"  revoked             : {'yes' if view.get('revoked') else 'no'}")
+    if view.get("revoked"):
+        print(f"  revoked_at          : {view.get('revoked_at') or '(none)'}")
+        if view.get("revoked_reason"):
+            print(f"  revoked_reason      : {view.get('revoked_reason')}")
+    return 0
+
+
+def _build_stats_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys stats",
+        description=(
+            "Aggregate counts over the issuance manifest. Displays "
+            "totals, per-tier breakdown, per-ref_code breakdown, and "
+            "per-creation-date breakdown — all derived from on-disk "
+            "metadata only."
+        ),
+    )
+    parser.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit JSON instead of the text summary.",
+    )
+    parser.add_argument(
+        "--manifest-path", default=None,
+        help="Override the manifest path.",
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help="Override the revocation log path.",
+    )
+    return parser
+
+
+def _stats_cli(argv: list[str]) -> int:
+    args = _build_stats_parser().parse_args(argv)
+
+    manifest = (
+        Path(args.manifest_path) if args.manifest_path
+        else _manifest_path()
+    )
+    revoked = (
+        Path(args.revoked_path) if args.revoked_path
+        else key_store.revoked_path()
+    )
+
+    manifest_rows = _read_jsonl_rows(manifest)
+    revocation_idx = _build_revocation_index(_read_jsonl_rows(revoked))
+
+    valid_rows = [r for r in manifest_rows if r.get("tier") in VALID_TIERS]
+    total = len(valid_rows)
+    revoked_count = sum(
+        1 for r in valid_rows
+        if r.get("key_hash") in revocation_idx
+    )
+    active = total - revoked_count
+
+    by_tier: dict[str, int] = {}
+    by_ref: dict[str, int] = {}
+    by_date: dict[str, int] = {}
+    for r in valid_rows:
+        tier = r.get("tier") or ""
+        by_tier[tier] = by_tier.get(tier, 0) + 1
+        ref = r.get("ref_code") or "(none)"
+        by_ref[ref] = by_ref.get(ref, 0) + 1
+        ts = r.get("created_at")
+        if isinstance(ts, str) and len(ts) >= 10:
+            day = ts[:10]
+        else:
+            day = "(unknown)"
+        by_date[day] = by_date.get(day, 0) + 1
+
+    summary = {
+        "total_issued": total,
+        "active": active,
+        "revoked": revoked_count,
+        "by_tier": dict(sorted(by_tier.items())),
+        "by_ref_code": dict(sorted(by_ref.items())),
+        "by_created_date": dict(sorted(by_date.items(), reverse=True)),
+    }
+
+    if args.as_json:
+        print(json.dumps(summary, indent=2, sort_keys=False))
+        return 0
+
+    print("API key manifest stats:")
+    print(f"  total issued      : {summary['total_issued']}")
+    print(f"  active            : {summary['active']}")
+    print(f"  revoked           : {summary['revoked']}")
+    print()
+    print("By tier:")
+    if summary["by_tier"]:
+        for tier, n in summary["by_tier"].items():
+            print(f"  {tier:<8} : {n}")
+    else:
+        print("  (none)")
+    print()
+    print("By ref_code:")
+    if summary["by_ref_code"]:
+        for ref, n in summary["by_ref_code"].items():
+            print(f"  {ref:<32} : {n}")
+    else:
+        print("  (none)")
+    print()
+    print("By created date (UTC):")
+    if summary["by_created_date"]:
+        for day, n in summary["by_created_date"].items():
+            print(f"  {day:<12} : {n}")
+    else:
+        print("  (none)")
+    return 0
+
+
 def _build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot.api.keys",
@@ -568,6 +1000,21 @@ def _build_top_parser() -> argparse.ArgumentParser:
         help="Append a revocation row for an issued API key.",
         add_help=False,
     )
+    subparsers.add_parser(
+        "list",
+        help="List issued keys (filtered, hash-only — no raw secrets).",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "show",
+        help="Show one manifest row by key_hash.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "stats",
+        help="Aggregate counts over the issuance manifest.",
+        add_help=False,
+    )
     return parser
 
 
@@ -582,11 +1029,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _issue_cli(rest)
     if command == "revoke":
         return _revoke_cli(rest)
+    if command == "list":
+        return _list_cli(rest)
+    if command == "show":
+        return _show_cli(rest)
+    if command == "stats":
+        return _stats_cli(rest)
     if command in ("-h", "--help"):
         _build_top_parser().print_help()
         return 0
     print(f"error: unknown command '{command}'", file=sys.stderr)
-    print("available commands: issue, revoke", file=sys.stderr)
+    print(
+        "available commands: issue, revoke, list, show, stats",
+        file=sys.stderr,
+    )
     return 2
 
 
