@@ -82,6 +82,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -89,9 +90,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import structlog
-
-log = structlog.get_logger(__name__)
+from trading_bot.api import key_store
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +109,23 @@ VALID_TIERS: frozenset[str] = frozenset({TIER_FREE, TIER_PREMIUM})
 # returns 43 characters that are all in ``[A-Za-z0-9\-_]``.
 KEY_BYTES = 32
 
-# Phase 6.1 — reuse the Phase 5.1 growth ref_code sanitiser so the
-# manifest's ``ref_code`` field is byte-identical to whatever the
-# live ``?ref=`` middleware would have logged. Lazy attribute, but
-# we resolve at module load to fail fast if the import is broken.
-from trading_bot.api.growth import _sanitize_ref_code as _sanitize_ref_code  # noqa: E402
+# Phase 6.1 — ref_code sanitiser. Inlined (rather than imported from
+# trading_bot.api.growth) so the operator CLI stays dependency-free
+# and importable in environments that don't have the live API
+# server's logging stack (e.g. structlog) installed. Parity with the
+# growth-middleware sanitiser is enforced by
+# tests/test_keys.py::test_sanitiser_matches_growth_sanitiser.
+_REF_CODE_MAX_LENGTH = 64
+_REF_CODE_STRIP_RE = re.compile(r"[^A-Za-z0-9\-_:.]")
+
+
+def _sanitize_ref_code(raw: Optional[str]) -> str:
+    if raw is None:
+        return ""
+    s = str(raw)
+    if not s:
+        return ""
+    return _REF_CODE_STRIP_RE.sub("", s)[:_REF_CODE_MAX_LENGTH]
 
 _write_lock = threading.Lock()
 

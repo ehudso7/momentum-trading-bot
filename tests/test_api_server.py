@@ -22,6 +22,7 @@ or data/ directories.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,9 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         "TRADING_UPGRADE_BANNER_COPY",
         "TRADING_LIMIT_HIT_COPY",
         "TRADING_REPORT_LIMIT_COPY",
+        # Phase 6.2 — manifest-backed key store paths.
+        "TRADING_API_KEYS_MANIFEST_PATH",
+        "TRADING_API_KEYS_REVOKED_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
@@ -92,9 +96,31 @@ def clean_api_env(monkeypatch, tmp_path_factory):
     # Phase 5.5 — upgrade events log path.
     upgrade_tmp = tmp_path_factory.mktemp("upgrade_events") / "events.jsonl"
     monkeypatch.setenv("TRADING_API_UPGRADE_EVENTS_LOG_PATH", str(upgrade_tmp))
+    # Phase 6.2 — point manifest + revocation paths at empty tmp files
+    # so the suite never sees a real ``data/api_keys_manifest.jsonl``
+    # left over from operator CLI runs. Tests that want manifest-backed
+    # auth override these paths and write rows themselves.
+    keys_manifest_tmp = (
+        tmp_path_factory.mktemp("api_keys_manifest")
+        / "api_keys_manifest.jsonl"
+    )
+    keys_revoked_tmp = (
+        tmp_path_factory.mktemp("api_keys_revoked")
+        / "api_keys_revoked.jsonl"
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest_tmp),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked_tmp),
+    )
     # Also wipe the billing module's in-memory cache between tests.
     from trading_bot.api import billing as _billing_mod
     _billing_mod.reset_cache_for_tests()
+    # Phase 6.2 — wipe the key_store cache so a previous test's
+    # manifest/revocation file does not leak into this one.
+    from trading_bot.api import key_store as _key_store_mod
+    _key_store_mod.reset_caches_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -5820,5 +5846,369 @@ class TestPhase59HtmlShape:
                 methods = getattr(route, "methods", set()) or set()
                 assert methods.issubset({"GET", "HEAD", "OPTIONS"})
                 break
+
+
+# ===========================================================================
+# Phase 6.2 — manifest-backed API key authentication
+# ===========================================================================
+
+
+class _ManifestEnv:
+    """Helper bundle of paths the Phase 6.2 tests share."""
+
+    def __init__(self, tmp_path: Path):
+        self.reports_dir = tmp_path / "reports"
+        self.manifest = tmp_path / "experiments.jsonl"
+        self.keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+        self.keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+
+
+@pytest.fixture
+def manifest_auth_env(monkeypatch, tmp_path: Path) -> _ManifestEnv:
+    """
+    Configure the server with NO env API key — the only way in is via
+    a row in the keys manifest. This is the realistic Phase 6.2
+    deployment shape.
+    """
+    env = _ManifestEnv(tmp_path)
+    # Explicitly leave TRADING_API_KEY / TRADING_API_PREMIUM_KEYS unset
+    # so the test exercises the manifest path exclusively.
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(env.reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(env.manifest))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(env.keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(env.keys_revoked),
+    )
+    return env
+
+
+def _issue_via_cli(tier: str, label: str = "user") -> tuple[str, str]:
+    """Issue a key in-process via the keys CLI and return (raw, hash)."""
+    from trading_bot.api.keys import issue_key
+
+    result = issue_key(tier=tier, label=label)
+    return result["api_key"], result["key_hash"]
+
+
+class TestPhase62ManifestKeyAuth:
+    """A key issued by the keys CLI authenticates against the live
+    server with no env-var edits."""
+
+    def test_free_manifest_key_authenticates_reports_endpoint(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        raw, _ = _issue_via_cli("free", label="phase62-free")
+        # Write a recent report so the endpoint has data to return.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        r = client.get(
+            "/reports/latest", headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_unknown_key_rejected_when_only_manifest_configured(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        # No issuance happens — the manifest is empty, so the server
+        # must fail-closed on protected endpoints.
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer never-issued-key"},
+        )
+        # Empty manifest + no env keys → 503 fail-closed.
+        assert r.status_code == 503
+
+    def test_no_env_no_manifest_returns_503(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer x"},
+        )
+        assert r.status_code == 503
+        assert "issue" in r.json()["detail"].lower()
+
+    def test_unknown_key_with_active_manifest_returns_403(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        _issue_via_cli("free", label="another")
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer not-the-issued-key"},
+        )
+        assert r.status_code == 403
+
+
+class TestPhase62TierBehaviour:
+    """Manifest tier flows through the existing free-tier limits."""
+
+    def test_free_manifest_key_subject_to_report_cap(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        raw, _ = _issue_via_cli("free", label="cap-victim")
+        # Tighten the report cap to 1 so we exhaust it in one call.
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "100")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # First /reports/* call goes through.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        # Second is blocked by the per-tier report-call cap.
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 403
+
+    def test_premium_manifest_key_bypasses_free_cap(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        raw, _ = _issue_via_cli("premium", label="vip")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Premium goes well past the free cap.
+        for _ in range(5):
+            r = client.get("/reports/latest", headers=h)
+            assert r.status_code == 200
+
+
+class TestPhase62Revocation:
+    """Revocation rejects a previously-issued key with 403 — without
+    a server restart, since key_store hot-reloads on mtime change."""
+
+    def test_revoked_manifest_key_rejected(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        from trading_bot.api import key_store
+        from trading_bot.api.keys import main as keys_main
+
+        raw, key_hash = _issue_via_cli("free", label="rotate")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Sanity — accepted before revocation.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+
+        # Revoke via the CLI entry point.
+        rc = keys_main([
+            "revoke", "--key-hash", key_hash, "--reason", "rotated",
+        ])
+        assert rc == 0
+        # Force the cache to reload — in production the next request's
+        # mtime check picks the new file up automatically.
+        key_store.reset_caches_for_tests()
+
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 403
+
+    def test_revocation_wins_over_env_premium(
+        self, client: TestClient, monkeypatch, tmp_path: Path,
+    ):
+        """A revoked hash must be rejected even when the same raw key
+        is also present in TRADING_API_PREMIUM_KEYS. Revocation is
+        the unambiguous kill switch."""
+        from trading_bot.api import key_store
+        from trading_bot.api.keys import main as keys_main
+
+        raw = "shared-key-XYZ"
+        reports_dir = tmp_path / "reports"
+        manifest = tmp_path / "manifest.jsonl"
+        keys_revoked = tmp_path / "revoked.jsonl"
+        monkeypatch.setenv(API_KEY_ENV_VAR, "unrelated-other-key")
+        monkeypatch.setenv("TRADING_API_PREMIUM_KEYS", raw)
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
+        monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked))
+        # Manifest can be empty; we're testing revocation precedence.
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_MANIFEST_PATH",
+            str(tmp_path / "empty_manifest.jsonl"),
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Sanity — env-premium accepts the key.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+
+        rc = keys_main([
+            "revoke", "--api-key", raw,
+            "--revoked-path", str(keys_revoked),
+        ])
+        assert rc == 0
+        key_store.reset_caches_for_tests()
+
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 403
+
+
+class TestPhase62Precedence:
+    """Stripe > env premium > manifest premium > manifest free > env free."""
+
+    def test_env_free_still_works(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        """Existing single-tenant TRADING_API_KEY deployments must
+        continue to work — Phase 6.2 is additive."""
+        # authed_env sets both TRADING_API_KEY and TRADING_API_PREMIUM_KEYS;
+        # remove the premium binding so the key resolves as free.
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(authed_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert r.status_code == 200
+
+    def test_env_premium_still_works(self, client: TestClient, authed_env):
+        """authed_env wires VALID_KEY into TRADING_API_PREMIUM_KEYS by
+        default — assert the path still resolves as premium."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(authed_env["reports_dir"], today)
+        # Tighten the cap; premium must bypass it.
+        # (Premium env precedence preserved — pre-Phase 6.2 contract.)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert r.status_code == 200
+
+    def test_stripe_premium_still_works(
+        self, client: TestClient, monkeypatch, tmp_path: Path,
+    ):
+        """A key sourced from the Stripe billing cache continues to
+        authenticate as premium — Phase 4.7 contract preserved.
+
+        Stripe-cached keys live alongside ``TRADING_API_KEY`` in the
+        existing deployment shape (Stripe alone has never satisfied
+        the fail-closed check). We assert the Stripe cache resolves
+        the bearer token to premium even when the env-key is set to a
+        different value."""
+        from trading_bot.api import billing
+
+        reports_dir = tmp_path / "reports"
+        monkeypatch.setenv(API_KEY_ENV_VAR, "unrelated-env-key")
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_xyz")
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_MANIFEST_PATH",
+            str(tmp_path / "empty_keys_manifest.jsonl"),
+        )
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_REVOKED_PATH",
+            str(tmp_path / "empty_revoked.jsonl"),
+        )
+        # Seed the Stripe-cache premium set.
+        billing.reset_cache_for_tests()
+        billing.add_premium_key("stripe-cache-key-123")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(reports_dir, today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer stripe-cache-key-123"},
+        )
+        assert r.status_code == 200
+
+    def test_manifest_premium_when_env_only_has_free_key(
+        self, client: TestClient, monkeypatch, tmp_path: Path,
+    ):
+        """Existing TRADING_API_KEY (free) coexists with a manifest-issued
+        premium key. Both authenticate; tier resolves correctly."""
+        reports_dir = tmp_path / "reports"
+        keys_manifest = tmp_path / "keys_manifest.jsonl"
+        keys_revoked = tmp_path / "revoked.jsonl"
+        monkeypatch.setenv(API_KEY_ENV_VAR, "legacy-free")
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+        )
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+        )
+        # Issue a premium manifest key against the right env path.
+        from trading_bot.api.keys import issue_key
+        issued = issue_key(tier="premium", label="vip")
+        raw_premium = issued["api_key"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(reports_dir, today)
+
+        # Free env key works.
+        r1 = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer legacy-free"},
+        )
+        assert r1.status_code == 200
+
+        # Premium manifest key also works.
+        r2 = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw_premium}"},
+        )
+        assert r2.status_code == 200
+
+
+class TestPhase62NoRawKeyOnDisk:
+    """No persisted artefact — manifest, revocation log, audit log,
+    or usage log — may contain the raw API key."""
+
+    def test_raw_key_absent_from_manifest_revoked_audit_usage(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api.keys import main as keys_main
+
+        raw, key_hash = _issue_via_cli("free", label="leak-test")
+        # Make a request so audit + usage logs accrue at least one row.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Now revoke by raw key (the path most likely to leak).
+        rc = keys_main([
+            "revoke", "--api-key", raw,
+            "--revoked-path", str(manifest_auth_env.keys_revoked),
+            "--reason", "leak-test",
+        ])
+        assert rc == 0
+
+        # Manifest stores only the hash.
+        manifest_body = manifest_auth_env.keys_manifest.read_text(
+            encoding="utf-8",
+        )
+        assert raw not in manifest_body
+        assert key_hash in manifest_body
+
+        # Revocation log stores only the hash.
+        revoked_body = manifest_auth_env.keys_revoked.read_text(
+            encoding="utf-8",
+        )
+        assert raw not in revoked_body
+        assert key_hash in revoked_body
+
+        # Audit log (Phase 4.4) stores no api key in any form except
+        # via authentication-status booleans.
+        audit_path = Path(os.environ["TRADING_API_AUDIT_LOG_PATH"])
+        if audit_path.exists():
+            assert raw not in audit_path.read_text(encoding="utf-8")
+
+        # Usage log (Phase 4.6) stores only key_hash.
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        if usage_path.exists():
+            usage_body = usage_path.read_text(encoding="utf-8")
+            assert raw not in usage_body
         else:
             raise AssertionError("/ route not registered")

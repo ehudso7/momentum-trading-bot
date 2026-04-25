@@ -35,6 +35,8 @@ See also:
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH`    | path             | `data/stripe_premium_keys.json` | SaaS API only | Persistent JSON list of opaque API-key strings with active subscriptions. Survives restarts. (Phase 4.7) |
 | `TRADING_API_CONVERSION_LOG_PATH`      | path             | `data/api_conversions.jsonl` | SaaS API only | Append-only JSONL of free → paid conversion events. Hashed keys only — no PII, no card data. (Phase 4.9) |
 | `TRADING_API_GROWTH_LOG_PATH`          | path             | `data/api_growth.jsonl`      | SaaS API only | Append-only JSONL of `?ref=<code>` referral events. Dedup'd per (hash, ref) within 24h. Hashed keys only. (Phase 5.1) |
+| `TRADING_API_KEYS_MANIFEST_PATH`       | path             | `data/api_keys_manifest.jsonl` | SaaS API only | Append-only JSONL of operator-issued keys (Phase 6.0/6.1). Server reads it as an auth source — keys whose hash appears here authenticate without env-var edits. Hashed keys only. (Phase 6.2) |
+| `TRADING_API_KEYS_REVOKED_PATH`        | path             | `data/api_keys_revoked.jsonl`  | SaaS API only | Append-only JSONL of revocation events. A revoked hash is rejected with 403 even when the same raw key also matches `TRADING_API_KEY` or appears in the Stripe cache. Hashed keys only. (Phase 6.2) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
