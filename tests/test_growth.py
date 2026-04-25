@@ -258,14 +258,22 @@ class TestDedup:
 
     def test_dedup_survives_process_restart(self, clean_growth_env):
         """Pre-populate a recent event, clear the cache (simulating a
-        process restart), and confirm the next call is still deduped."""
+        process restart), and confirm the next call is still deduped.
+
+        ``_ensure_dedup_loaded`` filters disk rows by the REAL wall
+        clock (24h dedup window), so this test must freeze the wall
+        clock to ``base + 30min`` — otherwise the row written at
+        ``base`` would be filtered out as out-of-window the moment
+        the test runs more than 24h after ``base``."""
+        from freezegun import freeze_time
         base = datetime(2026, 4, 24, 10, 0, 0, tzinfo=timezone.utc)
-        record_growth_event(api_key="u", ref_code="hn", path="/x", now=base)
-        reset_cache_for_tests()
-        r2 = record_growth_event(
-            api_key="u", ref_code="hn", path="/y",
-            now=base + timedelta(minutes=30),
-        )
+        with freeze_time(base + timedelta(minutes=30)):
+            record_growth_event(api_key="u", ref_code="hn", path="/x", now=base)
+            reset_cache_for_tests()
+            r2 = record_growth_event(
+                api_key="u", ref_code="hn", path="/y",
+                now=base + timedelta(minutes=30),
+            )
         assert r2["action"] == "deduped"
         # Still only one row on disk.
         assert len(_read(clean_growth_env)) == 1
