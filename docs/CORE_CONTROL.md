@@ -3579,6 +3579,329 @@ streak always has a target to chase.
   ``tests/test_stickiness.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
+### Phase 10.1 — shareability layer
+
+A small, stable copy-paste-ready ``share`` payload attached to
+each Phase 9.1 insight and to the Phase 9.2 daily hook so any
+caller can drop the text into a tweet, Slack, email, or any
+short-form channel without doing string-stitching of their own.
+
+**Module**
+
+``trading_bot/api/share.py`` — pure stdlib, imports nothing from
+FastAPI / structlog / the rest of ``trading_bot``. Two public
+entry points:
+
+```python
+build_insight_share(insight, *, is_premium, base_url)   -> dict | None
+build_daily_hook_share(hook,  *, is_premium, base_url)  -> dict | None
+```
+
+**Share schema** (every entry conforms when the helpers do not
+return ``None``)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``text`` | ``str`` | short, human-readable, copy-paste-ready |
+| ``cta``  | ``str`` | stable ``"Try it yourself"`` |
+| ``url``  | ``str`` | the deployment's public URL (Phase 7.3 ``TRADING_PUBLIC_BASE_URL``), with trailing slashes stripped |
+
+**Source rules**
+
+* Insight share: keyed on the insight's ``id``. Three rule IDs
+  have copy:
+  * ``trend.buy_delta``
+  * ``promotion.readiness``
+  * ``regime.dominant``
+
+  Insights with an unrecognised ``id`` get no ``share`` field
+  (fail-closed for future rules without copy).
+* Daily-hook share: every hook with a ``change`` value gets copy.
+* Both helpers return ``None`` when ``TRADING_PUBLIC_BASE_URL`` is
+  unset / blank — without a public URL the share field can't link
+  anywhere, so the field is omitted entirely. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Tier-aware copy**
+
+Both tiers receive a ``share`` field with the same SHAPE; the
+``text`` is what differs:
+
+| Insight / hook | Free copy | Premium copy |
+|---|---|---|
+| ``trend.buy_delta`` (up 10, +50%) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%)." |
+| ``promotion.readiness`` (ready, 25 days) | "Momentum Trading Bot promotion gate is GREEN after 25 consecutive passing day(s)." | "Momentum Trading Bot: promotion gate READY after 25 consecutive passing day(s)." |
+| ``promotion.readiness`` (blocked, 0 days) | "Momentum Trading Bot promotion gate is currently blocked." | "Momentum Trading Bot: promotion gate BLOCKED — no passing streak yet." |
+| ``regime.dominant`` (trending, 12 hits, 80% share) | "Momentum Trading Bot: 'trending' regime led today's signals." | "Momentum Trading Bot: 'trending' regime dominated with 12 hits (80.0% share)." |
+| ``daily_hook`` (up 10) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: Buys up 10 vs prior day (trending up)." |
+
+Premium copy carries the percent / share / streak figures so the
+text stands on its own as a social hook; free copy is the plain
+plain-language equivalent. The CTA and URL are identical.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — every insight returned in the
+  ``insights`` list is decorated via
+  ``_decorate_insights_with_share`` AFTER tier truncation, and
+  the daily hook is decorated via ``_decorate_daily_hook_with_share``.
+  The decoration helpers return a NEW list / dict (no mutation)
+  so a future serialiser can't accidentally see a share field on
+  a re-fetched insight.
+
+  Free callers see the share text matching what they receive in
+  the rest of the body (e.g. they don't see the percent figure
+  in their truncated trend insight, so the share text doesn't
+  include it either).
+* ``GET /dashboard`` — share is a JSON-payload concept; the HTML
+  dashboard does not surface it. (A future Phase 10.x can wire
+  share text into rendered banners if needed.)
+
+**Sample free response excerpt**
+
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "title": "Buy volume up vs prior day",
+      "summary": "Buys advanced 10 → 30 (was 20).",
+      "confidence": 0.5,
+      "severity": "info",
+      "evidence": {"delta": 10, "direction": "up"},
+      "action": "monitor for sustained improvement",
+      "share": {
+        "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      }
+    }
+  ],
+  "daily_hook": {
+    "headline":   "Buys up 10 vs prior day",
+    "change":     "up",
+    "magnitude":  10,
+    "since":      "2026-04-24",
+    "cta":        "Open the dashboard for the full breakdown",
+    "share": {
+      "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+      "cta":  "Try it yourself",
+      "url":  "https://momentum-trading-bot-production.up.railway.app"
+    }
+  }
+}
+```
+
+**Sample premium response excerpt**
+
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "evidence": {
+        "delta": 10, "direction": "up",
+        "curr_buy_rows": 30, "prev_buy_rows": 20,
+        "percent_change": 50.0
+      },
+      "share": {
+        "text": "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%).",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      },
+      "...": "..."
+    }
+  ]
+}
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any ``share`` field. Pinned by
+  ``TestPhase101NoLeak::test_raw_key_absent_from_share_text``.
+* Share text never includes evidence the caller doesn't already
+  see — a free caller's trend share never carries the
+  percent-change figure that Phase 8.2 trims from their evidence.
+  Pinned by ``TestPhase101InsightShareFreeUser::test_free_share_text_uses_plain_copy``.
+* Share is omitted entirely when ``TRADING_PUBLIC_BASE_URL`` is
+  unset, so a misconfigured deployment can't surface a dangling
+  URL or a placeholder string. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Boundary**
+
+* No new HTTP route. Phase 10.1 is helper code wired into
+  existing routes. Pinned by
+  ``TestPhase101CrossCutting::test_no_new_mutating_route``.
+* No new persistence — share text is computed per request from
+  data the caller is already receiving.
+* No new env vars. ``TRADING_PUBLIC_BASE_URL`` is the same env
+  var Phase 7.3 / 8.3 already use.
+* ``trading_bot/api/share.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_share.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
+### Phase 10.2 — public entry layer
+
+Lets unauthenticated callers experience the product instantly,
+without a key. Two surfaces are widened:
+
+  * ``GET /`` — content-negotiated. HTML by default (Phase 5.2
+    landing page unchanged); JSON preview when the caller
+    explicitly sends ``Accept: application/json``.
+  * ``GET /reports/latest`` — when no ``Authorization`` header is
+    present, returns the same free-tier projection an
+    authenticated free user would get, plus ``preview: True`` and
+    a ``get_started`` block.
+
+A new soft-auth dependency drives both surfaces:
+
+```python
+optional_api_key(request, creds=Depends(_security)) -> Optional[str]
+```
+
+* ``creds is None`` (no header) → returns ``None``; route handler
+  branches into preview mode.
+* Header present → delegates to ``require_api_key``, which
+  preserves every existing failure mode unchanged (401 for a
+  non-Bearer scheme handled at the FastAPI layer; 403 for an
+  invalid / revoked token; 503 when the deployment isn't
+  configured for any auth source).
+
+The asymmetry is deliberate: an invalid header still rejects
+loudly. Preview mode is reserved for genuine "I'm just looking"
+traffic that doesn't try to authenticate at all.
+
+**`get_started` block**
+
+Stable shape returned alongside every preview surface:
+
+```json
+{
+  "label": "Get a free API key from the operator to unlock the full report.",
+  "endpoint": "/reports/latest",
+  "command": "python -m trading_bot.api.keys issue --tier free --label <your-label>"
+}
+```
+
+**Sample `GET /` JSON response**
+
+```bash
+curl -H "Accept: application/json" https://your-host.example.com/
+```
+
+```json
+{
+  "preview": true,
+  "get_started": {...},
+  "daily_hook": {
+    "headline":  "Buys up 10 vs prior day",
+    "change":    "up",
+    "magnitude": 10,
+    "since":     "2026-04-24",
+    "cta":       "Open the dashboard for the full breakdown",
+    "share":     {...}
+  },
+  "top_insight": {
+    "id":         "trend.buy_delta",
+    "title":      "Buy volume up vs prior day",
+    "summary":    "Buys advanced 10 → 30 (was 20).",
+    "evidence":   {"delta": 10, "direction": "up"},
+    "confidence": 0.5,
+    "severity":   "info",
+    "action":     "monitor for sustained improvement",
+    "share":      {...}
+  }
+}
+```
+
+The shape is deliberately tighter than ``/reports/latest`` —
+only the daily hook + the single top-priority insight, both
+through the free-tier projection. The full insight list and the
+Phase 9.3 streak / nudge fields stay on ``/reports/latest`` so
+``GET /`` remains a teaser.
+
+**Sample `GET /reports/latest` unauthenticated response**
+
+Same shape as the authenticated free response (Phase 8.2 / 9.x
+projections), with two additional fields:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "totals": {...},
+  "promotion_readiness": {...},
+  "insights": [...],
+  "daily_hook": {...},
+  "streak": {...},
+  "nudge": {...},
+  "preview": true,
+  "get_started": {...}
+}
+```
+
+The ``upgrade`` envelope (Phase 8.3 Stripe Checkout URL) is
+deliberately absent on the preview path — a caller without a key
+can't be promoted via Stripe Checkout yet (no key for the
+metadata). They first need to issue a key via the operator CLI;
+the ``get_started.command`` carries that exact instruction.
+
+**Authenticated callers**
+
+Authenticated free and authenticated premium responses are
+UNCHANGED. They never carry the ``preview`` / ``get_started``
+markers — those are exclusive to the public-entry surface.
+Pinned by ``test_authenticated_free_does_not_get_preview_marker``
+and ``test_authenticated_premium_does_not_get_preview_marker``.
+
+**Auth matrix**
+
+| Header | Result |
+|---|---|
+| (none) | 200 + preview + ``get_started`` |
+| ``Authorization: Basic …`` | 200 + preview (HTTPBearer treats non-Bearer as ``creds=None``) |
+| ``Authorization: Bearer <invalid>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <revoked>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <valid free>`` | 200 + free body (no preview marker) |
+| ``Authorization: Bearer <valid premium>`` | 200 + full body (no preview marker) |
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any preview body. Pinned by
+  ``TestPhase102NoLeak`` (2 tests).
+* Preview never surfaces premium-only fields (``tier_stats``,
+  ``reason_stats``, ``regime_stats``, ``decile_stats``,
+  ``shadow_filter_simulation``, ``guardrails``, ``sources``).
+  Pinned by ``test_preview_omits_premium_only_fields``.
+* Preview insight evidence uses the Phase 9.1 free allow-list
+  exactly. Pinned by
+  ``test_preview_insight_evidence_uses_free_allowlist``.
+* Preview never writes a usage-log row — the Phase 4.6
+  ``usage_middleware`` short-circuits when
+  ``request.state.api_key`` is unset, which it stays for unauth
+  requests. Pinned by
+  ``test_preview_does_not_count_against_usage``.
+* The Phase 4.2 per-IP rate limiter still applies to preview
+  traffic (60 req/min default), so a misbehaving client cannot
+  hammer the public surface without consequence.
+
+**Boundary**
+
+* No new HTTP route. ``GET /`` and ``GET /reports/latest``
+  are both pre-existing routes whose behaviour was widened.
+  Pinned by ``TestPhase102CrossCutting::test_no_new_mutating_route``.
+* No new persistence — preview is computed per request from the
+  same files Phase 9.x already reads.
+* No new env vars.
+* The ``optional_api_key`` dependency lives in ``server.py``
+  alongside ``require_api_key``; both delegate to the same
+  validation chain, only differing in their fail-OPEN-on-missing
+  posture.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
