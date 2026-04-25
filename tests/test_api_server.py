@@ -294,8 +294,12 @@ class TestHealth:
 # ---------------------------------------------------------------------------
 
 
+# Phase 10.2 dropped /reports/latest from this list — it now serves
+# an unauthenticated free-tier preview when no Authorization header
+# is presented. The Phase-10.2 carve-out test class
+# (TestPhase102ReportsLatestPreviewAuthMatrix) covers the new
+# matrix; the remaining endpoints stay strictly protected.
 PROTECTED_ENDPOINTS = [
-    "/reports/latest",
     "/reports/2026-04-24",
     "/experiments/recent",
     "/experiments/1",
@@ -1450,10 +1454,13 @@ class TestRequestLogging:
     def test_auth_failure_is_logged_with_status_401(
         self, client: TestClient, authed_env, capsys
     ):
-        client.get("/reports/latest")
+        # Phase 10.2 dropped /reports/latest from the strictly-
+        # protected set; use /reports/{date} as the carrier route
+        # for this auth-failure logging test.
+        client.get("/reports/2026-04-24")
         out = self._capture(capsys)
         assert "api.request" in out
-        assert "path=/reports/latest" in out
+        assert "path=/reports/2026-04-24" in out
         assert "status=401" in out
 
     def test_log_never_includes_bearer_token(
@@ -1597,9 +1604,11 @@ class TestLandingPageIsPublic:
         self, client: TestClient, authed_env
     ):
         """Re-assert Phase 4.0 invariant — adding / must not weaken
-        auth on any protected endpoint."""
+        auth on any protected endpoint. Phase 10.2 dropped
+        /reports/latest from this set (it now serves an
+        unauthenticated preview); the remaining endpoints stay
+        strictly authenticated."""
         for path in (
-            "/reports/latest",
             "/reports/2026-04-24",
             "/experiments/recent",
             "/experiments/1",
@@ -2152,7 +2161,10 @@ class TestAuditAuthenticatedFlag:
     def test_protected_endpoint_without_auth_is_false(
         self, client: TestClient, authed_env, audit_path: Path
     ):
-        client.get("/reports/latest")  # no header → 401
+        # Phase 10.2 made /reports/latest unauthenticated-friendly
+        # (it now serves a preview). Use /reports/{date} as the
+        # carrier route for this auth-failure audit invariant.
+        client.get("/reports/2026-04-24")  # no header → 401
         rec = _read_audit(audit_path)[-1]
         assert rec["status_code"] == 401
         assert rec["authenticated"] is False
@@ -2848,8 +2860,10 @@ class TestPhase45BoundaryUnchanged:
     def test_no_header_still_401_on_protected_endpoints(
         self, client: TestClient, free_env
     ):
+        # Phase 10.2 dropped /reports/latest from this set —
+        # unauth there now serves a preview (covered by the
+        # Phase 10.2 carve-out class).
         for path in (
-            "/reports/latest",
             "/reports/2026-04-24",
             "/experiments/recent",
             "/experiments/1",
@@ -7449,7 +7463,10 @@ class TestPhase81NoCountForUnauthenticated:
     ):
         # Issue a key so the deployment is "configured" (not 503).
         _issue_phase81_key("free", "phase81-noauth-shape")
-        r = client.get("/reports/latest")
+        # Phase 10.2 made /reports/latest preview-on-no-header.
+        # Use /reports/{date} as the carrier route so the
+        # missing-auth response is still a 401 we can pin.
+        r = client.get("/reports/2026-04-24")
         assert r.status_code == 401
         # Usage log should be empty / non-existent — no row written
         # for an unauthenticated request.
@@ -10010,3 +10027,347 @@ class TestPhase101CrossCutting:
                     "evidence", "action"}.issubset(entry.keys())
             # Phase 10.1 share present.
             assert "share" in entry
+
+
+# ===========================================================================
+# Phase 10.2 — public entry layer
+# ===========================================================================
+
+
+class TestPhase102LandingJson:
+    """GET / supports content-negotiation: HTML for browsers,
+    JSON preview when the caller explicitly requests it."""
+
+    def test_default_request_still_serves_html(
+        self, client: TestClient, phase91_env,
+    ):
+        # No Accept header → TestClient sends Accept: */*. Browsers
+        # (and curl with no -H) should still get the existing
+        # Phase 5.2 HTML landing page.
+        r = client.get("/")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/html")
+        assert "<!DOCTYPE html>" in r.text
+
+    def test_html_accept_header_serves_html(
+        self, client: TestClient, phase91_env,
+    ):
+        r = client.get("/", headers={"Accept": "text/html"})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/html")
+
+    def test_json_accept_header_serves_preview_json(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get("/", headers={"Accept": "application/json"})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("application/json")
+        body = r.json()
+        assert body["preview"] is True
+        assert "get_started" in body
+        # Phase 10.2 GET / payload includes the daily_hook + a
+        # single top_insight (not the full insights list).
+        assert "daily_hook" in body
+        assert "top_insight" in body
+
+    def test_json_top_insight_is_single_dict_not_list(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()
+        ti = body["top_insight"]
+        assert isinstance(ti, dict)
+        assert "id" in ti
+        # Free projection — the trend insight comes first.
+        assert ti["id"] == "trend.buy_delta"
+
+    def test_json_preview_omits_premium_evidence(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()
+        ev = body["top_insight"]["evidence"]
+        # Free truncation: evidence is {delta, direction} only.
+        assert set(ev.keys()) == {"delta", "direction"}
+        # Daily hook on the preview is also free-projected.
+        hook = body["daily_hook"]
+        assert "confidence" not in hook
+        assert "driver" not in hook
+
+    def test_json_no_reports_omits_signals(
+        self, client: TestClient, phase91_env,
+    ):
+        # No reports planted → no daily_hook / top_insight, but
+        # the preview marker + get_started still come back.
+        body = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()
+        assert body["preview"] is True
+        assert "get_started" in body
+        assert "daily_hook" not in body
+        assert "top_insight" not in body
+
+
+class TestPhase102ReportsLatestPreview:
+    """GET /reports/latest with no Authorization header now serves
+    a free-tier preview body."""
+
+    def test_no_auth_returns_200_with_preview(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get("/reports/latest")
+        assert r.status_code == 200
+        body = r.json()
+        # Phase 10.2 markers.
+        assert body["preview"] is True
+        assert "get_started" in body
+        # Phase 8.2 free projection markers.
+        assert body["tier"] == "free"
+        assert "report_type" in body
+        assert "totals" in body
+        # Phase 9.1 / 9.2 / 9.3 fields ride through.
+        assert "insights" in body
+        assert "daily_hook" in body
+        # Phase 9.3 streak only fires when consec_passing_days > 0.
+        assert "streak" in body
+
+    def test_preview_omits_premium_only_fields(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        # Same premium-only set the Phase 8.2 truncation drops.
+        for premium_field in (
+            "tier_stats", "reason_stats", "regime_stats",
+            "decile_stats", "shadow_filter_simulation",
+            "guardrails", "sources",
+        ):
+            assert premium_field not in body, (
+                f"Phase 10.2: preview leaked premium field {premium_field!r}"
+            )
+
+    def test_preview_insight_evidence_uses_free_allowlist(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        trend = next(
+            (e for e in body["insights"] if e["id"] == "trend.buy_delta"),
+            None,
+        )
+        assert trend is not None
+        # Free truncation: evidence is {delta, direction}.
+        assert set(trend["evidence"].keys()) == {"delta", "direction"}
+
+    def test_preview_capped_to_free_insight_limit(
+        self, client: TestClient, phase91_env,
+    ):
+        # phase91 report has all three rule sources; free cap is 2.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        assert len(body["insights"]) <= 2
+
+    def test_preview_no_report_returns_404(
+        self, client: TestClient, phase91_env,
+    ):
+        # The same 404 path the auth'd surface uses — no report
+        # to project means nothing to return.
+        r = client.get("/reports/latest")
+        assert r.status_code == 404
+
+
+class TestPhase102ReportsLatestPreviewAuthMatrix:
+    """Matrix: no header → preview; bad header → still rejects."""
+
+    def test_no_header_returns_preview_200(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get("/reports/latest")
+        assert r.status_code == 200
+        assert r.json()["preview"] is True
+
+    def test_invalid_bearer_still_403(
+        self, client: TestClient, phase91_env,
+    ):
+        # Pre-issue someone so the manifest is non-empty (deployment
+        # is configured).
+        _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert r.status_code == 403
+
+    def test_non_bearer_scheme_still_401(
+        self, client: TestClient, phase91_env,
+    ):
+        _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Basic abc=="},
+        )
+        # HTTPBearer rejects non-Bearer; falls through to
+        # optional_api_key as creds=None → preview. Result: 200.
+        # This is the documented Phase 10.2 behaviour — non-Bearer
+        # is treated as "no header" by the soft-auth path.
+        assert r.status_code == 200
+        assert r.json()["preview"] is True
+
+    def test_authenticated_free_does_not_get_preview_marker(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body.get("preview") is None
+        assert "get_started" not in body
+        # Authenticated free still carries the tier marker.
+        assert body["tier"] == "free"
+
+    def test_authenticated_premium_does_not_get_preview_marker(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body.get("preview") is None
+        assert "get_started" not in body
+
+
+class TestPhase102NoLeak:
+    def test_preview_response_no_raw_key_marker(
+        self, client: TestClient, phase91_env,
+    ):
+        # Sanity — issue a key, then make an UNAUTH request.
+        # The preview body must not echo the raw key (it never
+        # had access to it anyway, but pin the invariant).
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get("/reports/latest").text
+        assert raw not in body_text
+
+    def test_landing_json_no_raw_key_marker(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).text
+        assert raw not in body_text
+
+
+class TestPhase102CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 10.2 leaked a mutating route: {m} {path}"
+                )
+
+    def test_preview_does_not_count_against_usage(
+        self, client: TestClient, phase91_env,
+    ):
+        """Unauthenticated preview requests must NOT write to the
+        per-key usage log — there's no key to count against."""
+        _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        # Make several preview calls.
+        for _ in range(5):
+            r = client.get("/reports/latest")
+            assert r.status_code == 200
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        if usage_path.exists():
+            body = usage_path.read_text("utf-8").strip()
+            # Preview never writes a usage row (no auth → no api_key
+            # on request.state → usage_middleware short-circuits).
+            assert body == "" or "/reports/latest" not in body, (
+                f"Phase 10.2: preview leaked into usage log: {body!r}"
+            )
+
+    def test_get_started_block_is_stable(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        gs = body["get_started"]
+        # Stable shape across both preview surfaces.
+        assert "label" in gs
+        assert "endpoint" in gs
+        assert gs["endpoint"] == "/reports/latest"
+        # Also surfaces from GET / JSON.
+        gs_root = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()["get_started"]
+        assert gs == gs_root

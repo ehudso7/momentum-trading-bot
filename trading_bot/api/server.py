@@ -886,6 +886,115 @@ def require_api_key(
     return presented
 
 
+def optional_api_key(
+    request: Request,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_security),
+) -> Optional[str]:
+    """
+    Phase 10.2 — soft-auth dependency.
+
+    * No ``Authorization`` header → returns ``None`` so the route
+      handler can branch into preview / public-entry mode.
+    * Header present → delegates to ``require_api_key``, which
+      preserves every existing failure mode unchanged (401 for a
+      non-Bearer scheme, 403 for an invalid / revoked token, 503
+      when the deployment isn't configured for any auth source).
+
+    Routes that opt into this dep get a fail-OPEN-on-missing
+    posture without any downgrade in the validation logic for
+    callers that DO present a header. An invalid header still
+    rejects loudly — preview is reserved for callers that genuinely
+    don't have a key to present.
+    """
+    if creds is None:
+        return None
+    return require_api_key(request, creds)
+
+
+# ---------------------------------------------------------------------------
+# Phase 10.2 — public entry helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_started_block() -> dict:
+    """
+    Phase 10.2 — stable "how do I unlock more?" payload attached to
+    every preview response. Operators with a CLI shell get the
+    exact command; SDK consumers get the endpoint they should call
+    once they have a key.
+    """
+    return {
+        "label": (
+            "Get a free API key from the operator to unlock the "
+            "full report."
+        ),
+        "endpoint": "/reports/latest",
+        "command": (
+            "python -m trading_bot.api.keys issue --tier free "
+            "--label <your-label>"
+        ),
+    }
+
+
+def _top_insight(insights: Optional[list[dict]]) -> Optional[dict]:
+    """
+    Phase 10.2 — pick the first non-empty insight from a list. The
+    Phase 9.1 builder returns insights in priority order, so the
+    first entry is the most actionable.
+    """
+    if not isinstance(insights, list):
+        return None
+    for entry in insights:
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _build_public_preview_payload(
+    request: Request,
+    *,
+    candidates: list,
+) -> dict:
+    """
+    Phase 10.2 — minimal teaser body used by ``GET /`` JSON
+    responses. Different shape from ``/reports/latest`` preview:
+    only the daily hook + the single top insight (free-tier
+    projected) + the get-started block. Keeps the public landing
+    surface tight.
+
+    ``candidates`` is the sorted list of report files; pulling
+    the load logic out of the handler keeps both endpoints' I/O
+    consistent.
+    """
+    # Unauthenticated → free-tier projection always.
+    payload: dict[str, Any] = {"preview": True, "get_started": _get_started_block()}
+    if not candidates:
+        return payload
+    try:
+        data = _sanitize_report(_parse_report_file(candidates[-1]))
+    except Exception:
+        return payload
+    prev = None
+    if len(candidates) >= 2:
+        try:
+            prev = _sanitize_report(_parse_report_file(candidates[-2]))
+        except Exception:
+            prev = None
+    insights_full = build_insights(data, prev)
+    daily_hook_full = build_daily_hook(data, prev, insights_full)
+
+    free_insights = _decorate_insights_with_share(
+        truncate_for_free(insights_full), is_premium=False,
+    )
+    free_hook = _decorate_daily_hook_with_share(
+        _truncate_hook_for_free(daily_hook_full), is_premium=False,
+    )
+    payload["top_insight"] = _top_insight(free_insights)
+    if free_hook is not None:
+        payload["daily_hook"] = free_hook
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Phase 4.5 — free-tier limit enforcement
 # ---------------------------------------------------------------------------
@@ -2324,18 +2433,41 @@ def render_landing_page_html(ref_code: str = "") -> str:
     )
 
 
-@app.get("/", response_class=HTMLResponse, tags=["public"])
-def landing_page(request: Request) -> HTMLResponse:
+@app.get("/", tags=["public"])
+def landing_page(request: Request):
     """
     Public product/status page. Intentionally unauthenticated.
 
+    Phase 5.2: returns the static landing-page HTML by default.
     The handler reads exactly one piece of runtime state: the
     ``?ref=<code>`` query parameter, which is sanitised to the
     growth-log charset before being echoed back. Every other byte
-    on the page is a compile-time constant, so the handler cannot
-    leak reports, manifest data, env secrets, or any other
+    on the HTML page is a compile-time constant, so the handler
+    cannot leak reports, manifest data, env secrets, or any other
     protected content.
+
+    Phase 10.2: API callers that explicitly request JSON via the
+    ``Accept`` header receive a tiny preview payload instead —
+    free-tier projected daily hook + the single top-priority
+    insight + ``preview: True`` + ``get_started`` block. The HTML
+    surface is unchanged for browsers (which always send
+    ``Accept: text/html``) and for clients that send the default
+    ``Accept: */*``.
     """
+    accept = (request.headers.get("accept", "") or "").lower()
+    wants_json = "application/json" in accept and "text/html" not in accept
+    if wants_json:
+        reports = _reports_dir()
+        candidates: list = []
+        if reports.is_dir():
+            candidates = sorted(reports.glob("alpha_report_*.json"))
+        return JSONResponse(
+            content=_build_public_preview_payload(
+                request, candidates=candidates,
+            ),
+            status_code=200,
+        )
+
     raw_ref = request.query_params.get("ref")
     ref_code = _sanitize_landing_ref_code(raw_ref) if raw_ref else ""
     return HTMLResponse(
@@ -2635,7 +2767,7 @@ def billing_checkout(
 @app.get("/reports/latest", tags=["reports"])
 def latest_report(
     request: Request,
-    api_key: str = Depends(require_api_key),
+    api_key: Optional[str] = Depends(optional_api_key),
 ) -> dict[str, Any]:
     """
     Return the most recent daily alpha validation report.
@@ -2651,6 +2783,14 @@ def latest_report(
     day's report. Free callers receive at most
     ``FREE_INSIGHT_LIMIT`` insights with evidence trimmed to the
     documented allow-list.
+
+    Phase 10.2 — UNAUTHENTICATED callers (no Authorization header)
+    now receive the same free-tier projection plus a ``preview:
+    True`` marker and a ``get_started`` block. Callers that DO
+    present a header still go through the full Phase 6.2
+    validation chain (invalid header → 401/403/503 unchanged), so
+    the preview surface is reserved for genuine "I'm just looking"
+    traffic.
     """
     reports = _reports_dir()
     if not reports.is_dir():
@@ -2690,6 +2830,31 @@ def latest_report(
     # nudge needs the prior report too.
     streak = build_streak(data, prev)
     nudge = build_nudge(data, prev)
+
+    if api_key is None:
+        # Phase 10.2 — unauthenticated preview. Same projection +
+        # decorations as the authenticated free path (so the
+        # response shape matches), plus a ``preview: True`` marker
+        # and ``get_started`` block so an integrator knows they
+        # received the public-entry surface.
+        preview_body = _project_report_for_free(data)
+        preview_body["insights"] = _decorate_insights_with_share(
+            truncate_for_free(insights), is_premium=False,
+        )
+        preview_hook = _truncate_hook_for_free(daily_hook)
+        if preview_hook is not None:
+            preview_body["daily_hook"] = _decorate_daily_hook_with_share(
+                preview_hook, is_premium=False,
+            )
+        preview_streak = truncate_streak_for_free(streak)
+        if preview_streak is not None:
+            preview_body["streak"] = preview_streak
+        preview_nudge = truncate_nudge_for_free(nudge)
+        if preview_nudge is not None:
+            preview_body["nudge"] = preview_nudge
+        preview_body["preview"] = True
+        preview_body["get_started"] = _get_started_block()
+        return preview_body
 
     if _is_premium_user(request):
         # Phase 10.1 — attach copy-paste-ready share payloads to

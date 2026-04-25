@@ -3798,6 +3798,166 @@ plain-language equivalent. The CTA and URL are identical.
   ``tests/test_share.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
+### Phase 10.2 — public entry layer
+
+Lets unauthenticated callers experience the product instantly,
+without a key. Two surfaces are widened:
+
+  * ``GET /`` — content-negotiated. HTML by default (Phase 5.2
+    landing page unchanged); JSON preview when the caller
+    explicitly sends ``Accept: application/json``.
+  * ``GET /reports/latest`` — when no ``Authorization`` header is
+    present, returns the same free-tier projection an
+    authenticated free user would get, plus ``preview: True`` and
+    a ``get_started`` block.
+
+A new soft-auth dependency drives both surfaces:
+
+```python
+optional_api_key(request, creds=Depends(_security)) -> Optional[str]
+```
+
+* ``creds is None`` (no header) → returns ``None``; route handler
+  branches into preview mode.
+* Header present → delegates to ``require_api_key``, which
+  preserves every existing failure mode unchanged (401 for a
+  non-Bearer scheme handled at the FastAPI layer; 403 for an
+  invalid / revoked token; 503 when the deployment isn't
+  configured for any auth source).
+
+The asymmetry is deliberate: an invalid header still rejects
+loudly. Preview mode is reserved for genuine "I'm just looking"
+traffic that doesn't try to authenticate at all.
+
+**`get_started` block**
+
+Stable shape returned alongside every preview surface:
+
+```json
+{
+  "label": "Get a free API key from the operator to unlock the full report.",
+  "endpoint": "/reports/latest",
+  "command": "python -m trading_bot.api.keys issue --tier free --label <your-label>"
+}
+```
+
+**Sample `GET /` JSON response**
+
+```bash
+curl -H "Accept: application/json" https://your-host.example.com/
+```
+
+```json
+{
+  "preview": true,
+  "get_started": {...},
+  "daily_hook": {
+    "headline":  "Buys up 10 vs prior day",
+    "change":    "up",
+    "magnitude": 10,
+    "since":     "2026-04-24",
+    "cta":       "Open the dashboard for the full breakdown",
+    "share":     {...}
+  },
+  "top_insight": {
+    "id":         "trend.buy_delta",
+    "title":      "Buy volume up vs prior day",
+    "summary":    "Buys advanced 10 → 30 (was 20).",
+    "evidence":   {"delta": 10, "direction": "up"},
+    "confidence": 0.5,
+    "severity":   "info",
+    "action":     "monitor for sustained improvement",
+    "share":      {...}
+  }
+}
+```
+
+The shape is deliberately tighter than ``/reports/latest`` —
+only the daily hook + the single top-priority insight, both
+through the free-tier projection. The full insight list and the
+Phase 9.3 streak / nudge fields stay on ``/reports/latest`` so
+``GET /`` remains a teaser.
+
+**Sample `GET /reports/latest` unauthenticated response**
+
+Same shape as the authenticated free response (Phase 8.2 / 9.x
+projections), with two additional fields:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "totals": {...},
+  "promotion_readiness": {...},
+  "insights": [...],
+  "daily_hook": {...},
+  "streak": {...},
+  "nudge": {...},
+  "preview": true,
+  "get_started": {...}
+}
+```
+
+The ``upgrade`` envelope (Phase 8.3 Stripe Checkout URL) is
+deliberately absent on the preview path — a caller without a key
+can't be promoted via Stripe Checkout yet (no key for the
+metadata). They first need to issue a key via the operator CLI;
+the ``get_started.command`` carries that exact instruction.
+
+**Authenticated callers**
+
+Authenticated free and authenticated premium responses are
+UNCHANGED. They never carry the ``preview`` / ``get_started``
+markers — those are exclusive to the public-entry surface.
+Pinned by ``test_authenticated_free_does_not_get_preview_marker``
+and ``test_authenticated_premium_does_not_get_preview_marker``.
+
+**Auth matrix**
+
+| Header | Result |
+|---|---|
+| (none) | 200 + preview + ``get_started`` |
+| ``Authorization: Basic …`` | 200 + preview (HTTPBearer treats non-Bearer as ``creds=None``) |
+| ``Authorization: Bearer <invalid>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <revoked>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <valid free>`` | 200 + free body (no preview marker) |
+| ``Authorization: Bearer <valid premium>`` | 200 + full body (no preview marker) |
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any preview body. Pinned by
+  ``TestPhase102NoLeak`` (2 tests).
+* Preview never surfaces premium-only fields (``tier_stats``,
+  ``reason_stats``, ``regime_stats``, ``decile_stats``,
+  ``shadow_filter_simulation``, ``guardrails``, ``sources``).
+  Pinned by ``test_preview_omits_premium_only_fields``.
+* Preview insight evidence uses the Phase 9.1 free allow-list
+  exactly. Pinned by
+  ``test_preview_insight_evidence_uses_free_allowlist``.
+* Preview never writes a usage-log row — the Phase 4.6
+  ``usage_middleware`` short-circuits when
+  ``request.state.api_key`` is unset, which it stays for unauth
+  requests. Pinned by
+  ``test_preview_does_not_count_against_usage``.
+* The Phase 4.2 per-IP rate limiter still applies to preview
+  traffic (60 req/min default), so a misbehaving client cannot
+  hammer the public surface without consequence.
+
+**Boundary**
+
+* No new HTTP route. ``GET /`` and ``GET /reports/latest``
+  are both pre-existing routes whose behaviour was widened.
+  Pinned by ``TestPhase102CrossCutting::test_no_new_mutating_route``.
+* No new persistence — preview is computed per request from the
+  same files Phase 9.x already reads.
+* No new env vars.
+* The ``optional_api_key`` dependency lives in ``server.py``
+  alongside ``require_api_key``; both delegate to the same
+  validation chain, only differing in their fail-OPEN-on-missing
+  posture.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 
