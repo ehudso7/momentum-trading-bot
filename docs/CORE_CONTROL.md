@@ -2128,6 +2128,95 @@ Pinned by `test_stripe_failure_does_not_write_manifest` and
 `--checkout` path. Pinned by source-grep test.
 
 
+### Phase 6.1 — referral key issuance flow
+
+The Phase 6.0 `issue` subcommand grows a single optional flag —
+`--ref <code>` — so an operator can pre-attribute a key to a
+referral / source channel at creation time, instead of relying
+on the user later hitting `?ref=`.
+
+**Command (additive)**
+
+    python -m trading_bot.api.keys issue \
+        --tier free|premium \
+        --label "<operator label>" \
+        --ref  "<channel code>"          # NEW; optional
+        [--checkout --success-url … --cancel-url …]
+
+**Manifest schema (single new field)**
+
+    {
+      "created_at":           "...Z",
+      "key_hash":             "<SHA-256(api_key)[:32]>",
+      "label_hash":           "<SHA-256(label)[:32]>",
+      "tier":                 "free" | "premium",
+      "checkout_session_id":  "cs_..." | null,
+      "ref_code":             "<sanitised>" | null   # ← Phase 6.1
+    }
+
+**Sanitisation contract.** `--ref` is run through the same
+`_sanitize_ref_code` helper the live `?ref=` middleware (Phase
+5.1 growth log) uses:
+
+* Charset: `[A-Za-z0-9\-_:.]`. Anything else is stripped.
+* Cap: 64 chars (truncated, not rejected).
+* Empty input, `None`, or a value that the sanitiser strips to
+  `""` is treated as "no ref" — the manifest stores `null` and
+  no Stripe metadata is set.
+
+Pinning this to the same helper means the manifest's `ref_code`
+is byte-identical to whatever the growth log would have stored
+for the same input, so downstream BI joins work cleanly across
+both files. Asserted by
+`TestPhase61RefSanitization::test_sanitiser_matches_growth_sanitiser`.
+
+**Stripe metadata pass-through.** `billing.create_checkout_session`
+gains a single optional `ref_code: Optional[str] = None` kwarg.
+When `--checkout` and a non-empty sanitised `--ref` are both
+present, the value flows into the Stripe POST body's
+`metadata[ref_code]` and `subscription_data[metadata][ref_code]`
+fields — alongside the existing Phase 4.7 `metadata[api_key]`
+fields. The Phase 4.7 webhook handler still keys on
+`metadata[api_key]`; `ref_code` is purely for downstream
+attribution analysis.
+
+End-to-end stub-HTTP test:
+`TestPhase61BillingMetadataFields::test_ref_code_lands_in_stripe_metadata`.
+
+**Backward compatibility (tested):**
+
+* `--ref` is optional. Omitting it leaves the manifest row
+  byte-equivalent to a Phase 6.0 row except for the new
+  `"ref_code": null` field.
+* The CLI stdout line for `ref_code` only appears when present.
+  Operators who don't use `--ref` see the exact Phase 6.0
+  output.
+* Calls to `issue_key()` that don't pass the `ref_code=` kwarg
+  still work.
+* Calls to `create_checkout_session()` that don't pass
+  `ref_code=` still produce the exact same Stripe POST body as
+  before (no `metadata[ref_code]` field) — pinned by
+  `test_no_ref_means_no_ref_metadata`.
+
+**Privacy invariants (re-asserted):**
+
+* Raw `api_key` never persisted (only the hash).
+* Raw `label` never persisted (only the hash).
+* Raw `--ref` value is sanitised before any persistence or
+  Stripe call. A `<script>alert(1)</script>` becomes
+  `scriptalert1script` on the manifest and on Stripe; the angle
+  brackets, slashes, and parens never appear on disk or in the
+  POST body. Pinned by `test_unsafe_chars_stripped` and
+  `test_only_sanitised_ref_passed_never_raw`.
+* Stripe checkout `url` still never persisted.
+* No customer email / IP / payment field is ever stored.
+
+**No new public surface.** Phase 6.1 adds no HTTP endpoint, no
+form, no JSON API, no env var. The whole feature lives behind
+the existing operator-only `python -m trading_bot.api.keys issue`
+shell command.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

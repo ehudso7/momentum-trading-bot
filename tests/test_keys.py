@@ -140,12 +140,15 @@ class TestIssueFreeTier:
         result = issue_key(tier="free", label="alice@example.com")
         assert set(result.keys()) == {
             "api_key", "key_hash", "tier", "created_at",
-            "label_hash", "checkout_session_id", "checkout_url",
+            "label_hash", "ref_code",
+            "checkout_session_id", "checkout_url",
             "manifest_path",
         }
         assert result["tier"] == "free"
         assert result["checkout_session_id"] is None
         assert result["checkout_url"] is None
+        # Phase 6.1 — ref_code is None when --ref omitted.
+        assert result["ref_code"] is None
         # Hashes match the raw inputs.
         assert result["key_hash"] == _hash_api_key(result["api_key"])
         assert result["label_hash"] == _hash_label("alice@example.com")
@@ -174,7 +177,9 @@ class TestIssueFreeTier:
         assert set(row.keys()) == {
             "created_at", "key_hash", "label_hash", "tier",
             "checkout_session_id",
+            "ref_code",  # Phase 6.1 — null when --ref omitted.
         }
+        assert row["ref_code"] is None
 
     def test_raw_key_never_in_manifest(self, manifest_path: Path):
         result = issue_key(tier="free", label="alice@example.com")
@@ -663,3 +668,399 @@ class TestDefaults:
         assert TIER_FREE == "free"
         assert TIER_PREMIUM == "premium"
         assert VALID_TIERS == {"free", "premium"}
+
+
+# ===========================================================================
+# Phase 6.1 — referral key issuance flow
+# ===========================================================================
+
+
+class TestPhase61RefSanitization:
+    """``--ref`` runs through the same sanitiser as the live ?ref=
+    middleware (Phase 5.1 growth) so manifest rows are byte-identical
+    to whatever the growth log would have stored."""
+
+    def test_safe_ref_persisted_verbatim(self, manifest_path: Path):
+        result = issue_key(
+            tier="free", label="alice", ref_code="twitter-launch_2026",
+        )
+        assert result["ref_code"] == "twitter-launch_2026"
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] == "twitter-launch_2026"
+
+    def test_unsafe_chars_stripped(self, manifest_path: Path):
+        """``<script>alert(1)</script>`` collapses to alphanumerics
+        because the sanitiser strips ``<>/``."""
+        result = issue_key(
+            tier="free", label="bob",
+            ref_code="<script>alert(1)</script>",
+        )
+        # Same charset rule as the growth sanitiser.
+        assert result["ref_code"] == "scriptalert1script"
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] == "scriptalert1script"
+        body = manifest_path.read_text(encoding="utf-8")
+        # The raw payload must NOT survive in any form.
+        assert "<script>" not in body
+        assert "</script>" not in body
+
+    def test_overlong_ref_truncated_to_64_chars(self, manifest_path: Path):
+        result = issue_key(
+            tier="free", label="carol", ref_code="x" * 200,
+        )
+        assert result["ref_code"] is not None
+        assert len(result["ref_code"]) == 64
+        (row,) = _read(manifest_path)
+        assert len(row["ref_code"]) == 64
+
+    def test_all_stripped_becomes_null(self, manifest_path: Path):
+        result = issue_key(
+            tier="free", label="dave",
+            ref_code="!@#$%^&*()",
+        )
+        assert result["ref_code"] is None
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] is None
+
+    @pytest.mark.parametrize("blank", [None, "", "   ", "\t\t"])
+    def test_blank_or_missing_ref_becomes_null(
+        self, manifest_path: Path, blank,
+    ):
+        result = issue_key(
+            tier="free", label="ed", ref_code=blank,
+        )
+        assert result["ref_code"] is None
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] is None
+
+    def test_sanitiser_matches_growth_sanitiser(self, manifest_path: Path):
+        """The keys module must hash through the SAME helper the
+        live growth middleware uses, so manifest.ref_code joins
+        cleanly with growth.ref_code."""
+        from trading_bot.api.growth import _sanitize_ref_code as g_sanitize
+        for raw in (
+            "twitter-q2",
+            "hn launch",  # space stripped
+            "ref.with:dots",
+            "weird?chars=here",
+            "x" * 100,
+        ):
+            expected = g_sanitize(raw)
+            result = issue_key(
+                tier="free", label=f"u-{raw}", ref_code=raw,
+            )
+            assert result["ref_code"] == (expected or None)
+
+
+class TestPhase61BackwardCompat:
+    """Issuing a key without --ref must look identical to the
+    Phase 6.0 surface from a downstream-reader perspective: the
+    ref_code field is present but null."""
+
+    def test_no_ref_kwarg_still_works(self, manifest_path: Path):
+        result = issue_key(tier="free", label="x")
+        assert result["ref_code"] is None
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] is None
+
+    def test_raw_label_still_never_persisted_with_ref(
+        self, manifest_path: Path,
+    ):
+        marker = "RAW_LABEL_STILL_DO_NOT_LEAK"
+        issue_key(tier="free", label=marker, ref_code="twitter")
+        body = manifest_path.read_text(encoding="utf-8")
+        assert marker not in body
+
+    def test_raw_key_still_never_persisted_with_ref(
+        self, manifest_path: Path,
+    ):
+        result = issue_key(
+            tier="free", label="alice", ref_code="twitter",
+        )
+        body = manifest_path.read_text(encoding="utf-8")
+        assert result["api_key"] not in body
+
+
+class TestPhase61CheckoutForwardsRef:
+    """When both ``--checkout`` and a non-empty ``--ref`` are used,
+    the sanitised ref_code is forwarded as a kwarg to the
+    checkout caller so it can land in Stripe metadata."""
+
+    def test_sanitised_ref_passed_to_checkout_caller(
+        self, manifest_path: Path,
+    ):
+        captured: dict = {}
+
+        def fake_checkout(api_key, success_url, cancel_url, **kw):
+            captured.update(kw)
+            return {
+                "checkout_session_id": "cs_test_ABC",
+                "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_ABC",
+                "api_key_hash": _hash_api_key(api_key),
+            }
+
+        result = issue_key(
+            tier="premium",
+            label="acme-corp",
+            ref_code="hn-launch",
+            with_checkout=True,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            checkout_caller=fake_checkout,
+        )
+        assert captured.get("ref_code") == "hn-launch"
+        assert result["ref_code"] == "hn-launch"
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] == "hn-launch"
+        assert row["checkout_session_id"] == "cs_test_ABC"
+
+    def test_only_sanitised_ref_passed_never_raw(
+        self, manifest_path: Path,
+    ):
+        captured: dict = {}
+
+        def fake_checkout(api_key, success_url, cancel_url, **kw):
+            captured.update(kw)
+            return {
+                "checkout_session_id": "cs_X",
+                "checkout_url": "https://x",
+                "api_key_hash": _hash_api_key(api_key),
+            }
+
+        issue_key(
+            tier="premium",
+            label="x",
+            ref_code="<script>twitter</script>",  # raw includes <>
+            with_checkout=True,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            checkout_caller=fake_checkout,
+        )
+        assert captured.get("ref_code") == "scripttwitterscript"
+        # The raw form must NEVER reach the checkout caller.
+        assert "<script>" not in str(captured)
+        assert "</script>" not in str(captured)
+
+    def test_no_ref_means_no_ref_kwarg_to_caller(
+        self, manifest_path: Path,
+    ):
+        """When --ref is omitted we MUST NOT pass ref_code=None to
+        the checkout caller — that would override its default in a
+        confusing way and could fail the Stripe Stripe POST
+        depending on how billing handles None vs absent."""
+        captured: dict = {}
+
+        def fake_checkout(api_key, success_url, cancel_url, **kw):
+            captured.update(kw)
+            return {
+                "checkout_session_id": "cs_X",
+                "checkout_url": "https://x",
+                "api_key_hash": _hash_api_key(api_key),
+            }
+
+        issue_key(
+            tier="premium", label="x",
+            with_checkout=True,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            checkout_caller=fake_checkout,
+        )
+        assert "ref_code" not in captured
+
+    def test_all_stripped_ref_means_no_ref_kwarg_to_caller(
+        self, manifest_path: Path,
+    ):
+        """A ``--ref`` value that fully sanitises to empty becomes
+        None and must NOT be forwarded to the caller."""
+        captured: dict = {}
+
+        def fake_checkout(api_key, success_url, cancel_url, **kw):
+            captured.update(kw)
+            return {
+                "checkout_session_id": "cs_X",
+                "checkout_url": "https://x",
+                "api_key_hash": _hash_api_key(api_key),
+            }
+
+        issue_key(
+            tier="premium", label="x",
+            ref_code="!@#$%",
+            with_checkout=True,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            checkout_caller=fake_checkout,
+        )
+        assert "ref_code" not in captured
+
+
+class TestPhase61BillingMetadataFields:
+    """End-to-end: sanitised ref_code lands in the actual Stripe
+    HTTP POST body's metadata fields. Uses billing's stub_http_post
+    pattern."""
+
+    def test_ref_code_lands_in_stripe_metadata(self, monkeypatch):
+        from trading_bot.api.billing import (
+            STRIPE_API_KEY_ENV_VAR,
+            STRIPE_PRICE_ID_PREMIUM_ENV_VAR,
+            create_checkout_session,
+        )
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_xyz")
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_test")
+
+        captured: dict = {}
+
+        def stub_post(**kwargs):
+            captured.update(kwargs)
+            return {
+                "id": "cs_test_session_abcdef",
+                "url": "https://checkout.stripe.com/c/pay/cs_test_session_abcdef",
+                "object": "checkout.session",
+                "mode": "subscription",
+            }
+
+        create_checkout_session(
+            "operator-issued-key-XYZ",
+            "https://app.example.com/billing/success",
+            "https://app.example.com/billing/cancel",
+            ref_code="hn-launch",
+            http_post=stub_post,
+        )
+        data = captured["data"]
+        assert data["metadata[ref_code]"] == "hn-launch"
+        assert data["subscription_data[metadata][ref_code]"] == "hn-launch"
+
+    def test_no_ref_means_no_ref_metadata(self, monkeypatch):
+        from trading_bot.api.billing import (
+            STRIPE_API_KEY_ENV_VAR,
+            STRIPE_PRICE_ID_PREMIUM_ENV_VAR,
+            create_checkout_session,
+        )
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_xyz")
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_test")
+
+        captured: dict = {}
+
+        def stub_post(**kwargs):
+            captured.update(kwargs)
+            return {
+                "id": "cs_x", "url": "https://x", "object": "checkout.session",
+            }
+
+        create_checkout_session(
+            "operator-issued-key-XYZ",
+            "https://app.example.com/billing/success",
+            "https://app.example.com/billing/cancel",
+            http_post=stub_post,
+        )
+        data = captured["data"]
+        # Phase 4.7 invariants still hold.
+        assert data["metadata[api_key]"] == "operator-issued-key-XYZ"
+        # Phase 6.1: no ref → no ref_code metadata fields.
+        assert "metadata[ref_code]" not in data
+        assert "subscription_data[metadata][ref_code]" not in data
+
+    def test_empty_ref_means_no_ref_metadata(self, monkeypatch):
+        from trading_bot.api.billing import (
+            STRIPE_API_KEY_ENV_VAR,
+            STRIPE_PRICE_ID_PREMIUM_ENV_VAR,
+            create_checkout_session,
+        )
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_xyz")
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_test")
+
+        captured: dict = {}
+
+        def stub_post(**kwargs):
+            captured.update(kwargs)
+            return {"id": "cs_x", "url": "https://x"}
+
+        # ``ref_code=""`` (the post-sanitisation 'no value' state)
+        # must not trigger the metadata insert.
+        create_checkout_session(
+            "key-X",
+            "https://e.com/ok",
+            "https://e.com/cancel",
+            ref_code="",
+            http_post=stub_post,
+        )
+        data = captured["data"]
+        assert "metadata[ref_code]" not in data
+
+
+class TestPhase61Cli:
+    def test_cli_with_ref_persists_and_prints(
+        self, manifest_path: Path,
+    ):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "issue",
+                "--tier", "free",
+                "--label", "alice@example.com",
+                "--ref", "twitter-launch_2026",
+            ],
+            capture_output=True, text=True,
+            env={
+                **__import__("os").environ,
+                KEYS_MANIFEST_ENV_VAR: str(manifest_path),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        # The new ref_code line is in stdout when present.
+        assert "ref_code" in result.stdout
+        assert "twitter-launch_2026" in result.stdout
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] == "twitter-launch_2026"
+        # Raw label still never on disk.
+        body = manifest_path.read_text(encoding="utf-8")
+        assert "alice@example.com" not in body
+
+    def test_cli_without_ref_omits_line_from_stdout(
+        self, manifest_path: Path,
+    ):
+        """No --ref should leave the stdout block byte-equivalent
+        to the Phase 6.0 surface (no leftover ``ref_code:`` line)."""
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "issue",
+                "--tier", "free",
+                "--label", "alice",
+            ],
+            capture_output=True, text=True,
+            env={
+                **__import__("os").environ,
+                KEYS_MANIFEST_ENV_VAR: str(manifest_path),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        ref_lines = [
+            ln for ln in result.stdout.splitlines()
+            if ln.strip().startswith("ref_code")
+        ]
+        assert ref_lines == []
+
+    def test_cli_unsafe_ref_persists_sanitised_form(
+        self, manifest_path: Path,
+    ):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "trading_bot.api.keys",
+                "issue",
+                "--tier", "free",
+                "--label", "x",
+                "--ref", "<script>xss</script>",
+            ],
+            capture_output=True, text=True,
+            env={
+                **__import__("os").environ,
+                KEYS_MANIFEST_ENV_VAR: str(manifest_path),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        (row,) = _read(manifest_path)
+        assert row["ref_code"] == "scriptxssscript"
+        # The raw payload appears nowhere — not in stdout, not in disk.
+        assert "<script>" not in result.stdout
+        body = manifest_path.read_text(encoding="utf-8")
+        assert "<script>" not in body

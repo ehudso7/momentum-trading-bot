@@ -510,6 +510,7 @@ def create_checkout_session(
     success_url: str,
     cancel_url: str,
     *,
+    ref_code: Optional[str] = None,
     http_post: Optional[HttpPoster] = None,
 ) -> dict:
     """
@@ -528,6 +529,14 @@ def create_checkout_session(
     The raw ``api_key`` is **never** returned, printed, or logged by
     this function — only the hashed form. Callers (CLI, scripts)
     must continue that hygiene.
+
+    Phase 6.1 — when ``ref_code`` is provided, it is added to the
+    Stripe Checkout session's ``metadata[ref_code]`` and
+    ``subscription_data[metadata][ref_code]``. The Phase 4.7
+    webhook handler still keys on ``metadata[api_key]`` for the
+    actual premium-cache update; ``ref_code`` is purely for
+    downstream attribution analysis. Empty / None ref_code is a
+    no-op (the field is simply not added to the POST body).
 
     Fail-closed: raises ``BillingConfigError`` when
     ``STRIPE_API_KEY`` or ``STRIPE_PRICE_ID_PREMIUM`` are missing.
@@ -561,6 +570,14 @@ def create_checkout_session(
         "subscription_data[metadata][api_key]": api_key,
         "customer_creation": "always",
     }
+    # Phase 6.1 — operator-supplied ref_code arrives here already
+    # sanitised by the caller (keys.issue_key uses the Phase 5.1
+    # growth sanitiser). We still string-coerce defensively.
+    if ref_code:
+        ref_str = str(ref_code).strip()
+        if ref_str:
+            data["metadata[ref_code]"] = ref_str
+            data["subscription_data[metadata][ref_code]"] = ref_str
 
     poster = http_post if http_post is not None else _post_to_stripe
     payload = poster(
