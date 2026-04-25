@@ -3,21 +3,23 @@ Phase 6.2 — Manifest-backed API key authentication.
 
 Pure-stdlib helper module that lets the live API server authenticate
 keys issued by ``python -m trading_bot.api.keys issue`` without ever
-storing the raw key.
+storing the raw key. The presented bearer token is hashed with
+``SHA-256(api_key)[:32]`` and looked up in the issuance manifest;
+revoked hashes are rejected up-front.
 
-IMPORTANT:
-The API key hash is the FULL SHA-256 hex digest.
-
-Earlier docs/code referenced SHA-256(api_key)[:32]. That caused a
-production mismatch because the issuer stored full 64-char hashes while
-runtime auth looked up 32-char hashes.
-
-This module now:
-  * hashes presented keys with full SHA-256;
-  * supports legacy 32-char revocation/manifest rows as fallback;
-  * never persists raw API keys;
-  * tolerates missing/malformed JSONL files;
-  * hot-reloads manifest/revocation files by path + mtime.
+This module deliberately:
+  * hashes presented keys with the same SHA-256[:32] every other
+    Phase 4/5/6 module uses (server / billing / conversion / growth /
+    upgrade_events / share_events / smoke / keys), so the join column
+    is byte-identical across every JSONL log;
+  * never persists raw API keys (they're only hashed on the way in);
+  * never persists raw labels;
+  * never opens the network;
+  * tolerates missing files, malformed JSONL rows, and concurrent
+    writers — every load path returns "no entries" on error rather
+    than raising;
+  * hot-reloads manifest/revocation files by path + mtime so a newly
+    appended row takes effect on the next request without a restart.
 """
 
 from __future__ import annotations
@@ -51,16 +53,23 @@ class ManifestEntry(NamedTuple):
 
 
 def hash_api_key(api_key: Optional[str]) -> str:
-    """Return FULL SHA-256 hex digest for an API key."""
+    """SHA-256[:32] — byte-identical to every other Phase 4/5/6 hasher.
+
+    Joining the manifest, revocation log, growth log, upgrade-events
+    log, conversion log, audit log, and usage log on ``key_hash``
+    requires every writer and every reader to produce the SAME 32-char
+    digest. The truncated form predates this module; the legacy
+    ``legacy_hash_api_key`` alias is kept for any caller that is
+    explicit about wanting the truncated form.
+    """
     if not api_key:
         return ""
-    return hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()
+    return hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()[:32]
 
 
 def legacy_hash_api_key(api_key: Optional[str]) -> str:
-    """Legacy SHA-256[:32] hash retained for backward compatibility."""
-    full = hash_api_key(api_key)
-    return full[:32] if full else ""
+    """Alias for ``hash_api_key`` retained for explicit callers."""
+    return hash_api_key(api_key)
 
 
 def manifest_path() -> Path:
@@ -205,30 +214,19 @@ def verify_api_key(api_key: Optional[str]) -> Optional[ManifestEntry]:
     """
     Validate a presented bearer token against the manifest.
 
-    Lookup order:
-    1. full SHA-256 hash
-    2. legacy SHA-256[:32] hash fallback
-
-    Revocation also checks both forms so older 32-char revocation rows
-    still block keys after the full-hash fix.
+    Hashes the presented key with the canonical SHA-256[:32] form,
+    rejects it if revoked, otherwise returns the manifest entry (or
+    ``None`` if no manifest row matches).
     """
     if not api_key:
         return None
 
-    full_hash = hash_api_key(api_key)
-    short_hash = full_hash[:32] if full_hash else ""
-
-    if not full_hash:
+    presented = hash_api_key(api_key)
+    if not presented:
         return None
-
-    if is_revoked(full_hash) or is_revoked(short_hash):
+    if is_revoked(presented):
         return None
-
-    entry = lookup_key_hash(full_hash)
-    if entry is not None:
-        return entry
-
-    return lookup_key_hash(short_hash)
+    return lookup_key_hash(presented)
 
 
 def has_active_keys() -> bool:
