@@ -3,7 +3,7 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "/bin/sh -c \"uvicorn trading_bot.api.server:app --host 0.0.0.0 --port $PORT\""
+startCommand = "/bin/sh -c \"chmod -R 777 /app/data || true && uvicorn trading_bot.api.server:app --host 0.0.0.0 --port 8080\""
 healthcheckPath = "/health"
 healthcheckTimeout = 5
 restartPolicyType = "ON_FAILURE"

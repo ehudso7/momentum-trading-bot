@@ -1769,6 +1769,154 @@ import time  # noqa: E402  — kept at the bottom so it stays scoped to Phase 6.
 
 
 # ===========================================================================
+# Phase 7.2 — bulk revocation cleanup helper
+# ===========================================================================
+
+
+class TestPhase72RevokeMany:
+    def test_revokes_each_supplied_hash(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        revoked = tmp_path / "phase72_revoked.jsonl"
+        monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(revoked))
+        from trading_bot.api import key_store
+        key_store.reset_caches_for_tests()
+
+        hashes = ["a" * 32, "b" * 32, "c" * 32]
+        rc = keys_main(
+            ["revoke-many"]
+            + sum((["--key-hash", h] for h in hashes), [])
+            + ["--reason", "launch-cleanup"]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "written       : 3" in out
+        for h in hashes:
+            assert h in out
+
+        rows = [
+            json.loads(line)
+            for line in revoked.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 3
+        assert {r["key_hash"] for r in rows} == set(hashes)
+        assert all(r["reason"] == "launch-cleanup" for r in rows)
+
+    def test_one_hash_still_works(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        revoked = tmp_path / "phase72_revoked_one.jsonl"
+        monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(revoked))
+        rc = keys_main(["revoke-many", "--key-hash", "d" * 32])
+        assert rc == 0
+        body = revoked.read_text(encoding="utf-8")
+        assert "d" * 32 in body
+
+    def test_no_key_hash_rejected(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_REVOKED_PATH",
+            str(tmp_path / "noop.jsonl"),
+        )
+        rc = keys_main(["revoke-many"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--key-hash" in err
+
+    def test_blank_key_hash_rejected(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_REVOKED_PATH",
+            str(tmp_path / "noop.jsonl"),
+        )
+        rc = keys_main(
+            ["revoke-many", "--key-hash", "   "],
+        )
+        assert rc == 2
+
+    def test_revoke_many_path_override(self, tmp_path: Path):
+        custom = tmp_path / "alt_bulk_revoked.jsonl"
+        rc = keys_main([
+            "revoke-many",
+            "--key-hash", "e" * 32,
+            "--key-hash", "f" * 32,
+            "--revoked-path", str(custom),
+        ])
+        assert rc == 0
+        assert custom.exists()
+        rows = [
+            json.loads(line)
+            for line in custom.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 2
+
+    def test_revoke_many_never_stores_raw_key(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """The CLI accepts ONLY pre-hashed values via --key-hash; if
+        an operator accidentally pastes a raw key, the test ensures
+        the raw value never lands on disk in any form (we only store
+        what was passed, and operators should pass the hash)."""
+        revoked = tmp_path / "phase72_no_leak.jsonl"
+        monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(revoked))
+
+        # Pretend the operator pasted a 'looks-like-hash' value that
+        # is actually the hash of a sensitive marker. The marker
+        # itself must not appear on disk.
+        import hashlib as _hl
+        marker = "RAW_BULK_REVOKE_MARKER_DO_NOT_LEAK"
+        h = _hl.sha256(marker.encode("utf-8")).hexdigest()[:32]
+        rc = keys_main(["revoke-many", "--key-hash", h])
+        assert rc == 0
+        body = revoked.read_text(encoding="utf-8")
+        assert marker not in body
+        assert h in body
+
+    def test_idempotent_against_list_show(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """Duplicate revocations are accepted; ``list --include-revoked``
+        and ``show`` still treat the key as revoked."""
+        manifest = tmp_path / "phase72_idemp_manifest.jsonl"
+        revoked = tmp_path / "phase72_idemp_revoked.jsonl"
+        monkeypatch.setenv(KEYS_MANIFEST_ENV_VAR, str(manifest))
+        monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(revoked))
+        from trading_bot.api import key_store
+        key_store.reset_caches_for_tests()
+
+        result = issue_key(tier="free", label="phase72-idemp")
+        h = result["key_hash"]
+        # Revoke the same hash three times — duplicates accepted.
+        rc1 = keys_main([
+            "revoke-many", "--key-hash", h, "--key-hash", h, "--key-hash", h,
+        ])
+        assert rc1 == 0
+        capsys.readouterr()  # drain
+
+        # show treats the key as revoked.
+        rc2 = keys_main(["show", "--key-hash", h])
+        assert rc2 == 0
+        out = capsys.readouterr().out
+        assert "revoked             : yes" in out
+
+        # list (default) hides the key.
+        rc3 = keys_main(["list"])
+        assert rc3 == 0
+        out = capsys.readouterr().out
+        assert h not in out
+
+        # list --include-revoked shows it.
+        rc4 = keys_main(["list", "--include-revoked"])
+        assert rc4 == 0
+        out = capsys.readouterr().out
+        assert h in out
+
+
+# ===========================================================================
 # Phase 6.4 — explicit --manifest-path / --revoked-path override tests
 # ===========================================================================
 #

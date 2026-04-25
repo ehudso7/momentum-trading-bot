@@ -280,3 +280,160 @@ invariant verbatim. To restate them in deployment terms:
 The above are pinned by `tests/test_keys.py` and
 `tests/test_api_server.py`. If a future change appears to weaken
 any of them, those tests will fail before the change can ship.
+
+
+## Launch Day Checklist (Phase 7.2)
+
+Single-page runbook for the moment you flip on real-traffic. Every
+step has a corresponding test that fails if the contract regresses.
+
+### 1 — Production start command is locked
+
+`railway.toml` must look exactly like this:
+
+```toml
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "/bin/sh -c \"chmod -R 777 /app/data || true && uvicorn trading_bot.api.server:app --host 0.0.0.0 --port 8080\""
+healthcheckPath = "/health"
+healthcheckTimeout = 5
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+```
+
+The leading `chmod` ensures the persistent volume mounted at
+`/app/data` is writable by the unprivileged uvicorn process. Pinned
+by `tests/test_launch_check.py::TestRailwayTomlLockdown`.
+
+### 2 — Railway env vars all point at the persistent volume
+
+In Railway → service → Variables:
+
+```
+TRADING_API_KEYS_MANIFEST_PATH=/app/data/api_keys_manifest.jsonl
+TRADING_API_KEYS_REVOKED_PATH=/app/data/api_keys_revoked.jsonl
+TRADING_STRIPE_PREMIUM_CACHE_PATH=/app/data/stripe_premium_keys.json
+TRADING_API_USAGE_LOG_PATH=/app/data/api_usage.jsonl
+TRADING_API_AUDIT_LOG_PATH=/app/data/api_access_audit.jsonl
+TRADING_API_GROWTH_LOG_PATH=/app/data/api_growth.jsonl
+TRADING_API_CONVERSION_LOG_PATH=/app/data/api_conversions.jsonl
+TRADING_API_UPGRADE_EVENTS_LOG_PATH=/app/data/api_upgrade_events.jsonl
+STRIPE_API_KEY=sk_live_…           # only when ready to accept payments
+STRIPE_WEBHOOK_SECRET=whsec_…       # only when Stripe is wired
+TRADING_LOG_JSON=true
+```
+
+### 3 — Issue the real user keys (Railway shell only)
+
+```bash
+# Inside `railway ssh` or the Railway dashboard "Shell" tab:
+python -m trading_bot.api.keys issue \
+    --tier free \
+    --label "alice@example.com" \
+    --manifest-path /app/data/api_keys_manifest.jsonl
+```
+
+The raw key is printed once — capture it out-of-band and hand-deliver
+it to the customer. Never paste it into chat, ticket systems,
+screenshots, or any logging surface.
+
+### 4 — Revoke any test keys you issued during dev
+
+If you issued anything during testing, either revoke each hash:
+
+```bash
+python -m trading_bot.api.keys revoke \
+    --key-hash <hash> \
+    --reason "test key cleanup" \
+    --revoked-path /app/data/api_keys_revoked.jsonl
+```
+
+…or batch-revoke a list:
+
+```bash
+python -m trading_bot.api.keys revoke-many \
+    --key-hash <hash1> --key-hash <hash2> --key-hash <hash3> \
+    --reason "test key cleanup" \
+    --revoked-path /app/data/api_keys_revoked.jsonl
+```
+
+Confirm the cleanup with:
+
+```bash
+python -m trading_bot.api.keys list --include-revoked \
+    --manifest-path /app/data/api_keys_manifest.jsonl \
+    --revoked-path  /app/data/api_keys_revoked.jsonl
+```
+
+Every test hash should now appear with `revoked=yes`.
+
+### 5 — Run launch_check on the Railway shell
+
+```bash
+python -m trading_bot.api.launch_check
+```
+
+Exits 0 + prints `READY` when every env var is set, every path is
+writable, and nothing points at `/tmp` or repo-local `data/`. Exits
+1 with `NOT READY` plus a line per failed check otherwise. Fix any
+`[FAIL]` row and re-run before continuing.
+
+### 6 — Run the production HTTP smoke test
+
+From the same Railway shell:
+
+```bash
+python -m trading_bot.api.launch_check --smoke \
+    --base-url https://your-host.example.com \
+    --api-key <real-issued-key>
+```
+
+This combines step 5 with the Phase 6.5 HTTP smoke runner — public
+landing, health, 401 / 403 / 200 protected paths, and `/dashboard`.
+The supplied `--api-key` is hashed in-process; the raw value never
+prints. Exits 0 only when every check passes.
+
+### 7 — Wire Stripe AFTER auth passes
+
+Only after step 6 reports `READY`:
+
+* In the Stripe Dashboard, create the webhook endpoint pointing at
+  `https://your-host.example.com/webhook/stripe`.
+* Subscribe to `customer.subscription.created`,
+  `customer.subscription.deleted`, `invoice.payment_failed`.
+* Copy the signing secret into `STRIPE_WEBHOOK_SECRET` and redeploy.
+* Smoke-test one real Checkout to confirm the webhook flips the
+  customer's tier to premium (Phase 7.0 does this automatically as
+  long as the `metadata.api_key` matches an issued manifest row).
+
+### 8 — Hand-deliver keys securely
+
+Channels (in descending order of preference):
+
+1. The customer's authenticated account on a separate platform
+   you already trust.
+2. End-to-end encrypted messaging (Signal, iMessage, etc.).
+3. A vault link that auto-destructs after one read.
+
+Never send a raw key over plain email, plain SMS, public chat, or
+any unencrypted channel.
+
+### Rollback signals
+
+If anything looks off after launch:
+
+* `python -m trading_bot.api.keys list --include-revoked` quickly
+  shows whether the manifest looks sane.
+* `python -m trading_bot.api.keys stats --json` gives total /
+  active / revoked counts at a glance.
+* `python -m trading_bot.api.launch_check --smoke ...` is safe to
+  re-run at any time — six lightweight HTTP requests against
+  documented endpoints.
+* To kill a leaked key immediately:
+  `python -m trading_bot.api.keys revoke --api-key <leaked-raw> \
+   --revoked-path /app/data/api_keys_revoked.jsonl --reason leaked`
+  — the next request bearing that key 403s within the mtime
+  reload window (sub-second in practice).
