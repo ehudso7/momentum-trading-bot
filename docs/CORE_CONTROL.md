@@ -3635,6 +3635,169 @@ streak always has a target to chase.
   ``tests/test_stickiness.py::TestBoundary::test_module_imports_only_stdlib_typing``.
 
 
+### Phase 10.1 — shareability layer
+
+A small, stable copy-paste-ready ``share`` payload attached to
+each Phase 9.1 insight and to the Phase 9.2 daily hook so any
+caller can drop the text into a tweet, Slack, email, or any
+short-form channel without doing string-stitching of their own.
+
+**Module**
+
+``trading_bot/api/share.py`` — pure stdlib, imports nothing from
+FastAPI / structlog / the rest of ``trading_bot``. Two public
+entry points:
+
+```python
+build_insight_share(insight, *, is_premium, base_url)   -> dict | None
+build_daily_hook_share(hook,  *, is_premium, base_url)  -> dict | None
+```
+
+**Share schema** (every entry conforms when the helpers do not
+return ``None``)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``text`` | ``str`` | short, human-readable, copy-paste-ready |
+| ``cta``  | ``str`` | stable ``"Try it yourself"`` |
+| ``url``  | ``str`` | the deployment's public URL (Phase 7.3 ``TRADING_PUBLIC_BASE_URL``), with trailing slashes stripped |
+
+**Source rules**
+
+* Insight share: keyed on the insight's ``id``. Three rule IDs
+  have copy:
+  * ``trend.buy_delta``
+  * ``promotion.readiness``
+  * ``regime.dominant``
+
+  Insights with an unrecognised ``id`` get no ``share`` field
+  (fail-closed for future rules without copy).
+* Daily-hook share: every hook with a ``change`` value gets copy.
+* Both helpers return ``None`` when ``TRADING_PUBLIC_BASE_URL`` is
+  unset / blank — without a public URL the share field can't link
+  anywhere, so the field is omitted entirely. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Tier-aware copy**
+
+Both tiers receive a ``share`` field with the same SHAPE; the
+``text`` is what differs:
+
+| Insight / hook | Free copy | Premium copy |
+|---|---|---|
+| ``trend.buy_delta`` (up 10, +50%) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%)." |
+| ``promotion.readiness`` (ready, 25 days) | "Momentum Trading Bot promotion gate is GREEN after 25 consecutive passing day(s)." | "Momentum Trading Bot: promotion gate READY after 25 consecutive passing day(s)." |
+| ``promotion.readiness`` (blocked, 0 days) | "Momentum Trading Bot promotion gate is currently blocked." | "Momentum Trading Bot: promotion gate BLOCKED — no passing streak yet." |
+| ``regime.dominant`` (trending, 12 hits, 80% share) | "Momentum Trading Bot: 'trending' regime led today's signals." | "Momentum Trading Bot: 'trending' regime dominated with 12 hits (80.0% share)." |
+| ``daily_hook`` (up 10) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: Buys up 10 vs prior day (trending up)." |
+
+Premium copy carries the percent / share / streak figures so the
+text stands on its own as a social hook; free copy is the plain
+plain-language equivalent. The CTA and URL are identical.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — every insight returned in the
+  ``insights`` list is decorated via
+  ``_decorate_insights_with_share`` AFTER tier truncation, and
+  the daily hook is decorated via ``_decorate_daily_hook_with_share``.
+  The decoration helpers return a NEW list / dict (no mutation)
+  so a future serialiser can't accidentally see a share field on
+  a re-fetched insight.
+
+  Free callers see the share text matching what they receive in
+  the rest of the body (e.g. they don't see the percent figure
+  in their truncated trend insight, so the share text doesn't
+  include it either).
+* ``GET /dashboard`` — share is a JSON-payload concept; the HTML
+  dashboard does not surface it. (A future Phase 10.x can wire
+  share text into rendered banners if needed.)
+
+**Sample free response excerpt**
+
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "title": "Buy volume up vs prior day",
+      "summary": "Buys advanced 10 → 30 (was 20).",
+      "confidence": 0.5,
+      "severity": "info",
+      "evidence": {"delta": 10, "direction": "up"},
+      "action": "monitor for sustained improvement",
+      "share": {
+        "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      }
+    }
+  ],
+  "daily_hook": {
+    "headline":   "Buys up 10 vs prior day",
+    "change":     "up",
+    "magnitude":  10,
+    "since":      "2026-04-24",
+    "cta":        "Open the dashboard for the full breakdown",
+    "share": {
+      "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+      "cta":  "Try it yourself",
+      "url":  "https://momentum-trading-bot-production.up.railway.app"
+    }
+  }
+}
+```
+
+**Sample premium response excerpt**
+
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "evidence": {
+        "delta": 10, "direction": "up",
+        "curr_buy_rows": 30, "prev_buy_rows": 20,
+        "percent_change": 50.0
+      },
+      "share": {
+        "text": "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%).",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      },
+      "...": "..."
+    }
+  ]
+}
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any ``share`` field. Pinned by
+  ``TestPhase101NoLeak::test_raw_key_absent_from_share_text``.
+* Share text never includes evidence the caller doesn't already
+  see — a free caller's trend share never carries the
+  percent-change figure that Phase 8.2 trims from their evidence.
+  Pinned by ``TestPhase101InsightShareFreeUser::test_free_share_text_uses_plain_copy``.
+* Share is omitted entirely when ``TRADING_PUBLIC_BASE_URL`` is
+  unset, so a misconfigured deployment can't surface a dangling
+  URL or a placeholder string. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Boundary**
+
+* No new HTTP route. Phase 10.1 is helper code wired into
+  existing routes. Pinned by
+  ``TestPhase101CrossCutting::test_no_new_mutating_route``.
+* No new persistence — share text is computed per request from
+  data the caller is already receiving.
+* No new env vars. ``TRADING_PUBLIC_BASE_URL`` is the same env
+  var Phase 7.3 / 8.3 already use.
+* ``trading_bot/api/share.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_share.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
 ## Phase 2.7 — dataset rotation (reference)
 
 

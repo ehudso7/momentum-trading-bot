@@ -79,6 +79,10 @@ from trading_bot.api.stickiness import (
     truncate_nudge_for_free,
     truncate_streak_for_free,
 )
+from trading_bot.api.share import (
+    build_daily_hook_share,
+    build_insight_share,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -2447,6 +2451,59 @@ DEFAULT_CHECKOUT_SUCCESS_PATH = "/dashboard?checkout=success"
 DEFAULT_CHECKOUT_CANCEL_PATH = "/dashboard?checkout=cancel"
 
 
+def _public_base_url() -> Optional[str]:
+    """
+    Phase 10.1 — read ``TRADING_PUBLIC_BASE_URL`` and return the
+    bare URL with any trailing slash stripped, or ``None`` when
+    unset / blank. The same env var powers Phase 7.3 / 8.3 / 10.1.
+    """
+    raw = (os.getenv(PUBLIC_BASE_URL_ENV_VAR, "") or "").strip()
+    if not raw:
+        return None
+    return raw.rstrip("/") or None
+
+
+def _decorate_insights_with_share(
+    insights: list[dict], *, is_premium: bool,
+) -> list[dict]:
+    """
+    Phase 10.1 — return a NEW list of insights with a ``share``
+    field added per entry (when the helper has copy for the
+    insight's id and the public base URL is configured).
+    """
+    if not isinstance(insights, list):
+        return []
+    base_url = _public_base_url()
+    out: list[dict] = []
+    for entry in insights:
+        if not isinstance(entry, dict):
+            continue
+        share = build_insight_share(
+            entry, is_premium=is_premium, base_url=base_url,
+        )
+        new_entry = dict(entry)
+        if share is not None:
+            new_entry["share"] = share
+        out.append(new_entry)
+    return out
+
+
+def _decorate_daily_hook_with_share(
+    hook: Optional[dict], *, is_premium: bool,
+) -> Optional[dict]:
+    """Phase 10.1 — return a NEW hook dict with a ``share`` field."""
+    if not isinstance(hook, dict):
+        return hook
+    base_url = _public_base_url()
+    share = build_daily_hook_share(
+        hook, is_premium=is_premium, base_url=base_url,
+    )
+    new_hook = dict(hook)
+    if share is not None:
+        new_hook["share"] = share
+    return new_hook
+
+
 def _build_checkout_redirect_urls() -> tuple[str, str]:
     """
     Return (success_url, cancel_url). Raises ``HTTPException(503)``
@@ -2635,19 +2692,31 @@ def latest_report(
     nudge = build_nudge(data, prev)
 
     if _is_premium_user(request):
-        data["insights"] = insights
+        # Phase 10.1 — attach copy-paste-ready share payloads to
+        # every insight whose id has supported copy AND to the
+        # daily_hook. Both helpers no-op when TRADING_PUBLIC_BASE_URL
+        # is unset, so the underlying entry stays unchanged.
+        data["insights"] = _decorate_insights_with_share(
+            insights, is_premium=True,
+        )
         if daily_hook is not None:
-            data["daily_hook"] = daily_hook
+            data["daily_hook"] = _decorate_daily_hook_with_share(
+                daily_hook, is_premium=True,
+            )
         if streak is not None:
             data["streak"] = streak
         if nudge is not None:
             data["nudge"] = nudge
         return data
     free_body = _project_report_for_free(data)
-    free_body["insights"] = truncate_for_free(insights)
+    free_body["insights"] = _decorate_insights_with_share(
+        truncate_for_free(insights), is_premium=False,
+    )
     free_hook = _truncate_hook_for_free(daily_hook)
     if free_hook is not None:
-        free_body["daily_hook"] = free_hook
+        free_body["daily_hook"] = _decorate_daily_hook_with_share(
+            free_hook, is_premium=False,
+        )
     free_streak = truncate_streak_for_free(streak)
     if free_streak is not None:
         free_body["streak"] = free_streak

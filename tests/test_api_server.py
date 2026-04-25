@@ -9773,3 +9773,240 @@ class TestPhase93CrossCutting:
         assert "daily_hook" in body
         assert "streak" in body
         assert "nudge" in body
+
+
+# ===========================================================================
+# Phase 10.1 — shareability layer
+# ===========================================================================
+
+
+_PHASE_101_BASE_URL = "https://share.example.com"
+
+
+@pytest.fixture
+def phase101_env(phase91_env, monkeypatch):
+    """Phase 9.1 base + TRADING_PUBLIC_BASE_URL set so the share
+    helpers have somewhere to point. Returns the same dict shape
+    as phase91_env."""
+    monkeypatch.setenv("TRADING_PUBLIC_BASE_URL", _PHASE_101_BASE_URL)
+    return phase91_env
+
+
+class TestPhase101InsightShareFreeUser:
+    def test_each_insight_carries_share_payload(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "insights" in body
+        # Free tier sees up to 2 insights; both must carry share.
+        for entry in body["insights"]:
+            assert "share" in entry, (
+                f"insight {entry['id']!r} missing share payload"
+            )
+            assert set(entry["share"].keys()) == {"text", "cta", "url"}
+            assert entry["share"]["url"] == _PHASE_101_BASE_URL
+            assert entry["share"]["cta"] == "Try it yourself"
+
+    def test_free_share_text_uses_plain_copy(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        trend = next(
+            (e for e in body["insights"] if e["id"] == "trend.buy_delta"),
+            None,
+        )
+        assert trend is not None
+        # Free copy: no percent-change figure.
+        assert "%" not in trend["share"]["text"]
+        assert "Momentum Trading Bot" in trend["share"]["text"]
+
+
+class TestPhase101InsightSharePremiumUser:
+    def test_premium_trend_share_includes_percent_change(
+        self, client: TestClient, phase101_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        trend = next(
+            (e for e in body["insights"] if e["id"] == "trend.buy_delta"),
+            None,
+        )
+        assert trend is not None
+        assert "%" in trend["share"]["text"]
+        assert "+50.0%" in trend["share"]["text"]
+
+
+class TestPhase101DailyHookShare:
+    def test_free_daily_hook_carries_share(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        hook = body["daily_hook"]
+        assert "share" in hook
+        assert set(hook["share"].keys()) == {"text", "cta", "url"}
+        assert hook["share"]["url"] == _PHASE_101_BASE_URL
+        # Free copy is plain.
+        assert "Buy signals up 10" in hook["share"]["text"]
+
+    def test_premium_daily_hook_share_carries_richer_copy(
+        self, client: TestClient, phase101_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        hook = body["daily_hook"]
+        assert "share" in hook
+        # Premium copy uses the headline + branded prefix.
+        assert "Momentum Trading Bot" in hook["share"]["text"]
+        assert "trending up" in hook["share"]["text"]
+
+
+class TestPhase101NoBaseUrlOmitsShare:
+    """When TRADING_PUBLIC_BASE_URL is unset (the default state in
+    most Phase 9 tests), the response must NOT carry share fields —
+    the underlying insight / hook stays unchanged."""
+
+    def test_no_base_url_means_no_share_on_insights(
+        self, client: TestClient, phase91_env, monkeypatch,
+    ):
+        # Don't use phase101_env — leave TRADING_PUBLIC_BASE_URL unset.
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        for entry in body["insights"]:
+            assert "share" not in entry, (
+                f"insight {entry['id']!r} leaked share without base URL"
+            )
+
+    def test_no_base_url_means_no_share_on_daily_hook(
+        self, client: TestClient, phase91_env, monkeypatch,
+    ):
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        hook = body.get("daily_hook")
+        assert hook is not None
+        assert "share" not in hook
+
+
+class TestPhase101NoLeak:
+    def test_raw_key_absent_from_share_text(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in text
+
+
+class TestPhase101CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 10.1 leaked a mutating route: {m} {path}"
+                )
+
+    def test_share_field_does_not_displace_existing_insight_fields(
+        self, client: TestClient, phase101_env, monkeypatch, tmp_path: Path,
+    ):
+        """The share decoration must layer on top of the existing
+        Phase 9.1 schema — every documented field still surfaces."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        for entry in body["insights"]:
+            # Phase 9.1 keys all present.
+            assert {"id", "title", "summary", "confidence", "severity",
+                    "evidence", "action"}.issubset(entry.keys())
+            # Phase 10.1 share present.
+            assert "share" in entry
