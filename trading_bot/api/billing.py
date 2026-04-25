@@ -220,10 +220,30 @@ def add_premium_key(api_key: str) -> None:
     key_hash = _hash_api_key(api_key)
     if not key_hash:
         return
+    add_premium_hash(key_hash)
+
+
+def add_premium_hash(key_hash: str) -> None:
+    """
+    Phase 7.4 — add ``key_hash`` directly to the persistent premium set.
+
+    Used by the Stripe webhook when an event carries
+    ``metadata[key_hash]`` (the Phase 7.3 ``POST /billing/checkout``
+    flow), so the raw API key is never required for promotion.
+
+    The cache file already holds hashes only (Phase 7.0); this helper
+    just bypasses the redundant hash step that ``add_premium_key``
+    performs internally.
+    """
+    if not key_hash or not isinstance(key_hash, str):
+        return
+    h = key_hash.strip()
+    if not h:
+        return
     _ensure_cache_loaded()
     path = _cache_path()
     with _cache_lock:
-        _cache.add(key_hash)
+        _cache.add(h)
         _save_cache(path, set(_cache))
 
 
@@ -239,10 +259,25 @@ def remove_premium_key(api_key: str) -> None:
     key_hash = _hash_api_key(api_key)
     if not key_hash:
         return
+    remove_premium_hash(key_hash)
+
+
+def remove_premium_hash(key_hash: str) -> None:
+    """
+    Phase 7.4 — remove ``key_hash`` directly from the persistent
+    premium set. Idempotent. Used by the Stripe webhook when
+    ``customer.subscription.deleted`` / ``invoice.payment_failed``
+    arrives with a ``metadata[key_hash]`` field (Phase 7.3 flow).
+    """
+    if not key_hash or not isinstance(key_hash, str):
+        return
+    h = key_hash.strip()
+    if not h:
+        return
     _ensure_cache_loaded()
     path = _cache_path()
     with _cache_lock:
-        _cache.discard(key_hash)
+        _cache.discard(h)
         _save_cache(path, set(_cache))
 
 
@@ -277,11 +312,18 @@ def is_stripe_configured() -> bool:
     """
     True iff the minimum env vars for Stripe-primary mode are present.
 
-    Detection is based on ``STRIPE_API_KEY`` because that is the
-    single value required for signed outbound Stripe calls. Without
-    it we fall back to the Phase 4.5 env-var premium-keys list.
+    Detection accepts EITHER the legacy ``STRIPE_API_KEY`` (Phase
+    4.7) or the Phase 7.3 preferred ``STRIPE_SECRET_KEY`` — both
+    name the same Stripe-side credential. Without either, we fall
+    back to the Phase 4.5 env-var premium-keys list.
     """
-    return bool((os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip())
+    legacy = (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
+    if legacy:
+        return True
+    # Phase 7.3 / 7.4 — STRIPE_SECRET_KEY is the preferred name.
+    # Read by literal so this function stays callable before the
+    # constant is defined further down the module.
+    return bool((os.getenv("STRIPE_SECRET_KEY", "") or "").strip())
 
 
 def _hash_api_key(api_key: Optional[str]) -> str:
@@ -425,22 +467,64 @@ def _extract_api_key_from_event_object(obj) -> Optional[str]:
     expanded by Stripe on the webhook. Customers referenced by plain
     string ID cannot be resolved without a Stripe API call, which
     this module deliberately does not make.
+
+    Backward-compat surface preserved across Phase 7.4 — new code
+    should call ``_extract_identity_from_event_object`` to also
+    retrieve the ``key_hash`` field.
+    """
+    api_key, _ = _extract_identity_from_event_object(obj)
+    return api_key
+
+
+def _extract_identity_from_event_object(
+    obj,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Phase 7.4 — pull both ``api_key`` and ``key_hash`` out of the
+    inner event object's metadata. Returns ``(api_key, key_hash)``.
+
+    Both top-level ``object.metadata.<field>`` and the defensive
+    ``object.customer.metadata.<field>`` fallback are checked. Either
+    or both may be present:
+
+      * Phase 4.7 / 4.8 operator-CLI checkout sends
+        ``metadata[api_key]`` (raw key).
+      * Phase 7.3 ``POST /billing/checkout`` sends
+        ``metadata[key_hash]`` (hash only) and deliberately omits
+        ``metadata[api_key]``.
+
+    The webhook handler prefers ``key_hash`` when both happen to be
+    present (no raw key needed).
     """
     if not isinstance(obj, dict):
-        return None
+        return (None, None)
+
+    api_key: Optional[str] = None
+    key_hash: Optional[str] = None
+
     meta = obj.get("metadata")
     if isinstance(meta, dict):
-        key = meta.get("api_key")
-        if key:
-            return str(key)
+        ak = meta.get("api_key")
+        if ak:
+            api_key = str(ak)
+        kh = meta.get("key_hash")
+        if kh:
+            key_hash = str(kh)
+
     customer = obj.get("customer")
     if isinstance(customer, dict):
         cmeta = customer.get("metadata")
         if isinstance(cmeta, dict):
-            key = cmeta.get("api_key")
-            if key:
-                return str(key)
-    return None
+            if api_key is None:
+                ak = cmeta.get("api_key")
+                if ak:
+                    api_key = str(ak)
+            if key_hash is None:
+                kh = cmeta.get("key_hash")
+                if kh:
+                    key_hash = str(kh)
+
+    return (api_key, key_hash)
 
 
 def _extract_price_id_from_event_object(obj) -> Optional[str]:
@@ -498,23 +582,51 @@ def _verify_against_manifest(api_key: str) -> bool:
     return key_store.verify_api_key(api_key) is not None
 
 
+def _verify_hash_against_manifest(key_hash: str) -> bool:
+    """
+    Phase 7.4 — same gate as ``_verify_against_manifest``, but takes
+    a hash directly. True iff the hash is in the issuance manifest
+    AND has not been revoked.
+    """
+    if not key_hash or not isinstance(key_hash, str):
+        return False
+    h = key_hash.strip()
+    if not h:
+        return False
+    try:
+        from trading_bot.api import key_store  # noqa: WPS433
+    except Exception as exc:
+        log.debug("billing.key_store_import_error", error=str(exc))
+        return False
+    if key_store.lookup_key_hash(h) is None:
+        return False
+    if key_store.is_revoked(h):
+        return False
+    return True
+
+
 def handle_webhook_event(event) -> dict:
     """
     Dispatch a parsed Stripe event to the cache.
 
     Recognized event types:
-      - ``customer.subscription.created`` — add api_key iff status
-        is ``active`` or ``trialing`` AND the key's hash is in the
-        issuance manifest (Phase 7.0 gate).
-      - ``customer.subscription.deleted`` — remove api_key. No
-        manifest check — deletions always flow through so a
-        cancelled subscription immediately loses premium access,
-        even if the corresponding manifest row was later deleted.
-      - ``invoice.payment_failed`` — remove api_key immediately
+      - ``customer.subscription.created`` — promote to premium when
+        ``status`` is ``active``/``trialing`` AND identity verifies
+        against the issuance manifest. Identity is taken from
+        ``metadata[key_hash]`` (Phase 7.3 hash-only path) when
+        present, falling back to ``metadata[api_key]`` (Phase 4.7
+        legacy raw-key path) otherwise.
+      - ``customer.subscription.deleted`` — remove premium for the
+        identity. No manifest check — deletions always flow through
+        so a cancelled subscription immediately loses access even
+        if the corresponding manifest row was later deleted.
+      - ``invoice.payment_failed`` — remove premium immediately
         (fail-closed on billing failures). No manifest check.
 
     Returns a small diagnostics dict — never raises, never echoes
-    the api_key back to the caller.
+    the api_key back to the caller. Phase 7.4 also surfaces the
+    identity source as ``"identity": "key_hash" | "api_key"`` so
+    operators can see which path the event flowed through.
     """
     if not isinstance(event, dict):
         return {"action": "ignored", "reason": "not_a_dict"}
@@ -522,57 +634,122 @@ def handle_webhook_event(event) -> dict:
     data = event.get("data") or {}
     obj = data.get("object") if isinstance(data, dict) else None
 
-    api_key = _extract_api_key_from_event_object(obj)
-    if not api_key:
+    api_key, key_hash = _extract_identity_from_event_object(obj)
+    if not api_key and not key_hash:
         return {
             "type": event_type,
             "action": "ignored",
-            "reason": "no_api_key_on_event",
+            "reason": "no_identity_on_event",
         }
+    # Phase 7.4 — prefer the hash path when available so the legacy
+    # raw-key flow only runs when we genuinely have no hash. The two
+    # sources should always agree; the preference order matches the
+    # privacy posture (no raw key needed).
+    use_hash = bool(key_hash)
+    identity_source = "key_hash" if use_hash else "api_key"
 
     if event_type == "customer.subscription.created":
-        status = (isinstance(obj, dict) and str(obj.get("status") or "")).lower()
+        status = (
+            isinstance(obj, dict) and str(obj.get("status") or "")
+        ).lower()
         if status not in _ACTIVE_SUBSCRIPTION_STATUSES:
             return {
                 "type": event_type,
                 "action": "ignored",
                 "reason": f"status={status or 'unknown'}",
             }
-        # Phase 7.0 — manifest verification gate. A webhook with an
-        # api_key we did not issue (or whose hash has been revoked)
-        # is rejected before any cache mutation. The raw api_key
-        # never leaves local scope.
-        if not _verify_against_manifest(api_key):
-            return {
-                "type": event_type,
-                "action": "ignored",
-                "reason": "key_not_in_manifest_or_revoked",
-            }
-        add_premium_key(api_key)
+
+        # Phase 7.0 / 7.4 — manifest verification gate. The hash
+        # path uses the supplied hash directly; the legacy api_key
+        # path hashes-then-verifies.
+        if use_hash:
+            if not _verify_hash_against_manifest(key_hash):  # type: ignore[arg-type]
+                return {
+                    "type": event_type,
+                    "action": "ignored",
+                    "reason": "key_not_in_manifest_or_revoked",
+                    "identity": identity_source,
+                }
+            add_premium_hash(key_hash)  # type: ignore[arg-type]
+        else:
+            if not _verify_against_manifest(api_key):  # type: ignore[arg-type]
+                return {
+                    "type": event_type,
+                    "action": "ignored",
+                    "reason": "key_not_in_manifest_or_revoked",
+                    "identity": identity_source,
+                }
+            add_premium_key(api_key)  # type: ignore[arg-type]
+
         # Phase 4.9 — fire-and-forget free→premium conversion
         # tracking. Any failure is caught so the webhook still
-        # returns a success action to the caller.
+        # returns a success action to the caller. The hash path
+        # uses the new Phase 7.4 conversion entry point so the raw
+        # key is never required.
         try:
-            from trading_bot.api.conversion import record_conversion
-            record_conversion(
-                api_key,
-                source="stripe",
-                price_id=_extract_price_id_from_event_object(obj),
+            from trading_bot.api.conversion import (
+                record_conversion,
+                record_conversion_for_hash,
             )
+            if use_hash:
+                record_conversion_for_hash(
+                    key_hash,  # type: ignore[arg-type]
+                    source="stripe",
+                    price_id=_extract_price_id_from_event_object(obj),
+                )
+            else:
+                record_conversion(
+                    api_key,  # type: ignore[arg-type]
+                    source="stripe",
+                    price_id=_extract_price_id_from_event_object(obj),
+                )
         except Exception as exc:
             log.debug("billing.conversion_error", error=str(exc))
-        return {"type": event_type, "action": "added"}
+        # Phase 8.4 — funnel: stage 3 of 3 (`upgrade_completed`).
+        # Best-effort. Compute the hash for the legacy api_key path
+        # so the funnel row is hash-only.
+        try:
+            from trading_bot.api.upgrade_events import (
+                EVENT_UPGRADE_COMPLETED,
+                record_upgrade_funnel_event,
+            )
+            funnel_hash = (
+                key_hash if use_hash else _hash_api_key(api_key)
+            )
+            record_upgrade_funnel_event(
+                funnel_hash, EVENT_UPGRADE_COMPLETED,
+                reason="stripe_webhook",
+                endpoint="/webhook/stripe",
+            )
+        except Exception as exc:
+            log.debug("billing.upgrade_funnel_error", error=str(exc))
+        return {
+            "type": event_type,
+            "action": "added",
+            "identity": identity_source,
+        }
 
     if event_type == "customer.subscription.deleted":
-        remove_premium_key(api_key)
-        return {"type": event_type, "action": "removed"}
+        if use_hash:
+            remove_premium_hash(key_hash)  # type: ignore[arg-type]
+        else:
+            remove_premium_key(api_key)  # type: ignore[arg-type]
+        return {
+            "type": event_type,
+            "action": "removed",
+            "identity": identity_source,
+        }
 
     if event_type == "invoice.payment_failed":
-        remove_premium_key(api_key)
+        if use_hash:
+            remove_premium_hash(key_hash)  # type: ignore[arg-type]
+        else:
+            remove_premium_key(api_key)  # type: ignore[arg-type]
         return {
             "type": event_type,
             "action": "removed",
             "reason": "payment_failed",
+            "identity": identity_source,
         }
 
     return {
@@ -763,6 +940,148 @@ def create_checkout_session(
         "checkout_session_id": session_id,
         "checkout_url": checkout_url,
         "api_key_hash": _hash_api_key(api_key),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.3 — end-user Stripe Checkout (hash-only, request-driven)
+# ---------------------------------------------------------------------------
+#
+# The Phase 4.8 ``create_checkout_session`` above is operator-only and
+# sends the raw ``api_key`` to Stripe metadata so the existing
+# Phase 4.7 webhook can resolve subscription.created back to the right
+# customer. That posture predates Phase 6.2's hash-only auth path.
+#
+# Phase 7.3 adds an end-user-facing Checkout creator that NEVER puts
+# the raw key into Stripe metadata. Identity flows through ``key_hash``
+# (the same SHA-256 prefix that the auth path looks up). The webhook
+# handler in ``handle_webhook_event`` will be extended to accept
+# ``metadata[key_hash]`` alongside the legacy ``metadata[api_key]``
+# in a future phase; for now, the Phase 7.3 endpoint relies on the
+# Stripe cache being populated via the existing webhook contract.
+#
+# Env vars (preferred names new in Phase 7.3, legacy fallbacks kept):
+#
+#   STRIPE_SECRET_KEY           — required (falls back to STRIPE_API_KEY)
+#   STRIPE_PREMIUM_PRICE_ID     — required (falls back to
+#                                  STRIPE_PRICE_ID_PREMIUM)
+#
+
+STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
+STRIPE_PREMIUM_PRICE_ID_ENV_VAR = "STRIPE_PREMIUM_PRICE_ID"
+
+
+def _resolve_stripe_secret() -> str:
+    """STRIPE_SECRET_KEY (preferred) → STRIPE_API_KEY (legacy)."""
+    primary = (os.getenv(STRIPE_SECRET_KEY_ENV_VAR, "") or "").strip()
+    if primary:
+        return primary
+    return (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
+
+
+def _resolve_premium_price_id() -> str:
+    """STRIPE_PREMIUM_PRICE_ID (preferred) → STRIPE_PRICE_ID_PREMIUM (legacy)."""
+    primary = (
+        os.getenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "") or ""
+    ).strip()
+    if primary:
+        return primary
+    return (
+        os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or ""
+    ).strip()
+
+
+def create_checkout_session_for_hash(
+    *,
+    key_hash: str,
+    success_url: str,
+    cancel_url: str,
+    http_post: Optional[HttpPoster] = None,
+) -> dict:
+    """
+    Create a Stripe Checkout session for the supplied ``key_hash``.
+
+    The raw API key is NEVER touched by this function — the caller
+    must hash the presented key first. Stripe metadata carries only
+    the hash, so even a Stripe-side leak cannot expose plaintext
+    keys.
+
+    Returns a small caller-safe dict::
+
+        {
+            "checkout_session_id": "cs_...",
+            "checkout_url":        "https://checkout.stripe.com/...",
+            "key_hash":            "<as supplied>",
+            "tier_to":             "premium",
+        }
+
+    Fail-closed: raises ``BillingConfigError`` when the secret key
+    or the premium price id are unset; raises ``BillingAPIError``
+    on any non-2xx Stripe response or malformed payload.
+    """
+    if not key_hash or not isinstance(key_hash, str) or not key_hash.strip():
+        raise ValueError("key_hash is required")
+    if not success_url or not str(success_url).strip():
+        raise ValueError("success_url is required")
+    if not cancel_url or not str(cancel_url).strip():
+        raise ValueError("cancel_url is required")
+    for name, value in (
+        ("success_url", success_url), ("cancel_url", cancel_url),
+    ):
+        if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
+            raise ValueError(
+                f"{name} contains forbidden whitespace / control characters"
+            )
+
+    stripe_secret = _resolve_stripe_secret()
+    price_id = _resolve_premium_price_id()
+    if not stripe_secret:
+        raise BillingConfigError(
+            f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured"
+        )
+    if not price_id:
+        raise BillingConfigError(
+            f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured"
+        )
+
+    key_hash = key_hash.strip()
+    data = {
+        "mode": "subscription",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        # Stripe-level identity is the HASH, never the raw key.
+        "client_reference_id": key_hash,
+        "metadata[key_hash]": key_hash,
+        "metadata[tier_from]": "free",
+        "metadata[tier_to]": "premium",
+        "subscription_data[metadata][key_hash]": key_hash,
+        "subscription_data[metadata][tier_to]": "premium",
+        "customer_creation": "always",
+    }
+
+    poster = http_post if http_post is not None else _post_to_stripe
+    payload = poster(
+        url=f"{STRIPE_API_BASE_URL}/checkout/sessions",
+        data=data,
+        auth=(stripe_secret, ""),
+        timeout=STRIPE_API_TIMEOUT_SECONDS,
+    )
+    if not isinstance(payload, dict):
+        raise BillingAPIError("stripe returned non-object JSON")
+
+    session_id = str(payload.get("id") or "")
+    checkout_url = str(payload.get("url") or "")
+    if not session_id or not checkout_url:
+        raise BillingAPIError(
+            "stripe response missing 'id' or 'url' field"
+        )
+    return {
+        "checkout_session_id": session_id,
+        "checkout_url": checkout_url,
+        "key_hash": key_hash,
+        "tier_to": "premium",
     }
 
 

@@ -47,7 +47,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import date as _date_type, datetime, timezone
+from datetime import date as _date_type, datetime, timedelta, timezone
 from html import escape as _esc
 from pathlib import Path
 from typing import Any, Optional
@@ -59,11 +59,25 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from trading_bot.api import key_store
 from trading_bot.api.billing import (
+    BillingAPIError,
+    BillingConfigError,
     STRIPE_WEBHOOK_SECRET_ENV_VAR,
+    create_checkout_session_for_hash,
     handle_webhook_event,
     is_premium_via_stripe,
     is_stripe_configured,
     verify_webhook_signature,
+)
+from trading_bot.api.insights import build_insights, truncate_for_free
+from trading_bot.api.daily_hook import (
+    build_daily_hook,
+    truncate_for_free as _truncate_hook_for_free,
+)
+from trading_bot.api.stickiness import (
+    build_nudge,
+    build_streak,
+    truncate_nudge_for_free,
+    truncate_streak_for_free,
 )
 
 log = structlog.get_logger(__name__)
@@ -116,6 +130,37 @@ _FREE_TIER_EXEMPT_PATHS: frozenset[str] = frozenset(
         "/apple-touch-icon.png",
         "/apple-touch-icon-precomposed.png",
     }
+)
+
+# Phase 8.1 — tier-aware daily usage enforcement.
+#
+# Phase 5.4 caps free-tier callers only and uses /reports/* as a
+# tighter sub-cap. Phase 8.1 layers a UNIFIED tier-aware daily
+# request cap on top: free callers get TRADING_FREE_DAILY_REQUEST_LIMIT,
+# premium callers get TRADING_PREMIUM_DAILY_REQUEST_LIMIT. Both
+# caps read the same usage JSONL log (Phase 4.6 schema unchanged).
+#
+# Registered LAST so it sits OUTERMOST in the middleware stack and
+# fires FIRST on every request — its 429 short-circuits the older
+# Phase 5.4 layer when both would otherwise reject the same call.
+USAGE_ENFORCEMENT_ENABLED_ENV_VAR = "TRADING_USAGE_ENFORCEMENT_ENABLED"
+FREE_DAILY_REQUEST_LIMIT_ENV_VAR = "TRADING_FREE_DAILY_REQUEST_LIMIT"
+PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR = "TRADING_PREMIUM_DAILY_REQUEST_LIMIT"
+USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR = "TRADING_USAGE_LIMIT_EXEMPT_PATHS"
+DEFAULT_FREE_DAILY_REQUEST_LIMIT = 50
+DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT = 1000
+USAGE_LIMIT_HEADER = "X-Usage-Limit"
+USAGE_REMAINING_HEADER = "X-Usage-Remaining"
+USAGE_TIER_HEADER = "X-Usage-Tier"
+RETRY_AFTER_HEADER = "Retry-After"
+USAGE_LIMIT_DETAIL = "usage limit reached — upgrade for higher limits"
+# Default exempt set for Phase 8.1 — same as Phase 5.4's. Operators
+# can extend via TRADING_USAGE_LIMIT_EXEMPT_PATHS=,/foo,/bar.
+_PHASE_81_DEFAULT_EXEMPT_PATHS: frozenset[str] = _FREE_TIER_EXEMPT_PATHS
+# Truthy-ish strings for the toggle. Anything else (including unset,
+# empty, "false", "0", "no") disables enforcement.
+_TRUTHY_STRINGS: frozenset[str] = frozenset(
+    {"1", "true", "yes", "on", "y", "t"},
 )
 
 # Phase 5.7 — dynamic free-tier nudge copy (reversible via env vars).
@@ -272,6 +317,66 @@ def _free_max_report_calls() -> int:
     return _parse_positive_int_env(
         FREE_MAX_REPORT_CALLS_ENV_VAR, DEFAULT_FREE_MAX_REPORT_CALLS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.1 — tier-aware usage enforcement helpers
+# ---------------------------------------------------------------------------
+
+
+def _usage_enforcement_enabled() -> bool:
+    """
+    Phase 8.1 — read the feature toggle. Default ON.
+
+    Anything in ``_TRUTHY_STRINGS`` enables; everything else
+    (including unset / blank / "false" / "0") disables. The default
+    when the env var is not set is ON, matching the spec.
+    """
+    raw = os.getenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR)
+    if raw is None:
+        return True
+    s = str(raw).strip().lower()
+    if not s:
+        # Explicitly-set blank disables, matching every other
+        # "blank == default-off" toggle in the codebase.
+        return False
+    return s in _TRUTHY_STRINGS
+
+
+def _free_daily_request_limit() -> int:
+    """Phase 8.1 — tier-aware free cap (default 50)."""
+    return _parse_positive_int_env(
+        FREE_DAILY_REQUEST_LIMIT_ENV_VAR, DEFAULT_FREE_DAILY_REQUEST_LIMIT,
+    )
+
+
+def _premium_daily_request_limit() -> int:
+    """Phase 8.1 — tier-aware premium cap (default 1000)."""
+    return _parse_positive_int_env(
+        PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR,
+        DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT,
+    )
+
+
+def _usage_limit_exempt_paths() -> frozenset[str]:
+    """
+    Phase 8.1 — union of the documented default exempt set with any
+    operator-supplied additions via TRADING_USAGE_LIMIT_EXEMPT_PATHS
+    (comma-separated). Blank entries are ignored. Paths without a
+    leading slash are normalised to one.
+    """
+    raw = (os.getenv(USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR, "") or "").strip()
+    if not raw:
+        return _PHASE_81_DEFAULT_EXEMPT_PATHS
+    extra: set[str] = set()
+    for piece in raw.split(","):
+        p = piece.strip()
+        if not p:
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        extra.add(p)
+    return _PHASE_81_DEFAULT_EXEMPT_PATHS | frozenset(extra)
 
 
 def _resolve_nudge_copy(env_var: str, default: str) -> str:
@@ -851,6 +956,245 @@ def _enforce_free_limits(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Phase 8.2 — feature-level tier differentiation
+# ---------------------------------------------------------------------------
+#
+# Free-tier callers receive a curated subset of each tier-gated
+# response; premium callers receive the full response. The split is
+# defined here once and used consistently across /reports/latest,
+# /reports/history, and /dashboard so a single allow-list change
+# propagates everywhere.
+
+PREMIUM_FEATURE_DETAIL = "premium feature — upgrade required"
+PREMIUM_FEATURE_HINT = "upgrade for full access"
+
+# Fields that survive the free-tier projection on a daily report.
+# Anything outside this allow-list is dropped before the response is
+# emitted. The allow-list keeps the high-level summary an integrator
+# needs to render a "did the bot work today?" view, while hiding the
+# deep per-tier / per-reason / per-regime breakdowns that are part
+# of the premium offering.
+_FREE_REPORT_ALLOWED_FIELDS: tuple[str, ...] = (
+    "report_type",
+    "report_date",
+    "scorer_fingerprint",
+    "totals",
+    "promotion_readiness",
+)
+
+
+def _is_premium_user(request: Request) -> bool:
+    """
+    Phase 8.2 — fast path for tier classification inside route
+    handlers and middleware.
+
+    Prefers the value cached on ``request.state.api_key_tier`` by
+    ``require_api_key`` (Phase 6.2). When that's missing — e.g. a
+    test calls a helper directly without going through the auth
+    dependency — falls back to extracting the bearer and consulting
+    ``_is_premium``.
+
+    Returns False on any unauthenticated request, so callers can use
+    this in /-style public handlers without a separate guard.
+    """
+    cached = getattr(
+        getattr(request, "state", None), "api_key_tier", None,
+    )
+    if cached == TIER_PREMIUM:
+        return True
+    if cached == TIER_FREE:
+        return False
+    api_key = _extract_bearer_token(request)
+    if not api_key:
+        return False
+    return _is_premium(api_key, request=request)
+
+
+def _project_report_for_free(report: dict) -> dict:
+    """
+    Project a sanitised daily report through the Phase 8.2 free-tier
+    allow-list. Returns a NEW dict; the input is not mutated. Pure
+    function — no I/O.
+
+    The Phase 8.3 upgrade payload is attached by the route handler
+    via ``_build_upgrade_payload`` (which makes a Stripe call), so
+    this helper stays cheap to call in tests and from the dashboard
+    renderer.
+    """
+    if not isinstance(report, dict):
+        return {"tier": TIER_FREE}
+    out: dict[str, Any] = {
+        f: report[f] for f in _FREE_REPORT_ALLOWED_FIELDS if f in report
+    }
+    out["tier"] = TIER_FREE
+    return out
+
+
+def _build_upgrade_payload(
+    request: Request,
+    *,
+    reason: str,
+    required: bool,
+    is_premium: Optional[bool] = None,
+    key_hash: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Phase 8.3 — upgrade-pressure payload builder.
+
+    Returns the documented dict shape::
+
+        {
+          "required":     bool,
+          "reason":       str,
+          "checkout_url": str,
+          "hint":         str,
+        }
+
+    …for free-tier callers, or ``None`` for premium callers and on
+    any Stripe-side failure. The caller is expected to attach the
+    payload to its response under an ``upgrade`` key when present
+    and emit the base response unchanged otherwise.
+
+    The ``checkout_url`` is freshly minted via
+    ``billing.create_checkout_session_for_hash`` and is NEVER
+    persisted — neither this function nor any caller writes the
+    URL to the operator logs, manifest, premium cache, or
+    revocation log. The Stripe-side metadata follows the Phase 7.3
+    hash-only contract (``metadata[key_hash]`` only, never
+    ``metadata[api_key]``).
+
+    Performance note: this helper makes one outbound Stripe
+    request per call. The caller is responsible for ensuring the
+    helper fires only on responses where the upgrade prompt
+    matters (free-tier 429 / 403 / limited-access body); premium
+    callers exit early and never trigger the network call.
+
+    Failure posture: any exception inside the Stripe call is
+    caught, logged at DEBUG, and produces a ``None`` return — so
+    a transient Stripe outage degrades to "no upgrade prompt
+    attached" rather than crashing the underlying response.
+    """
+    # Premium short-circuit — never call Stripe for an existing
+    # subscriber.
+    if is_premium is None:
+        is_premium = _is_premium_user(request)
+    if is_premium:
+        return None
+
+    # Find the caller's hash. Prefer the cached one set by
+    # require_api_key (Phase 6.2); otherwise re-extract the bearer
+    # so this helper works from middleware that fires BEFORE the
+    # auth dependency.
+    if not key_hash:
+        cached = getattr(
+            getattr(request, "state", None), "api_key_hash", None,
+        )
+        if cached:
+            key_hash = cached
+    if not key_hash:
+        api_key = _extract_bearer_token(request)
+        if not api_key:
+            return None
+        try:
+            key_hash = key_store.hash_api_key(api_key)
+        except Exception:
+            return None
+    if not key_hash:
+        return None
+
+    try:
+        success_url, cancel_url = _build_checkout_redirect_urls()
+    except HTTPException as exc:
+        # Public-base-url not configured → no checkout possible.
+        log.debug(
+            "upgrade_payload.config_missing",
+            reason=reason, status=int(exc.status_code),
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "upgrade_payload.url_build_error",
+            reason=reason, error=str(exc),
+        )
+        return None
+
+    try:
+        result = create_checkout_session_for_hash(
+            key_hash=key_hash,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive on Stripe path
+        log.debug(
+            "upgrade_payload.checkout_failed",
+            reason=reason, error=str(exc),
+        )
+        return None
+
+    # Phase 8.4 — funnel: stage 1 of 3 (`upgrade_shown`). Best-
+    # effort: any failure inside the writer is swallowed so the
+    # caller's response is unaffected.
+    try:
+        from trading_bot.api.upgrade_events import (
+            EVENT_UPGRADE_SHOWN, record_upgrade_funnel_event,
+        )
+        request_id = getattr(
+            getattr(request, "state", None), "request_id", None,
+        )
+        endpoint = ""
+        try:
+            endpoint = request.url.path
+        except Exception:
+            endpoint = ""
+        record_upgrade_funnel_event(
+            key_hash, EVENT_UPGRADE_SHOWN,
+            reason=reason, endpoint=endpoint, request_id=request_id,
+        )
+    except Exception as exc:
+        log.debug("upgrade_funnel.shown_emit_error", error=str(exc))
+
+    return {
+        "required": bool(required),
+        "reason": reason,
+        "checkout_url": result["checkout_url"],
+        "hint": PREMIUM_FEATURE_HINT,
+    }
+
+
+def _premium_required_response(
+    request: Request,
+    tier: str,
+) -> JSONResponse:
+    """
+    Phase 8.3 — uniform 403 builder for every premium-only feature.
+
+    Returns a ``JSONResponse`` (rather than raising
+    ``HTTPException``) so we can attach the Phase 8.3 upgrade
+    payload to the body. The body schema is::
+
+        {
+          "detail":  "premium feature — upgrade required",
+          "upgrade": <Phase 8.3 payload, or absent if Stripe failed>
+        }
+
+    Phase 8.2 contract preserved: ``detail`` is still the documented
+    constant, ``X-Usage-Tier`` still carries the caller's tier so a
+    client can branch without parsing the body.
+    """
+    body: dict[str, Any] = {"detail": PREMIUM_FEATURE_DETAIL}
+    upgrade = _build_upgrade_payload(
+        request, reason="feature_locked", required=True,
+    )
+    if upgrade is not None:
+        body["upgrade"] = upgrade
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=body,
+        headers={USAGE_TIER_HEADER: tier},
+    )
+
+
 def _sanitize_report(data: dict) -> dict:
     """
     Strip Core internals from a daily report dict before returning it.
@@ -1168,6 +1512,135 @@ async def request_logging_middleware(request: Request, call_next):
         client_ip=client_ip,
         request_id=request_id,
     )
+    return response
+
+
+@app.middleware("http")
+async def usage_enforcement_middleware(request: Request, call_next):
+    """
+    Phase 8.1 — tier-aware daily usage enforcement.
+
+    Layered ABOVE Phase 5.4's free-tier middleware in the request
+    pipeline so its 429 short-circuits when both would otherwise
+    reject the same call. Layered BELOW the audit + usage + growth
+    + cors + security-headers middlewares so 429 responses still
+    get audited and security-decorated.
+
+    Skipped for:
+      * the documented exempt paths (``/``, ``/health``,
+        ``/webhook/stripe``, the three browser icon routes) plus
+        anything operators add via
+        ``TRADING_USAGE_LIMIT_EXEMPT_PATHS``;
+      * unauthenticated requests (``_extract_bearer_token`` returns
+        None) — let ``require_api_key`` handle 401/403/503;
+      * unknown / bogus keys (``_is_known_key`` returns False) —
+        same: do not count failed auth against any user;
+      * the entire enforcement layer when
+        ``TRADING_USAGE_ENFORCEMENT_ENABLED`` is set to a non-truthy
+        value.
+
+    For authenticated callers the middleware:
+      1. Classifies the tier (premium vs free) using the existing
+         ``_is_premium`` helper.
+      2. Reads the per-key request count for the current UTC date
+         from the existing usage JSONL log (Phase 4.6 schema —
+         ``key_hash`` is already SHA-256, never the raw key).
+      3. Compares against the tier-appropriate cap:
+         * free → ``TRADING_FREE_DAILY_REQUEST_LIMIT`` (default 50)
+         * premium → ``TRADING_PREMIUM_DAILY_REQUEST_LIMIT`` (default 1000)
+      4. If at-or-above cap → 429 with the documented body and the
+         ``X-Usage-Limit`` / ``X-Usage-Remaining`` / ``X-Usage-Tier``
+         / ``Retry-After`` headers.
+      5. Otherwise calls ``call_next`` and decorates the response
+         with the same headers (so callers always know where they
+         stand). The headers reflect the *post-request* count when
+         we know the call will succeed.
+
+    Best-effort: any failure reading the usage log degrades to
+    "no counts yet" (Phase 4.6's ``_count_free_tier_usage_today``
+    already returns ``(0, 0)`` on disk trouble) so a partial outage
+    NEVER blocks an authenticated user.
+    """
+    if not _usage_enforcement_enabled():
+        return await call_next(request)
+
+    path = request.url.path
+    if path in _usage_limit_exempt_paths():
+        return await call_next(request)
+
+    api_key = _extract_bearer_token(request)
+    if not api_key:
+        # Anonymous: let require_api_key reject with 401.
+        return await call_next(request)
+    if not _is_known_key(api_key):
+        # Unknown / bogus / revoked: let require_api_key reject
+        # with 403. Do NOT count this against any user.
+        return await call_next(request)
+
+    is_premium = _is_premium(api_key)
+    tier = TIER_PREMIUM if is_premium else TIER_FREE
+    limit = (
+        _premium_daily_request_limit() if is_premium
+        else _free_daily_request_limit()
+    )
+    key_hash = _hash_api_key(api_key)
+    total_today, _ = _count_free_tier_usage_today(key_hash)
+
+    usage_headers = {
+        USAGE_LIMIT_HEADER: str(limit),
+        USAGE_REMAINING_HEADER: str(max(0, limit - total_today)),
+        USAGE_TIER_HEADER: tier,
+    }
+
+    if total_today >= limit:
+        # 429 with the same usage headers + Retry-After. The header
+        # value is the number of seconds until the next UTC midnight,
+        # since the cap is daily.
+        now_utc = datetime.now(timezone.utc)
+        midnight_utc = (
+            now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            + timedelta(days=1)
+        )
+        retry_after = max(1, int((midnight_utc - now_utc).total_seconds()))
+        body: dict[str, Any] = {"detail": USAGE_LIMIT_DETAIL}
+        # Phase 8.3 — attach the upgrade-pressure payload for free
+        # callers. Pass the already-classified is_premium + key_hash
+        # so the helper does not redundantly re-extract the bearer.
+        upgrade = _build_upgrade_payload(
+            request,
+            reason="usage_limit",
+            required=True,
+            is_premium=is_premium,
+            key_hash=key_hash,
+        )
+        if upgrade is not None:
+            body["upgrade"] = upgrade
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content=body,
+            headers={
+                **usage_headers,
+                USAGE_REMAINING_HEADER: "0",
+                RETRY_AFTER_HEADER: str(retry_after),
+            },
+        )
+
+    response: Response = await call_next(request)
+    # Decorate every response from this caller — including Phase 8.2
+    # premium-feature 403s, which DO consume usage quota because
+    # auth succeeded. Skip only 401/503 (the auth dependency
+    # rejected the request after we let it through, so no usage
+    # row will be written and we shouldn't lie about the count).
+    if response.status_code not in {401, 503}:
+        new_total = total_today + 1
+        response.headers[USAGE_LIMIT_HEADER] = str(limit)
+        response.headers[USAGE_REMAINING_HEADER] = str(
+            max(0, limit - new_total),
+        )
+        # Honour an explicit X-Usage-Tier set by the route handler
+        # (e.g. the Phase 8.2 premium-feature 403). Otherwise apply
+        # the middleware's classification.
+        response.headers.setdefault(USAGE_TIER_HEADER, tier)
     return response
 
 
@@ -1943,13 +2416,185 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
     }
 
 
-@app.get(
-    "/reports/latest",
-    tags=["reports"],
-    dependencies=[Depends(require_api_key)],
-)
-def latest_report() -> dict[str, Any]:
-    """Return the most recent daily alpha validation report."""
+# ---------------------------------------------------------------------------
+# Phase 7.3 — POST /billing/checkout (authenticated end-user upgrade)
+# ---------------------------------------------------------------------------
+#
+# A free-tier caller hits this endpoint to receive a Stripe Checkout
+# Session URL that — once paid — flips them to premium via the
+# existing Phase 4.7 / 7.0 webhook plumbing.
+#
+# Identity flows through ``key_hash`` exclusively:
+#   * the supplied bearer key is hashed by ``require_api_key`` and
+#     stashed on ``request.state.api_key_hash`` (Phase 6.2);
+#   * the hash is forwarded to Stripe in metadata and as
+#     ``client_reference_id``;
+#   * the raw key never leaves the request frame.
+#
+# Env vars (required for live operation):
+#   STRIPE_SECRET_KEY            (or legacy STRIPE_API_KEY)
+#   STRIPE_PREMIUM_PRICE_ID      (or legacy STRIPE_PRICE_ID_PREMIUM)
+#   TRADING_PUBLIC_BASE_URL      (e.g. https://your-host.example.com)
+#
+# Env vars (optional, with defaults):
+#   STRIPE_CHECKOUT_SUCCESS_PATH (default /dashboard?checkout=success)
+#   STRIPE_CHECKOUT_CANCEL_PATH  (default /dashboard?checkout=cancel)
+
+PUBLIC_BASE_URL_ENV_VAR = "TRADING_PUBLIC_BASE_URL"
+CHECKOUT_SUCCESS_PATH_ENV_VAR = "STRIPE_CHECKOUT_SUCCESS_PATH"
+CHECKOUT_CANCEL_PATH_ENV_VAR = "STRIPE_CHECKOUT_CANCEL_PATH"
+DEFAULT_CHECKOUT_SUCCESS_PATH = "/dashboard?checkout=success"
+DEFAULT_CHECKOUT_CANCEL_PATH = "/dashboard?checkout=cancel"
+
+
+def _build_checkout_redirect_urls() -> tuple[str, str]:
+    """
+    Return (success_url, cancel_url). Raises ``HTTPException(503)``
+    when ``TRADING_PUBLIC_BASE_URL`` is unset — Stripe Checkout
+    requires absolute URLs so we cannot guess.
+    """
+    base = (os.getenv(PUBLIC_BASE_URL_ENV_VAR, "") or "").strip()
+    if not base:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"checkout not configured: {PUBLIC_BASE_URL_ENV_VAR} "
+                "is unset"
+            ),
+        )
+    base = base.rstrip("/")
+    success_path = (
+        os.getenv(CHECKOUT_SUCCESS_PATH_ENV_VAR, "") or ""
+    ).strip() or DEFAULT_CHECKOUT_SUCCESS_PATH
+    cancel_path = (
+        os.getenv(CHECKOUT_CANCEL_PATH_ENV_VAR, "") or ""
+    ).strip() or DEFAULT_CHECKOUT_CANCEL_PATH
+    if not success_path.startswith("/"):
+        success_path = "/" + success_path
+    if not cancel_path.startswith("/"):
+        cancel_path = "/" + cancel_path
+    return (base + success_path, base + cancel_path)
+
+
+@app.post("/billing/checkout", tags=["billing"])
+def billing_checkout(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Authenticated free → premium Checkout Session creator.
+
+    Flow:
+      1. ``require_api_key`` authenticates the caller. The raw key is
+         consumed by the dependency and the SHA-256 hash is stashed
+         on ``request.state.api_key_hash``.
+      2. If the caller is already premium, return 409 — there's
+         nothing to upgrade. The customer should manage the existing
+         subscription via the Stripe customer portal (separate flow).
+      3. Build Stripe Checkout success/cancel URLs from
+         ``TRADING_PUBLIC_BASE_URL`` + the optional path env vars.
+      4. Call ``billing.create_checkout_session_for_hash`` with the
+         hash. The raw key is never forwarded to Stripe.
+      5. Return ``checkout_session_id``, ``checkout_url``,
+         ``key_hash``, ``tier_to``. The session URL is short-lived
+         and is NOT persisted to any operator log.
+    """
+    # Phase 6.2 always sets api_key_hash on request.state when auth
+    # succeeded; the explicit hash() call is defensive in case a
+    # future refactor unsets it.
+    cached_hash = getattr(
+        getattr(request, "state", None), "api_key_hash", None,
+    )
+    key_hash = cached_hash or key_store.hash_api_key(api_key)
+    if not key_hash:
+        # Should be unreachable since require_api_key guarantees a key.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to derive key_hash for authenticated caller",
+        )
+
+    if _is_premium(api_key, request=request):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "this key is already premium; manage the existing "
+                "subscription via Stripe directly"
+            ),
+        )
+
+    try:
+        success_url, cancel_url = _build_checkout_redirect_urls()
+        result = create_checkout_session_for_hash(
+            key_hash=key_hash,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+    except HTTPException:
+        raise
+    except BillingConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"checkout not configured: {exc}",
+        )
+    except BillingAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"checkout provider error: {exc}",
+        )
+    except ValueError as exc:
+        # Should not happen since we control the inputs, but treat as
+        # configuration if it does.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"checkout not configured: {exc}",
+        )
+
+    # Phase 8.4 — funnel: stage 2 of 3 (`upgrade_clicked`).
+    # Best-effort; never blocks the response.
+    try:
+        from trading_bot.api.upgrade_events import (
+            EVENT_UPGRADE_CLICKED, record_upgrade_funnel_event,
+        )
+        request_id = getattr(
+            getattr(request, "state", None), "request_id", None,
+        )
+        record_upgrade_funnel_event(
+            result["key_hash"], EVENT_UPGRADE_CLICKED,
+            reason="checkout_initiated",
+            endpoint="/billing/checkout",
+            request_id=request_id,
+        )
+    except Exception as exc:
+        log.debug("upgrade_funnel.clicked_emit_error", error=str(exc))
+
+    return {
+        "checkout_session_id": result["checkout_session_id"],
+        "checkout_url": result["checkout_url"],
+        "key_hash": result["key_hash"],
+        "tier_to": result["tier_to"],
+    }
+
+
+@app.get("/reports/latest", tags=["reports"])
+def latest_report(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Return the most recent daily alpha validation report.
+
+    Phase 8.2 — premium callers receive the full sanitised report;
+    free callers receive a curated subset (high-level summary +
+    upgrade hint). The per-row stats, decile breakdowns, and
+    shadow-filter simulation rows are part of the premium
+    offering.
+
+    Phase 9.1 — both tiers also receive an ``insights`` list
+    derived from the latest report and (best-effort) the prior
+    day's report. Free callers receive at most
+    ``FREE_INSIGHT_LIMIT`` insights with evidence trimmed to the
+    documented allow-list.
+    """
     reports = _reports_dir()
     if not reports.is_dir():
         raise HTTPException(
@@ -1962,8 +2607,89 @@ def latest_report() -> dict[str, Any]:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no daily reports available",
         )
-    data = _parse_report_file(candidates[-1])
-    return _sanitize_report(data)
+    data = _sanitize_report(_parse_report_file(candidates[-1]))
+    # Phase 9.1 — best-effort prior-day load. Any failure (missing
+    # file, parse error, sanitiser hiccup) yields ``None`` so the
+    # trend rule simply skips itself.
+    prev = None
+    if len(candidates) >= 2:
+        try:
+            prev = _sanitize_report(_parse_report_file(candidates[-2]))
+        except Exception as exc:
+            log.debug(
+                "reports_latest.prev_load_failed",
+                path=str(candidates[-2]), error=str(exc),
+            )
+            prev = None
+    insights = build_insights(data, prev)
+    # Phase 9.2 — daily-hook banner. Returns ``None`` when there's
+    # no prior report or both signal sources miss; the response
+    # then simply omits the ``daily_hook`` field.
+    daily_hook = build_daily_hook(data, prev, insights)
+    # Phase 9.3 — stickiness loop: streak (consecutive passing
+    # days) + missed-day nudge. Both are derived from the same
+    # report data; both omit themselves when there's nothing to
+    # say. Streak is a function of the current report alone;
+    # nudge needs the prior report too.
+    streak = build_streak(data, prev)
+    nudge = build_nudge(data, prev)
+
+    if _is_premium_user(request):
+        data["insights"] = insights
+        if daily_hook is not None:
+            data["daily_hook"] = daily_hook
+        if streak is not None:
+            data["streak"] = streak
+        if nudge is not None:
+            data["nudge"] = nudge
+        return data
+    free_body = _project_report_for_free(data)
+    free_body["insights"] = truncate_for_free(insights)
+    free_hook = _truncate_hook_for_free(daily_hook)
+    if free_hook is not None:
+        free_body["daily_hook"] = free_hook
+    free_streak = truncate_streak_for_free(streak)
+    if free_streak is not None:
+        free_body["streak"] = free_streak
+    free_nudge = truncate_nudge_for_free(nudge)
+    if free_nudge is not None:
+        free_body["nudge"] = free_nudge
+    upgrade = _build_upgrade_payload(
+        request, reason="limited_access", required=False, is_premium=False,
+    )
+    if upgrade is not None:
+        free_body["upgrade"] = upgrade
+    return free_body
+
+
+@app.get("/reports/history", tags=["reports"])
+def reports_history(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Phase 8.2 — premium-only listing of every daily report on disk.
+
+    Premium → ``{"count": N, "dates": [...]}`` sorted oldest →
+    newest. Free → 403 with the documented body and the Phase 8.3
+    upgrade payload (when Stripe is configured).
+
+    Registered BEFORE ``/reports/{date}`` so FastAPI's path matcher
+    treats "history" as a literal segment, not a date path-param.
+    """
+    if not _is_premium_user(request):
+        return _premium_required_response(request, TIER_FREE)
+
+    reports = _reports_dir()
+    dates: list[str] = []
+    if reports.is_dir():
+        for p in sorted(reports.glob("alpha_report_*.json")):
+            stem = p.stem  # alpha_report_2026-04-25
+            if stem.startswith("alpha_report_"):
+                candidate = stem[len("alpha_report_"):]
+                if _DATE_RE.match(candidate):
+                    dates.append(candidate)
+    return {"count": len(dates), "dates": dates}
 
 
 @app.get("/reports/{date}", tags=["reports"])
@@ -2291,12 +3017,143 @@ def _render_experiments(records: list[dict]) -> str:
     return f"<table>{header}{''.join(body)}</table>"
 
 
+def _render_insights_block(insights: Optional[list[dict]]) -> str:
+    """
+    Phase 9.1 — small dashboard section listing the precomputed
+    insights. Pure HTML; the caller has already truncated the
+    ``insights`` list to the appropriate tier.
+    """
+    if not insights:
+        return ""
+    items: list[str] = []
+    for entry in insights:
+        if not isinstance(entry, dict):
+            continue
+        title = _esc(str(entry.get("title", "")))
+        summary = _esc(str(entry.get("summary", "")))
+        action = _esc(str(entry.get("action", "")))
+        severity = _esc(str(entry.get("severity", "info")))
+        items.append(
+            f'<li class="insight insight-{severity}">'
+            f'<strong>{title}</strong>'
+            f'<p class="insight-summary">{summary}</p>'
+            f'<p class="insight-action">{action}</p>'
+            f"</li>"
+        )
+    if not items:
+        return ""
+    return (
+        "<section>"
+        "<h2>Insights</h2>"
+        f'<ul class="insights">{"".join(items)}</ul>'
+        "</section>"
+    )
+
+
+def _render_daily_hook_banner(hook: Optional[dict]) -> str:
+    """
+    Phase 9.2 — top-of-page "what changed since yesterday" banner.
+
+    Renders nothing when ``hook`` is ``None`` (e.g. no prior-day
+    report). Otherwise emits a small ``<aside>`` with the headline,
+    a change-direction tag for CSS, and the CTA. The same markup
+    works for both tiers; the underlying data is what differs.
+    """
+    if not isinstance(hook, dict):
+        return ""
+    headline = _esc(str(hook.get("headline", "")))
+    if not headline:
+        return ""
+    change = _esc(str(hook.get("change", "flat")))
+    cta = _esc(str(hook.get("cta", "")))
+    since = _esc(str(hook.get("since") or ""))
+    since_block = (
+        f'<span class="daily-hook-since">since {since}</span>'
+        if since else ""
+    )
+    cta_block = (
+        f'<span class="daily-hook-cta">{cta}</span>'
+        if cta else ""
+    )
+    return (
+        f'<aside class="daily-hook daily-hook-{change}">'
+        f'<strong>{headline}</strong>'
+        f"{since_block}"
+        f"{cta_block}"
+        "</aside>"
+    )
+
+
+def _render_streak_banner(streak: Optional[dict]) -> str:
+    """
+    Phase 9.3 — passing-streak banner. Renders nothing when the
+    streak is absent. Adds a ``streak-milestone`` modifier class
+    when the current day count hits a known milestone so a
+    custom stylesheet can celebrate without parsing markup.
+    """
+    if not isinstance(streak, dict):
+        return ""
+    label = _esc(str(streak.get("label", "")))
+    if not label:
+        return ""
+    milestone = bool(streak.get("milestone"))
+    next_target = streak.get("next_milestone")
+    cls = "streak"
+    if milestone:
+        cls += " streak-milestone"
+    next_block = ""
+    if isinstance(next_target, int) and next_target > 0:
+        next_block = (
+            f'<span class="streak-next">next milestone: '
+            f"{next_target} days</span>"
+        )
+    return (
+        f'<aside class="{cls}">'
+        f'<strong>{label}</strong>'
+        f"{next_block}"
+        "</aside>"
+    )
+
+
+def _render_nudge_banner(nudge: Optional[dict]) -> str:
+    """
+    Phase 9.3 — missed-day nudge banner. Renders nothing when
+    there's no nudge (normal daily cadence or first visit).
+    """
+    if not isinstance(nudge, dict):
+        return ""
+    headline = _esc(str(nudge.get("headline", "")))
+    if not headline:
+        return ""
+    cta = _esc(str(nudge.get("cta", "")))
+    since = _esc(str(nudge.get("since") or ""))
+    kind = _esc(str(nudge.get("kind", "missed_day")))
+    since_block = (
+        f'<span class="nudge-since">since {since}</span>'
+        if since else ""
+    )
+    cta_block = (
+        f'<span class="nudge-cta">{cta}</span>' if cta else ""
+    )
+    return (
+        f'<aside class="nudge nudge-{kind}">'
+        f'<strong>{headline}</strong>'
+        f"{since_block}"
+        f"{cta_block}"
+        "</aside>"
+    )
+
+
 def render_dashboard_html(
     report: Optional[dict],
     experiments: list[dict],
     *,
     tier: str = TIER_PREMIUM,
     banner_copy: Optional[str] = None,
+    insights: Optional[list[dict]] = None,
+    daily_hook: Optional[dict] = None,
+    streak: Optional[dict] = None,
+    nudge: Optional[dict] = None,
 ) -> str:
     """
     Build the dashboard HTML from sanitized inputs.
@@ -2393,6 +3250,11 @@ def render_dashboard_html(
     else:
         free_tier_banner = ""
 
+    insights_block = _render_insights_block(insights)
+    daily_hook_block = _render_daily_hook_banner(daily_hook)
+    streak_block = _render_streak_banner(streak)
+    nudge_block = _render_nudge_banner(nudge)
+
     return (
         "<!DOCTYPE html>"
         "<html lang=\"en\"><head>"
@@ -2402,8 +3264,15 @@ def render_dashboard_html(
         "</head><body>"
         "<h1>Momentum Trading Bot — Analytics Dashboard</h1>"
         f'<p class="meta">Read-only view. Generated at {generated_at}.</p>'
+        # Phase 9.3 — nudge first (re-engagement signal trumps
+        # everything when the user has been away), then streak
+        # (positive reinforcement), then daily-hook (yesterday-vs-today).
+        f"{nudge_block}"
+        f"{streak_block}"
+        f"{daily_hook_block}"
         f"{free_tier_banner}"
         f"{report_block}"
+        f"{insights_block}"
         f"{experiments_block}"
         "<footer>"
         "This dashboard is served by the Phase 4.0/4.1 SaaS boundary "
@@ -2440,6 +3309,7 @@ def dashboard(
     # Load latest report (best-effort — empty state wins on any error).
     report: Optional[dict] = None
     reports = _reports_dir()
+    prev_report: Optional[dict] = None
     if reports.is_dir():
         candidates = sorted(reports.glob("alpha_report_*.json"))
         if candidates:
@@ -2454,14 +3324,58 @@ def dashboard(
                 raw = None
             if isinstance(raw, dict):
                 report = _sanitize_report(raw)
+            # Phase 9.1 — best-effort prior-day load for the trend
+            # insight. Failure modes (missing / corrupt / unreadable)
+            # all collapse to ``None`` so the trend rule simply
+            # skips itself.
+            if len(candidates) >= 2:
+                try:
+                    prev_raw = json.loads(
+                        candidates[-2].read_text(encoding="utf-8"),
+                    )
+                    if isinstance(prev_raw, dict):
+                        prev_report = _sanitize_report(prev_raw)
+                except Exception as exc:
+                    log.debug(
+                        "dashboard.prev_report_load_failed",
+                        path=str(candidates[-2]), error=str(exc),
+                    )
 
     # Load last 10 experiments.
     records = _read_manifest_records(_manifest_path())
     experiments = [_sanitize_manifest(r) for r in records[-10:]] if records else []
 
-    tier = (
-        TIER_PREMIUM if _is_premium(api_key, request=request) else TIER_FREE
+    is_premium = _is_premium_user(request)
+    tier = TIER_PREMIUM if is_premium else TIER_FREE
+    # Phase 9.1 — compute insights from the FULL report (before the
+    # free-tier projection trims regime_stats / etc.) so the rules
+    # see every signal. Truncation for free callers happens after.
+    insights = build_insights(report, prev_report) if report is not None else []
+    # Phase 9.2 — same logic for the daily-hook banner. Compute
+    # before projection / truncation so the trend insight (which
+    # reads totals.buy_rows on both sides) has full data; tier
+    # truncation is applied after.
+    daily_hook = (
+        build_daily_hook(report, prev_report, insights)
+        if report is not None else None
     )
+    # Phase 9.3 — streak + missed-day nudge. Same compute-then-
+    # truncate pattern; both omit themselves cleanly when the
+    # signal isn't there.
+    streak = build_streak(report, prev_report) if report is not None else None
+    nudge = build_nudge(report, prev_report) if report is not None else None
+    # Phase 8.2 — when the caller is on the free tier, pass the
+    # report through the same allow-list that gates /reports/latest
+    # so the dashboard cannot accidentally surface the deep tier /
+    # decile / shadow-filter sections that are part of the premium
+    # offering. Premium callers see the full sanitised report.
+    if not is_premium and report is not None:
+        report = _project_report_for_free(report)
+    if not is_premium:
+        insights = truncate_for_free(insights)
+        daily_hook = _truncate_hook_for_free(daily_hook)
+        streak = truncate_streak_for_free(streak)
+        nudge = truncate_nudge_for_free(nudge)
     # Phase 5.7 + 5.8: resolve the banner copy ONCE so the exact
     # string rendered to the user is also the one we hash into the
     # telemetry row. Premium users skip the resolver entirely (no
@@ -2469,6 +3383,8 @@ def dashboard(
     banner_copy = _upgrade_banner_copy() if tier == TIER_FREE else None
     html = render_dashboard_html(
         report, experiments, tier=tier, banner_copy=banner_copy,
+        insights=insights, daily_hook=daily_hook,
+        streak=streak, nudge=nudge,
     )
     if tier == TIER_FREE:
         # Phase 5.5 + 5.8 — the banner is rendered in the HTML

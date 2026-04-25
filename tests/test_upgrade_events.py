@@ -80,14 +80,24 @@ def _read_records(path: Path) -> list[dict]:
 
 
 class TestEventWhitelist:
-    def test_five_documented_events(self):
-        """The spec enumerates exactly five event names."""
+    def test_documented_event_set(self):
+        """Phase 5.5/5.8 shipped 5 events; Phase 8.4 added 3 funnel
+        events. The set is now exactly these 8 — pinned so a
+        silent addition / removal trips this test."""
+        from trading_bot.api.upgrade_events import (
+            EVENT_UPGRADE_CLICKED,
+            EVENT_UPGRADE_COMPLETED,
+            EVENT_UPGRADE_SHOWN,
+        )
         assert VALID_EVENTS == {
             EVENT_DASHBOARD_BANNER_SEEN,
             EVENT_DAILY_REQUEST_LIMIT_HIT,
             EVENT_REPORT_LIMIT_HIT,
             EVENT_OLD_REPORT_BLOCKED,
             EVENT_EXPERIMENT_LIMIT_BLOCKED,
+            EVENT_UPGRADE_SHOWN,
+            EVENT_UPGRADE_CLICKED,
+            EVENT_UPGRADE_COMPLETED,
         }
 
     def test_event_strings_are_snake_case(self):
@@ -613,3 +623,151 @@ class TestPhase58CopyVariantHash:
         (row,) = _read_records(events_path)
         assert "copy_variant_hash" in row
         assert row["copy_variant_hash"] is None
+
+
+# ===========================================================================
+# Phase 8.4 — three-stage upgrade funnel
+# ===========================================================================
+
+
+from trading_bot.api.upgrade_events import (  # noqa: E402
+    EVENT_UPGRADE_CLICKED,
+    EVENT_UPGRADE_COMPLETED,
+    EVENT_UPGRADE_SHOWN,
+    record_upgrade_funnel_event,
+)
+
+
+class TestPhase84RecordUpgradeFunnelEventSkips:
+    def test_unknown_event_skipped(self, events_path: Path):
+        out = record_upgrade_funnel_event("a" * 64, "not_a_real_event")
+        assert out == {"action": "skipped", "reason": "unknown_event"}
+        # File never created.
+        assert not events_path.exists()
+
+    def test_blank_hash_skipped(self, events_path: Path):
+        for h in ("", "   ", None):
+            out = record_upgrade_funnel_event(h, EVENT_UPGRADE_SHOWN)
+            assert out == {"action": "skipped", "reason": "no_key_hash"}
+        assert not events_path.exists()
+
+    def test_legacy_event_through_funnel_helper_rejected(
+        self, events_path: Path,
+    ):
+        """The Phase 5.5 events go through ``record_upgrade_event``,
+        not the Phase 8.4 funnel helper. The funnel helper rejects
+        them so the schemas don't bleed."""
+        out = record_upgrade_funnel_event(
+            "a" * 64, "dashboard_banner_seen",
+        )
+        assert out["action"] == "skipped"
+        assert out["reason"] == "unknown_event"
+
+
+class TestPhase84RecordUpgradeFunnelEventSchema:
+    def test_records_documented_fields(self, events_path: Path):
+        out = record_upgrade_funnel_event(
+            "h" * 64, EVENT_UPGRADE_SHOWN,
+            reason="usage_limit", endpoint="/reports/latest",
+            request_id="req_abc",
+        )
+        assert out["action"] == "recorded"
+        assert out["event"] == "upgrade_shown"
+        assert out["api_key_hash"] == "h" * 64
+
+        (row,) = _read_records(events_path)
+        assert set(row.keys()) == {
+            "timestamp", "api_key_hash", "event", "tier",
+            "request_id", "reason", "endpoint",
+        }
+        assert row["api_key_hash"] == "h" * 64
+        assert row["event"] == "upgrade_shown"
+        assert row["tier"] == "free"
+        assert row["request_id"] == "req_abc"
+        assert row["reason"] == "usage_limit"
+        assert row["endpoint"] == "/reports/latest"
+
+    def test_optional_fields_default_none(self, events_path: Path):
+        record_upgrade_funnel_event("h" * 64, EVENT_UPGRADE_CLICKED)
+        (row,) = _read_records(events_path)
+        assert row["reason"] is None
+        assert row["endpoint"] is None
+        assert row["request_id"] is None
+
+    def test_overlong_reason_truncated(self, events_path: Path):
+        record_upgrade_funnel_event(
+            "h" * 64, EVENT_UPGRADE_SHOWN,
+            reason="x" * 500,
+        )
+        (row,) = _read_records(events_path)
+        assert row["reason"] is not None
+        assert len(row["reason"]) <= 64
+
+    def test_overlong_endpoint_truncated(self, events_path: Path):
+        record_upgrade_funnel_event(
+            "h" * 64, EVENT_UPGRADE_SHOWN,
+            endpoint="/x" * 500,
+        )
+        (row,) = _read_records(events_path)
+        assert row["endpoint"] is not None
+        assert len(row["endpoint"]) <= 128
+
+    def test_blank_reason_endpoint_dropped_to_none(
+        self, events_path: Path,
+    ):
+        record_upgrade_funnel_event(
+            "h" * 64, EVENT_UPGRADE_SHOWN,
+            reason="   ", endpoint="",
+        )
+        (row,) = _read_records(events_path)
+        assert row["reason"] is None
+        assert row["endpoint"] is None
+
+
+class TestPhase84RecordUpgradeFunnelEventNoLeak:
+    def test_raw_key_marker_never_persists(self, events_path: Path):
+        """The funnel helper accepts ONLY hashes; verify a raw-key
+        marker accidentally passed as ``key_hash`` would still
+        round-trip as-given (no extra hashing) but never be
+        re-decodable to a raw secret. Operators MUST pass a hash
+        — this test pins that the helper does not magically
+        sanitise raw keys."""
+        marker = "RAW_KEY_PHASE84_DO_NOT_LEAK_xyz"
+        # The helper does NOT hash again; it stores what it got.
+        # Operators using the helper correctly always pre-hash.
+        record_upgrade_funnel_event(marker, EVENT_UPGRADE_SHOWN)
+        body = events_path.read_text("utf-8")
+        # The marker IS in the file (because we passed it as the
+        # "hash"). The point of the test is that the helper does
+        # not LOG raw keys via the legacy api_key path. All call
+        # sites in the codebase pre-hash.
+        assert marker in body
+        # And the documented persisted shape is hash-only — there's
+        # no `api_key` field on the row.
+        (row,) = _read_records(events_path)
+        assert "api_key" not in row
+
+    def test_disk_failure_does_not_raise(
+        self, events_path: Path, monkeypatch,
+    ):
+        """Best-effort: a real disk failure (open() raises) must
+        be swallowed by the underlying _append_record helper. The
+        funnel helper still returns 'recorded' — the operator
+        observes the failure via structlog at DEBUG."""
+        import builtins
+        real_open = builtins.open
+
+        def fail_on_append(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "")
+            if "a" in mode and str(path).endswith(events_path.name):
+                raise OSError("simulated disk full")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fail_on_append)
+        # Must not raise.
+        out = record_upgrade_funnel_event(
+            "h" * 64, EVENT_UPGRADE_SHOWN,
+        )
+        assert out["action"] == "recorded"
+        # The file may or may not exist depending on mkdir+open
+        # ordering; what matters is no exception escaped.

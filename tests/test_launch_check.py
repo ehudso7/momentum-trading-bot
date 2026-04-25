@@ -486,11 +486,17 @@ class TestRailwayTomlLockdown:
 
 
 class TestNoNewPublicEndpoints:
-    """The whole point of Phase 7.2 is lockdown — there must be no
-    new public endpoints, and the only mutating route remains
-    POST /webhook/stripe."""
+    """The whole point of Phase 7.2 is lockdown — the only mutating
+    routes are POST /webhook/stripe (Phase 4.7 — Stripe webhook
+    deliveries) and POST /billing/checkout (Phase 7.3 —
+    authenticated end-user upgrade). Anything else is a regression."""
 
-    def test_only_mutating_route_is_stripe_webhook(self):
+    _ALLOWED_MUTATING_ROUTES: frozenset[tuple[str, str]] = frozenset({
+        ("POST", "/webhook/stripe"),
+        ("POST", "/billing/checkout"),
+    })
+
+    def test_only_mutating_routes_are_documented_ones(self):
         from trading_bot.api.server import app
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
@@ -501,6 +507,6 @@ class TestNoNewPublicEndpoints:
             # FastAPI auto-mounts an /openapi.json + /docs surface that
             # may include implicit OPTIONS — only flag real mutators.
             for verb in mutating:
-                assert path == "/webhook/stripe" and verb == "POST", (
+                assert (verb, path) in self._ALLOWED_MUTATING_ROUTES, (
                     f"Phase 7.2: leaked mutating route: {verb} {path}"
                 )

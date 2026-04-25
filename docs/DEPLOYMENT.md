@@ -40,9 +40,18 @@ The same files also need to be:
 |---|---|---|
 | `TRADING_API_KEY` | optional | Single-tenant legacy free-tier key. Phase 6.2 made this optional — the deployment is still configured if a manifest exists. |
 | `TRADING_API_PREMIUM_KEYS` | optional | Comma-separated env premium keys. Operator override. |
-| `STRIPE_API_KEY` | premium subscriptions | Presence enables Stripe-primary classification. |
+| `STRIPE_API_KEY` | premium subscriptions | Presence enables Stripe-primary classification. Legacy alias of `STRIPE_SECRET_KEY` for the Phase 7.3 checkout endpoint. |
+| `STRIPE_SECRET_KEY` | `POST /billing/checkout` | Stripe REST auth. Preferred over the legacy `STRIPE_API_KEY` for new deployments. (Phase 7.3) |
+| `STRIPE_PREMIUM_PRICE_ID` | `POST /billing/checkout` | Stripe Price ID of the premium subscription. Falls back to `STRIPE_PRICE_ID_PREMIUM`. (Phase 7.3) |
+| `TRADING_PUBLIC_BASE_URL` | `POST /billing/checkout` | Absolute URL prefix for Stripe success/cancel redirects (e.g. `https://your-host.example.com`). (Phase 7.3) |
+| `STRIPE_CHECKOUT_SUCCESS_PATH` | optional | Override the success-redirect path. Default: `/dashboard?checkout=success`. (Phase 7.3) |
+| `STRIPE_CHECKOUT_CANCEL_PATH` | optional | Override the cancel-redirect path. Default: `/dashboard?checkout=cancel`. (Phase 7.3) |
 | `STRIPE_WEBHOOK_SECRET` | premium subscriptions | Required for `POST /webhook/stripe`. |
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH` | premium subscriptions | Recommended Railway path: `/data/stripe_premium_keys.json` (same volume as the manifests). |
+| `TRADING_USAGE_ENFORCEMENT_ENABLED` | optional | Phase 8.1 — flip the tier-aware daily-cap layer off with `false`/`0`/`no`/`off`. Default ON. |
+| `TRADING_FREE_DAILY_REQUEST_LIMIT` | optional | Phase 8.1 — per-key per-UTC-day cap for free tier. Default `50`. Invalid values fall back to `50`. |
+| `TRADING_PREMIUM_DAILY_REQUEST_LIMIT` | optional | Phase 8.1 — per-key per-UTC-day cap for premium tier. Default `1000`. Invalid values fall back to `1000`. |
+| `TRADING_USAGE_LIMIT_EXEMPT_PATHS` | optional | Phase 8.1 — comma-separated extra exempt paths joined with the default exempt set (`/`, `/health`, the Phase 7.1 icons, `/webhook/stripe`). |
 
 
 ## Recommended Railway layout
@@ -324,6 +333,150 @@ TRADING_API_UPGRADE_EVENTS_LOG_PATH=/app/data/api_upgrade_events.jsonl
 STRIPE_API_KEY=sk_live_…           # only when ready to accept payments
 STRIPE_WEBHOOK_SECRET=whsec_…       # only when Stripe is wired
 TRADING_LOG_JSON=true
+
+# Phase 8.1 — tier-aware usage enforcement (defaults shown; all
+# four are optional). Tighten before launching, loosen as the
+# product matures.
+TRADING_USAGE_ENFORCEMENT_ENABLED=true
+TRADING_FREE_DAILY_REQUEST_LIMIT=50
+TRADING_PREMIUM_DAILY_REQUEST_LIMIT=1000
+# TRADING_USAGE_LIMIT_EXEMPT_PATHS=/some/extra/path
+```
+
+#### Phase 8.1 metering behaviour at a glance
+
+A free user under the cap sees their headroom on every response:
+
+```
+$ curl -i https://your-host.example.com/reports/latest \
+       -H "Authorization: Bearer <free-key>"
+HTTP/1.1 200 OK
+X-Usage-Limit: 50
+X-Usage-Remaining: 47
+X-Usage-Tier: free
+…
+```
+
+A free user that hits the cap is rejected with a documented body
+plus `Retry-After`:
+
+```
+$ curl -i https://your-host.example.com/reports/latest \
+       -H "Authorization: Bearer <free-key>"
+HTTP/1.1 429 Too Many Requests
+X-Usage-Limit: 50
+X-Usage-Remaining: 0
+X-Usage-Tier: free
+Retry-After: 27384
+Content-Type: application/json
+
+{"detail":"usage limit reached — upgrade for higher limits"}
+```
+
+#### Phase 8.2 feature differentiation at a glance
+
+| Feature | Free | Premium |
+|---|---|---|
+| `GET /reports/latest` | curated subset (`report_type`, `report_date`, `scorer_fingerprint`, `totals`, `promotion_readiness`) plus an `upgrade` envelope. Premium-only deep stats (tier / reason / regime / decile / shadow-filter / guardrails / sources) are dropped. | full sanitised report. |
+| `GET /reports/history` | `403 {"detail": "premium feature — upgrade required"}` with `X-Usage-Tier: free` | `{"count": N, "dates": ["YYYY-MM-DD", ...]}` |
+| `GET /dashboard` | banner + projected report (deep-stat sections hidden) | full HTML dashboard |
+
+Worked example — free response to `GET /reports/latest`:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "scorer_fingerprint": "f0b2…",
+  "totals": {"alpha_rows": 100, "buy_rows": 25, "skip_rows": 75},
+  "promotion_readiness": {"ready": true, "consecutive_passing_days": 21},
+  "tier": "free",
+  "upgrade": {
+    "detail": "premium feature — upgrade required",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+Worked example — free `GET /reports/history` (premium-only):
+
+```
+$ curl -i https://your-host.example.com/reports/history \
+       -H "Authorization: Bearer <free-key>"
+HTTP/1.1 403 Forbidden
+X-Usage-Tier: free
+X-Usage-Limit: 50
+X-Usage-Remaining: 46
+Content-Type: application/json
+
+{"detail":"premium feature — upgrade required"}
+```
+
+Note that the 403 still consumes the caller's daily usage quota
+(Phase 8.1) — gated requests count.
+
+#### Phase 8.3 upgrade-pressure payload
+
+When `STRIPE_SECRET_KEY` + `STRIPE_PREMIUM_PRICE_ID` +
+`TRADING_PUBLIC_BASE_URL` are configured (the same env vars that
+power `POST /billing/checkout`), every free-tier rejection or
+curated response carries a Phase 8.3 ``upgrade`` payload with a
+freshly-minted Stripe Checkout URL the client can redirect the
+user to immediately:
+
+```json
+{
+  "detail": "usage limit reached — upgrade for higher limits",
+  "upgrade": {
+    "required": true,
+    "reason": "usage_limit",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+Three `reason` values surface:
+
+| Where | `reason` | `required` |
+|---|---|---|
+| 429 from Phase 8.1 daily-cap exhaustion | `usage_limit` | `true` |
+| 403 from Phase 8.2 premium-only feature | `feature_locked` | `true` |
+| 200 from Phase 8.2 free `/reports/latest` curated body | `limited_access` | `false` |
+
+Premium callers never trigger a Stripe call on these paths, so
+their responses remain identical to the pre-Phase-8.3 shape.
+
+If Stripe is unreachable or `TRADING_PUBLIC_BASE_URL` is unset,
+the payload is dropped silently — the base response (429 / 403 /
+200) is unchanged. Operators can disable the 429 trigger point by
+flipping `TRADING_USAGE_ENFORCEMENT_ENABLED=false`, or disable
+all three Phase 8.3 payloads by unsetting `TRADING_PUBLIC_BASE_URL`.
+
+Performance note: every free-tier 429 / 403 / curated-200 makes
+ONE outbound Stripe POST. The Stripe Session itself is
+short-lived (Stripe expires it after 24h by default) and is NOT
+persisted server-side — checkout_url leak-guard is pinned by
+`tests/test_api_server.py::TestPhase83CheckoutUrlNotPersisted`.
+
+A premium user (promoted via Stripe Checkout / webhook) gets the
+higher cap automatically — no env edits, no restart:
+
+```
+$ curl -i https://your-host.example.com/reports/latest \
+       -H "Authorization: Bearer <same-key-after-upgrade>"
+HTTP/1.1 200 OK
+X-Usage-Limit: 1000
+X-Usage-Remaining: 939
+X-Usage-Tier: premium
+```
+
+To temporarily disable the entire metering layer (e.g., during an
+incident or migration):
+
+```
+$ railway variables --set TRADING_USAGE_ENFORCEMENT_ENABLED=false
+$ railway redeploy
 ```
 
 ### 3 — Issue the real user keys (Railway shell only)
@@ -406,8 +559,23 @@ Only after step 6 reports `READY`:
   `customer.subscription.deleted`, `invoice.payment_failed`.
 * Copy the signing secret into `STRIPE_WEBHOOK_SECRET` and redeploy.
 * Smoke-test one real Checkout to confirm the webhook flips the
-  customer's tier to premium (Phase 7.0 does this automatically as
-  long as the `metadata.api_key` matches an issued manifest row).
+  customer's tier to premium. The webhook accepts BOTH identity
+  shapes:
+  - `metadata[api_key]` (Phase 4.7 / 4.8 — operator-CLI
+    `keys issue --checkout` flow)
+  - `metadata[key_hash]` (Phase 7.3 — `POST /billing/checkout` flow,
+    no raw key on the wire)
+
+  Either one is verified against the issuance manifest before the
+  premium cache is mutated. Revoked hashes can never be re-promoted
+  by a Stripe replay regardless of which identity field carries
+  them. See `docs/CORE_CONTROL.md` § Phase 7.4 for the full table.
+
+* If both `STRIPE_API_KEY` (legacy) and `STRIPE_SECRET_KEY` (Phase
+  7.3 preferred) are set, they should hold the same Stripe-side
+  credential — `is_stripe_configured()` accepts either. Operators
+  rolling forward from a Phase 4.7 deployment may set just
+  `STRIPE_SECRET_KEY` and remove the legacy alias.
 
 ### 8 — Hand-deliver keys securely
 
