@@ -60,7 +60,12 @@ def _normalize_cache_entry(value: object) -> str:
 
 
 def _cache_path() -> Path:
-    return Path(os.getenv(STRIPE_PREMIUM_CACHE_ENV_VAR, DEFAULT_STRIPE_PREMIUM_CACHE_PATH))
+    return Path(
+        os.getenv(
+            STRIPE_PREMIUM_CACHE_ENV_VAR,
+            DEFAULT_STRIPE_PREMIUM_CACHE_PATH,
+        )
+    )
 
 
 def _read_raw_cache_entries(path: Path) -> Optional[list]:
@@ -71,13 +76,16 @@ def _read_raw_cache_entries(path: Path) -> Optional[list]:
     except Exception as exc:
         log.debug("billing.cache_load_error", path=str(path), error=str(exc))
         return None
-    return data if isinstance(data, list) else None
+    if not isinstance(data, list):
+        return None
+    return data
 
 
 def _save_cache(path: Path, hashes: set[str]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(sorted(hashes)) + "\n", encoding="utf-8")
+        payload = json.dumps(sorted(hashes))
+        path.write_text(payload + "\n", encoding="utf-8")
     except Exception as exc:
         log.debug("billing.cache_save_error", path=str(path), error=str(exc))
 
@@ -91,7 +99,9 @@ def _load_and_migrate_cache(path: Path) -> set[str]:
     needs_migration = False
 
     for v in raw:
-        s = str(v).strip() if v else ""
+        if not v:
+            continue
+        s = str(v).strip()
         if not s:
             continue
         if _looks_like_hash(s):
@@ -104,7 +114,11 @@ def _load_and_migrate_cache(path: Path) -> set[str]:
 
     if needs_migration:
         _save_cache(path, hashes)
-        log.info("billing.cache_migrated_to_hashes", path=str(path), entries=len(hashes))
+        log.info(
+            "billing.cache_migrated_to_hashes",
+            path=str(path),
+            entries=len(hashes),
+        )
 
     return hashes
 
@@ -129,8 +143,12 @@ def reset_cache_for_tests() -> None:
 
 
 def add_premium_key(api_key: str) -> None:
-    if api_key:
-        add_premium_hash(_hash_api_key(api_key))
+    if not api_key:
+        return
+    key_hash = _hash_api_key(api_key)
+    if not key_hash:
+        return
+    add_premium_hash(key_hash)
 
 
 def add_premium_hash(key_hash: str) -> None:
@@ -147,8 +165,12 @@ def add_premium_hash(key_hash: str) -> None:
 
 
 def remove_premium_key(api_key: str) -> None:
-    if api_key:
-        remove_premium_hash(_hash_api_key(api_key))
+    if not api_key:
+        return
+    key_hash = _hash_api_key(api_key)
+    if not key_hash:
+        return
+    remove_premium_hash(key_hash)
 
 
 def remove_premium_hash(key_hash: str) -> None:
@@ -190,7 +212,10 @@ def _hash_api_key(api_key: Optional[str]) -> str:
 def is_premium_via_stripe(api_key: Optional[str]) -> bool:
     if not api_key:
         return False
-    return is_premium_hash(_hash_api_key(api_key))
+    key_hash = _hash_api_key(api_key)
+    if not key_hash:
+        return False
+    return is_premium_hash(key_hash)
 
 
 def is_premium_hash(key_hash: Optional[str]) -> bool:
@@ -198,7 +223,7 @@ def is_premium_hash(key_hash: Optional[str]) -> bool:
         return False
     _ensure_cache_loaded()
     with _cache_lock:
-        return key_hash in _cache
+        return key_hash.strip() in _cache
 
 
 def _parse_signature_header(header: str) -> dict[str, list[str]]:
@@ -219,7 +244,9 @@ def verify_webhook_signature(
     tolerance: int = DEFAULT_SIGNATURE_TOLERANCE_SECONDS,
     now: Optional[int] = None,
 ) -> bool:
-    if not secret or not sig_header or payload is None:
+    if not secret or not sig_header:
+        return False
+    if payload is None:
         return False
 
     try:
@@ -241,7 +268,9 @@ def verify_webhook_signature(
             return False
 
         signed_payload = f"{ts}.".encode("utf-8") + (
-            payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode("utf-8")
+            payload
+            if isinstance(payload, (bytes, bytearray))
+            else str(payload).encode("utf-8")
         )
 
         expected = hmac.new(
@@ -261,7 +290,22 @@ def _extract_api_key_from_event_object(obj) -> Optional[str]:
     return api_key
 
 
-def _extract_identity_from_event_object(obj) -> tuple[Optional[str], Optional[str]]:
+def _extract_identity_from_event_object(
+    obj,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract API identity from Stripe event objects.
+
+    Supported sources:
+      1. object.metadata.api_key / object.metadata.key_hash
+      2. object.client_reference_id as key_hash
+      3. object.subscription_details.metadata.key_hash
+      4. expanded object.customer.metadata.api_key / key_hash
+      5. fetched customer metadata when object.customer is a Stripe customer id
+
+    The fetch fallback matters because many webhook objects carry
+    customer as a string id instead of an expanded customer object.
+    """
     if not isinstance(obj, dict):
         return (None, None)
 
@@ -271,11 +315,30 @@ def _extract_identity_from_event_object(obj) -> tuple[Optional[str], Optional[st
     meta = obj.get("metadata")
     if isinstance(meta, dict):
         ak = meta.get("api_key")
+        kh = meta.get("key_hash")
         if ak:
             api_key = str(ak)
-        kh = meta.get("key_hash")
         if kh:
             key_hash = str(kh)
+
+    client_reference_id = obj.get("client_reference_id")
+    if not key_hash and client_reference_id:
+        candidate = str(client_reference_id).strip()
+        if candidate:
+            key_hash = candidate
+
+    subscription_details = obj.get("subscription_details")
+    if isinstance(subscription_details, dict):
+        sd_meta = subscription_details.get("metadata")
+        if isinstance(sd_meta, dict):
+            if api_key is None:
+                ak = sd_meta.get("api_key")
+                if ak:
+                    api_key = str(ak)
+            if key_hash is None:
+                kh = sd_meta.get("key_hash")
+                if kh:
+                    key_hash = str(kh)
 
     customer = obj.get("customer")
     if isinstance(customer, dict):
@@ -290,7 +353,61 @@ def _extract_identity_from_event_object(obj) -> tuple[Optional[str], Optional[st
                 if kh:
                     key_hash = str(kh)
 
+    if isinstance(customer, str) and customer.strip() and not (api_key or key_hash):
+        fetched_api_key, fetched_key_hash = _fetch_identity_from_customer(
+            customer.strip()
+        )
+        api_key = api_key or fetched_api_key
+        key_hash = key_hash or fetched_key_hash
+
     return (api_key, key_hash)
+
+
+def _fetch_identity_from_customer(
+    customer_id: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Best-effort customer metadata fallback.
+
+    This is intentionally non-fatal. Stripe webhook processing should
+    never crash because customer lookup failed.
+    """
+    if not customer_id:
+        return (None, None)
+
+    secret = _resolve_stripe_secret()
+    if not secret:
+        return (None, None)
+
+    try:
+        import requests
+
+        response = requests.get(
+            f"{STRIPE_API_BASE_URL}/customers/{customer_id}",
+            auth=(secret, ""),
+            timeout=STRIPE_API_TIMEOUT_SECONDS,
+        )
+        if int(getattr(response, "status_code", 0) or 0) != 200:
+            return (None, None)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return (None, None)
+        meta = payload.get("metadata")
+        if not isinstance(meta, dict):
+            return (None, None)
+        api_key = meta.get("api_key")
+        key_hash = meta.get("key_hash")
+        return (
+            str(api_key) if api_key else None,
+            str(key_hash) if key_hash else None,
+        )
+    except Exception as exc:
+        log.debug(
+            "billing.customer_identity_fetch_error",
+            customer_id=customer_id,
+            error=str(exc),
+        )
+        return (None, None)
 
 
 def _extract_price_id_from_event_object(obj) -> Optional[str]:
@@ -326,6 +443,7 @@ def _verify_against_manifest(api_key: str) -> bool:
     except Exception as exc:
         log.debug("billing.key_store_import_error", error=str(exc))
         return False
+
     return key_store.verify_api_key(api_key) is not None
 
 
@@ -343,7 +461,13 @@ def _verify_hash_against_manifest(key_hash: str) -> bool:
         log.debug("billing.key_store_import_error", error=str(exc))
         return False
 
-    return key_store.lookup_key_hash(h) is not None and not key_store.is_revoked(h)
+    if key_store.lookup_key_hash(h) is None:
+        return False
+
+    if key_store.is_revoked(h):
+        return False
+
+    return True
 
 
 def _stripe_event_id(event: dict) -> str:
@@ -359,6 +483,15 @@ def _mark_event_processed(event_id: str) -> bool:
             return False
         _processed_event_ids.add(event_id)
         return True
+
+
+def _identity_from_event_or_client_reference(obj) -> tuple[Optional[str], Optional[str]]:
+    api_key, key_hash = _extract_identity_from_event_object(obj)
+    if key_hash:
+        key_hash = key_hash.strip()
+    if api_key:
+        api_key = api_key.strip()
+    return (api_key or None, key_hash or None)
 
 
 def handle_webhook_event(event) -> dict:
@@ -379,20 +512,69 @@ def handle_webhook_event(event) -> dict:
     data = event.get("data") or {}
     obj = data.get("object") if isinstance(data, dict) else None
 
-    api_key, key_hash = _extract_identity_from_event_object(obj)
-    if not api_key and not key_hash:
-        return {
-            "id": event_id,
-            "type": event_type,
-            "action": "ignored",
-            "reason": "no_identity_on_event",
-        }
-
+    api_key, key_hash = _identity_from_event_or_client_reference(obj)
     use_hash = bool(key_hash)
     identity_source = "key_hash" if use_hash else "api_key"
 
+    if event_type == "checkout.session.completed":
+        if not api_key and not key_hash:
+            return {
+                "id": event_id,
+                "type": event_type,
+                "action": "ignored",
+                "reason": "no_identity_on_event",
+            }
+
+        if use_hash:
+            if not _verify_hash_against_manifest(key_hash):  # type: ignore[arg-type]
+                return {
+                    "id": event_id,
+                    "type": event_type,
+                    "action": "ignored",
+                    "reason": "key_not_in_manifest_or_revoked",
+                    "identity": identity_source,
+                }
+            add_premium_hash(key_hash)  # type: ignore[arg-type]
+            funnel_hash = key_hash
+        else:
+            if not _verify_against_manifest(api_key):  # type: ignore[arg-type]
+                return {
+                    "id": event_id,
+                    "type": event_type,
+                    "action": "ignored",
+                    "reason": "key_not_in_manifest_or_revoked",
+                    "identity": identity_source,
+                }
+            add_premium_key(api_key)  # type: ignore[arg-type]
+            funnel_hash = _hash_api_key(api_key)
+
+        _record_conversion_and_funnel(
+            api_key=api_key,
+            key_hash=key_hash,
+            use_hash=use_hash,
+            obj=obj,
+            funnel_hash=funnel_hash,
+        )
+
+        return {
+            "id": event_id,
+            "type": event_type,
+            "action": "added",
+            "identity": identity_source,
+        }
+
     if event_type == "customer.subscription.created":
-        sub_status = (isinstance(obj, dict) and str(obj.get("status") or "")).lower()
+        if not api_key and not key_hash:
+            return {
+                "id": event_id,
+                "type": event_type,
+                "action": "ignored",
+                "reason": "no_identity_on_event",
+            }
+
+        sub_status = (
+            isinstance(obj, dict) and str(obj.get("status") or "")
+        ).lower()
 
         if sub_status not in _ACTIVE_SUBSCRIPTION_STATUSES:
             return {
@@ -425,38 +607,13 @@ def handle_webhook_event(event) -> dict:
             add_premium_key(api_key)  # type: ignore[arg-type]
             funnel_hash = _hash_api_key(api_key)
 
-        try:
-            from trading_bot.api.conversion import record_conversion, record_conversion_for_hash
-
-            if use_hash:
-                record_conversion_for_hash(
-                    key_hash,  # type: ignore[arg-type]
-                    source="stripe",
-                    price_id=_extract_price_id_from_event_object(obj),
-                )
-            else:
-                record_conversion(
-                    api_key,  # type: ignore[arg-type]
-                    source="stripe",
-                    price_id=_extract_price_id_from_event_object(obj),
-                )
-        except Exception as exc:
-            log.debug("billing.conversion_error", error=str(exc))
-
-        try:
-            from trading_bot.api.upgrade_events import (
-                EVENT_UPGRADE_COMPLETED,
-                record_upgrade_funnel_event,
-            )
-
-            record_upgrade_funnel_event(
-                funnel_hash,  # type: ignore[arg-type]
-                EVENT_UPGRADE_COMPLETED,
-                reason="stripe_webhook",
-                endpoint="/webhook/stripe",
-            )
-        except Exception as exc:
-            log.debug("billing.upgrade_funnel_error", error=str(exc))
+        _record_conversion_and_funnel(
+            api_key=api_key,
+            key_hash=key_hash,
+            use_hash=use_hash,
+            obj=obj,
+            funnel_hash=funnel_hash,
+        )
 
         return {
             "id": event_id,
@@ -466,6 +623,14 @@ def handle_webhook_event(event) -> dict:
         }
 
     if event_type == "customer.subscription.deleted":
+        if not api_key and not key_hash:
+            return {
+                "id": event_id,
+                "type": event_type,
+                "action": "ignored",
+                "reason": "no_identity_on_event",
+            }
+
         if use_hash:
             remove_premium_hash(key_hash)  # type: ignore[arg-type]
         else:
@@ -479,6 +644,14 @@ def handle_webhook_event(event) -> dict:
         }
 
     if event_type == "invoice.payment_failed":
+        if not api_key and not key_hash:
+            return {
+                "id": event_id,
+                "type": event_type,
+                "action": "ignored",
+                "reason": "no_identity_on_event",
+            }
+
         if use_hash:
             remove_premium_hash(key_hash)  # type: ignore[arg-type]
         else:
@@ -498,6 +671,52 @@ def handle_webhook_event(event) -> dict:
         "action": "ignored",
         "reason": "unhandled_type",
     }
+
+
+def _record_conversion_and_funnel(
+    *,
+    api_key: Optional[str],
+    key_hash: Optional[str],
+    use_hash: bool,
+    obj,
+    funnel_hash: Optional[str],
+) -> None:
+    try:
+        from trading_bot.api.conversion import (
+            record_conversion,
+            record_conversion_for_hash,
+        )
+
+        if use_hash and key_hash:
+            record_conversion_for_hash(
+                key_hash,
+                source="stripe",
+                price_id=_extract_price_id_from_event_object(obj),
+            )
+        elif api_key:
+            record_conversion(
+                api_key,
+                source="stripe",
+                price_id=_extract_price_id_from_event_object(obj),
+            )
+    except Exception as exc:
+        log.debug("billing.conversion_error", error=str(exc))
+
+    try:
+        from trading_bot.api.upgrade_events import (
+            EVENT_UPGRADE_COMPLETED,
+            record_upgrade_funnel_event,
+        )
+
+        if funnel_hash:
+            record_upgrade_funnel_event(
+                funnel_hash,
+                EVENT_UPGRADE_COMPLETED,
+                reason="stripe_webhook",
+                endpoint="/webhook/stripe",
+            )
+    except Exception as exc:
+        log.debug("billing.upgrade_funnel_error", error=str(exc))
 
 
 STRIPE_API_BASE_URL = "https://api.stripe.com/v1"
@@ -524,15 +743,22 @@ def _post_to_stripe(
     import requests
 
     try:
-        response = requests.post(url, data=data, auth=auth, timeout=timeout)
+        response = requests.post(
+            url,
+            data=data,
+            auth=auth,
+            timeout=timeout,
+        )
     except Exception as exc:
-        raise BillingAPIError(f"stripe request failed: {type(exc).__name__}") from exc
+        raise BillingAPIError(
+            f"stripe request failed: {type(exc).__name__}"
+        ) from exc
 
     status_code = int(getattr(response, "status_code", 0) or 0)
 
     if not (200 <= status_code < 300):
         try:
-            body_preview = getattr(response, "text", "")[:200]
+            body_preview = getattr(response, "text", "")[:500]
         except Exception:
             body_preview = ""
 
@@ -547,7 +773,9 @@ def _post_to_stripe(
     try:
         return response.json()
     except Exception as exc:
-        raise BillingAPIError(f"stripe response not valid JSON: {type(exc).__name__}") from exc
+        raise BillingAPIError(
+            f"stripe response not valid JSON: {type(exc).__name__}"
+        ) from exc
 
 
 def _validate_checkout_inputs(
@@ -562,9 +790,14 @@ def _validate_checkout_inputs(
     if not cancel_url or not str(cancel_url).strip():
         raise ValueError("cancel_url is required")
 
-    for name, value in (("success_url", success_url), ("cancel_url", cancel_url)):
+    for name, value in (
+        ("success_url", success_url),
+        ("cancel_url", cancel_url),
+    ):
         if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
-            raise ValueError(f"{name} contains forbidden whitespace / control characters")
+            raise ValueError(
+                f"{name} contains forbidden whitespace / control characters"
+            )
 
 
 def create_checkout_session(
@@ -583,7 +816,11 @@ def create_checkout_session(
     if not stripe_secret:
         raise BillingConfigError(f"{STRIPE_API_KEY_ENV_VAR} is not configured")
     if not price_id:
-        raise BillingConfigError(f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR} is not configured")
+        raise BillingConfigError(
+            f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR} is not configured"
+        )
+
+    api_key_hash = _hash_api_key(api_key)
 
     data = {
         "mode": "subscription",
@@ -591,8 +828,11 @@ def create_checkout_session(
         "line_items[0][quantity]": "1",
         "success_url": success_url,
         "cancel_url": cancel_url,
+        "client_reference_id": api_key_hash,
         "metadata[api_key]": api_key,
+        "metadata[key_hash]": api_key_hash,
         "subscription_data[metadata][api_key]": api_key,
+        "subscription_data[metadata][key_hash]": api_key_hash,
     }
 
     if ref_code:
@@ -621,7 +861,7 @@ def create_checkout_session(
     return {
         "checkout_session_id": session_id,
         "checkout_url": checkout_url,
-        "api_key_hash": _hash_api_key(api_key),
+        "api_key_hash": api_key_hash,
     }
 
 
@@ -657,17 +897,26 @@ def create_checkout_session_for_hash(
     if not cancel_url or not str(cancel_url).strip():
         raise ValueError("cancel_url is required")
 
-    for name, value in (("success_url", success_url), ("cancel_url", cancel_url)):
+    for name, value in (
+        ("success_url", success_url),
+        ("cancel_url", cancel_url),
+    ):
         if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
-            raise ValueError(f"{name} contains forbidden whitespace / control characters")
+            raise ValueError(
+                f"{name} contains forbidden whitespace / control characters"
+            )
 
     stripe_secret = _resolve_stripe_secret()
     price_id = _resolve_premium_price_id()
 
     if not stripe_secret:
-        raise BillingConfigError(f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured")
+        raise BillingConfigError(
+            f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured"
+        )
     if not price_id:
-        raise BillingConfigError(f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured")
+        raise BillingConfigError(
+            f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured"
+        )
 
     key_hash = key_hash.strip()
 
@@ -682,6 +931,7 @@ def create_checkout_session_for_hash(
         "metadata[tier_from]": "free",
         "metadata[tier_to]": "premium",
         "subscription_data[metadata][key_hash]": key_hash,
+        "subscription_data[metadata][tier_from]": "free",
         "subscription_data[metadata][tier_to]": "premium",
     }
 
@@ -715,7 +965,8 @@ def _checkout_cli(argv: list[str]) -> int:
         prog="python -m trading_bot.api.billing checkout",
         description=(
             "Generate a Stripe Checkout URL for upgrading an API key "
-            "to the premium tier. Operator-only — the raw API key is never printed."
+            "to the premium tier. Operator-only — the raw API key is "
+            "never printed to stdout."
         ),
     )
     parser.add_argument("--api-key", required=True)
@@ -725,7 +976,11 @@ def _checkout_cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     try:
-        result = create_checkout_session(args.api_key, args.success_url, args.cancel_url)
+        result = create_checkout_session(
+            args.api_key,
+            args.success_url,
+            args.cancel_url,
+        )
     except BillingConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
