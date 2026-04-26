@@ -745,7 +745,11 @@ class TestCreateCheckoutSessionPayload:
         assert data["line_items[0][quantity]"] == "1"
         assert data["success_url"] == SAFE_SUCCESS_URL
         assert data["cancel_url"] == SAFE_CANCEL_URL
-        assert data["customer_creation"] == "always"
+        # ``customer_creation`` is intentionally absent — Stripe
+        # rejects it in subscription mode (it's only valid in
+        # payment / setup mode). Subscription-mode sessions create
+        # a customer record by construction.
+        assert "customer_creation" not in data
         # Api key on BOTH session metadata AND subscription metadata —
         # so the webhook handler gets it regardless of expansion.
         assert data["metadata[api_key]"] == SAFE_API_KEY_FOR_CHECKOUT
@@ -1006,3 +1010,393 @@ class TestPhase48NoNewApiRoute:
             "from trading_bot.main",
         ):
             assert pat not in src
+
+
+# ===========================================================================
+# Phase: Stripe test-mode hardening (preferred env vars + webhook idempotency)
+# ===========================================================================
+
+
+from trading_bot.api.billing import (  # noqa: E402
+    STRIPE_PREMIUM_PRICE_ID_ENV_VAR,
+    STRIPE_SECRET_KEY_ENV_VAR,
+    _resolve_premium_price_id,
+    _resolve_stripe_secret,
+)
+
+
+class TestStripeSecretResolver:
+    def test_unset_returns_empty(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        assert _resolve_stripe_secret() == ""
+
+    def test_legacy_only(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
+        assert _resolve_stripe_secret() == "sk_test_legacy"
+
+    def test_preferred_only(self, monkeypatch):
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_preferred")
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        assert _resolve_stripe_secret() == "sk_test_preferred"
+
+    def test_preferred_wins_over_legacy(self, monkeypatch):
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_PREFERRED")
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
+        assert _resolve_stripe_secret() == "sk_test_PREFERRED"
+
+    def test_blank_preferred_falls_through_to_legacy(self, monkeypatch):
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "   ")
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
+        assert _resolve_stripe_secret() == "sk_test_legacy"
+
+
+class TestPremiumPriceIdResolver:
+    def test_unset_returns_empty(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
+        assert _resolve_premium_price_id() == ""
+
+    def test_legacy_only(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_legacy")
+        assert _resolve_premium_price_id() == "price_legacy"
+
+    def test_preferred_only(self, monkeypatch):
+        monkeypatch.setenv(
+            STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_preferred",
+        )
+        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
+        assert _resolve_premium_price_id() == "price_preferred"
+
+    def test_preferred_wins_over_legacy(self, monkeypatch):
+        monkeypatch.setenv(
+            STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_PREFERRED",
+        )
+        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_legacy")
+        assert _resolve_premium_price_id() == "price_PREFERRED"
+
+
+class TestIsStripeConfiguredAcceptsEitherEnv:
+    """is_stripe_configured() must accept either env-var name —
+    Phase test-mode hardening adds the preferred STRIPE_SECRET_KEY
+    name without breaking the legacy STRIPE_API_KEY path."""
+
+    def test_with_preferred_env(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_preferred")
+        assert is_stripe_configured() is True
+
+    def test_with_legacy_env(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
+        assert is_stripe_configured() is True
+
+    def test_with_neither_env(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        assert is_stripe_configured() is False
+
+
+class TestCheckoutAcceptsPreferredEnv:
+    """create_checkout_session must succeed when ONLY the new
+    preferred env-var names are set (no legacy fallback present)."""
+
+    def test_checkout_with_only_preferred_env(self, monkeypatch):
+        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_pref_1")
+        monkeypatch.setenv(
+            STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_pref_1",
+        )
+
+        captured = {}
+
+        def stub(**kwargs):
+            captured.update(kwargs)
+            return {
+                "id": "cs_test_session_pref",
+                "url": "https://checkout.stripe.com/c/pay/cs_test_session_pref",
+                "object": "checkout.session",
+            }
+
+        from trading_bot.api.billing import create_checkout_session
+        result = create_checkout_session(
+            "user-key-X",
+            "https://app.example.com/billing/success",
+            "https://app.example.com/billing/cancel",
+            http_post=stub,
+        )
+        assert result["checkout_session_id"] == "cs_test_session_pref"
+        assert captured["data"]["line_items[0][price]"] == "price_pref_1"
+        assert captured["auth"][0] == "sk_test_pref_1"
+
+    def test_checkout_payload_excludes_customer_creation(
+        self, monkeypatch,
+    ):
+        """Subscription mode + customer_creation crashes Stripe — the
+        field MUST NOT be in the POST body."""
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_x")
+        monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_x")
+
+        captured = {}
+
+        def stub(**kwargs):
+            captured.update(kwargs)
+            return {"id": "cs_x", "url": "https://x"}
+
+        from trading_bot.api.billing import create_checkout_session
+        create_checkout_session(
+            "user-key-X",
+            "https://app.example.com/billing/success",
+            "https://app.example.com/billing/cancel",
+            http_post=stub,
+        )
+        data = captured["data"]
+        assert data["mode"] == "subscription"
+        assert "customer_creation" not in data
+
+    def test_checkout_does_not_include_raw_key_in_returned_dict(
+        self, monkeypatch,
+    ):
+        """The returned dict must contain api_key_hash, never the
+        raw key — operator-issuance + CLI hygiene relies on this."""
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_x")
+        monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_x")
+
+        def stub(**kwargs):
+            return {"id": "cs_x", "url": "https://x"}
+
+        from trading_bot.api.billing import create_checkout_session
+        raw_key = "RAW_USER_KEY_DO_NOT_LEAK"
+        result = create_checkout_session(
+            raw_key,
+            "https://app.example.com/billing/success",
+            "https://app.example.com/billing/cancel",
+            http_post=stub,
+        )
+        assert raw_key not in json.dumps(result)
+        assert "api_key_hash" in result
+
+
+class TestWebhookIdempotent:
+    """Stripe retries deliveries on any non-2xx (and sometimes
+    spuriously on 2xx). The same event id must be a no-op the
+    second time so a retried `customer.subscription.deleted` between
+    an admin re-grant doesn't silently revoke premium twice."""
+
+    def test_duplicate_created_event_not_double_processed(self):
+        reset_cache_for_tests()
+        event = {
+            "id": "evt_TEST_dup_created",
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "user-AAA"},
+            }},
+        }
+        first = handle_webhook_event(event)
+        second = handle_webhook_event(event)
+        assert first["action"] == "added"
+        assert second["action"] == "ignored"
+        assert second["reason"] == "duplicate_event"
+        assert "user-AAA" in current_premium_keys()
+
+    def test_duplicate_deleted_event_does_not_double_remove(self):
+        """Even if the operator re-granted premium between the two
+        deliveries, the duplicate event id must short-circuit."""
+        reset_cache_for_tests()
+        handle_webhook_event({
+            "id": "evt_initial_create",
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "user-BBB"},
+            }},
+        })
+        delete_event = {
+            "id": "evt_TEST_dup_deleted",
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": "user-BBB"},
+            }},
+        }
+        first = handle_webhook_event(delete_event)
+        assert first["action"] == "removed"
+        assert "user-BBB" not in current_premium_keys()
+
+        # Operator re-grants premium via a NEW subscription event.
+        handle_webhook_event({
+            "id": "evt_re_grant",
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "user-BBB"},
+            }},
+        })
+        assert "user-BBB" in current_premium_keys()
+
+        # Stripe re-delivers the SAME deletion event — must be a no-op.
+        second = handle_webhook_event(delete_event)
+        assert second["action"] == "ignored"
+        assert second["reason"] == "duplicate_event"
+        # Premium status was preserved by the dedup.
+        assert "user-BBB" in current_premium_keys()
+
+    def test_no_event_id_means_no_dedup(self):
+        """Events without an id field should NOT be deduped (we
+        can't tell which is which)."""
+        reset_cache_for_tests()
+        event_no_id = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "user-CCC"},
+            }},
+        }
+        first = handle_webhook_event(event_no_id)
+        second = handle_webhook_event(event_no_id)
+        assert first["action"] == "added"
+        assert second["action"] == "added"
+
+    def test_dedup_eviction_keeps_memory_bounded(self, monkeypatch):
+        """The dedup state must not grow unboundedly. Force the cap
+        to a small value and confirm older event ids are evicted."""
+        reset_cache_for_tests()
+        monkeypatch.setattr(billing, "_WEBHOOK_DEDUP_MAX", 3)
+        for i in range(5):
+            handle_webhook_event({
+                "id": f"evt_E{i}",
+                "type": "customer.subscription.created",
+                "data": {"object": {
+                    "status": "active",
+                    "metadata": {"api_key": f"user-X{i}"},
+                }},
+            })
+        # The first event id should have been evicted by now.
+        assert "evt_E0" not in billing._webhook_seen_set
+        # The most recent ones are still there.
+        assert "evt_E4" in billing._webhook_seen_set
+        # Bounded.
+        assert len(billing._webhook_seen_ids) == 3
+
+
+class TestCancellationRemovesPremium:
+    """End-to-end: after a subscription.deleted event, the key's
+    entitlement (its 'key_hash' / identity in the premium cache)
+    is gone."""
+
+    def test_subscription_deleted_removes_key_from_cache(self):
+        reset_cache_for_tests()
+        api_key = "promoted-then-cancelled-key"
+        handle_webhook_event({
+            "id": "evt_create_AAA",
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": api_key},
+            }},
+        })
+        assert api_key in current_premium_keys()
+        assert is_premium_via_stripe(api_key) is True
+
+        result = handle_webhook_event({
+            "id": "evt_delete_AAA",
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": api_key},
+            }},
+        })
+        assert result["action"] == "removed"
+        assert api_key not in current_premium_keys()
+        assert is_premium_via_stripe(api_key) is False
+
+    def test_payment_failed_also_removes(self):
+        reset_cache_for_tests()
+        api_key = "user-payment-fail"
+        handle_webhook_event({
+            "id": "evt_create_pay_fail",
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": api_key},
+            }},
+        })
+        assert api_key in current_premium_keys()
+        result = handle_webhook_event({
+            "id": "evt_invoice_failed",
+            "type": "invoice.payment_failed",
+            "data": {"object": {
+                "metadata": {"api_key": api_key},
+            }},
+        })
+        assert result["action"] == "removed"
+        assert result["reason"] == "payment_failed"
+        assert api_key not in current_premium_keys()
+
+    def test_cancellation_for_unknown_key_is_safe_noop(self):
+        """A cancellation for a key the cache doesn't know about
+        is still safe — set.discard semantics."""
+        reset_cache_for_tests()
+        result = handle_webhook_event({
+            "id": "evt_unknown_delete",
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": "never-promoted"},
+            }},
+        })
+        assert result["action"] == "removed"
+        assert "never-promoted" not in current_premium_keys()
+
+
+class TestLiveBehaviorPreserved:
+    """Calls that worked before must still work — the test-mode
+    hardening must not have broken the deployed surface."""
+
+    def test_legacy_env_only_still_works_for_checkout(self, monkeypatch):
+        """The currently-deployed Railway env still uses
+        STRIPE_API_KEY + STRIPE_PRICE_ID_PREMIUM only."""
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy_only")
+        monkeypatch.setenv(
+            STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_legacy_only",
+        )
+
+        captured = {}
+
+        def stub(**kwargs):
+            captured.update(kwargs)
+            return {"id": "cs_legacy", "url": "https://x"}
+
+        from trading_bot.api.billing import create_checkout_session
+        result = create_checkout_session(
+            "user-LEG",
+            "https://app.example.com/billing/success",
+            "https://app.example.com/billing/cancel",
+            http_post=stub,
+        )
+        assert result["checkout_session_id"] == "cs_legacy"
+        assert captured["data"]["line_items[0][price]"] == "price_legacy_only"
+        assert captured["auth"][0] == "sk_test_legacy_only"
+
+    def test_existing_event_payloads_still_dispatch(self):
+        """Spot-check: the three handled event types still produce
+        the expected actions when inputs are exactly what the live
+        deployment delivers."""
+        reset_cache_for_tests()
+        for evt_id, evt_type, expected in (
+            ("evt_C1", "customer.subscription.created", "added"),
+            ("evt_D1", "customer.subscription.deleted", "removed"),
+            ("evt_F1", "invoice.payment_failed", "removed"),
+        ):
+            api_key = f"user-{evt_id}"
+            payload = {
+                "id": evt_id, "type": evt_type,
+                "data": {"object": {
+                    "status": "active",
+                    "metadata": {"api_key": api_key},
+                }},
+            }
+            assert handle_webhook_event(payload)["action"] == expected

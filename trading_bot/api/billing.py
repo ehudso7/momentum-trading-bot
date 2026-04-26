@@ -16,12 +16,20 @@ No new pip dependency required — Stripe's documented webhook
 signature scheme (v1, HMAC-SHA256 of `<timestamp>.<raw_payload>`) is
 implemented manually with stdlib ``hmac`` + ``hashlib``.
 
-Env vars consumed:
-    STRIPE_API_KEY                     — presence toggles Stripe-primary mode
-    STRIPE_WEBHOOK_SECRET              — HMAC secret for signature verification
-    STRIPE_PRICE_ID_PREMIUM            — premium price id (informational only)
-    TRADING_STRIPE_PREMIUM_CACHE_PATH  — path to the persistent JSON cache
-                                         (default: data/stripe_premium_keys.json)
+Env vars consumed (preferred names checked first; legacy names fall
+back transparently — both currently-deployed and the new test-mode
+runbook keep working):
+
+    Preferred:
+        STRIPE_SECRET_KEY                  — Stripe secret (sk_test_… / sk_live_…)
+        STRIPE_WEBHOOK_SECRET              — HMAC secret for signature verification
+        STRIPE_PREMIUM_PRICE_ID            — premium price id (informational only)
+    Legacy fallbacks (still honoured):
+        STRIPE_API_KEY                     — alias of STRIPE_SECRET_KEY
+        STRIPE_PRICE_ID_PREMIUM            — alias of STRIPE_PREMIUM_PRICE_ID
+    Cache:
+        TRADING_STRIPE_PREMIUM_CACHE_PATH  — path to the persistent JSON cache
+                                             (default: data/stripe_premium_keys.json)
 """
 
 from __future__ import annotations
@@ -49,6 +57,36 @@ log = structlog.get_logger(__name__)
 STRIPE_API_KEY_ENV_VAR = "STRIPE_API_KEY"
 STRIPE_WEBHOOK_SECRET_ENV_VAR = "STRIPE_WEBHOOK_SECRET"
 STRIPE_PRICE_ID_PREMIUM_ENV_VAR = "STRIPE_PRICE_ID_PREMIUM"
+
+# Preferred, more conventional env-var names. The legacy ones above
+# remain valid fallbacks so existing deployments keep working
+# without a coordinated env rotation.
+STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
+STRIPE_PREMIUM_PRICE_ID_ENV_VAR = "STRIPE_PREMIUM_PRICE_ID"
+
+
+def _resolve_stripe_secret() -> str:
+    """
+    Return the Stripe secret to use, preferring ``STRIPE_SECRET_KEY``
+    and falling back to ``STRIPE_API_KEY``. Empty string when neither
+    is set.
+    """
+    preferred = (os.getenv(STRIPE_SECRET_KEY_ENV_VAR, "") or "").strip()
+    if preferred:
+        return preferred
+    return (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
+
+
+def _resolve_premium_price_id() -> str:
+    """
+    Return the premium Stripe price id, preferring
+    ``STRIPE_PREMIUM_PRICE_ID`` and falling back to
+    ``STRIPE_PRICE_ID_PREMIUM``. Empty string when neither is set.
+    """
+    preferred = (os.getenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "") or "").strip()
+    if preferred:
+        return preferred
+    return (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
 STRIPE_PREMIUM_CACHE_ENV_VAR = "TRADING_STRIPE_PREMIUM_CACHE_PATH"
 DEFAULT_STRIPE_PREMIUM_CACHE_PATH = "data/stripe_premium_keys.json"
 
@@ -68,6 +106,45 @@ _ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset({"active", "trialing"}
 _cache_lock = threading.Lock()
 _cache: set[str] = set()
 _cache_loaded_from: Optional[Path] = None
+
+# Webhook event-id dedup. Stripe retries deliveries on any non-2xx
+# response (and sometimes spuriously on 2xx) — we track the last N
+# event ids we've processed so a re-delivery is a fast no-op
+# instead of re-running the cache mutation. Bounded so a long-lived
+# process can't accumulate state without limit.
+_WEBHOOK_DEDUP_MAX = 1024
+_webhook_seen_lock = threading.Lock()
+_webhook_seen_ids: list[str] = []
+_webhook_seen_set: set[str] = set()
+
+
+def _has_seen_webhook_event(event_id: str) -> bool:
+    """
+    Thread-safe check-and-record. Returns True iff this exact
+    ``event_id`` has been processed within the dedup window.
+    Empty / falsy event_ids are never deduped (we don't want to
+    silently coalesce legitimately-different events that happened
+    to arrive without an ``id`` field).
+    """
+    if not event_id:
+        return False
+    with _webhook_seen_lock:
+        if event_id in _webhook_seen_set:
+            return True
+        _webhook_seen_set.add(event_id)
+        _webhook_seen_ids.append(event_id)
+        # FIFO eviction once we hit the cap.
+        while len(_webhook_seen_ids) > _WEBHOOK_DEDUP_MAX:
+            evicted = _webhook_seen_ids.pop(0)
+            _webhook_seen_set.discard(evicted)
+        return False
+
+
+def _reset_webhook_dedup_for_tests() -> None:
+    """Clear the dedup memory between tests."""
+    with _webhook_seen_lock:
+        _webhook_seen_set.clear()
+        _webhook_seen_ids.clear()
 
 
 def _cache_path() -> Path:
@@ -122,6 +199,9 @@ def reset_cache_for_tests() -> None:
     with _cache_lock:
         _cache.clear()
         _cache_loaded_from = None
+    # Also clear the webhook dedup memory so a previous test's
+    # event ids don't suppress a fresh test's webhook calls.
+    _reset_webhook_dedup_for_tests()
 
 
 def add_premium_key(api_key: str) -> None:
@@ -165,11 +245,13 @@ def is_stripe_configured() -> bool:
     """
     True iff the minimum env vars for Stripe-primary mode are present.
 
-    Detection is based on ``STRIPE_API_KEY`` because that is the
-    single value required for signed outbound Stripe calls. Without
-    it we fall back to the Phase 4.5 env-var premium-keys list.
+    Detection is based on the Stripe secret key because that is the
+    single value required for signed outbound Stripe calls. Both the
+    preferred ``STRIPE_SECRET_KEY`` and the legacy ``STRIPE_API_KEY``
+    are accepted; the resolver picks whichever is set. Without
+    either we fall back to the Phase 4.5 env-var premium-keys list.
     """
-    return bool((os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip())
+    return bool(_resolve_stripe_secret())
 
 
 def _hash_api_key(api_key: Optional[str]) -> str:
@@ -360,12 +442,33 @@ def handle_webhook_event(event) -> dict:
       - ``invoice.payment_failed`` — remove api_key immediately
         (fail-closed on billing failures).
 
+    Idempotent on the Stripe ``event.id`` — duplicate deliveries
+    return ``{"action": "ignored", "reason": "duplicate_event"}``
+    without re-running the cache mutation. Stripe's documented
+    retry semantics make this important: a retried delivery for
+    ``customer.subscription.created`` would otherwise re-add an
+    already-present key (harmless), but a retried delivery for
+    ``customer.subscription.deleted`` between an admin re-grant
+    would silently re-revoke premium.
+
     Returns a small diagnostics dict — never raises, never echoes
     the api_key back to the caller.
     """
     if not isinstance(event, dict):
         return {"action": "ignored", "reason": "not_a_dict"}
     event_type = str(event.get("type") or "")
+    event_id = str(event.get("id") or "")
+
+    # Idempotency check FIRST — before any cache mutation, before
+    # any extraction. A duplicate event id short-circuits.
+    if event_id and _has_seen_webhook_event(event_id):
+        return {
+            "type": event_type,
+            "id": event_id,
+            "action": "ignored",
+            "reason": "duplicate_event",
+        }
+
     data = event.get("data") or {}
     obj = data.get("object") if isinstance(data, dict) else None
 
@@ -538,25 +641,35 @@ def create_checkout_session(
     downstream attribution analysis. Empty / None ref_code is a
     no-op (the field is simply not added to the POST body).
 
-    Fail-closed: raises ``BillingConfigError`` when
-    ``STRIPE_API_KEY`` or ``STRIPE_PRICE_ID_PREMIUM`` are missing.
-    The webhook secret is NOT required for this operation.
+    Fail-closed: raises ``BillingConfigError`` when neither
+    ``STRIPE_SECRET_KEY`` / ``STRIPE_API_KEY`` nor
+    ``STRIPE_PREMIUM_PRICE_ID`` / ``STRIPE_PRICE_ID_PREMIUM`` is
+    configured. The webhook secret is NOT required for this
+    operation.
     """
     _validate_checkout_inputs(api_key, success_url, cancel_url)
 
-    stripe_secret = (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
-    price_id = (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
+    stripe_secret = _resolve_stripe_secret()
+    price_id = _resolve_premium_price_id()
     if not stripe_secret:
         raise BillingConfigError(
-            f"{STRIPE_API_KEY_ENV_VAR} is not configured"
+            f"{STRIPE_SECRET_KEY_ENV_VAR} (or fallback "
+            f"{STRIPE_API_KEY_ENV_VAR}) is not configured"
         )
     if not price_id:
         raise BillingConfigError(
-            f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR} is not configured"
+            f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} (or fallback "
+            f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR}) is not configured"
         )
 
     # Stripe accepts application/x-www-form-urlencoded with bracketed
     # field names for nested structures.
+    #
+    # Note: ``customer_creation`` is intentionally omitted. Stripe
+    # documents that field as valid only in ``payment`` and ``setup``
+    # modes — including it in ``subscription`` mode causes Stripe to
+    # reject the request. (Subscription-mode checkout sessions
+    # always create a customer record by construction.)
     data = {
         "mode": "subscription",
         "line_items[0][price]": price_id,
@@ -568,7 +681,6 @@ def create_checkout_session(
         # it up even when the customer isn't expanded by Stripe.
         "metadata[api_key]": api_key,
         "subscription_data[metadata][api_key]": api_key,
-        "customer_creation": "always",
     }
     # Phase 6.1 — operator-supplied ref_code arrives here already
     # sanitised by the caller (keys.issue_key uses the Phase 5.1
