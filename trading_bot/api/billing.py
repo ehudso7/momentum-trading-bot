@@ -36,9 +36,6 @@ _cache_lock = threading.Lock()
 _cache: set[str] = set()
 _cache_loaded_from: Optional[Path] = None
 
-# Phase 11.2 — webhook idempotency guard.
-# In-memory guard against duplicate Stripe event processing.
-# Next hardening step should persist this to JSONL/DB before multi-instance scaling.
 _processed_event_lock = threading.Lock()
 _processed_event_ids: set[str] = set()
 
@@ -63,12 +60,7 @@ def _normalize_cache_entry(value: object) -> str:
 
 
 def _cache_path() -> Path:
-    return Path(
-        os.getenv(
-            STRIPE_PREMIUM_CACHE_ENV_VAR,
-            DEFAULT_STRIPE_PREMIUM_CACHE_PATH,
-        )
-    )
+    return Path(os.getenv(STRIPE_PREMIUM_CACHE_ENV_VAR, DEFAULT_STRIPE_PREMIUM_CACHE_PATH))
 
 
 def _read_raw_cache_entries(path: Path) -> Optional[list]:
@@ -79,16 +71,13 @@ def _read_raw_cache_entries(path: Path) -> Optional[list]:
     except Exception as exc:
         log.debug("billing.cache_load_error", path=str(path), error=str(exc))
         return None
-    if not isinstance(data, list):
-        return None
-    return data
+    return data if isinstance(data, list) else None
 
 
 def _save_cache(path: Path, hashes: set[str]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(sorted(hashes))
-        path.write_text(payload + "\n", encoding="utf-8")
+        path.write_text(json.dumps(sorted(hashes)) + "\n", encoding="utf-8")
     except Exception as exc:
         log.debug("billing.cache_save_error", path=str(path), error=str(exc))
 
@@ -102,9 +91,7 @@ def _load_and_migrate_cache(path: Path) -> set[str]:
     needs_migration = False
 
     for v in raw:
-        if not v:
-            continue
-        s = str(v).strip()
+        s = str(v).strip() if v else ""
         if not s:
             continue
         if _looks_like_hash(s):
@@ -117,11 +104,7 @@ def _load_and_migrate_cache(path: Path) -> set[str]:
 
     if needs_migration:
         _save_cache(path, hashes)
-        log.info(
-            "billing.cache_migrated_to_hashes",
-            path=str(path),
-            entries=len(hashes),
-        )
+        log.info("billing.cache_migrated_to_hashes", path=str(path), entries=len(hashes))
 
     return hashes
 
@@ -146,12 +129,8 @@ def reset_cache_for_tests() -> None:
 
 
 def add_premium_key(api_key: str) -> None:
-    if not api_key:
-        return
-    key_hash = _hash_api_key(api_key)
-    if not key_hash:
-        return
-    add_premium_hash(key_hash)
+    if api_key:
+        add_premium_hash(_hash_api_key(api_key))
 
 
 def add_premium_hash(key_hash: str) -> None:
@@ -168,12 +147,8 @@ def add_premium_hash(key_hash: str) -> None:
 
 
 def remove_premium_key(api_key: str) -> None:
-    if not api_key:
-        return
-    key_hash = _hash_api_key(api_key)
-    if not key_hash:
-        return
-    remove_premium_hash(key_hash)
+    if api_key:
+        remove_premium_hash(_hash_api_key(api_key))
 
 
 def remove_premium_hash(key_hash: str) -> None:
@@ -215,12 +190,7 @@ def _hash_api_key(api_key: Optional[str]) -> str:
 def is_premium_via_stripe(api_key: Optional[str]) -> bool:
     if not api_key:
         return False
-    key_hash = _hash_api_key(api_key)
-    if not key_hash:
-        return False
-    _ensure_cache_loaded()
-    with _cache_lock:
-        return key_hash in _cache
+    return is_premium_hash(_hash_api_key(api_key))
 
 
 def is_premium_hash(key_hash: Optional[str]) -> bool:
@@ -249,9 +219,7 @@ def verify_webhook_signature(
     tolerance: int = DEFAULT_SIGNATURE_TOLERANCE_SECONDS,
     now: Optional[int] = None,
 ) -> bool:
-    if not secret or not sig_header:
-        return False
-    if payload is None:
+    if not secret or not sig_header or payload is None:
         return False
 
     try:
@@ -273,9 +241,7 @@ def verify_webhook_signature(
             return False
 
         signed_payload = f"{ts}.".encode("utf-8") + (
-            payload
-            if isinstance(payload, (bytes, bytearray))
-            else str(payload).encode("utf-8")
+            payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode("utf-8")
         )
 
         expected = hmac.new(
@@ -295,9 +261,7 @@ def _extract_api_key_from_event_object(obj) -> Optional[str]:
     return api_key
 
 
-def _extract_identity_from_event_object(
-    obj,
-) -> tuple[Optional[str], Optional[str]]:
+def _extract_identity_from_event_object(obj) -> tuple[Optional[str], Optional[str]]:
     if not isinstance(obj, dict):
         return (None, None)
 
@@ -362,7 +326,6 @@ def _verify_against_manifest(api_key: str) -> bool:
     except Exception as exc:
         log.debug("billing.key_store_import_error", error=str(exc))
         return False
-
     return key_store.verify_api_key(api_key) is not None
 
 
@@ -380,28 +343,14 @@ def _verify_hash_against_manifest(key_hash: str) -> bool:
         log.debug("billing.key_store_import_error", error=str(exc))
         return False
 
-    if key_store.lookup_key_hash(h) is None:
-        return False
-
-    if key_store.is_revoked(h):
-        return False
-
-    return True
+    return key_store.lookup_key_hash(h) is not None and not key_store.is_revoked(h)
 
 
 def _stripe_event_id(event: dict) -> str:
-    event_id = str(event.get("id") or "").strip()
-    return event_id
+    return str(event.get("id") or "").strip()
 
 
 def _mark_event_processed(event_id: str) -> bool:
-    """
-    Return True if this event id was newly marked processed.
-
-    Return False when the event id was already seen in this process.
-    This is intentionally in-memory for Phase 11.2; production
-    multi-instance deployments should move this to persistent storage.
-    """
     if not event_id:
         return True
 
@@ -413,13 +362,6 @@ def _mark_event_processed(event_id: str) -> bool:
 
 
 def handle_webhook_event(event) -> dict:
-    """
-    Dispatch a parsed Stripe event to the premium cache.
-
-    Phase 11.2 adds in-process idempotency by Stripe event id. Duplicate
-    deliveries return ignored/duplicate_event before cache mutation,
-    conversion logging, or funnel logging.
-    """
     if not isinstance(event, dict):
         return {"action": "ignored", "reason": "not_a_dict"}
 
@@ -450,9 +392,7 @@ def handle_webhook_event(event) -> dict:
     identity_source = "key_hash" if use_hash else "api_key"
 
     if event_type == "customer.subscription.created":
-        sub_status = (
-            isinstance(obj, dict) and str(obj.get("status") or "")
-        ).lower()
+        sub_status = (isinstance(obj, dict) and str(obj.get("status") or "")).lower()
 
         if sub_status not in _ACTIVE_SUBSCRIPTION_STATUSES:
             return {
@@ -486,10 +426,7 @@ def handle_webhook_event(event) -> dict:
             funnel_hash = _hash_api_key(api_key)
 
         try:
-            from trading_bot.api.conversion import (
-                record_conversion,
-                record_conversion_for_hash,
-            )
+            from trading_bot.api.conversion import record_conversion, record_conversion_for_hash
 
             if use_hash:
                 record_conversion_for_hash(
@@ -587,16 +524,9 @@ def _post_to_stripe(
     import requests
 
     try:
-        response = requests.post(
-            url,
-            data=data,
-            auth=auth,
-            timeout=timeout,
-        )
+        response = requests.post(url, data=data, auth=auth, timeout=timeout)
     except Exception as exc:
-        raise BillingAPIError(
-            f"stripe request failed: {type(exc).__name__}"
-        ) from exc
+        raise BillingAPIError(f"stripe request failed: {type(exc).__name__}") from exc
 
     status_code = int(getattr(response, "status_code", 0) or 0)
 
@@ -617,9 +547,7 @@ def _post_to_stripe(
     try:
         return response.json()
     except Exception as exc:
-        raise BillingAPIError(
-            f"stripe response not valid JSON: {type(exc).__name__}"
-        ) from exc
+        raise BillingAPIError(f"stripe response not valid JSON: {type(exc).__name__}") from exc
 
 
 def _validate_checkout_inputs(
@@ -634,14 +562,9 @@ def _validate_checkout_inputs(
     if not cancel_url or not str(cancel_url).strip():
         raise ValueError("cancel_url is required")
 
-    for name, value in (
-        ("success_url", success_url),
-        ("cancel_url", cancel_url),
-    ):
+    for name, value in (("success_url", success_url), ("cancel_url", cancel_url)):
         if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
-            raise ValueError(
-                f"{name} contains forbidden whitespace / control characters"
-            )
+            raise ValueError(f"{name} contains forbidden whitespace / control characters")
 
 
 def create_checkout_session(
@@ -660,9 +583,7 @@ def create_checkout_session(
     if not stripe_secret:
         raise BillingConfigError(f"{STRIPE_API_KEY_ENV_VAR} is not configured")
     if not price_id:
-        raise BillingConfigError(
-            f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR} is not configured"
-        )
+        raise BillingConfigError(f"{STRIPE_PRICE_ID_PREMIUM_ENV_VAR} is not configured")
 
     data = {
         "mode": "subscription",
@@ -672,7 +593,6 @@ def create_checkout_session(
         "cancel_url": cancel_url,
         "metadata[api_key]": api_key,
         "subscription_data[metadata][api_key]": api_key,
-        "customer_creation": "always",
     }
 
     if ref_code:
@@ -737,26 +657,17 @@ def create_checkout_session_for_hash(
     if not cancel_url or not str(cancel_url).strip():
         raise ValueError("cancel_url is required")
 
-    for name, value in (
-        ("success_url", success_url),
-        ("cancel_url", cancel_url),
-    ):
+    for name, value in (("success_url", success_url), ("cancel_url", cancel_url)):
         if any(ch in value for ch in ("\n", "\r", "\t", "\x00")):
-            raise ValueError(
-                f"{name} contains forbidden whitespace / control characters"
-            )
+            raise ValueError(f"{name} contains forbidden whitespace / control characters")
 
     stripe_secret = _resolve_stripe_secret()
     price_id = _resolve_premium_price_id()
 
     if not stripe_secret:
-        raise BillingConfigError(
-            f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured"
-        )
+        raise BillingConfigError(f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured")
     if not price_id:
-        raise BillingConfigError(
-            f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured"
-        )
+        raise BillingConfigError(f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured")
 
     key_hash = key_hash.strip()
 
@@ -772,7 +683,6 @@ def create_checkout_session_for_hash(
         "metadata[tier_to]": "premium",
         "subscription_data[metadata][key_hash]": key_hash,
         "subscription_data[metadata][tier_to]": "premium",
-        "customer_creation": "always",
     }
 
     poster = http_post if http_post is not None else _post_to_stripe
@@ -805,8 +715,7 @@ def _checkout_cli(argv: list[str]) -> int:
         prog="python -m trading_bot.api.billing checkout",
         description=(
             "Generate a Stripe Checkout URL for upgrading an API key "
-            "to the premium tier. Operator-only — the raw API key is "
-            "never printed to stdout."
+            "to the premium tier. Operator-only — the raw API key is never printed."
         ),
     )
     parser.add_argument("--api-key", required=True)
@@ -816,11 +725,7 @@ def _checkout_cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     try:
-        result = create_checkout_session(
-            args.api_key,
-            args.success_url,
-            args.cancel_url,
-        )
+        result = create_checkout_session(args.api_key, args.success_url, args.cancel_url)
     except BillingConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
