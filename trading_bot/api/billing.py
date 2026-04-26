@@ -908,7 +908,6 @@ def create_checkout_session(
         # it up even when the customer isn't expanded by Stripe.
         "metadata[api_key]": api_key,
         "subscription_data[metadata][api_key]": api_key,
-        "customer_creation": "always",
     }
     # Phase 6.1 — operator-supplied ref_code arrives here already
     # sanitised by the caller (keys.issue_key uses the Phase 5.1
@@ -1058,7 +1057,6 @@ def create_checkout_session_for_hash(
         "metadata[tier_to]": "premium",
         "subscription_data[metadata][key_hash]": key_hash,
         "subscription_data[metadata][tier_to]": "premium",
-        "customer_creation": "always",
     }
 
     poster = http_post if http_post is not None else _post_to_stripe
