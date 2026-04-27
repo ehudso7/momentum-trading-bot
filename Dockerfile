@@ -28,9 +28,14 @@ USER botuser
 
 EXPOSE 8080
 
-# Health check: verify the dashboard is responsive
+# Health check: verify the dashboard is responsive on whatever port
+# the platform asked us to bind. PaaS hosts (Railway / Heroku /
+# Render / Fly) inject $PORT at container start; we honour it via
+# `${PORT:-8080}` so a missing env var still falls back to the
+# historical default. Shell form (no JSON brackets) is required for
+# the ${} expansion to happen inside the container at runtime.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["curl", "-f", "http://localhost:8080/healthz"]
+    CMD curl -f "http://localhost:${PORT:-8080}/healthz" || exit 1
 
 # Use dumb-init as PID 1 for proper signal forwarding
 # This ensures SIGTERM from Docker/Railway reaches the Python process
