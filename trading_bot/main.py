@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import os
 import signal
 import sys
 import threading
@@ -1428,6 +1429,38 @@ def _reset_paper_account(config: AppConfig) -> None:
         sys.exit(1)
 
 
+def _default_dashboard_port() -> int:
+    """
+    Resolve the default dashboard port.
+
+    PaaS hosts (Railway, Heroku, Render, Fly, …) inject a ``PORT``
+    env var the container MUST bind to — their edge proxy routes
+    external traffic and the platform healthcheck to that exact
+    port. Hard-coding 8080 means the healthcheck fails the moment
+    the platform assigns anything else.
+
+    Resolution order:
+      * ``PORT`` env var (PaaS convention) when it parses as a
+        positive integer in the legal TCP range.
+      * fallback ``8080`` (the historical default, also what the
+        Dockerfile EXPOSEs and the in-image HEALTHCHECK probes).
+
+    Failure is fail-soft to the fallback. We deliberately do NOT
+    raise on a malformed ``PORT`` because the alternative is a
+    healthcheck-failure deploy loop with no human-readable cause.
+    """
+    raw = os.environ.get("PORT")
+    if not raw:
+        return 8080
+    try:
+        port = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 8080
+    if not (1 <= port <= 65535):
+        return 8080
+    return port
+
+
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1454,8 +1487,13 @@ def main() -> None:
     parser.add_argument(
         "--dashboard-port",
         type=int,
-        default=8080,
-        help="Dashboard web UI port (default: 8080, 0 to disable)",
+        default=_default_dashboard_port(),
+        help=(
+            "Dashboard web UI port. "
+            "Defaults to the PORT env var (PaaS convention) or "
+            "8080 if PORT is unset / malformed. "
+            "Pass 0 to disable the dashboard entirely."
+        ),
     )
     parser.add_argument(
         "--reset-paper",

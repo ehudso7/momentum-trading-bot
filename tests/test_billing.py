@@ -838,7 +838,11 @@ class TestCreateCheckoutSessionPayload:
         assert data["line_items[0][quantity]"] == "1"
         assert data["success_url"] == SAFE_SUCCESS_URL
         assert data["cancel_url"] == SAFE_CANCEL_URL
-        assert data["customer_creation"] == "always"
+        # ``customer_creation`` is intentionally absent — Stripe
+        # rejects it in subscription mode (it's only valid in
+        # payment / setup mode). Subscription-mode sessions create
+        # a customer record by construction.
+        assert "customer_creation" not in data
         # Api key on BOTH session metadata AND subscription metadata —
         # so the webhook handler gets it regardless of expansion.
         assert data["metadata[api_key]"] == SAFE_API_KEY_FOR_CHECKOUT
