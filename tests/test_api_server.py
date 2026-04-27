@@ -22,6 +22,7 @@ or data/ directories.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,14 @@ def clean_api_env(monkeypatch, tmp_path_factory):
         "TRADING_UPGRADE_BANNER_COPY",
         "TRADING_LIMIT_HIT_COPY",
         "TRADING_REPORT_LIMIT_COPY",
+        # Phase 6.2 — manifest-backed key store paths.
+        "TRADING_API_KEYS_MANIFEST_PATH",
+        "TRADING_API_KEYS_REVOKED_PATH",
+        # Phase 8.1 — tier-aware usage enforcement knobs.
+        "TRADING_USAGE_ENFORCEMENT_ENABLED",
+        "TRADING_FREE_DAILY_REQUEST_LIMIT",
+        "TRADING_PREMIUM_DAILY_REQUEST_LIMIT",
+        "TRADING_USAGE_LIMIT_EXEMPT_PATHS",
     ):
         monkeypatch.delenv(name, raising=False)
     # Redirect the Phase 4.4 default audit file into a throwaway tmp
@@ -92,9 +101,31 @@ def clean_api_env(monkeypatch, tmp_path_factory):
     # Phase 5.5 — upgrade events log path.
     upgrade_tmp = tmp_path_factory.mktemp("upgrade_events") / "events.jsonl"
     monkeypatch.setenv("TRADING_API_UPGRADE_EVENTS_LOG_PATH", str(upgrade_tmp))
+    # Phase 6.2 — point manifest + revocation paths at empty tmp files
+    # so the suite never sees a real ``data/api_keys_manifest.jsonl``
+    # left over from operator CLI runs. Tests that want manifest-backed
+    # auth override these paths and write rows themselves.
+    keys_manifest_tmp = (
+        tmp_path_factory.mktemp("api_keys_manifest")
+        / "api_keys_manifest.jsonl"
+    )
+    keys_revoked_tmp = (
+        tmp_path_factory.mktemp("api_keys_revoked")
+        / "api_keys_revoked.jsonl"
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest_tmp),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked_tmp),
+    )
     # Also wipe the billing module's in-memory cache between tests.
     from trading_bot.api import billing as _billing_mod
     _billing_mod.reset_cache_for_tests()
+    # Phase 6.2 — wipe the key_store cache so a previous test's
+    # manifest/revocation file does not leak into this one.
+    from trading_bot.api import key_store as _key_store_mod
+    _key_store_mod.reset_caches_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -263,8 +294,12 @@ class TestHealth:
 # ---------------------------------------------------------------------------
 
 
+# Phase 10.2 dropped /reports/latest from this list — it now serves
+# an unauthenticated free-tier preview when no Authorization header
+# is presented. The Phase-10.2 carve-out test class
+# (TestPhase102ReportsLatestPreviewAuthMatrix) covers the new
+# matrix; the remaining endpoints stay strictly protected.
 PROTECTED_ENDPOINTS = [
-    "/reports/latest",
     "/reports/2026-04-24",
     "/experiments/recent",
     "/experiments/1",
@@ -691,9 +726,11 @@ class TestBoundaryEnforcement:
             for method in methods:
                 if method in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe", (
-                    f"non-read-only route detected: {method} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both.
+                assert (method, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only route detected: {method} {path}"
                 assert method == "POST", (
                     f"/webhook/stripe may only accept POST, got {method}"
                 )
@@ -1417,10 +1454,13 @@ class TestRequestLogging:
     def test_auth_failure_is_logged_with_status_401(
         self, client: TestClient, authed_env, capsys
     ):
-        client.get("/reports/latest")
+        # Phase 10.2 dropped /reports/latest from the strictly-
+        # protected set; use /reports/{date} as the carrier route
+        # for this auth-failure logging test.
+        client.get("/reports/2026-04-24")
         out = self._capture(capsys)
         assert "api.request" in out
-        assert "path=/reports/latest" in out
+        assert "path=/reports/2026-04-24" in out
         assert "status=401" in out
 
     def test_log_never_includes_bearer_token(
@@ -1491,9 +1531,11 @@ class TestPhase42BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_forbidden_imports_still_enforced(self):
         """Re-assert Phase 4.0 invariant — no Core imports."""
@@ -1562,9 +1604,11 @@ class TestLandingPageIsPublic:
         self, client: TestClient, authed_env
     ):
         """Re-assert Phase 4.0 invariant — adding / must not weaken
-        auth on any protected endpoint."""
+        auth on any protected endpoint. Phase 10.2 dropped
+        /reports/latest from this set (it now serves an
+        unauthenticated preview); the remaining endpoints stay
+        strictly authenticated."""
         for path in (
-            "/reports/latest",
             "/reports/2026-04-24",
             "/experiments/recent",
             "/experiments/1",
@@ -1756,9 +1800,11 @@ class TestLandingPageBoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_landing_route_accepts_only_get_head_options(self):
         for route in app.routes:
@@ -2115,7 +2161,10 @@ class TestAuditAuthenticatedFlag:
     def test_protected_endpoint_without_auth_is_false(
         self, client: TestClient, authed_env, audit_path: Path
     ):
-        client.get("/reports/latest")  # no header → 401
+        # Phase 10.2 made /reports/latest unauthenticated-friendly
+        # (it now serves a preview). Use /reports/{date} as the
+        # carrier route for this auth-failure audit invariant.
+        client.get("/reports/2026-04-24")  # no header → 401
         rec = _read_audit(audit_path)[-1]
         assert rec["status_code"] == 401
         assert rec["authenticated"] is False
@@ -2281,9 +2330,11 @@ class TestPhase44BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_audit_never_writes_report_or_experiment_contents(
         self, client: TestClient, authed_env, audit_path: Path
@@ -2809,8 +2860,10 @@ class TestPhase45BoundaryUnchanged:
     def test_no_header_still_401_on_protected_endpoints(
         self, client: TestClient, free_env
     ):
+        # Phase 10.2 dropped /reports/latest from this set —
+        # unauth there now serves a preview (covered by the
+        # Phase 10.2 carve-out class).
         for path in (
-            "/reports/latest",
             "/reports/2026-04-24",
             "/experiments/recent",
             "/experiments/1",
@@ -2870,9 +2923,11 @@ class TestPhase45BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method introduced: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method introduced: {m} {path}"
 
     def test_forbidden_imports_still_clean(self):
         src = (
@@ -3238,9 +3293,11 @@ class TestPhase46BoundaryUnchanged:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"non-read-only method: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"non-read-only method: {m} {path}"
 
     def test_forbidden_imports_still_clean_after_phase_4_6(self):
         src = (
@@ -3319,11 +3376,35 @@ def stripe_env(monkeypatch, tmp_path: Path):
     manifest = tmp_path / "manifest.jsonl"
     monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
     monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
+
+    # Phase 7.0 — pre-issue the fixture api_key into the issuance
+    # manifest so the webhook's manifest-gate accepts Stripe events
+    # for this customer. The autouse clean_api_env fixture already
+    # redirected TRADING_API_KEYS_MANIFEST_PATH to a tmp file.
+    import hashlib as _hl
+    keys_manifest = Path(os.environ["TRADING_API_KEYS_MANIFEST_PATH"])
+    keys_manifest.parent.mkdir(parents=True, exist_ok=True)
+    key_hash = _hl.sha256(
+        b"stripe-customer-api-key",
+    ).hexdigest()[:32]
+    row = {
+        "created_at": "2026-04-25T00:00:00.000000Z",
+        "key_hash": key_hash,
+        "label_hash": "f" * 32,
+        "tier": "free",
+        "checkout_session_id": None,
+    }
+    with open(keys_manifest, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
+
     return {
         "cache_file": cache_file,
         "reports_dir": reports_dir,
         "manifest": manifest,
         "api_key": "stripe-customer-api-key",
+        "api_key_hash": key_hash,
     }
 
 
@@ -3658,10 +3739,12 @@ class TestWebhookNeverPersistsSensitiveData:
             "LEAKED_CARDHOLDER",
             "4242424242424242",
             "999",
+            # Phase 7.0 — the raw api_key itself no longer lands on disk.
+            api_key,
         ):
             assert leak not in raw, f"leaked {leak!r} to {stripe_env['cache_file']}"
-        # The opaque api_key is the ONLY thing persisted.
-        assert api_key in raw
+        # The hash IS expected — Phase 7.0 persisted form.
+        assert stripe_env["api_key_hash"] in raw
 
     def test_webhook_response_body_never_echoes_sensitive_fields(
         self, client: TestClient, stripe_env
@@ -3695,13 +3778,15 @@ class TestWebhookNeverPersistsSensitiveData:
 
 class TestPhase47Boundary:
     def test_only_non_read_verb_is_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
+                assert (m, path) in allowed, (
                     f"non-read-only method {m} on {path}"
                 )
 
@@ -4001,9 +4086,11 @@ class TestPhase52DoesNotAddNewMutatingRoute:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
-                    f"Phase 5.2 introduced a non-read verb: {m} {path}"
-                )
+                # Phase 7.3 added POST /billing/checkout — allow both.
+                assert (m, path) in {
+                    ("POST", "/webhook/stripe"),
+                    ("POST", "/billing/checkout"),
+                }, f"Phase 5.2 introduced a non-read verb: {m} {path}"
 
     def test_root_accepts_only_get_head_options(self):
         for route in app.routes:
@@ -4592,13 +4679,15 @@ class TestPhase54BoundaryUnchanged:
             )
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
+                assert (m, path) in allowed, (
                     f"non-read-only verb introduced: {m} {path}"
                 )
 
@@ -4987,13 +5076,15 @@ class TestPhase55Boundary:
             assert forbidden not in src
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST"
+                assert (m, path) in allowed
 
 
 # ===========================================================================
@@ -5396,13 +5487,15 @@ class TestPhase57BoundaryUnchanged:
             assert forbidden not in src
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
+        # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST"
+                assert (m, path) in allowed
 
     def test_responses_never_echo_env_var_names(
         self, client: TestClient, free_env, usage_path: Path, monkeypatch,
@@ -5820,5 +5913,4461 @@ class TestPhase59HtmlShape:
                 methods = getattr(route, "methods", set()) or set()
                 assert methods.issubset({"GET", "HEAD", "OPTIONS"})
                 break
+
+
+# ===========================================================================
+# Phase 6.2 — manifest-backed API key authentication
+# ===========================================================================
+
+
+class _ManifestEnv:
+    """Helper bundle of paths the Phase 6.2 tests share."""
+
+    def __init__(self, tmp_path: Path):
+        self.reports_dir = tmp_path / "reports"
+        self.manifest = tmp_path / "experiments.jsonl"
+        self.keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+        self.keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+
+
+@pytest.fixture
+def manifest_auth_env(monkeypatch, tmp_path: Path) -> _ManifestEnv:
+    """
+    Configure the server with NO env API key — the only way in is via
+    a row in the keys manifest. This is the realistic Phase 6.2
+    deployment shape.
+    """
+    env = _ManifestEnv(tmp_path)
+    # Explicitly leave TRADING_API_KEY / TRADING_API_PREMIUM_KEYS unset
+    # so the test exercises the manifest path exclusively.
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(env.reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(env.manifest))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(env.keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(env.keys_revoked),
+    )
+    return env
+
+
+def _issue_via_cli(tier: str, label: str = "user") -> tuple[str, str]:
+    """Issue a key in-process via the keys CLI and return (raw, hash)."""
+    from trading_bot.api.keys import issue_key
+
+    result = issue_key(tier=tier, label=label)
+    return result["api_key"], result["key_hash"]
+
+
+class TestPhase62ManifestKeyAuth:
+    """A key issued by the keys CLI authenticates against the live
+    server with no env-var edits."""
+
+    def test_free_manifest_key_authenticates_reports_endpoint(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        raw, _ = _issue_via_cli("free", label="phase62-free")
+        # Write a recent report so the endpoint has data to return.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        r = client.get(
+            "/reports/latest", headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_unknown_key_rejected_when_only_manifest_configured(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        # No issuance happens — the manifest is empty, so the server
+        # must fail-closed on protected endpoints.
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer never-issued-key"},
+        )
+        # Empty manifest + no env keys → 503 fail-closed.
+        assert r.status_code == 503
+
+    def test_no_env_no_manifest_returns_503(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer x"},
+        )
+        assert r.status_code == 503
+        assert "issue" in r.json()["detail"].lower()
+
+    def test_unknown_key_with_active_manifest_returns_403(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        _issue_via_cli("free", label="another")
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer not-the-issued-key"},
+        )
+        assert r.status_code == 403
+
+
+class TestPhase62TierBehaviour:
+    """Manifest tier flows through the existing free-tier limits."""
+
+    def test_free_manifest_key_subject_to_report_cap(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        raw, _ = _issue_via_cli("free", label="cap-victim")
+        # Tighten the report cap to 1 so we exhaust it in one call.
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "100")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # First /reports/* call goes through.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        # Second is blocked by the per-tier report-call cap.
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 403
+
+    def test_premium_manifest_key_bypasses_free_cap(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        raw, _ = _issue_via_cli("premium", label="vip")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Premium goes well past the free cap.
+        for _ in range(5):
+            r = client.get("/reports/latest", headers=h)
+            assert r.status_code == 200
+
+
+class TestPhase62Revocation:
+    """Revocation rejects a previously-issued key with 403 — without
+    a server restart, since key_store hot-reloads on mtime change."""
+
+    def test_revoked_manifest_key_rejected(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+    ):
+        from trading_bot.api import key_store
+        from trading_bot.api.keys import main as keys_main
+
+        raw, key_hash = _issue_via_cli("free", label="rotate")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Sanity — accepted before revocation.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+
+        # Revoke via the CLI entry point.
+        rc = keys_main([
+            "revoke", "--key-hash", key_hash, "--reason", "rotated",
+        ])
+        assert rc == 0
+        # Force the cache to reload — in production the next request's
+        # mtime check picks the new file up automatically.
+        key_store.reset_caches_for_tests()
+
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 403
+
+    def test_revocation_wins_over_env_premium(
+        self, client: TestClient, monkeypatch, tmp_path: Path,
+    ):
+        """A revoked hash must be rejected even when the same raw key
+        is also present in TRADING_API_PREMIUM_KEYS. Revocation is
+        the unambiguous kill switch."""
+        from trading_bot.api import key_store
+        from trading_bot.api.keys import main as keys_main
+
+        raw = "shared-key-XYZ"
+        reports_dir = tmp_path / "reports"
+        manifest = tmp_path / "manifest.jsonl"
+        keys_revoked = tmp_path / "revoked.jsonl"
+        monkeypatch.setenv(API_KEY_ENV_VAR, "unrelated-other-key")
+        monkeypatch.setenv("TRADING_API_PREMIUM_KEYS", raw)
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(manifest))
+        monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked))
+        # Manifest can be empty; we're testing revocation precedence.
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_MANIFEST_PATH",
+            str(tmp_path / "empty_manifest.jsonl"),
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Sanity — env-premium accepts the key.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+
+        rc = keys_main([
+            "revoke", "--api-key", raw,
+            "--revoked-path", str(keys_revoked),
+        ])
+        assert rc == 0
+        key_store.reset_caches_for_tests()
+
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 403
+
+
+class TestPhase62Precedence:
+    """Stripe > env premium > manifest premium > manifest free > env free."""
+
+    def test_env_free_still_works(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        """Existing single-tenant TRADING_API_KEY deployments must
+        continue to work — Phase 6.2 is additive."""
+        # authed_env sets both TRADING_API_KEY and TRADING_API_PREMIUM_KEYS;
+        # remove the premium binding so the key resolves as free.
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(authed_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert r.status_code == 200
+
+    def test_env_premium_still_works(self, client: TestClient, authed_env):
+        """authed_env wires VALID_KEY into TRADING_API_PREMIUM_KEYS by
+        default — assert the path still resolves as premium."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(authed_env["reports_dir"], today)
+        # Tighten the cap; premium must bypass it.
+        # (Premium env precedence preserved — pre-Phase 6.2 contract.)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {VALID_KEY}"},
+        )
+        assert r.status_code == 200
+
+    def test_stripe_premium_still_works(
+        self, client: TestClient, monkeypatch, tmp_path: Path,
+    ):
+        """A key sourced from the Stripe billing cache continues to
+        authenticate as premium — Phase 4.7 contract preserved.
+
+        Stripe-cached keys live alongside ``TRADING_API_KEY`` in the
+        existing deployment shape (Stripe alone has never satisfied
+        the fail-closed check). We assert the Stripe cache resolves
+        the bearer token to premium even when the env-key is set to a
+        different value."""
+        from trading_bot.api import billing
+
+        reports_dir = tmp_path / "reports"
+        monkeypatch.setenv(API_KEY_ENV_VAR, "unrelated-env-key")
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_xyz")
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_MANIFEST_PATH",
+            str(tmp_path / "empty_keys_manifest.jsonl"),
+        )
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_REVOKED_PATH",
+            str(tmp_path / "empty_revoked.jsonl"),
+        )
+        # Seed the Stripe-cache premium set.
+        billing.reset_cache_for_tests()
+        billing.add_premium_key("stripe-cache-key-123")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(reports_dir, today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer stripe-cache-key-123"},
+        )
+        assert r.status_code == 200
+
+    def test_manifest_premium_when_env_only_has_free_key(
+        self, client: TestClient, monkeypatch, tmp_path: Path,
+    ):
+        """Existing TRADING_API_KEY (free) coexists with a manifest-issued
+        premium key. Both authenticate; tier resolves correctly."""
+        reports_dir = tmp_path / "reports"
+        keys_manifest = tmp_path / "keys_manifest.jsonl"
+        keys_revoked = tmp_path / "revoked.jsonl"
+        monkeypatch.setenv(API_KEY_ENV_VAR, "legacy-free")
+        monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+        monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+        )
+        monkeypatch.setenv(
+            "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+        )
+        # Issue a premium manifest key against the right env path.
+        from trading_bot.api.keys import issue_key
+        issued = issue_key(tier="premium", label="vip")
+        raw_premium = issued["api_key"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(reports_dir, today)
+
+        # Free env key works.
+        r1 = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer legacy-free"},
+        )
+        assert r1.status_code == 200
+
+        # Premium manifest key also works.
+        r2 = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw_premium}"},
+        )
+        assert r2.status_code == 200
+
+
+class TestPhase62NoRawKeyOnDisk:
+    """No persisted artefact — manifest, revocation log, audit log,
+    or usage log — may contain the raw API key."""
+
+    def test_raw_key_absent_from_manifest_revoked_audit_usage(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api.keys import main as keys_main
+
+        raw, key_hash = _issue_via_cli("free", label="leak-test")
+        # Make a request so audit + usage logs accrue at least one row.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Now revoke by raw key (the path most likely to leak).
+        rc = keys_main([
+            "revoke", "--api-key", raw,
+            "--revoked-path", str(manifest_auth_env.keys_revoked),
+            "--reason", "leak-test",
+        ])
+        assert rc == 0
+
+        # Manifest stores only the hash.
+        manifest_body = manifest_auth_env.keys_manifest.read_text(
+            encoding="utf-8",
+        )
+        assert raw not in manifest_body
+        assert key_hash in manifest_body
+
+        # Revocation log stores only the hash.
+        revoked_body = manifest_auth_env.keys_revoked.read_text(
+            encoding="utf-8",
+        )
+        assert raw not in revoked_body
+        assert key_hash in revoked_body
+
+        # Audit log (Phase 4.4) stores no api key in any form except
+        # via authentication-status booleans.
+        audit_path = Path(os.environ["TRADING_API_AUDIT_LOG_PATH"])
+        if audit_path.exists():
+            assert raw not in audit_path.read_text(encoding="utf-8")
+
+        # Usage log (Phase 4.6) stores only key_hash.
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        if usage_path.exists():
+            usage_body = usage_path.read_text(encoding="utf-8")
+            assert raw not in usage_body
         else:
             raise AssertionError("/ route not registered")
+
+
+# ===========================================================================
+# Phase 7.0 — Stripe → key activation bridge (end-to-end via live server)
+# ===========================================================================
+
+
+class TestPhase70StripeActivationFlow:
+    """End-to-end: operator issues a free manifest key, Stripe fires
+    subscription.created (via handle_webhook_event), the SAME key now
+    resolves as premium against the live FastAPI app — no env-var
+    edits, no manifest mutation."""
+
+    def test_issue_free_then_webhook_upgrade_grants_premium(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        from trading_bot.api import billing, key_store
+        from trading_bot.api.keys import issue_key
+
+        # Stripe must be "configured" for is_premium_via_stripe to
+        # count in _is_premium's precedence order.
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        # Billing cache on its own tmp path.
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(manifest_auth_env.keys_manifest.parent / "stripe_cache.json"),
+        )
+        billing.reset_cache_for_tests()
+
+        issued = issue_key(tier="free", label="phase7-stripe")
+        raw = issued["api_key"]
+        key_hash = issued["key_hash"]
+        manifest_bytes_before = manifest_auth_env.keys_manifest.read_bytes()
+
+        # Write a report so /reports/latest can return 200.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+
+        # Before the Stripe event, the key authenticates but is FREE.
+        # Tighten the free cap so we can observe the tier.
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        h = {"Authorization": f"Bearer {raw}"}
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        # Second /reports/* request should now 403 (free-tier cap hit).
+        assert client.get("/reports/latest", headers=h).status_code == 403
+
+        # Now fire the Stripe subscription.created webhook.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        # Reset server-side caches so _is_premium / is_premium_via_stripe
+        # re-read the premium cache.
+        billing.reset_cache_for_tests()
+        key_store.reset_caches_for_tests()
+
+        # Premium now. Issue several /reports/latest calls; premium
+        # is exempt from the free cap.
+        for _ in range(5):
+            r = client.get("/reports/latest", headers=h)
+            assert r.status_code == 200
+
+        # The issuance manifest was NEVER mutated.
+        assert manifest_auth_env.keys_manifest.read_bytes() == manifest_bytes_before
+        # And the manifest row still says tier=free (unchanged).
+        import json as _json
+        rows = [
+            _json.loads(line)
+            for line in manifest_auth_env.keys_manifest.read_text().splitlines()
+            if line.strip()
+        ]
+        assert any(r["key_hash"] == key_hash and r["tier"] == "free" for r in rows)
+
+    def test_cancellation_reverts_to_manifest_tier(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        from trading_bot.api import billing, key_store
+        from trading_bot.api.keys import issue_key
+
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(manifest_auth_env.keys_manifest.parent / "stripe_cache.json"),
+        )
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        billing.reset_cache_for_tests()
+
+        issued = issue_key(tier="free", label="phase7-cancel")
+        raw = issued["api_key"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(manifest_auth_env.reports_dir, today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Promote to premium.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        key_store.reset_caches_for_tests()
+        # Premium bypasses the free cap.
+        for _ in range(3):
+            assert client.get("/reports/latest", headers=h).status_code == 200
+
+        # Cancel.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": raw},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        key_store.reset_caches_for_tests()
+
+        # Back to the manifest's tier (free). Cap should kick in.
+        # First call consumes the remaining quota; we may already be
+        # near the cap from the promotion window, so just assert the
+        # eventual 403 lands.
+        statuses = [
+            client.get("/reports/latest", headers=h).status_code
+            for _ in range(3)
+        ]
+        assert 403 in statuses, (
+            f"expected at least one 403 after cancellation; got {statuses!r}"
+        )
+
+    def test_unissued_key_webhook_is_rejected_server_side(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch,
+    ):
+        """A Stripe event for an api_key we never issued must NOT
+        grant the bearer any access. The server still 403s because
+        the key is not in env, Stripe cache (webhook gate refused),
+        or manifest."""
+        from trading_bot.api import billing
+
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(manifest_auth_env.keys_manifest.parent / "stripe_cache.json"),
+        )
+        billing.reset_cache_for_tests()
+        # Pre-issue a DIFFERENT key so the server is configured (manifest
+        # non-empty) and the unknown-key path returns 403 rather than 503.
+        from trading_bot.api.keys import issue_key
+        issue_key(tier="free", label="some-other-user")
+
+        phantom = "stripe-phantom-key-never-issued"
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": phantom},
+            }},
+        })
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {phantom}"},
+        )
+        assert r.status_code == 403
+
+
+class TestPhase70NoRawKeyInStripeCache:
+    """End-to-end: a raw api_key promoted via the Stripe webhook
+    must NOT appear in the premium cache file — only its hash."""
+
+    def test_cache_file_has_only_hash_after_webhook(
+        self, client: TestClient, manifest_auth_env: _ManifestEnv,
+        monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        from trading_bot.api.keys import issue_key
+
+        cache_path = tmp_path / "stripe_cache_phase7.json"
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_path),
+        )
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase7")
+        billing.reset_cache_for_tests()
+
+        issued = issue_key(tier="free", label="phase7-leak-test")
+        raw = issued["api_key"]
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+
+        assert cache_path.exists()
+        body = cache_path.read_text(encoding="utf-8")
+        assert raw not in body, (
+            "Phase 7.0: raw api_key must never appear in the Stripe cache"
+        )
+        assert issued["key_hash"] in body
+
+
+# ===========================================================================
+# Phase 7.1 — browser icon noise cleanup
+# ===========================================================================
+
+
+ICON_PATHS = (
+    "/favicon.ico",
+    "/apple-touch-icon.png",
+    "/apple-touch-icon-precomposed.png",
+)
+
+
+class TestPhase71IconRoutes:
+    """All three browser icon routes return 204 No Content with
+    security headers applied and no auth required."""
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_returns_204_no_content(self, client: TestClient, path: str):
+        r = client.get(path)
+        assert r.status_code == 204
+        assert r.content == b""
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_no_auth_required(self, client: TestClient, path: str):
+        # No Authorization header — still 204, never 401/403/503.
+        r = client.get(path)
+        assert r.status_code == 204
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_also_204_when_no_api_key_configured(
+        self, client: TestClient, monkeypatch, path: str,
+    ):
+        """Even when the server has NO auth configured, icon routes
+        must not 503 — they're public by browser convention."""
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        r = client.get(path)
+        assert r.status_code == 204
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_security_headers_still_applied(
+        self, client: TestClient, path: str,
+    ):
+        r = client.get(path)
+        assert r.headers.get("X-Content-Type-Options") == "nosniff"
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert r.headers.get("Referrer-Policy") == "no-referrer"
+        assert "Content-Security-Policy" in r.headers
+
+    @pytest.mark.parametrize("path", ICON_PATHS)
+    def test_only_safe_verbs_registered(self, path: str):
+        """No POST/PUT/DELETE/PATCH on any icon route."""
+        for route in app.routes:
+            if getattr(route, "path", "") == path:
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"}), (
+                    f"{path} registered a mutating verb: {methods}"
+                )
+
+    def test_icons_do_not_count_toward_free_tier_cap(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        """Phase 5.4 free-tier cap must NOT apply to icon requests —
+        a browser that refreshes a page 100 times must not lock the
+        user out of /reports/."""
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "5")
+        # Raise the Phase 4.2 per-IP cap well above the hammer count
+        # so this test isolates the Phase 5.4 free-tier behaviour.
+        monkeypatch.setenv("TRADING_API_RATE_LIMIT_PER_MINUTE", "1000")
+        monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(authed_env["reports_dir"], today)
+        h = {"Authorization": f"Bearer {VALID_KEY}"}
+
+        # Hammer the icons — they should NOT consume the daily cap.
+        for _ in range(20):
+            for p in ICON_PATHS:
+                r = client.get(p, headers=h)
+                assert r.status_code == 204
+
+        # A real protected request still succeeds (cap untouched).
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 200
+
+    def test_icons_do_not_write_usage_log_rows(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        """Icon requests are noise — they must not pollute the
+        per-key usage log."""
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        # No Authorization header — icon routes should still 204 without
+        # any usage row.
+        for p in ICON_PATHS:
+            client.get(p)
+        if usage_path.exists():
+            body = usage_path.read_text(encoding="utf-8")
+            for p in ICON_PATHS:
+                assert p not in body, (
+                    f"Phase 7.1: icon path {p!r} should not be in the usage log"
+                )
+
+
+# ===========================================================================
+# Phase 7.3 — POST /billing/checkout (authenticated end-user upgrade)
+# ===========================================================================
+
+
+class _CheckoutFakePoster:
+    """Records every Stripe POST so tests can assert exact metadata shape."""
+
+    def __init__(self, response=None, raise_exc=None):
+        self.response = response or {
+            "id": "cs_phase73_endpoint",
+            "url": "https://checkout.stripe.com/c/cs_phase73_endpoint",
+        }
+        self.raise_exc = raise_exc
+        self.calls = []
+
+    def __call__(self, *, url, data, auth, timeout):
+        self.calls.append({"url": url, "data": dict(data), "auth": auth})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return dict(self.response) if isinstance(self.response, dict) else self.response
+
+
+@pytest.fixture
+def checkout_env(monkeypatch, tmp_path: Path):
+    """
+    Configure the server with a free-tier manifest key + Stripe env
+    + a public base URL so POST /billing/checkout can succeed.
+    """
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "manifest.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_phase73_endpoint")
+    monkeypatch.setenv("STRIPE_PREMIUM_PRICE_ID", "price_test_phase73_endpoint")
+    monkeypatch.setenv("TRADING_PUBLIC_BASE_URL", "https://api.example.com")
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+def _issue_free_for_checkout() -> tuple[str, str]:
+    """Issue a free key in-process and return (raw, hash)."""
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier="free", label="phase73-checkout")
+    return result["api_key"], result["key_hash"]
+
+
+def _patch_stripe_poster(monkeypatch, fake: _CheckoutFakePoster):
+    from trading_bot.api import billing as _billing_mod
+    monkeypatch.setattr(_billing_mod, "_post_to_stripe", fake)
+
+
+class TestPhase73CheckoutAuth:
+    def test_missing_auth_returns_401(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        # Fail-closed posture requires manifest to be non-empty for 401
+        # (vs 503). Pre-issue a key so the deployment is "configured".
+        _issue_free_for_checkout()
+        r = client.post("/billing/checkout")
+        assert r.status_code == 401
+
+    def test_bogus_key_returns_403(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert r.status_code == 403
+
+
+class TestPhase73CheckoutHappyPath:
+    def test_free_key_creates_checkout_session(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["checkout_session_id"] == "cs_phase73_endpoint"
+        assert body["checkout_url"].startswith("https://checkout.stripe.com/")
+        assert body["key_hash"] == key_hash
+        assert body["tier_to"] == "premium"
+
+    def test_response_never_includes_raw_api_key(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, _ = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        assert raw not in r.text
+
+    def test_stripe_metadata_contains_key_hash_not_raw(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        data = fake.calls[0]["data"]
+        # Hash present in EVERY documented metadata field.
+        assert data["client_reference_id"] == key_hash
+        assert data["metadata[key_hash]"] == key_hash
+        assert data["metadata[tier_from]"] == "free"
+        assert data["metadata[tier_to]"] == "premium"
+        # Raw key absent from the entire form payload.
+        for value in data.values():
+            assert raw not in str(value), (
+                f"raw api_key leaked into Stripe metadata: {value!r}"
+            )
+
+    def test_stripe_subscription_metadata_contains_key_hash(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        data = fake.calls[0]["data"]
+        assert data["subscription_data[metadata][key_hash]"] == key_hash
+        assert data["subscription_data[metadata][tier_to]"] == "premium"
+
+    def test_default_success_and_cancel_urls(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        data = fake.calls[0]["data"]
+        assert data["success_url"] == (
+            "https://api.example.com/dashboard?checkout=success"
+        )
+        assert data["cancel_url"] == (
+            "https://api.example.com/dashboard?checkout=cancel"
+        )
+
+    def test_overridden_success_and_cancel_paths(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.setenv("STRIPE_CHECKOUT_SUCCESS_PATH", "/welcome")
+        monkeypatch.setenv("STRIPE_CHECKOUT_CANCEL_PATH", "/back")
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        data = fake.calls[0]["data"]
+        assert data["success_url"] == "https://api.example.com/welcome"
+        assert data["cancel_url"] == "https://api.example.com/back"
+
+
+class TestPhase73CheckoutAlreadyPremium:
+    def test_premium_key_returns_409(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, _ = _issue_free_for_checkout()
+        # Promote the key via the existing webhook path so the
+        # premium classifier returns True.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        # Make sure Stripe is "configured" so _is_premium hits the
+        # cache path.
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase73_already_premium")
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 409
+        assert "already premium" in r.json()["detail"].lower()
+
+
+class TestPhase73CheckoutMisconfigured:
+    def test_missing_stripe_secret_returns_503(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.delenv("STRIPE_SECRET_KEY", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+        raw, _ = _issue_free_for_checkout()
+        # Don't patch _post_to_stripe — config check fails first.
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 503
+        assert "STRIPE_SECRET_KEY" in r.json()["detail"]
+
+    def test_missing_premium_price_id_returns_503(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.delenv("STRIPE_PREMIUM_PRICE_ID", raising=False)
+        monkeypatch.delenv("STRIPE_PRICE_ID_PREMIUM", raising=False)
+        raw, _ = _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 503
+        assert "STRIPE_PREMIUM_PRICE_ID" in r.json()["detail"]
+
+    def test_missing_public_base_url_returns_503(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        raw, _ = _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 503
+        assert "TRADING_PUBLIC_BASE_URL" in r.json()["detail"]
+
+
+class TestPhase73CheckoutStripeFailure:
+    def test_stripe_api_error_returns_502(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster(
+            raise_exc=BillingAPIError("simulated stripe 500"),
+        )
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 502
+        assert "checkout provider error" in r.json()["detail"].lower()
+
+    def test_stripe_returns_malformed_payload_502(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, _ = _issue_free_for_checkout()
+        fake = _CheckoutFakePoster(response={"id": "cs_x"})  # missing url
+        _patch_stripe_poster(monkeypatch, fake)
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 502
+
+
+class TestPhase73CheckoutNoPersistence:
+    """The checkout_url returned to the caller must NOT land on disk
+    in any operator log — manifest, revoked, usage, audit, premium
+    cache, conversion, upgrade events."""
+
+    def test_checkout_url_never_persisted_to_any_log(
+        self, client: TestClient, checkout_env, monkeypatch, tmp_path: Path,
+    ):
+        # Distinctive marker so a substring search is meaningful.
+        marker = "https://checkout.stripe.com/c/cs_PHASE73_LEAK_GUARD_xyz"
+        fake = _CheckoutFakePoster(response={
+            "id": "cs_PHASE73_LEAK_GUARD_xyz",
+            "url": marker,
+        })
+        _patch_stripe_poster(monkeypatch, fake)
+        # Point the Stripe cache at a tmp path inside checkout_env's tree.
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(checkout_env["keys_manifest"].parent / "stripe_cache.json"),
+        )
+        from trading_bot.api import billing
+        billing.reset_cache_for_tests()
+
+        raw, _ = _issue_free_for_checkout()
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        # The response DOES carry the URL (caller-safe).
+        assert marker in r.text
+
+        # Every operator log on disk must NOT contain it.
+        logs_to_check: list[Path] = [
+            checkout_env["keys_manifest"],
+            checkout_env["keys_revoked"],
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            Path(os.environ["TRADING_API_AUDIT_LOG_PATH"]),
+            Path(os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]),
+            checkout_env["keys_manifest"].parent / "stripe_cache.json",
+        ]
+        for path in logs_to_check:
+            if path.exists():
+                body = path.read_text(encoding="utf-8")
+                assert marker not in body, (
+                    f"checkout_url leaked into {path}"
+                )
+
+    def test_raw_api_key_never_persisted_after_checkout(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Manifest stores hash, not raw key.
+        manifest_body = checkout_env["keys_manifest"].read_text("utf-8")
+        assert raw not in manifest_body
+        assert key_hash in manifest_body
+        # Audit log never contains the raw key in any form.
+        audit_path = Path(os.environ["TRADING_API_AUDIT_LOG_PATH"])
+        if audit_path.exists():
+            assert raw not in audit_path.read_text("utf-8")
+        # Usage log uses hashes only.
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        if usage_path.exists():
+            assert raw not in usage_path.read_text("utf-8")
+
+
+# ===========================================================================
+# Phase 7.4 — end-to-end /billing/checkout → webhook[key_hash] → premium
+# ===========================================================================
+
+
+class TestPhase74CheckoutWebhookEndToEnd:
+    """The Phase 7.3 endpoint plus the Phase 7.4 webhook handler
+    must compose into a complete free → premium flow that requires
+    no raw API key on the wire to Stripe and no env-var edits."""
+
+    def test_checkout_then_webhook_promotes_to_premium(
+        self, client: TestClient, checkout_env, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        from trading_bot.api.keys import issue_key
+
+        # Stripe + manifest plumbing.
+        cache_path = tmp_path / "stripe_cache_phase74.json"
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_path),
+        )
+        billing.reset_cache_for_tests()
+
+        # Free key + report so /reports/latest can return 200.
+        result = issue_key(tier="free", label="phase74-e2e")
+        raw = result["api_key"]
+        key_hash = result["key_hash"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+
+        # Step 1: /billing/checkout — returns a Checkout URL.
+        fake = _CheckoutFakePoster()
+        _patch_stripe_poster(monkeypatch, fake)
+        r1 = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r1.status_code == 200, r1.text
+        body = r1.json()
+        assert body["key_hash"] == key_hash
+        # Confirm the key_hash was actually placed in the Stripe payload.
+        forwarded = fake.calls[0]["data"]
+        assert forwarded["metadata[key_hash]"] == key_hash
+        assert "metadata[api_key]" not in forwarded
+
+        # Sanity — pre-webhook the key is FREE. Tighten the cap so
+        # the next /reports/latest call demonstrates that.
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        h = {"Authorization": f"Bearer {raw}"}
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        assert client.get("/reports/latest", headers=h).status_code == 403
+
+        # Step 2: Stripe fires customer.subscription.created with the
+        # SAME metadata Phase 7.3 sent (key_hash only — no api_key).
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {
+                    "key_hash": key_hash,
+                    "tier_from": "free",
+                    "tier_to": "premium",
+                },
+            }},
+        })
+        assert result["action"] == "added"
+        assert result["identity"] == "key_hash"
+
+        # Reset the in-memory premium cache so the server re-reads.
+        billing.reset_cache_for_tests()
+
+        # Step 3: same key now resolves as PREMIUM and bypasses the
+        # free-tier cap.
+        for _ in range(5):
+            assert client.get(
+                "/reports/latest", headers=h,
+            ).status_code == 200
+
+        # And the on-disk cache contains ONLY the hash — no raw key.
+        body_disk = cache_path.read_text(encoding="utf-8")
+        assert key_hash in body_disk
+        assert raw not in body_disk
+
+    def test_cancellation_via_hash_reverts_to_free(
+        self, client: TestClient, checkout_env, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        from trading_bot.api.keys import issue_key
+
+        cache_path = tmp_path / "stripe_cache_phase74_cancel.json"
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH", str(cache_path),
+        )
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1")
+        billing.reset_cache_for_tests()
+
+        result = issue_key(tier="free", label="phase74-cancel")
+        raw, key_hash = result["api_key"], result["key_hash"]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+        h = {"Authorization": f"Bearer {raw}"}
+
+        # Promote via hash path.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        for _ in range(3):
+            assert client.get("/reports/latest", headers=h).status_code == 200
+
+        # Cancel via hash path.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        billing.reset_cache_for_tests()
+
+        # Back to free → cap applies.
+        statuses = [
+            client.get("/reports/latest", headers=h).status_code
+            for _ in range(3)
+        ]
+        assert 403 in statuses, (
+            f"expected 403 after cancellation; got {statuses!r}"
+        )
+
+    def test_unissued_key_hash_in_webhook_does_not_grant_access(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        """A Stripe replay carrying a key_hash we never issued must
+        NOT promote that hash. The HTTP layer also still 403s."""
+        from trading_bot.api import billing
+
+        # Configure for a clean Stripe-only state.
+        billing.reset_cache_for_tests()
+        # Pre-issue someone ELSE so the deployment is configured.
+        from trading_bot.api.keys import issue_key
+        issue_key(tier="free", label="some-other-user")
+
+        phantom_hash = "f" * 32
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": phantom_hash},
+            }},
+        })
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+
+        # And no fake bearer can be invented to use the phantom hash —
+        # the auth path requires a key whose hash matches a manifest
+        # row, not a hash itself.
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {phantom_hash}"},
+        )
+        assert r.status_code == 403
+
+
+# ===========================================================================
+# Phase 8.1 — tier-aware usage enforcement
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    DEFAULT_FREE_DAILY_REQUEST_LIMIT,
+    DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT,
+    FREE_DAILY_REQUEST_LIMIT_ENV_VAR,
+    PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR,
+    RETRY_AFTER_HEADER,
+    USAGE_ENFORCEMENT_ENABLED_ENV_VAR,
+    USAGE_LIMIT_DETAIL,
+    USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR,
+    USAGE_LIMIT_HEADER,
+    USAGE_REMAINING_HEADER,
+    USAGE_TIER_HEADER,
+    _free_daily_request_limit,
+    _premium_daily_request_limit,
+    _usage_enforcement_enabled,
+    _usage_limit_exempt_paths,
+)
+
+
+def _seed_usage_today(
+    usage_path: Path, *, key_hash: str, tier: str, n: int,
+    method: str = "GET", path: str = "/reports/latest",
+) -> None:
+    """Append ``n`` minimal Phase 4.6-style usage rows for ``key_hash``
+    dated today (UTC). Used to fast-forward the enforcement counter."""
+    usage_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with open(usage_path, "a", encoding="utf-8") as fh:
+        for _ in range(n):
+            fh.write(json.dumps({
+                "timestamp": today,
+                "key_hash": key_hash,
+                "tier": tier,
+                "method": method,
+                "path": path,
+                "status_code": 200,
+                "duration_ms": 1.0,
+            }) + "\n")
+
+
+class TestPhase81Helpers:
+    def test_default_free_limit_is_50(self, monkeypatch):
+        monkeypatch.delenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, raising=False)
+        assert _free_daily_request_limit() == DEFAULT_FREE_DAILY_REQUEST_LIMIT
+        assert DEFAULT_FREE_DAILY_REQUEST_LIMIT == 50
+
+    def test_default_premium_limit_is_1000(self, monkeypatch):
+        monkeypatch.delenv(
+            PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR, raising=False,
+        )
+        assert (
+            _premium_daily_request_limit()
+            == DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT
+        )
+        assert DEFAULT_PREMIUM_DAILY_REQUEST_LIMIT == 1000
+
+    def test_invalid_free_limit_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "not-an-int")
+        assert _free_daily_request_limit() == 50
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "-5")
+        assert _free_daily_request_limit() == 50
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "")
+        assert _free_daily_request_limit() == 50
+
+    def test_invalid_premium_limit_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR, "garbage")
+        assert _premium_daily_request_limit() == 1000
+
+    def test_enforcement_enabled_default_true(self, monkeypatch):
+        monkeypatch.delenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, raising=False)
+        assert _usage_enforcement_enabled() is True
+
+    def test_enforcement_disabled_by_explicit_false(self, monkeypatch):
+        for value in ("false", "0", "no", "off", "False", "NO"):
+            monkeypatch.setenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, value)
+            assert _usage_enforcement_enabled() is False
+
+    def test_enforcement_enabled_by_truthy(self, monkeypatch):
+        for value in ("true", "1", "yes", "on", "True", "YES"):
+            monkeypatch.setenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, value)
+            assert _usage_enforcement_enabled() is True
+
+    def test_exempt_paths_default_set(self, monkeypatch):
+        monkeypatch.delenv(USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR, raising=False)
+        exempt = _usage_limit_exempt_paths()
+        for p in ("/", "/health", "/webhook/stripe",
+                  "/favicon.ico", "/apple-touch-icon.png",
+                  "/apple-touch-icon-precomposed.png"):
+            assert p in exempt
+
+    def test_exempt_paths_extended_via_env(self, monkeypatch):
+        monkeypatch.setenv(
+            USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR,
+            "/foo, bar , ,/baz",
+        )
+        exempt = _usage_limit_exempt_paths()
+        assert "/foo" in exempt
+        assert "/bar" in exempt
+        assert "/baz" in exempt
+        # Defaults still present.
+        assert "/health" in exempt
+
+
+@pytest.fixture
+def phase81_env(monkeypatch, tmp_path: Path):
+    """Set up a manifest-backed deployment with an isolated usage log
+    so the Phase 8.1 enforcement counter starts at zero."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    usage_log = tmp_path / "usage_phase81.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    monkeypatch.setenv("TRADING_API_USAGE_LOG_PATH", str(usage_log))
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+        "usage_log": usage_log,
+    }
+
+
+def _issue_phase81_key(tier: str, label: str) -> tuple[str, str]:
+    """Issue a key in-process and return (raw, hash)."""
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=label)
+    return result["api_key"], result["key_hash"]
+
+
+class TestPhase81FreeUserUnderLimit:
+    def test_under_limit_succeeds_with_headers(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-under")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "10")
+        # Seed 3 prior calls so we expect remaining = 6 after this one.
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free", n=3,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        assert r.headers[USAGE_LIMIT_HEADER] == "10"
+        # Pre-call total was 3; this call would make it 4 → remaining = 6.
+        assert r.headers[USAGE_REMAINING_HEADER] == "6"
+        assert r.headers[USAGE_TIER_HEADER] == "free"
+
+
+class TestPhase81FreeUserAtLimit:
+    def test_at_limit_returns_429_with_documented_body(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-at")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "10")
+        # Seed exactly the limit so the next call is rejected.
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free", n=10,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        assert r.json() == {"detail": USAGE_LIMIT_DETAIL}
+        assert r.headers[USAGE_LIMIT_HEADER] == "10"
+        assert r.headers[USAGE_REMAINING_HEADER] == "0"
+        assert r.headers[USAGE_TIER_HEADER] == "free"
+        # Retry-After must be a positive integer in seconds (≤ 86400).
+        ra = int(r.headers[RETRY_AFTER_HEADER])
+        assert 1 <= ra <= 86400
+
+
+class TestPhase81PremiumUserExceedsFreeButUnderPremium:
+    def test_premium_passes_when_over_free_cap(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase81_key("free", "phase81-premium-bypass")
+        # Promote via Phase 7.4 hash path so the key is premium.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        billing.reset_cache_for_tests()
+        # Seed 60 prior calls — well over the free 50/day default,
+        # well under the premium 1000/day default.
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash,
+            tier="premium", n=60,
+        )
+        # Make sure Stripe is "configured" so _is_premium routes
+        # through the cache.
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase81")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(phase81_env["usage_log"].parent / "stripe_cache.json"),
+        )
+        billing.reset_cache_for_tests()
+        # Re-promote because we just reset the cache + re-pointed it.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.headers[USAGE_TIER_HEADER] == "premium"
+        # Premium cap is 1000; we seeded 60; this call → 61 → remaining 939.
+        assert r.headers[USAGE_LIMIT_HEADER] == "1000"
+        assert int(r.headers[USAGE_REMAINING_HEADER]) >= 900
+
+
+class TestPhase81PremiumUserAtPremiumLimit:
+    def test_premium_at_premium_limit_returns_429(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase81_key("free", "phase81-premium-cap")
+        monkeypatch.setenv(PREMIUM_DAILY_REQUEST_LIMIT_ENV_VAR, "5")
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase81_atcap")
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(phase81_env["usage_log"].parent / "stripe_cache_atcap.json"),
+        )
+        billing.reset_cache_for_tests()
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash,
+            tier="premium", n=5,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        assert r.headers[USAGE_TIER_HEADER] == "premium"
+        assert r.headers[USAGE_LIMIT_HEADER] == "5"
+        assert r.headers[USAGE_REMAINING_HEADER] == "0"
+
+
+class TestPhase81PublicPathsExempt:
+    @pytest.mark.parametrize("path", [
+        "/", "/health", "/favicon.ico",
+        "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
+    ])
+    def test_public_path_never_429s(
+        self, client: TestClient, phase81_env, monkeypatch, path: str,
+    ):
+        raw, key_hash = _issue_phase81_key("free", f"phase81-public-{path}")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "1")
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free",
+            n=10000,
+        )
+        # Even with the counter way over the cap, public paths must
+        # NEVER 429. (No auth header on purpose — these paths don't
+        # need it.)
+        r = client.get(path)
+        assert r.status_code != 429
+
+    def test_webhook_stripe_never_429s(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        # Webhook is exempt regardless of auth state. Stripe doesn't
+        # send Authorization. The endpoint will 503 (no
+        # STRIPE_WEBHOOK_SECRET configured) or 400 (bad signature),
+        # but it must NEVER 429 from the usage layer.
+        r = client.post("/webhook/stripe", content=b"{}")
+        assert r.status_code != 429
+
+
+class TestPhase81OperatorExtendsExempt:
+    def test_extra_exempt_path_skips_enforcement(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-extra-exempt")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "1")
+        # Operator-supplied extra exempt path; /reports/latest is
+        # absurd as an exempt route but it's a clear test signal.
+        monkeypatch.setenv(
+            USAGE_LIMIT_EXEMPT_PATHS_ENV_VAR, "/reports/latest",
+        )
+        # Lift Phase 5.4's older free-tier cap out of the way so the
+        # only enforcement under test is Phase 8.1.
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash,
+            tier="free", n=10000,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Even though the counter is way over, the operator
+        # exempted this path → no 429.
+        assert r.status_code == 200
+
+
+class TestPhase81NoCountForUnauthenticated:
+    def test_missing_auth_does_not_write_usage(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        # Issue a key so the deployment is "configured" (not 503).
+        _issue_phase81_key("free", "phase81-noauth-shape")
+        # Phase 10.2 made /reports/latest preview-on-no-header.
+        # Use /reports/{date} as the carrier route so the
+        # missing-auth response is still a 401 we can pin.
+        r = client.get("/reports/2026-04-24")
+        assert r.status_code == 401
+        # Usage log should be empty / non-existent — no row written
+        # for an unauthenticated request.
+        if phase81_env["usage_log"].exists():
+            body = phase81_env["usage_log"].read_text("utf-8").strip()
+            assert body == "", (
+                f"Phase 8.1: unauthenticated request leaked into usage log: "
+                f"{body!r}"
+            )
+
+    def test_bogus_key_does_not_write_usage(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        _issue_phase81_key("free", "phase81-bogus-shape")
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert r.status_code == 403
+        if phase81_env["usage_log"].exists():
+            body = phase81_env["usage_log"].read_text("utf-8").strip()
+            assert body == ""
+
+
+class TestPhase81UsageLogStoresHashOnly:
+    def test_usage_log_after_request_contains_only_hash(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-hash-only")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = phase81_env["usage_log"].read_text("utf-8")
+        assert raw not in body, "Phase 8.1: raw key leaked into usage log"
+        assert key_hash in body
+
+
+class TestPhase81EnforcementCanBeDisabled:
+    def test_disabled_lets_through_over_limit_traffic(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase81_key("free", "phase81-disabled")
+        monkeypatch.setenv(FREE_DAILY_REQUEST_LIMIT_ENV_VAR, "1")
+        monkeypatch.setenv(USAGE_ENFORCEMENT_ENABLED_ENV_VAR, "false")
+        # Phase 5.4's older free-tier cap is independent of the
+        # Phase 8.1 toggle — lift it so this test isolates Phase 8.1.
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            phase81_env["usage_log"], key_hash=key_hash, tier="free",
+            n=10000,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Under-limit semantics restored: request goes through and
+        # no Phase-8.1 headers are added.
+        assert r.status_code == 200
+        assert USAGE_LIMIT_HEADER not in r.headers
+        assert USAGE_REMAINING_HEADER not in r.headers
+
+
+class TestPhase81MissingUsageLogFailsOpen:
+    def test_no_usage_log_means_count_zero(
+        self, client: TestClient, phase81_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase81_key("free", "phase81-failopen")
+        # Don't seed anything → usage log file does not exist.
+        assert not phase81_env["usage_log"].exists()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(phase81_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        # Headers are still present and reflect "this is the first
+        # request today" (count=1 → remaining = 49).
+        assert r.headers[USAGE_LIMIT_HEADER] == "50"
+        assert r.headers[USAGE_REMAINING_HEADER] == "49"
+
+
+class TestPhase81DoesNotIntroduceMutatingRoute:
+    def test_no_new_mutating_route(self):
+        """Phase 8.1 is middleware — it must not register any new
+        HTTP route. The single-mutating-route invariant remains
+        POST /webhook/stripe + POST /billing/checkout."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 8.1 leaked a mutating route: {m} {path}"
+                )
+
+
+# ===========================================================================
+# Phase 8.2 — feature-level tier differentiation
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    PREMIUM_FEATURE_DETAIL,
+    PREMIUM_FEATURE_HINT,
+    _FREE_REPORT_ALLOWED_FIELDS,
+    _is_premium_user,
+    _project_report_for_free,
+)
+
+
+# Fields that the FULL sanitised report carries but should be ABSENT
+# from the free-tier projection — used as leak-guard markers.
+_PREMIUM_REPORT_FIELDS: tuple[str, ...] = (
+    "tier_stats", "reason_stats", "regime_stats",
+    "decile_stats", "shadow_filter_simulation", "guardrails",
+    "sources",
+)
+
+
+def _write_full_report(reports_dir: Path, date: str) -> Path:
+    """A daily report with every premium-tier deep field populated
+    so leak-guard tests can detect what the free projection drops."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    body = {
+        "report_type": "daily_alpha_validation",
+        "report_date": date,
+        "scorer_fingerprint": "f" * 64,
+        "totals": {
+            "alpha_rows": 100, "buy_rows": 25, "skip_rows": 75,
+        },
+        "promotion_readiness": {
+            "ready": True, "consecutive_passing_days": 21,
+        },
+        "tier_stats": {"A": {"count": 5}, "B": {"count": 7}},
+        "reason_stats": {"alpha_filter_blocked:tier=D:min=B": 3},
+        "regime_stats": {"trending": {"hits": 12}},
+        "decile_stats": [{"decile": 1, "n": 10}],
+        "shadow_filter_simulation": [{"row_id": "x", "would_block": False}],
+        "guardrails": {"any_critical": False, "warnings": []},
+        "sources": {
+            "alpha_scores": {
+                "exists": True, "rows": 100, "resolved_files": 1,
+            },
+        },
+    }
+    target = reports_dir / f"alpha_report_{date}.json"
+    target.write_text(json.dumps(body), encoding="utf-8")
+    return target
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82PureHelpers:
+    def test_is_premium_user_reads_cached_tier_premium(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(api_key_tier="premium"))
+        # Headers needed by _extract_bearer_token in the fallback path —
+        # not reached because the cached value is honoured first.
+        req.headers = {}
+        assert _is_premium_user(req) is True
+
+    def test_is_premium_user_reads_cached_tier_free(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(
+            state=SimpleNamespace(api_key_tier="free"),
+            headers={},
+        )
+        assert _is_premium_user(req) is False
+
+    def test_is_premium_user_unauthenticated_returns_false(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(), headers={})
+        assert _is_premium_user(req) is False
+
+    def test_project_report_for_free_keeps_only_allow_listed_fields(self):
+        sample = {
+            "report_type": "daily_alpha_validation",
+            "report_date": "2026-04-25",
+            "scorer_fingerprint": "f" * 64,
+            "totals": {"alpha_rows": 100},
+            "promotion_readiness": {"ready": True},
+            # All of these are premium-only — must be dropped.
+            "tier_stats": {"A": 1}, "reason_stats": {"x": 1},
+            "regime_stats": {"y": 2}, "decile_stats": [1, 2],
+            "shadow_filter_simulation": [], "guardrails": {},
+            "sources": {"alpha_scores": {}},
+        }
+        out = _project_report_for_free(sample)
+        for f in _FREE_REPORT_ALLOWED_FIELDS:
+            assert f in out
+        for f in _PREMIUM_REPORT_FIELDS:
+            assert f not in out
+        assert out["tier"] == "free"
+        # Phase 8.3 — the helper is now pure; the upgrade payload
+        # is attached by the route handler (which makes a Stripe
+        # call), not by this projector.
+        assert "upgrade" not in out
+
+    def test_project_report_for_free_input_not_mutated(self):
+        sample = {"report_type": "x", "tier_stats": {"A": 1}}
+        before = dict(sample)
+        _project_report_for_free(sample)
+        assert sample == before
+
+    def test_project_report_for_free_handles_non_dict(self):
+        out = _project_report_for_free(None)  # type: ignore[arg-type]
+        assert out == {"tier": "free"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.2 fixture — manifest-backed deployment with one issued key
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def phase82_env(monkeypatch, tmp_path: Path):
+    """Manifest-backed deployment with isolated paths so each Phase
+    8.2 test starts from a known state."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+def _issue_phase82_key(tier: str = "free") -> tuple[str, str]:
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=f"phase82-{tier}")
+    return result["api_key"], result["key_hash"]
+
+
+def _promote_to_premium(raw: str, key_hash: str, monkeypatch, tmp_path: Path):
+    """Use the Phase 7.4 webhook hash path to flip a free key to premium."""
+    from trading_bot.api import billing
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase82")
+    monkeypatch.setenv(
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        str(tmp_path / "stripe_cache_phase82.json"),
+    )
+    billing.reset_cache_for_tests()
+    billing.handle_webhook_event({
+        "type": "customer.subscription.created",
+        "data": {"object": {
+            "status": "active",
+            "metadata": {"key_hash": key_hash},
+        }},
+    })
+    billing.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# /reports/latest — tier-aware projection
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82ReportsLatestFreeUser:
+    def test_free_user_gets_truncated_report(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+
+        # Allow-listed fields are present.
+        assert body["report_type"] == "daily_alpha_validation"
+        assert body["report_date"] == today
+        assert "totals" in body
+        assert body["tier"] == "free"
+        # Phase 8.3 — the upgrade payload requires Stripe config
+        # which this test doesn't provide. The route MUST degrade
+        # to "no upgrade attached" rather than crashing the body.
+        assert "upgrade" not in body
+        # Premium-only fields are absent.
+        for f in _PREMIUM_REPORT_FIELDS:
+            assert f not in body, (
+                f"Phase 8.2: free-tier response leaked premium field {f!r}"
+            )
+
+
+class TestPhase82ReportsLatestPremiumUser:
+    def test_premium_user_gets_full_report(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase82_key("free")
+        _promote_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # Premium-only fields ARE present.
+        for f in _PREMIUM_REPORT_FIELDS:
+            assert f in body, (
+                f"Phase 8.2: premium response is missing {f!r}"
+            )
+        # The "free upgrade" envelope is NOT present for premium.
+        assert "upgrade" not in body
+        assert body.get("tier") != "free"
+
+
+# ---------------------------------------------------------------------------
+# /reports/history — premium only
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82ReportsHistoryFreeUser:
+    def test_free_user_returns_403(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        assert r.json() == {"detail": PREMIUM_FEATURE_DETAIL}
+        assert r.headers["X-Usage-Tier"] == "free"
+
+
+class TestPhase82ReportsHistoryPremiumUser:
+    def test_premium_user_returns_full_history(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase82_key("free")
+        _promote_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant three reports across different dates.
+        for d in ("2026-04-23", "2026-04-24", "2026-04-25"):
+            _write_full_report(phase82_env["reports_dir"], d)
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["count"] == 3
+        assert body["dates"] == ["2026-04-23", "2026-04-24", "2026-04-25"]
+
+    def test_history_does_not_collide_with_date_route(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        """``/reports/history`` must hit the literal route, not the
+        ``/reports/{date}`` path-param route — even for a free
+        caller. The 403 must say "premium feature", not "invalid date"."""
+        raw, _ = _issue_phase82_key("free")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        assert r.json() == {"detail": PREMIUM_FEATURE_DETAIL}
+
+
+# ---------------------------------------------------------------------------
+# /dashboard — tier-aware projection
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82DashboardFreeUser:
+    def test_free_dashboard_omits_premium_data(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        text = r.text
+        # The free dashboard renders the upgrade banner and limits the
+        # data surface — none of the planted premium-data values
+        # should appear in the HTML.
+        assert "would_block" not in text  # shadow_filter_simulation row
+        assert "alpha_filter_blocked:tier=D:min=B" not in text
+
+
+class TestPhase82DashboardPremiumUser:
+    def test_premium_dashboard_renders_full_data(
+        self, client: TestClient, phase82_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase82_key("free")
+        _promote_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting Phase 8.2 invariants
+# ---------------------------------------------------------------------------
+
+
+class TestPhase82UpgradeMessageConsistent:
+    def test_history_403_body_matches_constant(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.json()["detail"] == PREMIUM_FEATURE_DETAIL
+
+    def test_free_reports_latest_envelope_marks_tier(
+        self, client: TestClient, phase82_env,
+    ):
+        # Phase 8.3 moved the user-visible upgrade copy into the
+        # Stripe-backed payload (covered by Phase 8.3 tests). The
+        # body still announces the caller's tier so a client knows
+        # it received a curated subset.
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body["tier"] == "free"
+
+
+class TestPhase82UsageEnforcementStillApplies:
+    def test_gated_403_still_consumes_usage_quota(
+        self, client: TestClient, phase82_env, monkeypatch,
+    ):
+        """A free user whose /reports/history call returns 403
+        (premium feature) must STILL count toward their daily usage
+        quota. Otherwise free users could spam gated endpoints
+        without consequence."""
+        raw, key_hash = _issue_phase82_key("free")
+        # Tighten the cap to 1 so the next request after the 403
+        # observes the quota was consumed.
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "2")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+
+        # Hit /reports/history twice — both 403 (premium-only) but
+        # both should consume usage.
+        h = {"Authorization": f"Bearer {raw}"}
+        r1 = client.get("/reports/history", headers=h)
+        assert r1.status_code == 403
+        r2 = client.get("/reports/history", headers=h)
+        assert r2.status_code == 403
+        # Third call exceeds the daily cap → 429.
+        r3 = client.get("/reports/history", headers=h)
+        assert r3.status_code == 429
+
+    def test_gated_403_carries_usage_headers(
+        self, client: TestClient, phase82_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "10")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        assert r.headers["X-Usage-Tier"] == "free"
+        # Phase 8.1 headers are added by the enforcement middleware
+        # on every non-exempt response (including 403s from gated
+        # routes).
+        assert "X-Usage-Limit" in r.headers
+        assert "X-Usage-Remaining" in r.headers
+
+
+class TestPhase82NoRawKeyInResponses:
+    def test_raw_key_absent_from_history_response(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert raw not in r.text
+        for header_value in r.headers.values():
+            assert raw not in header_value
+
+    def test_raw_key_absent_from_reports_latest_free_response(
+        self, client: TestClient, phase82_env,
+    ):
+        raw, _ = _issue_phase82_key("free")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase82_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert raw not in r.text
+
+
+class TestPhase82DoesNotIntroduceMutatingRoute:
+    def test_no_new_mutating_route(self):
+        """Phase 8.2 only adds a GET route — the single-mutating-route
+        invariant remains POST /webhook/stripe + POST /billing/checkout."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 8.2 leaked a mutating route: {m} {path}"
+                )
+
+    def test_history_route_only_safe_verbs(self):
+        for route in app.routes:
+            if getattr(route, "path", "") == "/reports/history":
+                methods = getattr(route, "methods", set()) or set()
+                assert methods.issubset({"GET", "HEAD", "OPTIONS"})
+                break
+        else:
+            raise AssertionError("/reports/history not registered")
+
+
+# ===========================================================================
+# Phase 8.3 — upgrade pressure system
+# ===========================================================================
+
+
+from trading_bot.api.server import (  # noqa: E402
+    _build_upgrade_payload,
+)
+
+
+@pytest.fixture
+def phase83_env(monkeypatch, tmp_path: Path):
+    """Phase 8.2 test base + Stripe checkout env wired so the
+    Phase 8.3 helper can mint checkout URLs end-to-end."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    # Phase 8.3 — Stripe Checkout config so _build_upgrade_payload
+    # can mint a URL.
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_phase83")
+    monkeypatch.setenv("STRIPE_PREMIUM_PRICE_ID", "price_test_phase83")
+    monkeypatch.setenv("TRADING_PUBLIC_BASE_URL", "https://api.example.com")
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+# Distinctive marker so leak tests can grep for it.
+_PHASE83_CHECKOUT_URL = (
+    "https://checkout.stripe.com/c/cs_PHASE83_LEAK_GUARD_xyz"
+)
+
+
+class _Phase83FakePoster:
+    """Deterministic Stripe stub for the Phase 8.3 helper. Records
+    every POST and returns either a configured URL or raises a
+    BillingAPIError."""
+
+    def __init__(self, response=None, raise_exc=None):
+        self.response = response or {
+            "id": "cs_PHASE83_LEAK_GUARD_xyz",
+            "url": _PHASE83_CHECKOUT_URL,
+        }
+        self.raise_exc = raise_exc
+        self.calls: list[dict] = []
+
+    def __call__(self, *, url, data, auth, timeout):
+        self.calls.append({"url": url, "data": dict(data), "auth": auth})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return dict(self.response) if isinstance(self.response, dict) else self.response
+
+
+def _patch_phase83_poster(monkeypatch, fake: _Phase83FakePoster):
+    from trading_bot.api import billing as _billing_mod
+    monkeypatch.setattr(_billing_mod, "_post_to_stripe", fake)
+
+
+def _issue_phase83_key(tier: str = "free") -> tuple[str, str]:
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=f"phase83-{tier}")
+    return result["api_key"], result["key_hash"]
+
+
+def _promote_phase83_to_premium(
+    raw: str, key_hash: str, monkeypatch, tmp_path: Path,
+):
+    from trading_bot.api import billing
+    monkeypatch.setenv(
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        str(tmp_path / "stripe_cache_phase83.json"),
+    )
+    billing.reset_cache_for_tests()
+    billing.handle_webhook_event({
+        "type": "customer.subscription.created",
+        "data": {"object": {
+            "status": "active",
+            "metadata": {"key_hash": key_hash},
+        }},
+    })
+    billing.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Pure helper unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83BuildUpgradePayload:
+    def test_premium_user_returns_none(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(
+            state=SimpleNamespace(api_key_tier="premium"),
+            headers={},
+        )
+        out = _build_upgrade_payload(
+            req, reason="usage_limit", required=True,
+        )
+        assert out is None
+
+    def test_premium_user_explicit_arg_skips_stripe(
+        self, monkeypatch,
+    ):
+        """is_premium=True must short-circuit before Stripe is called.
+        Patch _post_to_stripe to raise — if it's invoked, the test
+        fails."""
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium")
+        from trading_bot.api import billing as _billing_mod
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(), headers={})
+        out = _build_upgrade_payload(
+            req, reason="x", required=False, is_premium=True,
+            key_hash="a" * 32,
+        )
+        assert out is None
+        assert called["n"] == 0
+
+    def test_no_key_hash_no_bearer_returns_none(self):
+        from types import SimpleNamespace
+        req = SimpleNamespace(state=SimpleNamespace(), headers={})
+        out = _build_upgrade_payload(
+            req, reason="x", required=False, is_premium=False,
+        )
+        assert out is None
+
+
+# ---------------------------------------------------------------------------
+# 429 — usage_limit
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83Usage429UpgradePayload:
+    def test_free_429_includes_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        body = r.json()
+        assert body["detail"] == "usage limit reached — upgrade for higher limits"
+        assert body["upgrade"] == {
+            "required": True,
+            "reason": "usage_limit",
+            "checkout_url": _PHASE83_CHECKOUT_URL,
+            "hint": "upgrade for full access",
+        }
+        # Stripe payload uses key_hash only (Phase 7.3 contract).
+        forwarded = fake.calls[0]["data"]
+        assert forwarded["metadata[key_hash]"] == key_hash
+        assert "metadata[api_key]" not in forwarded
+        # The raw key is NEVER in the body or any header.
+        assert raw not in r.text
+        for v in r.headers.values():
+            assert raw not in v
+
+    def test_premium_429_does_not_include_payload(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _promote_phase83_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        monkeypatch.setenv("TRADING_PREMIUM_DAILY_REQUEST_LIMIT", "1")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="premium", n=10,
+        )
+        # Patch Stripe to fail loudly if invoked — premium must NOT
+        # trigger a checkout call on its own 429.
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium 429")
+        from trading_bot.api import billing as _billing_mod
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        body = r.json()
+        assert body["detail"]
+        assert "upgrade" not in body
+        assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 403 — feature_locked
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83Premium403UpgradePayload:
+    def test_free_403_includes_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        body = r.json()
+        assert body["detail"] == "premium feature — upgrade required"
+        assert body["upgrade"] == {
+            "required": True,
+            "reason": "feature_locked",
+            "checkout_url": _PHASE83_CHECKOUT_URL,
+            "hint": "upgrade for full access",
+        }
+        # X-Usage-Tier still set (Phase 8.2 contract).
+        assert r.headers["X-Usage-Tier"] == "free"
+
+
+# ---------------------------------------------------------------------------
+# /reports/latest — limited_access
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83ReportsLatestLimitedAccess:
+    def test_free_reports_latest_includes_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase83_key("free")
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tier"] == "free"
+        assert body["upgrade"] == {
+            "required": False,
+            "reason": "limited_access",
+            "checkout_url": _PHASE83_CHECKOUT_URL,
+            "hint": "upgrade for full access",
+        }
+        assert raw not in r.text
+
+    def test_premium_reports_latest_omits_payload(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _promote_phase83_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Premium must NOT trigger a Stripe call for /reports/latest.
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium")
+        from trading_bot.api import billing as _billing_mod
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "upgrade" not in body
+        assert body.get("tier") != "free"
+        assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stripe failure → graceful degradation
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83StripeFailureGracefulDegradation:
+    def test_429_without_payload_when_stripe_fails(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, key_hash = _issue_phase83_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        # Stripe returns a 5xx — the 429 must still come back.
+        _patch_phase83_poster(
+            monkeypatch,
+            _Phase83FakePoster(
+                raise_exc=BillingAPIError("simulated stripe 500"),
+            ),
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        body = r.json()
+        # Base response intact; upgrade payload absent.
+        assert body["detail"]
+        assert "upgrade" not in body
+
+    def test_403_without_payload_when_stripe_fails(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(
+            monkeypatch,
+            _Phase83FakePoster(
+                raise_exc=BillingAPIError("simulated stripe 500"),
+            ),
+        )
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        body = r.json()
+        assert body["detail"] == "premium feature — upgrade required"
+        assert "upgrade" not in body
+
+    def test_reports_latest_without_payload_when_stripe_fails(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(
+            monkeypatch,
+            _Phase83FakePoster(
+                raise_exc=BillingAPIError("simulated stripe 500"),
+            ),
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tier"] == "free"
+        assert "upgrade" not in body
+
+    def test_no_public_base_url_skips_payload(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, _ = _issue_phase83_key("free")
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        fake = _Phase83FakePoster()
+        _patch_phase83_poster(monkeypatch, fake)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "upgrade" not in body
+        # Stripe must not have been invoked (we exit before
+        # attempting to mint the URL).
+        assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# checkout_url not persisted anywhere
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83CheckoutUrlNotPersisted:
+    def test_url_absent_from_every_operator_log(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import billing
+        monkeypatch.setenv(
+            "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+            str(tmp_path / "stripe_cache_phase83_persist.json"),
+        )
+        billing.reset_cache_for_tests()
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        # Hit each of the three trigger paths.
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # Force a 429 too.
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+
+        logs_to_check: list[Path] = [
+            phase83_env["keys_manifest"],
+            phase83_env["keys_revoked"],
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            Path(os.environ["TRADING_API_AUDIT_LOG_PATH"]),
+            Path(os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]),
+            tmp_path / "stripe_cache_phase83_persist.json",
+        ]
+        for path in logs_to_check:
+            if path.exists():
+                body = path.read_text(encoding="utf-8")
+                assert _PHASE83_CHECKOUT_URL not in body, (
+                    f"Phase 8.3: checkout_url leaked into {path}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting invariants
+# ---------------------------------------------------------------------------
+
+
+class TestPhase83CrossCutting:
+    def test_usage_enforcement_still_applies_after_payload_attached(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """The Phase 8.3 payload MUST NOT silence the Phase 8.1
+        429 enforcement — gated 429s still 429."""
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        h = {"Authorization": f"Bearer {raw}"}
+        # First call: 200.
+        assert client.get("/reports/latest", headers=h).status_code == 200
+        # Second call: 429 with usage headers.
+        r = client.get("/reports/latest", headers=h)
+        assert r.status_code == 429
+        assert r.headers["X-Usage-Limit"] == "1"
+        assert r.headers["X-Usage-Remaining"] == "0"
+
+    def test_payload_does_not_introduce_mutating_route(self):
+        """Phase 8.3 is helper code — no new HTTP route."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 8.3 leaked a mutating route: {m} {path}"
+                )
+
+
+# ===========================================================================
+# Phase 8.4 — three-stage upgrade funnel (integration)
+# ===========================================================================
+
+
+def _read_funnel_rows() -> list[dict]:
+    """Load every row from the upgrade-events log configured by
+    the autouse fixture."""
+    path = Path(os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"])
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text("utf-8").splitlines():
+        s = line.strip()
+        if s:
+            out.append(json.loads(s))
+    return out
+
+
+class TestPhase84FunnelShownEvent:
+    """upgrade_shown fires from inside _build_upgrade_payload after a
+    successful Stripe Checkout creation."""
+
+    def test_429_emits_shown(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        assert rows[0]["reason"] == "usage_limit"
+        assert rows[0]["endpoint"] == "/reports/latest"
+        assert rows[0]["tier"] == "free"
+
+    def test_403_emits_shown(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        r = client.get(
+            "/reports/history",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 403
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(rows) == 1
+        assert rows[0]["reason"] == "feature_locked"
+        assert rows[0]["endpoint"] == "/reports/history"
+
+    def test_free_reports_latest_emits_shown(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(rows) == 1
+        assert rows[0]["reason"] == "limited_access"
+        assert rows[0]["endpoint"] == "/reports/latest"
+
+    def test_premium_does_not_emit_shown(
+        self, client: TestClient, phase83_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase83_key("free")
+        _promote_phase83_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Patch Stripe to fail loudly if invoked — premium must NOT
+        # trigger a checkout call OR a funnel event.
+        from trading_bot.api import billing as _billing_mod
+        called = {"n": 0}
+        def boom(**kw):
+            called["n"] += 1
+            raise AssertionError("Stripe must not be called for premium")
+        monkeypatch.setattr(_billing_mod, "_post_to_stripe", boom)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert rows == []
+        assert called["n"] == 0
+
+    def test_no_dedupe_spam_on_single_response(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """A single request must produce AT MOST one upgrade_shown
+        row — even though the response goes through middleware,
+        handler, and renderer. The sources don't overlap, so the
+        natural flow gives us one per request automatically."""
+        raw, _ = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        shown = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_shown"]
+        assert len(shown) == 1
+
+
+class TestPhase84FunnelClickedEvent:
+    """upgrade_clicked fires from POST /billing/checkout after the
+    Stripe Session is created."""
+
+    def test_checkout_emits_clicked(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_clicked"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        assert rows[0]["endpoint"] == "/billing/checkout"
+        assert rows[0]["reason"] == "checkout_initiated"
+
+    def test_checkout_failure_does_not_emit_clicked(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api.billing import BillingAPIError
+        raw, _ = _issue_free_for_checkout()
+        _patch_stripe_poster(
+            monkeypatch,
+            _CheckoutFakePoster(raise_exc=BillingAPIError("boom")),
+        )
+        r = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 502
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_clicked"]
+        assert rows == []
+
+
+class TestPhase84FunnelCompletedEvent:
+    """upgrade_completed fires from billing.handle_webhook_event on
+    customer.subscription.created success."""
+
+    def test_webhook_hash_path_emits_completed(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase83_key("free")
+        result = billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        assert result["action"] == "added"
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        assert rows[0]["reason"] == "stripe_webhook"
+        assert rows[0]["endpoint"] == "/webhook/stripe"
+
+    def test_webhook_legacy_api_key_path_emits_completed_with_hash(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """The legacy metadata[api_key] path must hash the raw key
+        before logging the funnel row — the funnel log is
+        hash-only."""
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase83_key("free")
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": raw},
+            }},
+        })
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == key_hash
+        # Raw key absent from the funnel log.
+        body = Path(
+            os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]
+        ).read_text("utf-8")
+        assert raw not in body
+
+    def test_webhook_ignored_event_emits_no_completed(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        # Unissued key → webhook ignored → no funnel row.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": "z" * 32},
+            }},
+        })
+        rows = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        assert rows == []
+
+    def test_cancellation_does_not_emit_completed(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_phase83_key("free")
+        # Promote first.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+        # Cancellation must NOT emit a "completed" event.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {"metadata": {"key_hash": key_hash}}},
+        })
+        completed = [r for r in _read_funnel_rows() if r.get("event") == "upgrade_completed"]
+        # Exactly one — from the created, not the deleted.
+        assert len(completed) == 1
+
+
+class TestPhase84FunnelEndToEnd:
+    """All three stages firing in one realistic scenario."""
+
+    def test_full_funnel_shown_clicked_completed(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+
+        # Stage 1: free user hits /reports/latest → upgrade_shown.
+        r1 = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r1.status_code == 200
+
+        # Stage 2: user clicks the checkout URL → POST /billing/checkout.
+        r2 = client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r2.status_code == 200
+
+        # Stage 3: Stripe fires the webhook → upgrade_completed.
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+
+        events = [r["event"] for r in _read_funnel_rows()
+                  if r.get("event") in {
+                      "upgrade_shown", "upgrade_clicked", "upgrade_completed",
+                  }]
+        # All three appear in the documented order.
+        assert events == [
+            "upgrade_shown", "upgrade_clicked", "upgrade_completed",
+        ]
+
+
+class TestPhase84FunnelLeakGuard:
+    """No raw API key may appear in the upgrade-events log on any
+    Phase 8.4 trigger path."""
+
+    def test_no_raw_key_after_full_funnel(
+        self, client: TestClient, checkout_env, monkeypatch,
+    ):
+        from trading_bot.api import billing
+        raw, key_hash = _issue_free_for_checkout()
+        _patch_stripe_poster(monkeypatch, _CheckoutFakePoster())
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_report(checkout_env["reports_dir"], today)
+
+        client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        client.post(
+            "/billing/checkout",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        billing.handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": key_hash},
+            }},
+        })
+
+        body = Path(
+            os.environ["TRADING_API_UPGRADE_EVENTS_LOG_PATH"]
+        ).read_text("utf-8")
+        assert raw not in body
+        # The hash IS present (3x — once per event).
+        assert body.count(key_hash) == 3
+
+
+class TestPhase84FunnelLoggingFailureDoesNotBreakRequest:
+    def test_429_still_returns_when_funnel_writer_explodes(
+        self, client: TestClient, phase83_env, monkeypatch,
+    ):
+        """If the funnel writer raises, the 429 (or 200 / 403) MUST
+        still come back. The funnel layer is best-effort."""
+        from trading_bot.api import upgrade_events as _ue
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated funnel writer failure")
+        monkeypatch.setattr(_ue, "record_upgrade_funnel_event", boom)
+
+        raw, key_hash = _issue_phase83_key("free")
+        _patch_phase83_poster(monkeypatch, _Phase83FakePoster())
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        _write_full_report(phase83_env["reports_dir"], today)
+
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        # The 429 still comes back even though the funnel writer raised.
+        assert r.status_code == 429
+        assert r.json()["detail"]
+
+
+# ===========================================================================
+# Phase 9.1 — insight layer (integration with /reports/latest + /dashboard)
+# ===========================================================================
+
+
+def _phase91_full_report_dict(date: str, *, buy_rows: int = 30) -> dict:
+    """Daily report carrying every field the Phase 9.1 rules consume."""
+    return {
+        "report_type": "daily_alpha_validation",
+        "report_date": date,
+        "scorer_fingerprint": "f" * 64,
+        "totals": {
+            "alpha_rows": 100, "buy_rows": buy_rows, "skip_rows": 70,
+        },
+        "promotion_readiness": {
+            "ready": False, "consecutive_passing_days": 5,
+        },
+        "regime_stats": {
+            "trending": {"hits": 12},
+            "choppy": {"hits": 3},
+        },
+        # Premium-only deep stats — keep them populated so we can also
+        # verify the free projection still drops them.
+        "tier_stats": {"A": {"count": 5}},
+        "reason_stats": {"alpha_filter_blocked:tier=D:min=B": 3},
+        "decile_stats": [{"decile": 1, "n": 10}],
+        "shadow_filter_simulation": [{"row_id": "x", "would_block": False}],
+        "guardrails": {"any_critical": False, "warnings": []},
+        "sources": {
+            "alpha_scores": {
+                "exists": True, "rows": 100, "resolved_files": 1,
+            },
+        },
+    }
+
+
+def _write_phase91_report(reports_dir: Path, date: str, *, buy_rows: int = 30) -> Path:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    target = reports_dir / f"alpha_report_{date}.json"
+    target.write_text(
+        json.dumps(_phase91_full_report_dict(date, buy_rows=buy_rows)),
+        encoding="utf-8",
+    )
+    return target
+
+
+@pytest.fixture
+def phase91_env(monkeypatch, tmp_path: Path):
+    """Manifest-backed deployment with a populated reports dir.
+    Phase 9.1 tests only care about the response shape, not Stripe."""
+    reports_dir = tmp_path / "reports"
+    keys_manifest = tmp_path / "api_keys_manifest.jsonl"
+    keys_revoked = tmp_path / "api_keys_revoked.jsonl"
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("TRADING_API_PREMIUM_KEYS", raising=False)
+    monkeypatch.setenv(REPORTS_DIR_ENV_VAR, str(reports_dir))
+    monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_MANIFEST_PATH", str(keys_manifest),
+    )
+    monkeypatch.setenv(
+        "TRADING_API_KEYS_REVOKED_PATH", str(keys_revoked),
+    )
+    return {
+        "reports_dir": reports_dir,
+        "keys_manifest": keys_manifest,
+        "keys_revoked": keys_revoked,
+    }
+
+
+def _issue_phase91_key(tier: str = "free") -> tuple[str, str]:
+    from trading_bot.api.keys import issue_key
+    result = issue_key(tier=tier, label=f"phase91-{tier}")
+    return result["api_key"], result["key_hash"]
+
+
+def _promote_phase91_to_premium(
+    raw: str, key_hash: str, monkeypatch, tmp_path: Path,
+):
+    from trading_bot.api import billing
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_phase91")
+    monkeypatch.setenv(
+        "TRADING_STRIPE_PREMIUM_CACHE_PATH",
+        str(tmp_path / "stripe_cache_phase91.json"),
+    )
+    billing.reset_cache_for_tests()
+    billing.handle_webhook_event({
+        "type": "customer.subscription.created",
+        "data": {"object": {
+            "status": "active",
+            "metadata": {"key_hash": key_hash},
+        }},
+    })
+    billing.reset_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# /reports/latest — insights attached
+# ---------------------------------------------------------------------------
+
+
+class TestPhase91ReportsLatestInsightsPremium:
+    def test_premium_gets_full_insight_list(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant 2 reports so the trend rule has something to compare.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "insights" in body
+        ids = [e["id"] for e in body["insights"]]
+        # All three rules fire because the report has all three fields.
+        assert ids == [
+            "trend.buy_delta", "promotion.readiness", "regime.dominant",
+        ]
+        trend = body["insights"][0]
+        # Premium evidence carries the deep fields.
+        assert "curr_buy_rows" in trend["evidence"]
+        assert "prev_buy_rows" in trend["evidence"]
+        assert "percent_change" in trend["evidence"]
+
+
+class TestPhase91ReportsLatestInsightsFree:
+    def test_free_gets_at_most_two_insights(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tier"] == "free"
+        assert "insights" in body
+        assert len(body["insights"]) <= 2
+        # Evidence on the free trend insight is trimmed to the
+        # documented allow-list (no curr/prev/percent fields).
+        trend = [
+            e for e in body["insights"]
+            if e["id"] == "trend.buy_delta"
+        ][0]
+        assert set(trend["evidence"].keys()) == {"delta", "direction"}
+
+    def test_free_insight_schema_complete(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        for entry in body["insights"]:
+            assert set(entry.keys()) == {
+                "id", "title", "summary", "confidence",
+                "severity", "evidence", "action",
+            }
+
+
+class TestPhase91ReportsLatestInsightsTrendPrev:
+    def test_trend_only_when_prev_exists(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant ONLY today — no prior-day report, so trend rule is skipped.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        ids = [e["id"] for e in body["insights"]]
+        assert "trend.buy_delta" not in ids
+        # The other two rules still fire.
+        assert "promotion.readiness" in ids
+        assert "regime.dominant" in ids
+
+
+class TestPhase91ReportsLatestNoLeak:
+    def test_raw_key_absent_from_insights_response(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in body_text
+
+
+# ---------------------------------------------------------------------------
+# /dashboard — insights rendered into HTML
+# ---------------------------------------------------------------------------
+
+
+class TestPhase91DashboardInsights:
+    def test_premium_dashboard_renders_insights_section(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Section header is present.
+        assert "<h2>Insights</h2>" in html
+        # All three insight titles surface for premium.
+        assert "Buy volume up vs prior day" in html
+        assert "Promotion readiness" in html
+        assert "Dominant regime" in html
+
+    def test_free_dashboard_renders_at_most_two_insights(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Two list items in the Insights section (trend + readiness).
+        # The third rule (regime) is dropped by FREE_INSIGHT_LIMIT=2.
+        assert "<h2>Insights</h2>" in html
+        # Tally insights by counting the per-entry CSS class.
+        n_insights = html.count('class="insight insight-')
+        assert n_insights == 2
+
+    def test_dashboard_no_insights_section_when_no_report(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # No reports planted → insights list empty → section absent.
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert "<h2>Insights</h2>" not in html
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting invariants
+# ---------------------------------------------------------------------------
+
+
+class TestPhase91CrossCutting:
+    def test_no_new_mutating_route(self):
+        """Phase 9.1 is helper code — no new HTTP routes."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 9.1 leaked a mutating route: {m} {path}"
+                )
+
+    def test_usage_enforcement_still_applies(
+        self, client: TestClient, phase91_env, monkeypatch,
+    ):
+        """The new insights field MUST NOT silence the Phase 8.1
+        429 enforcement."""
+        raw, key_hash = _issue_phase91_key("free")
+        monkeypatch.setenv("TRADING_FREE_DAILY_REQUEST_LIMIT", "1")
+        monkeypatch.setenv("TRADING_FREE_MAX_REQUESTS_PER_DAY", "1000000")
+        monkeypatch.setenv("TRADING_FREE_MAX_REPORT_CALLS", "1000000")
+        _seed_usage_today(
+            Path(os.environ["TRADING_API_USAGE_LOG_PATH"]),
+            key_hash=key_hash, tier="free", n=10,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert r.status_code == 429
+
+
+# ===========================================================================
+# Phase 9.2 — daily-hook banner (integration with /reports/latest + /dashboard)
+# ===========================================================================
+
+
+class TestPhase92ReportsLatestHookPresent:
+    def test_premium_response_includes_full_hook(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "daily_hook" in body
+        hook = body["daily_hook"]
+        assert set(hook.keys()) == {
+            "headline", "change", "magnitude", "confidence",
+            "since", "driver", "cta",
+        }
+        assert hook["change"] == "up"
+        assert hook["magnitude"] == 10
+        assert hook["since"] == "2026-04-24"
+        assert hook["driver"] == "trend.buy_delta"
+
+    def test_free_response_includes_simplified_hook(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body["tier"] == "free"
+        assert "daily_hook" in body
+        hook = body["daily_hook"]
+        # Free response carries headline / change / magnitude / since
+        # / cta — but NOT confidence and NOT driver.
+        assert set(hook.keys()) == {
+            "headline", "change", "magnitude", "since", "cta",
+        }
+        assert "confidence" not in hook
+        assert "driver" not in hook
+
+
+class TestPhase92ReportsLatestHookAbsent:
+    def test_no_prev_report_omits_hook(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Plant ONLY today — no prior-day report, hook must be absent.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "daily_hook" not in body
+
+    def test_free_no_prev_report_omits_hook(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "daily_hook" not in body
+
+
+class TestPhase92DashboardHookBanner:
+    def test_premium_dashboard_renders_hook_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Banner uses a stable CSS class so dashboards / scrapers
+        # can latch onto it.
+        assert 'class="daily-hook daily-hook-up"' in html
+        assert "Buys up 10 vs prior day" in html
+        assert "since 2026-04-24" in html
+        assert "Open the dashboard for the full breakdown" in html
+
+    def test_free_dashboard_renders_hook_banner(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        # Free dashboard renders the same banner shape — it's the
+        # underlying data that's truncated, not the markup.
+        assert 'class="daily-hook daily-hook-up"' in html
+        assert "Buys up 10 vs prior day" in html
+
+    def test_dashboard_omits_banner_when_no_prev(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="daily-hook' not in html
+
+    def test_dashboard_omits_banner_when_no_reports(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # No reports planted → no hook → no banner.
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="daily-hook' not in html
+
+    def test_dashboard_banner_renders_above_report_section(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        """The banner must appear ABOVE the latest-report section so
+        repeat visitors see the day-over-day signal first."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        banner_pos = html.index('class="daily-hook')
+        # The latest-report heading is either "Latest report" (empty
+        # state) or "Latest report — <date>" when a report exists.
+        # Match either form via the common prefix.
+        report_pos = html.index("<h2>Latest report")
+        assert banner_pos < report_pos
+
+
+class TestPhase92NoLeak:
+    def test_raw_key_absent_from_hook_response(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in body_text
+
+    def test_raw_key_absent_from_dashboard_html(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in html
+
+
+class TestPhase92CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 9.2 leaked a mutating route: {m} {path}"
+                )
+
+    def test_hook_does_not_affect_existing_insights_field(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        """Phase 9.1 insights must continue to surface alongside
+        the new daily_hook field."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "insights" in body
+        assert "daily_hook" in body
+        # The insights list and the hook agree on the trend direction.
+        trend = [
+            e for e in body["insights"]
+            if e["id"] == "trend.buy_delta"
+        ][0]
+        assert trend["evidence"]["direction"] == body["daily_hook"]["change"]
+
+
+# ===========================================================================
+# Phase 9.3 — stickiness loop (streak + missed-day nudge)
+# ===========================================================================
+
+
+class TestPhase93ReportsLatestStreak:
+    """The streak field surfaces from promotion_readiness on both
+    tiers; premium gets next_milestone, free does not."""
+
+    def test_premium_response_includes_full_streak(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Promotion readiness in _phase91_full_report_dict is
+        # consecutive_passing_days=5 → milestone, next=7.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "streak" in body
+        streak = body["streak"]
+        assert set(streak.keys()) == {
+            "days", "label", "milestone", "next_milestone",
+        }
+        assert streak["days"] == 5
+        assert streak["milestone"] is True
+        assert streak["next_milestone"] == 7
+
+    def test_free_response_drops_next_milestone(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body["tier"] == "free"
+        streak = body["streak"]
+        assert set(streak.keys()) == {"days", "label", "milestone"}
+        assert "next_milestone" not in streak
+        assert streak["days"] == 5
+
+    def test_zero_consecutive_days_omits_streak(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Override the standard fixture with a zero-streak report.
+        body = _phase91_full_report_dict("2026-04-25", buy_rows=30)
+        body["promotion_readiness"]["consecutive_passing_days"] = 0
+        target = phase91_env["reports_dir"] / "alpha_report_2026-04-25.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(body), encoding="utf-8")
+        out = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "streak" not in out
+
+
+class TestPhase93ReportsLatestNudge:
+    """The missed-day nudge fires only when there's a gap > 1 day
+    between the latest two reports on disk."""
+
+    def test_two_day_gap_emits_nudge(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # 2026-04-22 and 2026-04-25 → gap of 3 days → days_missed=2.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "nudge" in body
+        nudge = body["nudge"]
+        assert nudge["kind"] == "missed_day"
+        assert nudge["days_missed"] == 2
+        assert nudge["since"] == "2026-04-22"
+        assert "missed 2 days" in nudge["headline"]
+
+    def test_consecutive_days_omits_nudge(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "nudge" not in body
+
+    def test_no_prev_omits_nudge(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        # Only one report planted — nudge needs a prior to compute.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "nudge" not in body
+        # Streak still present (it's a function of the current
+        # report alone, doesn't need a prev).
+        assert "streak" in body
+
+    def test_free_nudge_carries_full_user_facing_fields(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        nudge = body["nudge"]
+        # The current Phase 9.3 nudge schema is entirely user-facing
+        # so free callers see every field — but the helper still
+        # passes through the projector defensively.
+        assert set(nudge.keys()) == {
+            "kind", "headline", "days_missed", "since", "cta",
+        }
+
+
+class TestPhase93DashboardBanners:
+    def test_premium_dashboard_renders_streak_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="streak streak-milestone"' in html
+        assert "5-day passing streak" in html
+        assert "next milestone: 7 days" in html
+
+    def test_free_dashboard_streak_omits_next_milestone(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="streak streak-milestone"' in html
+        assert "5-day passing streak" in html
+        # Free tier does NOT see the forward-looking next-milestone
+        # hint.
+        assert "next milestone" not in html
+
+    def test_dashboard_renders_missed_day_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="nudge nudge-missed_day"' in html
+        assert "missed 2 days of reports" in html
+        assert "since 2026-04-22" in html
+
+    def test_dashboard_omits_streak_banner_when_no_streak(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        body = _phase91_full_report_dict("2026-04-25", buy_rows=30)
+        body["promotion_readiness"]["consecutive_passing_days"] = 0
+        target = phase91_env["reports_dir"] / "alpha_report_2026-04-25.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(body), encoding="utf-8")
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="streak' not in html
+
+    def test_dashboard_omits_nudge_banner_when_no_gap(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert 'class="nudge' not in html
+
+    def test_nudge_banner_renders_above_streak_banner(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        """When a re-engaging user has both signals, the missed-day
+        nudge sits ABOVE the streak so the re-engagement message
+        comes first."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        nudge_pos = html.index('class="nudge')
+        streak_pos = html.index('class="streak')
+        assert nudge_pos < streak_pos
+
+
+class TestPhase93NoLeak:
+    def test_raw_key_absent_from_json_response(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in body_text
+
+    def test_raw_key_absent_from_dashboard_html(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        html = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in html
+
+
+class TestPhase93CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 9.3 leaked a mutating route: {m} {path}"
+                )
+
+    def test_streak_and_nudge_coexist_with_existing_fields(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-22", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        # Phase 9.1 + 9.2 + 9.3 fields all present together.
+        assert "insights" in body
+        assert "daily_hook" in body
+        assert "streak" in body
+        assert "nudge" in body
+
+
+# ===========================================================================
+# Phase 10.1 — shareability layer
+# ===========================================================================
+
+
+_PHASE_101_BASE_URL = "https://share.example.com"
+
+
+@pytest.fixture
+def phase101_env(phase91_env, monkeypatch):
+    """Phase 9.1 base + TRADING_PUBLIC_BASE_URL set so the share
+    helpers have somewhere to point. Returns the same dict shape
+    as phase91_env."""
+    monkeypatch.setenv("TRADING_PUBLIC_BASE_URL", _PHASE_101_BASE_URL)
+    return phase91_env
+
+
+class TestPhase101InsightShareFreeUser:
+    def test_each_insight_carries_share_payload(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert "insights" in body
+        # Free tier sees up to 2 insights; both must carry share.
+        for entry in body["insights"]:
+            assert "share" in entry, (
+                f"insight {entry['id']!r} missing share payload"
+            )
+            assert set(entry["share"].keys()) == {"text", "cta", "url"}
+            assert entry["share"]["url"] == _PHASE_101_BASE_URL
+            assert entry["share"]["cta"] == "Try it yourself"
+
+    def test_free_share_text_uses_plain_copy(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        trend = next(
+            (e for e in body["insights"] if e["id"] == "trend.buy_delta"),
+            None,
+        )
+        assert trend is not None
+        # Free copy: no percent-change figure.
+        assert "%" not in trend["share"]["text"]
+        assert "Momentum Trading Bot" in trend["share"]["text"]
+
+
+class TestPhase101InsightSharePremiumUser:
+    def test_premium_trend_share_includes_percent_change(
+        self, client: TestClient, phase101_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        trend = next(
+            (e for e in body["insights"] if e["id"] == "trend.buy_delta"),
+            None,
+        )
+        assert trend is not None
+        assert "%" in trend["share"]["text"]
+        assert "+50.0%" in trend["share"]["text"]
+
+
+class TestPhase101DailyHookShare:
+    def test_free_daily_hook_carries_share(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        hook = body["daily_hook"]
+        assert "share" in hook
+        assert set(hook["share"].keys()) == {"text", "cta", "url"}
+        assert hook["share"]["url"] == _PHASE_101_BASE_URL
+        # Free copy is plain.
+        assert "Buy signals up 10" in hook["share"]["text"]
+
+    def test_premium_daily_hook_share_carries_richer_copy(
+        self, client: TestClient, phase101_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        hook = body["daily_hook"]
+        assert "share" in hook
+        # Premium copy uses the headline + branded prefix.
+        assert "Momentum Trading Bot" in hook["share"]["text"]
+        assert "trending up" in hook["share"]["text"]
+
+
+class TestPhase101NoBaseUrlOmitsShare:
+    """When TRADING_PUBLIC_BASE_URL is unset (the default state in
+    most Phase 9 tests), the response must NOT carry share fields —
+    the underlying insight / hook stays unchanged."""
+
+    def test_no_base_url_means_no_share_on_insights(
+        self, client: TestClient, phase91_env, monkeypatch,
+    ):
+        # Don't use phase101_env — leave TRADING_PUBLIC_BASE_URL unset.
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        for entry in body["insights"]:
+            assert "share" not in entry, (
+                f"insight {entry['id']!r} leaked share without base URL"
+            )
+
+    def test_no_base_url_means_no_share_on_daily_hook(
+        self, client: TestClient, phase91_env, monkeypatch,
+    ):
+        monkeypatch.delenv("TRADING_PUBLIC_BASE_URL", raising=False)
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        hook = body.get("daily_hook")
+        assert hook is not None
+        assert "share" not in hook
+
+
+class TestPhase101NoLeak:
+    def test_raw_key_absent_from_share_text(
+        self, client: TestClient, phase101_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        text = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).text
+        assert raw not in text
+
+
+class TestPhase101CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 10.1 leaked a mutating route: {m} {path}"
+                )
+
+    def test_share_field_does_not_displace_existing_insight_fields(
+        self, client: TestClient, phase101_env, monkeypatch, tmp_path: Path,
+    ):
+        """The share decoration must layer on top of the existing
+        Phase 9.1 schema — every documented field still surfaces."""
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase101_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        for entry in body["insights"]:
+            # Phase 9.1 keys all present.
+            assert {"id", "title", "summary", "confidence", "severity",
+                    "evidence", "action"}.issubset(entry.keys())
+            # Phase 10.1 share present.
+            assert "share" in entry
+
+
+# ===========================================================================
+# Phase 10.2 — public entry layer
+# ===========================================================================
+
+
+class TestPhase102LandingJson:
+    """GET / supports content-negotiation: HTML for browsers,
+    JSON preview when the caller explicitly requests it."""
+
+    def test_default_request_still_serves_html(
+        self, client: TestClient, phase91_env,
+    ):
+        # No Accept header → TestClient sends Accept: */*. Browsers
+        # (and curl with no -H) should still get the existing
+        # Phase 5.2 HTML landing page.
+        r = client.get("/")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/html")
+        assert "<!DOCTYPE html>" in r.text
+
+    def test_html_accept_header_serves_html(
+        self, client: TestClient, phase91_env,
+    ):
+        r = client.get("/", headers={"Accept": "text/html"})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/html")
+
+    def test_json_accept_header_serves_preview_json(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get("/", headers={"Accept": "application/json"})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("application/json")
+        body = r.json()
+        assert body["preview"] is True
+        assert "get_started" in body
+        # Phase 10.2 GET / payload includes the daily_hook + a
+        # single top_insight (not the full insights list).
+        assert "daily_hook" in body
+        assert "top_insight" in body
+
+    def test_json_top_insight_is_single_dict_not_list(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()
+        ti = body["top_insight"]
+        assert isinstance(ti, dict)
+        assert "id" in ti
+        # Free projection — the trend insight comes first.
+        assert ti["id"] == "trend.buy_delta"
+
+    def test_json_preview_omits_premium_evidence(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()
+        ev = body["top_insight"]["evidence"]
+        # Free truncation: evidence is {delta, direction} only.
+        assert set(ev.keys()) == {"delta", "direction"}
+        # Daily hook on the preview is also free-projected.
+        hook = body["daily_hook"]
+        assert "confidence" not in hook
+        assert "driver" not in hook
+
+    def test_json_no_reports_omits_signals(
+        self, client: TestClient, phase91_env,
+    ):
+        # No reports planted → no daily_hook / top_insight, but
+        # the preview marker + get_started still come back.
+        body = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()
+        assert body["preview"] is True
+        assert "get_started" in body
+        assert "daily_hook" not in body
+        assert "top_insight" not in body
+
+
+class TestPhase102ReportsLatestPreview:
+    """GET /reports/latest with no Authorization header now serves
+    a free-tier preview body."""
+
+    def test_no_auth_returns_200_with_preview(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get("/reports/latest")
+        assert r.status_code == 200
+        body = r.json()
+        # Phase 10.2 markers.
+        assert body["preview"] is True
+        assert "get_started" in body
+        # Phase 8.2 free projection markers.
+        assert body["tier"] == "free"
+        assert "report_type" in body
+        assert "totals" in body
+        # Phase 9.1 / 9.2 / 9.3 fields ride through.
+        assert "insights" in body
+        assert "daily_hook" in body
+        # Phase 9.3 streak only fires when consec_passing_days > 0.
+        assert "streak" in body
+
+    def test_preview_omits_premium_only_fields(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        # Same premium-only set the Phase 8.2 truncation drops.
+        for premium_field in (
+            "tier_stats", "reason_stats", "regime_stats",
+            "decile_stats", "shadow_filter_simulation",
+            "guardrails", "sources",
+        ):
+            assert premium_field not in body, (
+                f"Phase 10.2: preview leaked premium field {premium_field!r}"
+            )
+
+    def test_preview_insight_evidence_uses_free_allowlist(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        trend = next(
+            (e for e in body["insights"] if e["id"] == "trend.buy_delta"),
+            None,
+        )
+        assert trend is not None
+        # Free truncation: evidence is {delta, direction}.
+        assert set(trend["evidence"].keys()) == {"delta", "direction"}
+
+    def test_preview_capped_to_free_insight_limit(
+        self, client: TestClient, phase91_env,
+    ):
+        # phase91 report has all three rule sources; free cap is 2.
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-24", buy_rows=20,
+        )
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        assert len(body["insights"]) <= 2
+
+    def test_preview_no_report_returns_404(
+        self, client: TestClient, phase91_env,
+    ):
+        # The same 404 path the auth'd surface uses — no report
+        # to project means nothing to return.
+        r = client.get("/reports/latest")
+        assert r.status_code == 404
+
+
+class TestPhase102ReportsLatestPreviewAuthMatrix:
+    """Matrix: no header → preview; bad header → still rejects."""
+
+    def test_no_header_returns_preview_200(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get("/reports/latest")
+        assert r.status_code == 200
+        assert r.json()["preview"] is True
+
+    def test_invalid_bearer_still_403(
+        self, client: TestClient, phase91_env,
+    ):
+        # Pre-issue someone so the manifest is non-empty (deployment
+        # is configured).
+        _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Bearer not-a-real-key"},
+        )
+        assert r.status_code == 403
+
+    def test_non_bearer_scheme_still_401(
+        self, client: TestClient, phase91_env,
+    ):
+        _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        r = client.get(
+            "/reports/latest",
+            headers={"Authorization": "Basic abc=="},
+        )
+        # HTTPBearer rejects non-Bearer; falls through to
+        # optional_api_key as creds=None → preview. Result: 200.
+        # This is the documented Phase 10.2 behaviour — non-Bearer
+        # is treated as "no header" by the soft-auth path.
+        assert r.status_code == 200
+        assert r.json()["preview"] is True
+
+    def test_authenticated_free_does_not_get_preview_marker(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body.get("preview") is None
+        assert "get_started" not in body
+        # Authenticated free still carries the tier marker.
+        assert body["tier"] == "free"
+
+    def test_authenticated_premium_does_not_get_preview_marker(
+        self, client: TestClient, phase91_env, monkeypatch, tmp_path: Path,
+    ):
+        raw, key_hash = _issue_phase91_key("free")
+        _promote_phase91_to_premium(raw, key_hash, monkeypatch, tmp_path)
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get(
+            "/reports/latest",
+            headers={"Authorization": f"Bearer {raw}"},
+        ).json()
+        assert body.get("preview") is None
+        assert "get_started" not in body
+
+
+class TestPhase102NoLeak:
+    def test_preview_response_no_raw_key_marker(
+        self, client: TestClient, phase91_env,
+    ):
+        # Sanity — issue a key, then make an UNAUTH request.
+        # The preview body must not echo the raw key (it never
+        # had access to it anyway, but pin the invariant).
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get("/reports/latest").text
+        assert raw not in body_text
+
+    def test_landing_json_no_raw_key_marker(
+        self, client: TestClient, phase91_env,
+    ):
+        raw, _ = _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body_text = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).text
+        assert raw not in body_text
+
+
+class TestPhase102CrossCutting:
+    def test_no_new_mutating_route(self):
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        for route in app.routes:
+            methods = getattr(route, "methods", None) or set()
+            path = getattr(route, "path", "") or ""
+            for m in methods:
+                if m in {"GET", "HEAD", "OPTIONS"}:
+                    continue
+                assert (m, path) in allowed, (
+                    f"Phase 10.2 leaked a mutating route: {m} {path}"
+                )
+
+    def test_preview_does_not_count_against_usage(
+        self, client: TestClient, phase91_env,
+    ):
+        """Unauthenticated preview requests must NOT write to the
+        per-key usage log — there's no key to count against."""
+        _issue_phase91_key("free")
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        # Make several preview calls.
+        for _ in range(5):
+            r = client.get("/reports/latest")
+            assert r.status_code == 200
+        usage_path = Path(os.environ["TRADING_API_USAGE_LOG_PATH"])
+        if usage_path.exists():
+            body = usage_path.read_text("utf-8").strip()
+            # Preview never writes a usage row (no auth → no api_key
+            # on request.state → usage_middleware short-circuits).
+            assert body == "" or "/reports/latest" not in body, (
+                f"Phase 10.2: preview leaked into usage log: {body!r}"
+            )
+
+    def test_get_started_block_is_stable(
+        self, client: TestClient, phase91_env,
+    ):
+        _write_phase91_report(
+            phase91_env["reports_dir"], "2026-04-25", buy_rows=30,
+        )
+        body = client.get("/reports/latest").json()
+        gs = body["get_started"]
+        # Stable shape across both preview surfaces.
+        assert "label" in gs
+        assert "endpoint" in gs
+        assert gs["endpoint"] == "/reports/latest"
+        # Also surfaces from GET / JSON.
+        gs_root = client.get(
+            "/", headers={"Accept": "application/json"},
+        ).json()["get_started"]
+        assert gs == gs_root

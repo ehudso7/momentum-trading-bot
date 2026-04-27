@@ -58,6 +58,11 @@ def clean_stripe_env(monkeypatch, tmp_path: Path):
     """
     Clear all Stripe env vars + point the cache at a tmp file so
     tests never touch the real data/ directory.
+
+    Phase 7.0: also redirect the issuance manifest / revocation log
+    to tmp files and reset the ``key_store`` cache, because the
+    webhook handler now consults the manifest before mutating the
+    premium cache.
     """
     for name in (
         STRIPE_API_KEY_ENV_VAR,
@@ -66,16 +71,57 @@ def clean_stripe_env(monkeypatch, tmp_path: Path):
     ):
         monkeypatch.delenv(name, raising=False)
     cache_file = tmp_path / "stripe_premium.json"
+    manifest_file = tmp_path / "api_keys_manifest.jsonl"
+    revoked_file = tmp_path / "api_keys_revoked.jsonl"
     monkeypatch.setenv(STRIPE_PREMIUM_CACHE_ENV_VAR, str(cache_file))
+    monkeypatch.setenv("TRADING_API_KEYS_MANIFEST_PATH", str(manifest_file))
+    monkeypatch.setenv("TRADING_API_KEYS_REVOKED_PATH", str(revoked_file))
     reset_cache_for_tests()
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
     yield cache_file
     reset_cache_for_tests()
+    key_store.reset_caches_for_tests()
 
 
 @pytest.fixture
 def cache_file(clean_stripe_env) -> Path:
     """Alias for the tmp cache path configured by clean_stripe_env."""
     return clean_stripe_env
+
+
+def _manifest_file_from_env() -> Path:
+    return Path(os.environ["TRADING_API_KEYS_MANIFEST_PATH"])
+
+
+def _hash(api_key: str) -> str:
+    """Local SHA-256[:32] — byte-identical to the billing / server hashers."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:32]
+
+
+def _pre_issue(api_key: str, *, tier: str = "free") -> str:
+    """
+    Phase 7.0 helper — append a minimal manifest row for ``api_key``
+    so a subsequent webhook event passes the Phase 7.0 manifest gate.
+
+    Returns the key_hash. Clears the ``key_store`` mtime-cache so the
+    next read picks up the new row.
+    """
+    path = _manifest_file_from_env()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key_hash = _hash(api_key)
+    row = {
+        "created_at": "2026-04-25T00:00:00.000000Z",
+        "key_hash": key_hash,
+        "label_hash": "f" * 32,
+        "tier": tier,
+        "checkout_session_id": None,
+    }
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+    from trading_bot.api import key_store
+    key_store.reset_caches_for_tests()
+    return key_hash
 
 
 def _sign(payload: bytes, secret: str, *, ts: Optional[int] = None) -> str:
@@ -263,18 +309,25 @@ class TestPremiumCache:
         assert is_premium_via_stripe("user-123") is True
         assert is_premium_via_stripe("someone-else") is False
 
-    def test_add_persists_to_file(self, cache_file: Path):
+    def test_add_persists_to_file_as_hash_not_raw(self, cache_file: Path):
+        """Phase 7.0: the raw api_key is hashed in-process; only the
+        SHA-256[:32] hash lands on disk."""
         add_premium_key("user-123")
         assert cache_file.exists()
-        data = json.loads(cache_file.read_text("utf-8"))
-        assert data == ["user-123"]
+        body = cache_file.read_text("utf-8")
+        data = json.loads(body)
+        assert data == [_hash("user-123")]
+        # The raw value must NOT appear on disk.
+        assert "user-123" not in body
 
     def test_remove_then_read(self, cache_file: Path):
         add_premium_key("user-123")
         remove_premium_key("user-123")
         assert is_premium_via_stripe("user-123") is False
-        # File should not contain the key either.
-        assert "user-123" not in cache_file.read_text("utf-8")
+        # Neither the raw key nor its hash should be in the file.
+        body = cache_file.read_text("utf-8")
+        assert "user-123" not in body
+        assert _hash("user-123") not in body
 
     def test_remove_missing_key_is_idempotent(self, cache_file: Path):
         remove_premium_key("never-added")  # must not raise
@@ -284,17 +337,43 @@ class TestPremiumCache:
         add_premium_key(None)
         assert current_premium_keys() == set()
 
-    def test_cache_reload_from_disk(self, cache_file: Path):
-        # Populate cache externally, then force reload.
+    def test_cache_reload_from_disk_legacy_raw_keys_migrated(
+        self, cache_file: Path,
+    ):
+        """Phase 7.0 migration: a cache file containing legacy raw
+        keys is transparently re-hashed and re-saved on load. Lookup
+        by the raw key still works via ``is_premium_via_stripe``."""
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(
             json.dumps(["pre-existing-a", "pre-existing-b"]),
             encoding="utf-8",
         )
         reset_cache_for_tests()
+        # Lookup by the raw key still succeeds — the function hashes
+        # internally.
         assert is_premium_via_stripe("pre-existing-a") is True
         assert is_premium_via_stripe("pre-existing-b") is True
         assert is_premium_via_stripe("not-there") is False
+        # And the on-disk file has been rewritten with hashes only.
+        rewritten = json.loads(cache_file.read_text("utf-8"))
+        assert set(rewritten) == {
+            _hash("pre-existing-a"), _hash("pre-existing-b"),
+        }
+        assert "pre-existing-a" not in cache_file.read_text("utf-8")
+
+    def test_cache_reload_from_disk_already_hashed(self, cache_file: Path):
+        """A cache file whose entries are already 32-char hex hashes
+        is left untouched (no re-migration)."""
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        hashes = sorted([_hash("user-a"), _hash("user-b")])
+        cache_file.write_text(json.dumps(hashes), encoding="utf-8")
+        mtime_before = cache_file.stat().st_mtime
+        reset_cache_for_tests()
+        # Looking up by the raw values still works.
+        assert is_premium_via_stripe("user-a") is True
+        assert is_premium_via_stripe("user-b") is True
+        # And the file contents are unchanged (sorted + spaced as before).
+        assert json.loads(cache_file.read_text("utf-8")) == hashes
 
     def test_corrupt_cache_file_does_not_crash(
         self, cache_file: Path
@@ -314,7 +393,8 @@ class TestPremiumCache:
     def test_add_deduplicates(self, cache_file: Path):
         for _ in range(5):
             add_premium_key("same-key")
-        assert current_premium_keys() == {"same-key"}
+        # Phase 7.0 — the cache holds one hash, not five raw copies.
+        assert current_premium_keys() == {_hash("same-key")}
 
     def test_thread_safe_concurrent_writes(self, cache_file: Path):
         N = 30
@@ -329,7 +409,7 @@ class TestPremiumCache:
         for t in threads:
             t.join()
         stored = current_premium_keys()
-        assert stored == {f"key-{i}" for i in range(N)}
+        assert stored == {_hash(f"key-{i}") for i in range(N)}
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +419,8 @@ class TestPremiumCache:
 
 class TestHandleWebhookEvent:
     def test_subscription_created_active_adds_premium(self, cache_file: Path):
+        # Phase 7.0 — webhook gates on manifest presence.
+        _pre_issue("user-xyz", tier="free")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -353,6 +435,7 @@ class TestHandleWebhookEvent:
     def test_subscription_created_trialing_also_adds_premium(
         self, cache_file: Path
     ):
+        _pre_issue("user-trial", tier="free")
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {
@@ -414,13 +497,17 @@ class TestHandleWebhookEvent:
         assert is_premium_via_stripe("user-x") is False
 
     def test_event_without_api_key_ignored(self, cache_file: Path):
+        # Phase 7.4 — the reason string broadened from
+        # "no_api_key_on_event" to "no_identity_on_event" because
+        # the webhook now accepts metadata[key_hash] as a valid
+        # alternative identity. Behaviour is otherwise unchanged.
         event = {
             "type": "customer.subscription.created",
             "data": {"object": {"status": "active"}},
         }
         result = handle_webhook_event(event)
         assert result["action"] == "ignored"
-        assert result["reason"] == "no_api_key_on_event"
+        assert result["reason"] == "no_identity_on_event"
 
     def test_non_dict_event_ignored(self):
         assert handle_webhook_event(None)["action"] == "ignored"
@@ -448,7 +535,11 @@ class TestNoSensitiveDataStored:
     names, full customer records — must NOT end up on disk.
     """
 
-    def test_cache_never_contains_card_data(self, cache_file: Path):
+    def test_cache_never_contains_card_data_or_raw_api_key(
+        self, cache_file: Path,
+    ):
+        # Pre-issue so the webhook's Phase 7.0 gate passes.
+        _pre_issue("opaque-key-abc")
         # A stripe event decorated with sensitive-looking fields.
         event = {
             "type": "customer.subscription.created",
@@ -482,10 +573,12 @@ class TestNoSensitiveDataStored:
             "4242424242424242",
             "exp_month", "exp_year", "last4",
             "pan", "cvv",
+            # Phase 7.0: the raw api_key itself must also NOT land on disk.
+            "opaque-key-abc",
         ):
             assert forbidden not in raw, f"leaked {forbidden!r}"
-        # Only the opaque api key survives.
-        assert "opaque-key-abc" in raw
+        # The hash IS expected — it's the Phase 7.0 persisted form.
+        assert _hash("opaque-key-abc") in raw
 
     def test_event_without_metadata_leaves_cache_empty(
         self, cache_file: Path
@@ -966,24 +1059,41 @@ class TestCliCheckout:
 
 
 class TestPhase48NoNewApiRoute:
-    def test_no_checkout_route_on_server(self):
-        """Phase 4.8 must NOT add a /checkout endpoint to the FastAPI app."""
+    def test_no_signup_or_subscribe_routes(self):
+        """Phase 4.8 forbade public sign-up endpoints. Phase 7.3 added
+        the SINGLE authenticated upgrade route ``POST /billing/checkout``;
+        this test still forbids every other shape (sign-up forms,
+        public /upgrade, /subscribe, /checkout in unrelated paths)."""
         from trading_bot.api.server import app
         forbidden_fragments = (
-            "/checkout",
+            "/signup",
+            "/sign-up",
+            "/register",
             "/subscribe",
             "/upgrade",
-            "/billing/checkout",
         )
         for route in app.routes:
             path = getattr(route, "path", "") or ""
             for frag in forbidden_fragments:
                 assert frag not in path, (
-                    f"Phase 4.8 introduced a public billing route: {path}"
+                    f"public billing surface introduced: {path}"
                 )
 
+    def test_billing_checkout_route_is_authenticated(self):
+        """Phase 7.3: ``POST /billing/checkout`` exists and requires
+        authentication. The route is sanctioned, but it must NOT be
+        a public sign-up endpoint."""
+        from fastapi.testclient import TestClient
+        from trading_bot.api.server import app
+        client = TestClient(app)
+        # No Authorization header → 401, never 200.
+        r = client.post("/billing/checkout")
+        assert r.status_code in {401, 503}, r.status_code
+
     def test_only_non_read_verb_is_still_webhook_stripe(self):
-        """The only mutating route must still be POST /webhook/stripe."""
+        """The only mutating routes are POST /webhook/stripe (Phase 4.7)
+        and POST /billing/checkout (Phase 7.3). Anything else is a regression."""
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
         from trading_bot.api.server import app
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
@@ -991,7 +1101,7 @@ class TestPhase48NoNewApiRoute:
             for m in methods:
                 if m in {"GET", "HEAD", "OPTIONS"}:
                     continue
-                assert path == "/webhook/stripe" and m == "POST", (
+                assert (m, path) in allowed, (
                     f"Phase 4.8 leaked a mutating route: {m} {path}"
                 )
 
@@ -1013,390 +1123,858 @@ class TestPhase48NoNewApiRoute:
 
 
 # ===========================================================================
-# Phase: Stripe test-mode hardening (preferred env vars + webhook idempotency)
+# Phase 7.0 — Stripe → key activation bridge
+# ===========================================================================
+
+
+class TestPhase70ManifestGate:
+    """A Stripe subscription.created event must only promote an
+    api_key to premium if that key was actually issued via the
+    operator CLI (manifest lookup succeeds) AND has not been revoked."""
+
+    def test_unissued_key_webhook_ignored(self, cache_file: Path):
+        """A webhook with an api_key nobody issued is rejected — no
+        cache mutation, and the file either stays absent or stays
+        empty."""
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "never-issued-key"},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+        assert is_premium_via_stripe("never-issued-key") is False
+        if cache_file.exists():
+            # File may have been created empty by a prior load; it
+            # must not contain the rejected hash or the raw key.
+            body = cache_file.read_text("utf-8")
+            assert "never-issued-key" not in body
+            assert _hash("never-issued-key") not in body
+
+    def test_issued_key_webhook_adds_premium(self, cache_file: Path):
+        """Happy path: operator issues the key, webhook promotes it."""
+        _pre_issue("issued-key-happy-path", tier="free")
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "issued-key-happy-path"},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "added"
+        assert is_premium_via_stripe("issued-key-happy-path") is True
+
+    def test_revoked_key_webhook_ignored(self, cache_file: Path):
+        """A key that was issued but later revoked must NOT be
+        re-promoted by a Stripe event. Revocation is absolute."""
+        from trading_bot.api import key_store
+        _pre_issue("issued-then-revoked", tier="free")
+        key_store.append_revocation(
+            key_hash=_hash("issued-then-revoked"),
+            reason="phase7-test",
+        )
+        key_store.reset_caches_for_tests()
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "issued-then-revoked"},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+        assert is_premium_via_stripe("issued-then-revoked") is False
+
+
+class TestPhase70ManifestNotMutated:
+    """The Stripe webhook must NEVER touch the issuance manifest."""
+
+    def test_manifest_bytes_unchanged_after_webhook(self, cache_file: Path):
+        _pre_issue("manifest-immutable", tier="free")
+        mpath = _manifest_file_from_env()
+        before = mpath.read_bytes()
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "manifest-immutable"},
+            }},
+        }
+        handle_webhook_event(event)
+        after = mpath.read_bytes()
+        assert before == after, (
+            "Phase 7.0: webhook must never mutate the issuance manifest"
+        )
+
+
+class TestPhase70CancellationFlow:
+    """Cancellation / payment failure flows through without manifest
+    verification — a cancelled customer always loses premium
+    immediately, even if their manifest row has since been deleted."""
+
+    def test_cancellation_removes_premium(self, cache_file: Path):
+        _pre_issue("cancelled-user", tier="free")
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "cancelled-user"},
+            }},
+        })
+        assert is_premium_via_stripe("cancelled-user") is True
+        result = handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": "cancelled-user"},
+            }},
+        })
+        assert result["action"] == "removed"
+        assert is_premium_via_stripe("cancelled-user") is False
+
+    def test_payment_failed_removes_premium(self, cache_file: Path):
+        _pre_issue("payment-fail-user", tier="free")
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "payment-fail-user"},
+            }},
+        })
+        assert is_premium_via_stripe("payment-fail-user") is True
+        result = handle_webhook_event({
+            "type": "invoice.payment_failed",
+            "data": {"object": {
+                "metadata": {"api_key": "payment-fail-user"},
+            }},
+        })
+        assert result["action"] == "removed"
+        assert is_premium_via_stripe("payment-fail-user") is False
+
+    def test_cancellation_without_prior_activation_is_noop(
+        self, cache_file: Path,
+    ):
+        """A cancellation for a key we never promoted still returns
+        'removed' (idempotent) but no longer requires a manifest
+        lookup — an orphan cancellation does not blow up."""
+        result = handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {
+                "metadata": {"api_key": "orphan-cancellation"},
+            }},
+        })
+        assert result["action"] == "removed"
+
+
+class TestPhase70HashOnlyPersistence:
+    """The raw api_key must never land on disk — neither in the
+    premium cache, nor in any other operator-visible file."""
+
+    def test_add_premium_key_persists_only_hash(self, cache_file: Path):
+        add_premium_key("RAW_KEY_PHASE70_DO_NOT_LEAK_777")
+        body = cache_file.read_text(encoding="utf-8")
+        assert "RAW_KEY_PHASE70_DO_NOT_LEAK_777" not in body
+        assert _hash("RAW_KEY_PHASE70_DO_NOT_LEAK_777") in body
+
+    def test_webhook_persists_only_hash(self, cache_file: Path):
+        marker = "RAW_KEY_WEBHOOK_PHASE70_DO_NOT_LEAK"
+        _pre_issue(marker)
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": marker},
+            }},
+        })
+        body = cache_file.read_text(encoding="utf-8")
+        assert marker not in body
+        assert _hash(marker) in body
+
+    def test_is_premium_hash_shortcut(self, cache_file: Path):
+        """``is_premium_hash`` lets the server skip a re-hash on the
+        request hot path. Returns True only when the hash is in the
+        cache."""
+        from trading_bot.api.billing import is_premium_hash
+        add_premium_key("hashshort-123")
+        assert is_premium_hash(_hash("hashshort-123")) is True
+        assert is_premium_hash("0" * 32) is False
+        assert is_premium_hash("") is False
+        assert is_premium_hash(None) is False
+
+
+# ===========================================================================
+# Phase 7.3 — create_checkout_session_for_hash (hash-only metadata)
 # ===========================================================================
 
 
 from trading_bot.api.billing import (  # noqa: E402
+    BillingAPIError,
+    BillingConfigError,
     STRIPE_PREMIUM_PRICE_ID_ENV_VAR,
     STRIPE_SECRET_KEY_ENV_VAR,
-    _resolve_premium_price_id,
-    _resolve_stripe_secret,
+    create_checkout_session_for_hash,
 )
 
 
-class TestStripeSecretResolver:
-    def test_unset_returns_empty(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
-        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
-        assert _resolve_stripe_secret() == ""
-
-    def test_legacy_only(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
-        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
-        assert _resolve_stripe_secret() == "sk_test_legacy"
-
-    def test_preferred_only(self, monkeypatch):
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_preferred")
-        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
-        assert _resolve_stripe_secret() == "sk_test_preferred"
-
-    def test_preferred_wins_over_legacy(self, monkeypatch):
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_PREFERRED")
-        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
-        assert _resolve_stripe_secret() == "sk_test_PREFERRED"
-
-    def test_blank_preferred_falls_through_to_legacy(self, monkeypatch):
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "   ")
-        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
-        assert _resolve_stripe_secret() == "sk_test_legacy"
+@pytest.fixture
+def phase73_stripe_env(monkeypatch, tmp_path: Path):
+    """Configure both Phase 7.3 env vars for the helper tests."""
+    monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_phase73")
+    monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_test_phase73")
+    return tmp_path
 
 
-class TestPremiumPriceIdResolver:
-    def test_unset_returns_empty(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
-        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
-        assert _resolve_premium_price_id() == ""
+class _FakePoster:
+    """Records every Stripe POST so tests can assert exact metadata shape."""
 
-    def test_legacy_only(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
-        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_legacy")
-        assert _resolve_premium_price_id() == "price_legacy"
-
-    def test_preferred_only(self, monkeypatch):
-        monkeypatch.setenv(
-            STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_preferred",
-        )
-        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
-        assert _resolve_premium_price_id() == "price_preferred"
-
-    def test_preferred_wins_over_legacy(self, monkeypatch):
-        monkeypatch.setenv(
-            STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_PREFERRED",
-        )
-        monkeypatch.setenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_legacy")
-        assert _resolve_premium_price_id() == "price_PREFERRED"
-
-
-class TestIsStripeConfiguredAcceptsEitherEnv:
-    """is_stripe_configured() must accept either env-var name —
-    Phase test-mode hardening adds the preferred STRIPE_SECRET_KEY
-    name without breaking the legacy STRIPE_API_KEY path."""
-
-    def test_with_preferred_env(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_preferred")
-        assert is_stripe_configured() is True
-
-    def test_with_legacy_env(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
-        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy")
-        assert is_stripe_configured() is True
-
-    def test_with_neither_env(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
-        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
-        assert is_stripe_configured() is False
-
-
-class TestCheckoutAcceptsPreferredEnv:
-    """create_checkout_session must succeed when ONLY the new
-    preferred env-var names are set (no legacy fallback present)."""
-
-    def test_checkout_with_only_preferred_env(self, monkeypatch):
-        monkeypatch.delenv(STRIPE_API_KEY_ENV_VAR, raising=False)
-        monkeypatch.delenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, raising=False)
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_pref_1")
-        monkeypatch.setenv(
-            STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_pref_1",
-        )
-
-        captured = {}
-
-        def stub(**kwargs):
-            captured.update(kwargs)
-            return {
-                "id": "cs_test_session_pref",
-                "url": "https://checkout.stripe.com/c/pay/cs_test_session_pref",
-                "object": "checkout.session",
-            }
-
-        from trading_bot.api.billing import create_checkout_session
-        result = create_checkout_session(
-            "user-key-X",
-            "https://app.example.com/billing/success",
-            "https://app.example.com/billing/cancel",
-            http_post=stub,
-        )
-        assert result["checkout_session_id"] == "cs_test_session_pref"
-        assert captured["data"]["line_items[0][price]"] == "price_pref_1"
-        assert captured["auth"][0] == "sk_test_pref_1"
-
-    def test_checkout_payload_excludes_customer_creation(
-        self, monkeypatch,
+    def __init__(
+        self,
+        response: Optional[dict] = None,
+        raise_exc: Optional[Exception] = None,
     ):
-        """Subscription mode + customer_creation crashes Stripe — the
-        field MUST NOT be in the POST body."""
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_x")
-        monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_x")
+        self.response = response or {
+            "id": "cs_test_phase73",
+            "url": "https://checkout.stripe.com/c/cs_test_phase73",
+        }
+        self.raise_exc = raise_exc
+        self.calls: list[dict] = []
 
-        captured = {}
+    def __call__(self, *, url: str, data: dict, auth, timeout: float):
+        self.calls.append({
+            "url": url, "data": dict(data), "auth": auth, "timeout": timeout,
+        })
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        # Return the response as-is so tests can simulate non-dict
+        # Stripe payloads (the helper must reject those).
+        if isinstance(self.response, dict):
+            return dict(self.response)
+        return self.response
 
-        def stub(**kwargs):
-            captured.update(kwargs)
-            return {"id": "cs_x", "url": "https://x"}
 
-        from trading_bot.api.billing import create_checkout_session
-        create_checkout_session(
-            "user-key-X",
-            "https://app.example.com/billing/success",
-            "https://app.example.com/billing/cancel",
-            http_post=stub,
+class TestCreateCheckoutSessionForHash:
+    def test_happy_path_returns_documented_fields(
+        self, phase73_stripe_env,
+    ):
+        poster = _FakePoster()
+        result = create_checkout_session_for_hash(
+            key_hash="a" * 32,
+            success_url="https://example.com/dashboard?checkout=success",
+            cancel_url="https://example.com/dashboard?checkout=cancel",
+            http_post=poster,
         )
-        data = captured["data"]
+        assert result == {
+            "checkout_session_id": "cs_test_phase73",
+            "checkout_url": "https://checkout.stripe.com/c/cs_test_phase73",
+            "key_hash": "a" * 32,
+            "tier_to": "premium",
+        }
+
+    def test_metadata_contains_key_hash_not_raw_key(
+        self, phase73_stripe_env,
+    ):
+        """The hash must land in metadata; the raw api_key must NEVER
+        be sent to Stripe under any field name."""
+        poster = _FakePoster()
+        marker = "RAW_KEY_PHASE73_DO_NOT_LEAK"
+        # Even though the helper takes a hash, simulate the realistic
+        # case where the operator pre-hashes their secret marker.
+        h = hashlib.sha256(marker.encode("utf-8")).hexdigest()[:32]
+        create_checkout_session_for_hash(
+            key_hash=h,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        data = poster.calls[0]["data"]
+        # Documented metadata fields are present:
+        assert data["client_reference_id"] == h
+        assert data["metadata[key_hash]"] == h
+        assert data["metadata[tier_from]"] == "free"
+        assert data["metadata[tier_to]"] == "premium"
+        assert data["subscription_data[metadata][key_hash]"] == h
+        assert data["subscription_data[metadata][tier_to]"] == "premium"
+        # The raw api_key marker is absent from EVERY field:
+        for value in data.values():
+            assert marker not in str(value)
+        # And the legacy raw-key field is NOT present.
+        assert "metadata[api_key]" not in data
+        assert "subscription_data[metadata][api_key]" not in data
+
+    def test_subscription_mode_and_price_id(self, phase73_stripe_env):
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="b" * 32,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        data = poster.calls[0]["data"]
         assert data["mode"] == "subscription"
-        assert "customer_creation" not in data
+        assert data["line_items[0][price]"] == "price_test_phase73"
+        assert data["line_items[0][quantity]"] == "1"
 
-    def test_checkout_does_not_include_raw_key_in_returned_dict(
+    def test_success_and_cancel_urls_propagated(
+        self, phase73_stripe_env,
+    ):
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="c" * 32,
+            success_url="https://app.example.com/welcome",
+            cancel_url="https://app.example.com/cancel",
+            http_post=poster,
+        )
+        data = poster.calls[0]["data"]
+        assert data["success_url"] == "https://app.example.com/welcome"
+        assert data["cancel_url"] == "https://app.example.com/cancel"
+
+    def test_legacy_env_var_fallback(self, monkeypatch):
+        """STRIPE_SECRET_KEY / STRIPE_PREMIUM_PRICE_ID are preferred,
+        but the legacy STRIPE_API_KEY / STRIPE_PRICE_ID_PREMIUM names
+        must keep working so existing deployments don't break."""
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_legacy_test")
+        monkeypatch.setenv("STRIPE_PRICE_ID_PREMIUM", "price_legacy_test")
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="d" * 32,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
+        )
+        assert poster.calls[0]["auth"] == ("sk_legacy_test", "")
+        assert poster.calls[0]["data"]["line_items[0][price]"] == "price_legacy_test"
+
+    def test_missing_secret_raises_billing_config_error(
         self, monkeypatch,
     ):
-        """The returned dict must contain api_key_hash, never the
-        raw key — operator-issuance + CLI hygiene relies on this."""
-        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_test_x")
+        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY", raising=False)
         monkeypatch.setenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "price_x")
+        with pytest.raises(BillingConfigError) as exc:
+            create_checkout_session_for_hash(
+                key_hash="e" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+        assert STRIPE_SECRET_KEY_ENV_VAR in str(exc.value)
 
-        def stub(**kwargs):
-            return {"id": "cs_x", "url": "https://x"}
+    def test_missing_price_id_raises_billing_config_error(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(STRIPE_SECRET_KEY_ENV_VAR, "sk_x")
+        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv("STRIPE_PRICE_ID_PREMIUM", raising=False)
+        with pytest.raises(BillingConfigError) as exc:
+            create_checkout_session_for_hash(
+                key_hash="f" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+        assert STRIPE_PREMIUM_PRICE_ID_ENV_VAR in str(exc.value)
 
-        from trading_bot.api.billing import create_checkout_session
-        raw_key = "RAW_USER_KEY_DO_NOT_LEAK"
-        result = create_checkout_session(
-            raw_key,
-            "https://app.example.com/billing/success",
-            "https://app.example.com/billing/cancel",
-            http_post=stub,
+    def test_blank_hash_rejected(self, phase73_stripe_env):
+        for h in ("", "   ", None):
+            with pytest.raises(ValueError):
+                create_checkout_session_for_hash(
+                    key_hash=h,  # type: ignore[arg-type]
+                    success_url="https://e.com/ok",
+                    cancel_url="https://e.com/cancel",
+                    http_post=_FakePoster(),
+                )
+
+    def test_blank_urls_rejected(self, phase73_stripe_env):
+        with pytest.raises(ValueError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32, success_url="",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+        with pytest.raises(ValueError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32, success_url="https://e.com/ok",
+                cancel_url="",
+                http_post=_FakePoster(),
+            )
+
+    def test_url_with_newline_rejected(self, phase73_stripe_env):
+        with pytest.raises(ValueError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok\nX-Inject: pwn",
+                cancel_url="https://e.com/cancel",
+                http_post=_FakePoster(),
+            )
+
+    def test_stripe_non_dict_response_raises_api_error(
+        self, phase73_stripe_env,
+    ):
+        bad = _FakePoster()
+        bad.response = ["not", "a", "dict"]  # type: ignore[assignment]
+        with pytest.raises(BillingAPIError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=bad,
+            )
+
+    def test_stripe_missing_id_or_url_raises_api_error(
+        self, phase73_stripe_env,
+    ):
+        bad = _FakePoster(response={"id": "cs_x"})  # missing url
+        with pytest.raises(BillingAPIError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=bad,
+            )
+
+    def test_stripe_failure_propagates_as_api_error(
+        self, phase73_stripe_env,
+    ):
+        boom = _FakePoster(raise_exc=BillingAPIError("simulated stripe 500"))
+        with pytest.raises(BillingAPIError):
+            create_checkout_session_for_hash(
+                key_hash="a" * 32,
+                success_url="https://e.com/ok",
+                cancel_url="https://e.com/cancel",
+                http_post=boom,
+            )
+
+    def test_stripe_secret_used_in_basic_auth(self, phase73_stripe_env):
+        poster = _FakePoster()
+        create_checkout_session_for_hash(
+            key_hash="a" * 32,
+            success_url="https://e.com/ok",
+            cancel_url="https://e.com/cancel",
+            http_post=poster,
         )
-        assert raw_key not in json.dumps(result)
-        assert "api_key_hash" in result
+        assert poster.calls[0]["auth"] == ("sk_test_phase73", "")
 
 
-class TestWebhookIdempotent:
-    """Stripe retries deliveries on any non-2xx (and sometimes
-    spuriously on 2xx). The same event id must be a no-op the
-    second time so a retried `customer.subscription.deleted` between
-    an admin re-grant doesn't silently revoke premium twice."""
+# ===========================================================================
+# Phase 7.4 — hash-based Stripe webhook promotion
+# ===========================================================================
 
-    def test_duplicate_created_event_not_double_processed(self):
-        reset_cache_for_tests()
-        event = {
-            "id": "evt_TEST_dup_created",
-            "type": "customer.subscription.created",
-            "data": {"object": {
-                "status": "active",
-                "metadata": {"api_key": "user-AAA"},
-            }},
-        }
-        first = handle_webhook_event(event)
-        second = handle_webhook_event(event)
-        assert first["action"] == "added"
-        assert second["action"] == "ignored"
-        assert second["reason"] == "duplicate_event"
-        assert "user-AAA" in current_premium_keys()
 
-    def test_duplicate_deleted_event_does_not_double_remove(self):
-        """Even if the operator re-granted premium between the two
-        deliveries, the duplicate event id must short-circuit."""
-        reset_cache_for_tests()
-        handle_webhook_event({
-            "id": "evt_initial_create",
-            "type": "customer.subscription.created",
-            "data": {"object": {
-                "status": "active",
-                "metadata": {"api_key": "user-BBB"},
-            }},
-        })
-        delete_event = {
-            "id": "evt_TEST_dup_deleted",
-            "type": "customer.subscription.deleted",
-            "data": {"object": {
-                "metadata": {"api_key": "user-BBB"},
-            }},
-        }
-        first = handle_webhook_event(delete_event)
-        assert first["action"] == "removed"
-        assert "user-BBB" not in current_premium_keys()
+from trading_bot.api.billing import (  # noqa: E402
+    _extract_identity_from_event_object,
+    _verify_hash_against_manifest,
+    add_premium_hash,
+    remove_premium_hash,
+)
 
-        # Operator re-grants premium via a NEW subscription event.
-        handle_webhook_event({
-            "id": "evt_re_grant",
-            "type": "customer.subscription.created",
-            "data": {"object": {
-                "status": "active",
-                "metadata": {"api_key": "user-BBB"},
-            }},
-        })
-        assert "user-BBB" in current_premium_keys()
 
-        # Stripe re-delivers the SAME deletion event — must be a no-op.
-        second = handle_webhook_event(delete_event)
-        assert second["action"] == "ignored"
-        assert second["reason"] == "duplicate_event"
-        # Premium status was preserved by the dedup.
-        assert "user-BBB" in current_premium_keys()
+class TestExtractIdentityFromEventObject:
+    """Phase 7.4 — both ``api_key`` and ``key_hash`` are extracted
+    independently from ``object.metadata`` and the
+    ``object.customer.metadata`` fallback."""
 
-    def test_no_event_id_means_no_dedup(self):
-        """Events without an id field should NOT be deduped (we
-        can't tell which is which)."""
-        reset_cache_for_tests()
-        event_no_id = {
-            "type": "customer.subscription.created",
-            "data": {"object": {
-                "status": "active",
-                "metadata": {"api_key": "user-CCC"},
-            }},
-        }
-        first = handle_webhook_event(event_no_id)
-        second = handle_webhook_event(event_no_id)
-        assert first["action"] == "added"
-        assert second["action"] == "added"
+    def test_metadata_only_api_key(self):
+        result = _extract_identity_from_event_object(
+            {"metadata": {"api_key": "raw"}},
+        )
+        assert result == ("raw", None)
 
-    def test_dedup_eviction_keeps_memory_bounded(self, monkeypatch):
-        """The dedup state must not grow unboundedly. Force the cap
-        to a small value and confirm older event ids are evicted."""
-        reset_cache_for_tests()
-        monkeypatch.setattr(billing, "_WEBHOOK_DEDUP_MAX", 3)
-        for i in range(5):
-            handle_webhook_event({
-                "id": f"evt_E{i}",
-                "type": "customer.subscription.created",
-                "data": {"object": {
-                    "status": "active",
-                    "metadata": {"api_key": f"user-X{i}"},
+    def test_metadata_only_key_hash(self):
+        result = _extract_identity_from_event_object(
+            {"metadata": {"key_hash": "h" * 32}},
+        )
+        assert result == (None, "h" * 32)
+
+    def test_metadata_with_both(self):
+        result = _extract_identity_from_event_object(
+            {"metadata": {"api_key": "raw", "key_hash": "h" * 32}},
+        )
+        assert result == ("raw", "h" * 32)
+
+    def test_customer_fallback_for_each(self):
+        result = _extract_identity_from_event_object(
+            {
+                "metadata": {},
+                "customer": {"metadata": {
+                    "api_key": "from-customer",
+                    "key_hash": "h" * 32,
                 }},
-            })
-        # The first event id should have been evicted by now.
-        assert "evt_E0" not in billing._webhook_seen_set
-        # The most recent ones are still there.
-        assert "evt_E4" in billing._webhook_seen_set
-        # Bounded.
-        assert len(billing._webhook_seen_ids) == 3
+            },
+        )
+        assert result == ("from-customer", "h" * 32)
+
+    def test_top_level_wins_over_customer_fallback(self):
+        """If both top-level metadata and customer.metadata have a
+        field, the top-level value should be preferred."""
+        result = _extract_identity_from_event_object(
+            {
+                "metadata": {"api_key": "top"},
+                "customer": {"metadata": {"api_key": "fallback"}},
+            },
+        )
+        assert result == ("top", None)
+
+    def test_no_identity_returns_none_pair(self):
+        assert _extract_identity_from_event_object(
+            {"metadata": {}},
+        ) == (None, None)
+        assert _extract_identity_from_event_object(None) == (None, None)
+        assert _extract_identity_from_event_object("not a dict") == (
+            None, None,
+        )
 
 
-class TestCancellationRemovesPremium:
-    """End-to-end: after a subscription.deleted event, the key's
-    entitlement (its 'key_hash' / identity in the premium cache)
-    is gone."""
+class TestVerifyHashAgainstManifest:
+    def test_unknown_hash_rejected(self, cache_file: Path):
+        assert _verify_hash_against_manifest("z" * 32) is False
 
-    def test_subscription_deleted_removes_key_from_cache(self):
-        reset_cache_for_tests()
-        api_key = "promoted-then-cancelled-key"
-        handle_webhook_event({
-            "id": "evt_create_AAA",
+    def test_known_hash_accepted(self, cache_file: Path):
+        h = _pre_issue("user-7-4-verify")
+        assert _verify_hash_against_manifest(h) is True
+
+    def test_revoked_hash_rejected(self, cache_file: Path):
+        from trading_bot.api import key_store
+        h = _pre_issue("user-7-4-revoked")
+        key_store.append_revocation(key_hash=h, reason="phase74-test")
+        key_store.reset_caches_for_tests()
+        assert _verify_hash_against_manifest(h) is False
+
+    def test_blank_input_rejected(self, cache_file: Path):
+        assert _verify_hash_against_manifest("") is False
+        assert _verify_hash_against_manifest("   ") is False
+        assert _verify_hash_against_manifest(None) is False  # type: ignore[arg-type]
+
+
+class TestAddRemovePremiumHash:
+    def test_add_then_check(self, cache_file: Path):
+        h = "p" * 32
+        add_premium_hash(h)
+        assert is_premium_via_stripe("anything-with-this-hash") is False
+        # is_premium_via_stripe takes a raw key — for the hash path,
+        # use the new is_premium_hash helper.
+        from trading_bot.api.billing import is_premium_hash
+        assert is_premium_hash(h) is True
+
+    def test_add_persists_only_hash(self, cache_file: Path):
+        h = "q" * 32
+        add_premium_hash(h)
+        body = cache_file.read_text("utf-8")
+        # The hash IS on disk, but no raw key (we never had one).
+        assert h in body
+        # And the documented schema is preserved.
+        data = json.loads(body)
+        assert isinstance(data, list)
+        assert h in data
+
+    def test_remove_then_check(self, cache_file: Path):
+        h = "r" * 32
+        add_premium_hash(h)
+        from trading_bot.api.billing import is_premium_hash
+        assert is_premium_hash(h) is True
+        remove_premium_hash(h)
+        assert is_premium_hash(h) is False
+
+    def test_blank_input_noop(self, cache_file: Path):
+        add_premium_hash("")
+        add_premium_hash(None)  # type: ignore[arg-type]
+        add_premium_hash("   ")
+        # Cache file may or may not exist — either way, no entries.
+        from trading_bot.api.billing import current_premium_keys
+        assert current_premium_keys() == set()
+
+
+class TestPhase74WebhookHashPath:
+    """customer.subscription.created with metadata[key_hash] should
+    promote without needing the raw api_key."""
+
+    def test_valid_key_hash_promotes(self, cache_file: Path):
+        h = _pre_issue("user-hash-promotion")
+        event = {
             "type": "customer.subscription.created",
             "data": {"object": {
                 "status": "active",
-                "metadata": {"api_key": api_key},
+                "metadata": {"key_hash": h, "tier_to": "premium"},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "added"
+        assert result["identity"] == "key_hash"
+        from trading_bot.api.billing import is_premium_hash
+        assert is_premium_hash(h) is True
+
+    def test_unknown_key_hash_does_not_promote(self, cache_file: Path):
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": "z" * 32},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+        assert result["identity"] == "key_hash"
+
+    def test_revoked_key_hash_does_not_promote(self, cache_file: Path):
+        from trading_bot.api import key_store
+        h = _pre_issue("user-hash-revoked")
+        key_store.append_revocation(key_hash=h, reason="phase74-test")
+        key_store.reset_caches_for_tests()
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": h},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "ignored"
+        assert result["reason"] == "key_not_in_manifest_or_revoked"
+
+    def test_inactive_status_does_not_promote(self, cache_file: Path):
+        h = _pre_issue("user-hash-incomplete")
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "incomplete",
+                "metadata": {"key_hash": h},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "ignored"
+        assert "status" in result["reason"]
+
+    def test_trialing_status_promotes(self, cache_file: Path):
+        h = _pre_issue("user-hash-trialing")
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "trialing",
+                "metadata": {"key_hash": h},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "added"
+
+    def test_when_both_provided_hash_path_wins(self, cache_file: Path):
+        """If a (legacy + new) Stripe payload has both api_key and
+        key_hash, the hash path wins — no raw key reaches the
+        verifier or the cache write."""
+        h = _pre_issue("user-both")
+        event = {
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {
+                    # Raw key value is intentionally a marker that's
+                    # NOT the issued raw — verifying the hash path
+                    # ignores it entirely.
+                    "api_key": "RAW_BOTH_DO_NOT_USE",
+                    "key_hash": h,
+                },
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "added"
+        assert result["identity"] == "key_hash"
+        # The ignored raw-key marker did not produce a cache entry of its own.
+        body = cache_file.read_text("utf-8")
+        assert "RAW_BOTH_DO_NOT_USE" not in body
+
+
+class TestPhase74WebhookCancellationByHash:
+    def test_cancellation_removes_premium_by_hash(self, cache_file: Path):
+        h = _pre_issue("user-hash-cancel")
+        # Promote first.
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": h},
             }},
         })
-        assert api_key in current_premium_keys()
-        assert is_premium_via_stripe(api_key) is True
+        from trading_bot.api.billing import is_premium_hash
+        assert is_premium_hash(h) is True
 
+        # Cancel via hash.
         result = handle_webhook_event({
-            "id": "evt_delete_AAA",
             "type": "customer.subscription.deleted",
-            "data": {"object": {
-                "metadata": {"api_key": api_key},
-            }},
+            "data": {"object": {"metadata": {"key_hash": h}}},
         })
         assert result["action"] == "removed"
-        assert api_key not in current_premium_keys()
-        assert is_premium_via_stripe(api_key) is False
+        assert result["identity"] == "key_hash"
+        assert is_premium_hash(h) is False
 
-    def test_payment_failed_also_removes(self):
-        reset_cache_for_tests()
-        api_key = "user-payment-fail"
+    def test_payment_failed_removes_premium_by_hash(self, cache_file: Path):
+        h = _pre_issue("user-hash-pf")
         handle_webhook_event({
-            "id": "evt_create_pay_fail",
             "type": "customer.subscription.created",
             "data": {"object": {
                 "status": "active",
-                "metadata": {"api_key": api_key},
+                "metadata": {"key_hash": h},
             }},
         })
-        assert api_key in current_premium_keys()
+        from trading_bot.api.billing import is_premium_hash
+        assert is_premium_hash(h) is True
+
         result = handle_webhook_event({
-            "id": "evt_invoice_failed",
             "type": "invoice.payment_failed",
-            "data": {"object": {
-                "metadata": {"api_key": api_key},
-            }},
+            "data": {"object": {"metadata": {"key_hash": h}}},
         })
         assert result["action"] == "removed"
         assert result["reason"] == "payment_failed"
-        assert api_key not in current_premium_keys()
+        assert is_premium_hash(h) is False
 
-    def test_cancellation_for_unknown_key_is_safe_noop(self):
-        """A cancellation for a key the cache doesn't know about
-        is still safe — set.discard semantics."""
-        reset_cache_for_tests()
-        result = handle_webhook_event({
-            "id": "evt_unknown_delete",
-            "type": "customer.subscription.deleted",
+
+class TestPhase74LegacyApiKeyPathStillWorks:
+    """The Phase 4.7 metadata[api_key] flow MUST still work — Phase
+    7.4 is purely additive."""
+
+    def test_legacy_promotion_still_promotes(self, cache_file: Path):
+        _pre_issue("legacy-api-key-user")
+        event = {
+            "type": "customer.subscription.created",
             "data": {"object": {
-                "metadata": {"api_key": "never-promoted"},
+                "status": "active",
+                "metadata": {"api_key": "legacy-api-key-user"},
+            }},
+        }
+        result = handle_webhook_event(event)
+        assert result["action"] == "added"
+        assert result["identity"] == "api_key"
+        assert is_premium_via_stripe("legacy-api-key-user") is True
+
+    def test_legacy_cancellation_still_removes(self, cache_file: Path):
+        _pre_issue("legacy-cancel-user")
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"api_key": "legacy-cancel-user"},
             }},
         })
+        result = handle_webhook_event({
+            "type": "customer.subscription.deleted",
+            "data": {"object": {"metadata": {"api_key": "legacy-cancel-user"}}},
+        })
         assert result["action"] == "removed"
-        assert "never-promoted" not in current_premium_keys()
+        assert result["identity"] == "api_key"
+        assert is_premium_via_stripe("legacy-cancel-user") is False
 
 
-class TestLiveBehaviorPreserved:
-    """Calls that worked before must still work — the test-mode
-    hardening must not have broken the deployed surface."""
+class TestPhase74WebhookPersistence:
+    def test_premium_cache_contains_only_hash_after_hash_path(
+        self, cache_file: Path,
+    ):
+        h = _pre_issue("user-leak-guard")
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": h},
+            }},
+        })
+        body = cache_file.read_text("utf-8")
+        # Hash present, nothing else.
+        assert h in body
+        data = json.loads(body)
+        assert data == [h]
 
-    def test_legacy_env_only_still_works_for_checkout(self, monkeypatch):
-        """The currently-deployed Railway env still uses
-        STRIPE_API_KEY + STRIPE_PRICE_ID_PREMIUM only."""
-        monkeypatch.delenv(STRIPE_SECRET_KEY_ENV_VAR, raising=False)
-        monkeypatch.delenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, raising=False)
-        monkeypatch.setenv(STRIPE_API_KEY_ENV_VAR, "sk_test_legacy_only")
+    def test_planted_pii_in_event_does_not_reach_cache(
+        self, cache_file: Path,
+    ):
+        h = _pre_issue("user-pii-guard")
+        marker_email = "PII_LEAK_PHASE74_alice@example.com"
+        marker_name = "PII_LEAK_PHASE74_NAME"
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": h},
+                "customer": {
+                    "email": marker_email,
+                    "name": marker_name,
+                    "metadata": {"pan": "4242424242424242", "cvv": "987"},
+                },
+            }},
+        })
+        body = cache_file.read_text("utf-8")
+        for forbidden in (marker_email, marker_name,
+                          "4242424242424242", "987", "pan", "cvv"):
+            assert forbidden not in body, f"leaked {forbidden!r}"
+
+
+class TestPhase74ConversionLoggingByHash:
+    """Phase 7.4 — record_conversion_for_hash records a conversion
+    for the hash without needing the raw key. The webhook plumbs it
+    through automatically."""
+
+    def test_record_conversion_for_hash_writes_row(
+        self, cache_file: Path, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import conversion
+        conv_path = tmp_path / "conv_phase74.jsonl"
         monkeypatch.setenv(
-            STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "price_legacy_only",
+            "TRADING_API_CONVERSION_LOG_PATH", str(conv_path),
         )
-
-        captured = {}
-
-        def stub(**kwargs):
-            captured.update(kwargs)
-            return {"id": "cs_legacy", "url": "https://x"}
-
-        from trading_bot.api.billing import create_checkout_session
-        result = create_checkout_session(
-            "user-LEG",
-            "https://app.example.com/billing/success",
-            "https://app.example.com/billing/cancel",
-            http_post=stub,
+        conversion.reset_cache_for_tests()
+        result = conversion.record_conversion_for_hash(
+            "h" * 32, source="stripe", price_id="price_phase74",
         )
-        assert result["checkout_session_id"] == "cs_legacy"
-        assert captured["data"]["line_items[0][price]"] == "price_legacy_only"
-        assert captured["auth"][0] == "sk_test_legacy_only"
+        assert result["action"] == "recorded"
+        assert result["api_key_hash"] == "h" * 32
+        rows = [
+            json.loads(line)
+            for line in conv_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == "h" * 32
+        assert rows[0]["price_id"] == "price_phase74"
 
-    def test_existing_event_payloads_still_dispatch(self):
-        """Spot-check: the three handled event types still produce
-        the expected actions when inputs are exactly what the live
-        deployment delivers."""
-        reset_cache_for_tests()
-        for evt_id, evt_type, expected in (
-            ("evt_C1", "customer.subscription.created", "added"),
-            ("evt_D1", "customer.subscription.deleted", "removed"),
-            ("evt_F1", "invoice.payment_failed", "removed"),
-        ):
-            api_key = f"user-{evt_id}"
-            payload = {
-                "id": evt_id, "type": evt_type,
-                "data": {"object": {
-                    "status": "active",
-                    "metadata": {"api_key": api_key},
-                }},
-            }
-            assert handle_webhook_event(payload)["action"] == expected
+    def test_record_conversion_for_hash_dedupes(
+        self, cache_file: Path, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import conversion
+        monkeypatch.setenv(
+            "TRADING_API_CONVERSION_LOG_PATH",
+            str(tmp_path / "conv_phase74_dedup.jsonl"),
+        )
+        conversion.reset_cache_for_tests()
+        a = conversion.record_conversion_for_hash("k" * 32)
+        b = conversion.record_conversion_for_hash("k" * 32)
+        assert a["action"] == "recorded"
+        assert b["action"] == "deduped"
+
+    def test_webhook_hash_path_writes_conversion_row(
+        self, cache_file: Path, monkeypatch, tmp_path: Path,
+    ):
+        from trading_bot.api import conversion
+        conv_path = tmp_path / "conv_e2e.jsonl"
+        monkeypatch.setenv(
+            "TRADING_API_CONVERSION_LOG_PATH", str(conv_path),
+        )
+        conversion.reset_cache_for_tests()
+        h = _pre_issue("user-conv-e2e")
+        handle_webhook_event({
+            "type": "customer.subscription.created",
+            "data": {"object": {
+                "status": "active",
+                "metadata": {"key_hash": h},
+                "items": {"data": [{"price": {"id": "price_e2e_74"}}]},
+            }},
+        })
+        rows = [
+            json.loads(line)
+            for line in conv_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["api_key_hash"] == h
+        assert rows[0]["price_id"] == "price_e2e_74"

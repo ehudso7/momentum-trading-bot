@@ -35,6 +35,8 @@ See also:
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH`    | path             | `data/stripe_premium_keys.json` | SaaS API only | Persistent JSON list of opaque API-key strings with active subscriptions. Survives restarts. (Phase 4.7) |
 | `TRADING_API_CONVERSION_LOG_PATH`      | path             | `data/api_conversions.jsonl` | SaaS API only | Append-only JSONL of free → paid conversion events. Hashed keys only — no PII, no card data. (Phase 4.9) |
 | `TRADING_API_GROWTH_LOG_PATH`          | path             | `data/api_growth.jsonl`      | SaaS API only | Append-only JSONL of `?ref=<code>` referral events. Dedup'd per (hash, ref) within 24h. Hashed keys only. (Phase 5.1) |
+| `TRADING_API_KEYS_MANIFEST_PATH`       | path             | `data/api_keys_manifest.jsonl` | SaaS API only | Append-only JSONL of operator-issued keys (Phase 6.0/6.1). Server reads it as an auth source — keys whose hash appears here authenticate without env-var edits. Hashed keys only. (Phase 6.2) |
+| `TRADING_API_KEYS_REVOKED_PATH`        | path             | `data/api_keys_revoked.jsonl`  | SaaS API only | Append-only JSONL of revocation events. A revoked hash is rejected with 403 even when the same raw key also matches `TRADING_API_KEY` or appears in the Stripe cache. Hashed keys only. (Phase 6.2) |
 
 An **invalid value** for any switch silently falls back to the default
 — a typo must never silently relax a safety rail.
@@ -2284,6 +2286,1620 @@ existing operator-only `python -m trading_bot.api.keys` shell
 entry-point. There is still no HTTP endpoint, no form, no JSON
 API, no env var added. The dispatcher's "available commands"
 help text now lists both `issue` and `list`.
+
+
+### Phase 6.3 — key manifest inspection CLI
+
+Three read-only subcommands on the existing operator CLI let an
+operator audit issued and revoked keys without ever surfacing a
+raw secret. No HTTP endpoint, no public surface — same shell-only
+posture as the rest of Phase 6.
+
+```
+python -m trading_bot.api.keys list
+python -m trading_bot.api.keys list --tier free|premium
+python -m trading_bot.api.keys list --ref <ref_code>
+python -m trading_bot.api.keys list --include-revoked
+python -m trading_bot.api.keys list --json
+
+python -m trading_bot.api.keys show --key-hash <hash>
+python -m trading_bot.api.keys show --key-hash <hash> --json
+
+python -m trading_bot.api.keys stats
+python -m trading_bot.api.keys stats --json
+```
+
+**Output surface (pinned allow-list)**
+
+Every inspection command projects manifest rows into the same
+fixed field set before printing. Anything outside the allow-list
+— including fields that a future `issue_key` schema bump might
+quietly add — is dropped:
+
+| Field                   | Source                         |
+|---|---|
+| `created_at`            | manifest row                    |
+| `key_hash`              | manifest row                    |
+| `tier`                  | manifest row                    |
+| `ref_code`              | manifest row                    |
+| `checkout_session_id`   | manifest row (may be `null`)    |
+| `revoked`               | derived from the revocation log |
+| `revoked_at`            | revocation row (if revoked)     |
+| `revoked_reason`        | revocation row (if present)     |
+
+**Never printed** — `api_key`, `label`, `label_hash`,
+`checkout_url`. The first three are never persisted to begin with
+(Phase 6.0/6.2); the last is never persisted to begin with
+(Phase 6.0). `label_hash` is on disk but the inspection surface
+omits it — operators who need it grep the manifest directly.
+
+**Behaviour**
+
+* `list` sorts newest first by `created_at`; unparseable
+  timestamps fall to the bottom.
+* Filters (`--tier`, `--ref`) are ANDed. `--ref` runs through
+  the Phase 5.1 growth sanitiser first so it matches whatever
+  the manifest actually stored (i.e. the same transformation
+  the live `?ref=` middleware applies).
+* Revoked rows are hidden by default; `--include-revoked`
+  shows them alongside active rows and adds a `revoked` column.
+* Missing files (manifest or revocation log) produce a clean
+  "0 active" report rather than a crash.
+* Malformed JSONL rows, rows missing `key_hash`, and rows with
+  an unrecognised `tier` are silently skipped — same posture
+  as the auth-path reader.
+* `show` looks a single manifest row up by `key_hash` and
+  returns exit-code 2 with a stderr message if no row matches.
+* `stats` counts `total_issued`, `active`, `revoked`, plus
+  per-tier / per-ref_code / per-created-date breakdowns. The
+  `revoked` counter counts manifest rows that have been revoked
+  — stray revocation rows for hashes never issued are ignored.
+
+**Boundary** — Phase 6.3 adds no new module and no new import
+into Core. The commands live in `trading_bot.api.keys` alongside
+`issue` and `revoke`, so the dependency-light CLI posture
+(no `structlog`, no `fastapi`) is preserved. Pinned by
+`tests/test_keys.py::TestPhase63NoCoreImports`.
+
+
+### Phase 6.4 — Railway persistent manifest strategy
+
+Phase 6.0 / 6.2 / 6.3 added the issuance / auth / inspection
+plumbing. Phase 6.4 covers the production deployment story:
+where the manifest and revocation log **actually live** on the
+Railway side so issued keys survive restarts and re-deploys.
+
+There is no new code in Phase 6.4 — every flag (`--manifest-path`,
+`--revoked-path`) and every env var (`TRADING_API_KEYS_MANIFEST_PATH`,
+`TRADING_API_KEYS_REVOKED_PATH`) was already shipped in 6.2 / 6.3.
+The contribution is operational guidance:
+
+* point both env vars at a persistent volume (`/data/...` on Railway);
+* issue / revoke / inspect from a Railway shell against that volume;
+* keep the manifest out of git;
+* never confuse a *local* manifest with the *production* manifest
+  — a key issued locally has never reached Railway and will 403.
+
+Full operator runbook — production env vars, Railway volume layout,
+worked CLI examples, three deployment options, and the local-vs-
+production warning — lives in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+
+### Phase 7.0 — Stripe → key activation bridge
+
+Phase 7.0 closes the loop between the Phase 6 issuance model and the
+Phase 4.7 Stripe billing cache. A paid subscription now activates
+premium access **automatically** on `customer.subscription.created`
+without the operator editing env vars or touching the manifest.
+
+Two hardening changes ship together:
+
+**1. Hash-only premium cache.** `data/stripe_premium_keys.json` now
+stores SHA-256[:32] hashes exclusively. `add_premium_key` hashes its
+input in-process; the raw api_key never reaches disk. Legacy cache
+files that still contain raw keys are transparently re-hashed and
+rewritten on the next load — no operator intervention required.
+
+**2. Manifest verification gate.** Before adding an api_key to the
+cache, the webhook handler calls
+`trading_bot.api.key_store.verify_api_key(api_key)`. A hit means
+the key is in the issuance manifest AND has not been revoked. A
+miss — unknown hash, or revoked hash — causes the webhook to return
+
+```
+{ "action": "ignored", "reason": "key_not_in_manifest_or_revoked" }
+```
+
+No cache mutation, no conversion-log row, no side effects. The
+revoked-key path is the important one: a key rotated off the
+manifest can never be re-promoted by a Stripe replay. Cancellation
+(`customer.subscription.deleted`) and payment failure
+(`invoice.payment_failed`) still flow through without the gate so a
+cancelled customer immediately loses premium even if their manifest
+row was already deleted.
+
+**Auth precedence (Phase 7.0, unchanged from Phase 6.2)**
+
+```
+1. revoked hash             → 403 (kill switch)
+2. Stripe cache (premium)    → premium   ← webhook-driven
+3. TRADING_API_PREMIUM_KEYS  → premium   (operator override)
+4. manifest tier="premium"   → premium   (CLI-issued)
+5. manifest tier="free"      → free      (CLI-issued)
+6. TRADING_API_KEY exact     → free      (legacy single-tenant)
+7. otherwise                 → 403
+```
+
+Stripe always overrides the manifest tier. A key issued as free
+(step 5) is promoted to premium (step 2) the moment the webhook
+fires. A cancellation drops the key out of step 2 and the next
+request resolves via step 5 again — free access restored.
+
+**Privacy invariants (pinned by tests)**
+
+* Raw `api_key` never reaches disk (Phase 7.0 migration of the
+  Stripe cache). Pinned by
+  `tests/test_billing.py::TestPhase70HashOnlyPersistence` and
+  `tests/test_api_server.py::TestPhase70NoRawKeyInStripeCache`.
+* The webhook NEVER mutates the issuance manifest. Pinned by
+  `tests/test_billing.py::TestPhase70ManifestNotMutated` —
+  manifest bytes compare equal before/after a
+  `subscription.created` delivery.
+* Customer email, customer name, PAN, CVV, and payment-method
+  fields are never persisted — the webhook handler only reads
+  `object.metadata.api_key`. Pinned by
+  `tests/test_billing.py::TestNoSensitiveDataStored`.
+* Revoked keys cannot be re-promoted by a Stripe replay. Pinned by
+  `tests/test_billing.py::TestPhase70ManifestGate::test_revoked_key_webhook_ignored`.
+
+**No new public surface, no Core imports.** `billing.py` still
+imports nothing from `trading_bot.core.*`, `trading_bot.execution`,
+`trading_bot.portfolio`, `trading_bot.risk`, `trading_bot.scanners`,
+`trading_bot.strategies`, or `trading_bot.main`. `key_store` is
+lazy-imported inside the webhook handler so the billing module
+remains loadable in environments where the manifest file is not
+configured. No new HTTP endpoint is added — the Stripe webhook
+already existed (`POST /webhook/stripe`, Phase 4.7).
+
+
+### Phase 7.1 — browser icon noise cleanup
+
+Browsers auto-request `/favicon.ico`, `/apple-touch-icon.png`, and
+`/apple-touch-icon-precomposed.png` on every page view. We do not
+ship icon assets, so those requests would otherwise 404 and bloat
+the audit log. Three explicit routes return `204 No Content` with
+no body, no auth required, and the standard security-header set
+still applied. The icon paths are added to both
+`_FREE_TIER_EXEMPT_PATHS` and `_PUBLIC_PATHS_NO_USAGE` so a browser
+that refreshes a page 100 times cannot consume free-tier quota or
+pollute per-key usage metrics. Pinned by
+`tests/test_api_server.py::TestPhase71IconRoutes`.
+
+
+### Phase 7.2 — production launch lockdown
+
+Hardening + verification + cleanup wrapped in one phase so a real
+launch can ship safely.
+
+**1. `railway.toml` is locked.** The production start command
+`chmod -R 777 /app/data || true && uvicorn trading_bot.api.server:app
+--host 0.0.0.0 --port 8080` is fixed in the repo and pinned by
+`tests/test_launch_check.py::TestRailwayTomlLockdown`. The toml file
+must NOT invoke `keys issue` / `revoke` / `list` at boot — issuance
+remains operator-only.
+
+**2. `python -m trading_bot.api.launch_check`** is a pure-stdlib
+operator CLI that verifies the deployment is launch-ready: every
+required env var is set, paths are writable, and nothing points at
+`/tmp` (rejected unless `--allow-tmp`) or repo-local `data/`
+(rejected when `RAILWAY_ENVIRONMENT` is set). Returns exit 0 + prints
+`READY` on success, exit 1 + `NOT READY` on any failure. JSON output
+via `--json`.
+
+**3. `python -m trading_bot.api.launch_check --smoke ...`** combines
+the env check with the Phase 6.5 HTTP smoke runner — same six
+checks (public landing, health, 401, 403/503, 200/404, dashboard).
+The supplied `--api-key` is hashed in-process; the raw value never
+appears in any output. The smoke runner is injectable so the
+combined wrapper is fully unit-testable without real network IO.
+
+**4. `python -m trading_bot.api.keys revoke-many --key-hash H ...`**
+appends one revocation row per `--key-hash`. Useful for launch-day
+cleanup when several test keys need to be invalidated at once.
+Duplicates are accepted; the read side (`list`, `show`) deduplicates
+into "revoked = yes". The CLI accepts ONLY pre-hashed values so an
+operator cannot accidentally land a raw key on disk via this path.
+
+**5. Launch Day Checklist** — the full operator runbook lives in
+[`DEPLOYMENT.md`](DEPLOYMENT.md) ("Launch Day Checklist" section).
+Eight steps: lock `railway.toml`, set Railway env vars, issue real
+keys from the Railway shell, revoke test keys, run `launch_check`,
+run `launch_check --smoke`, wire Stripe AFTER auth passes,
+hand-deliver keys securely.
+
+**No new public endpoints.** Phase 7.2 adds three CLIs and zero
+HTTP routes. Phase 7.3 (the next section) explicitly adds one new
+mutating route — `POST /billing/checkout` — alongside the existing
+`POST /webhook/stripe`; the single-mutating-route invariant in
+`tests/test_launch_check.py::TestNoNewPublicEndpoints` lists both.
+
+
+### Phase 7.3 — authenticated Stripe Checkout endpoint
+
+> The user requested this work as "Phase 7.1"; it ships here as 7.3
+> to avoid collision with the previously-shipped Phase 7.1 (browser
+> icon noise cleanup) and Phase 7.2 (production launch lockdown).
+> The behaviour is identical to the spec.
+
+A free-tier user calls `POST /billing/checkout` to receive a Stripe
+Checkout Session URL that flips them to premium on payment via the
+existing Phase 4.7 / 7.0 webhook plumbing. There is no public
+sign-up form — the caller must already authenticate with an issued
+manifest key.
+
+**Request**
+
+```
+POST /billing/checkout
+Authorization: Bearer <issued-key>
+```
+
+**Response (200)**
+
+```json
+{
+  "checkout_session_id": "cs_test_...",
+  "checkout_url": "https://checkout.stripe.com/c/cs_test_...",
+  "key_hash": "<SHA-256(api_key)[:32]>",
+  "tier_to": "premium"
+}
+```
+
+The `checkout_url` is short-lived and lives in memory only — it is
+returned to the caller but persisted nowhere on the server.
+
+**Status codes**
+
+| Code | When |
+|---|---|
+| 200 | Free key, Stripe Checkout Session created. |
+| 401 | Missing `Authorization: Bearer` header. |
+| 403 | Key not in manifest (or revoked). |
+| 409 | Already premium — manage the existing subscription via Stripe. |
+| 502 | Stripe API returned a non-2xx or malformed payload. |
+| 503 | `STRIPE_SECRET_KEY`, `STRIPE_PREMIUM_PRICE_ID`, or `TRADING_PUBLIC_BASE_URL` is unset. |
+
+**Env vars (required for live operation)**
+
+| Env var | Purpose | Fallback |
+|---|---|---|
+| `STRIPE_SECRET_KEY` | Stripe REST auth (Basic, password empty). | `STRIPE_API_KEY` (legacy Phase 4.7 name) |
+| `STRIPE_PREMIUM_PRICE_ID` | Stripe Price ID of the premium subscription. | `STRIPE_PRICE_ID_PREMIUM` (legacy) |
+| `TRADING_PUBLIC_BASE_URL` | Absolute URL prefix for success/cancel redirects (e.g. `https://your-host.example.com`). | — |
+
+**Env vars (optional)**
+
+| Env var | Default |
+|---|---|
+| `STRIPE_CHECKOUT_SUCCESS_PATH` | `/dashboard?checkout=success` |
+| `STRIPE_CHECKOUT_CANCEL_PATH`  | `/dashboard?checkout=cancel`  |
+
+**What goes to Stripe**
+
+The handler builds a subscription-mode Checkout Session POST with:
+
+```
+mode                                          = subscription
+line_items[0][price]                          = STRIPE_PREMIUM_PRICE_ID
+line_items[0][quantity]                       = 1
+success_url                                   = TRADING_PUBLIC_BASE_URL + success path
+cancel_url                                    = TRADING_PUBLIC_BASE_URL + cancel path
+client_reference_id                           = <key_hash>
+metadata[key_hash]                            = <key_hash>
+metadata[tier_from]                           = free
+metadata[tier_to]                             = premium
+subscription_data[metadata][key_hash]         = <key_hash>
+subscription_data[metadata][tier_to]          = premium
+customer_creation                             = always
+```
+
+Note: `metadata[api_key]` (legacy Phase 4.7 raw-key field) is
+**deliberately absent** from this code path. The Stripe webhook
+handler extends to consume `metadata[key_hash]` in a future phase;
+until then the existing operator-CLI flow (`keys issue --checkout`)
+continues to populate `metadata[api_key]` for back-compat.
+
+**Privacy invariants (every one tested)**
+
+* The raw `api_key` is **never** sent to Stripe. Pinned by
+  `test_metadata_contains_key_hash_not_raw_key` and
+  `test_stripe_metadata_contains_key_hash_not_raw`.
+* The `checkout_url` is **never** persisted to the manifest, the
+  revocation log, the usage log, the audit log, the Stripe premium
+  cache, the conversion log, or the upgrade-events log. Pinned by
+  `test_checkout_url_never_persisted_to_any_log`.
+* The 409 response for an already-premium caller does not echo
+  the raw key. Pinned by `test_premium_key_returns_409`.
+* Misconfiguration responses (503) name the missing env var, never
+  the caller's key. Pinned by the `TestPhase73CheckoutMisconfigured`
+  class.
+
+**Boundary**
+
+* The checkout helper (`billing.create_checkout_session_for_hash`)
+  reuses Phase 4.8's `_post_to_stripe`, `BillingConfigError`, and
+  `BillingAPIError` — no new HTTP code paths to maintain.
+* `POST /billing/checkout` joins `POST /webhook/stripe` as the only
+  mutating routes in the entire app. Pinned across
+  `tests/test_billing.py`, `tests/test_api_server.py`, and
+  `tests/test_launch_check.py`.
+
+
+### Phase 7.4 — hash-based Stripe webhook promotion
+
+Closes the loop on the Phase 7.3 hash-only Checkout flow. The
+Stripe webhook handler now accepts ``metadata[key_hash]`` directly,
+so a customer paying through `POST /billing/checkout` is auto-
+promoted to premium without any raw API key ever reaching Stripe
+or this server's billing path.
+
+**Webhook identity extraction (Phase 7.4 contract)**
+
+`_extract_identity_from_event_object` returns a `(api_key, key_hash)`
+tuple, pulling each independently from `object.metadata` and
+defensively from `object.customer.metadata`. The handler prefers
+`key_hash` when both are present.
+
+| Source on Stripe object | Phase | Promoted as |
+|---|---|---|
+| `metadata[key_hash]` | 7.3 / 7.4 (preferred) | hash directly |
+| `metadata[api_key]` | 4.7 / 4.8 (legacy operator-CLI) | hash of api_key |
+| neither | — | `{action: ignored, reason: no_identity_on_event}` |
+
+The handler's response gains an `"identity"` field
+(`"key_hash"` or `"api_key"`) so operators can see which path the
+event flowed through.
+
+**Manifest gate (unchanged semantics, hash-input variant added)**
+
+* `_verify_against_manifest(api_key)` (Phase 7.0) — hashes then
+  validates.
+* `_verify_hash_against_manifest(key_hash)` (new in Phase 7.4) —
+  validates the hash directly. Both check
+  `key_store.lookup_key_hash(...) is not None` AND
+  `not key_store.is_revoked(...)`. A revoked hash can never be
+  re-promoted by a Stripe replay, regardless of which identity
+  field the event carries.
+
+**Premium-cache helpers (hash-only, Phase 7.0 schema preserved)**
+
+| Function | Input | Notes |
+|---|---|---|
+| `add_premium_key(api_key)` | raw key | Hashes, then delegates to `add_premium_hash`. |
+| `add_premium_hash(key_hash)` | hash | New in Phase 7.4 — bypasses the redundant hash. |
+| `remove_premium_key(api_key)` | raw key | Hashes, then delegates to `remove_premium_hash`. |
+| `remove_premium_hash(key_hash)` | hash | New in Phase 7.4 — symmetric removal. |
+
+The on-disk schema (`data/stripe_premium_keys.json` — list of
+SHA-256[:32] hashes) is unchanged.
+
+**Conversion logging (Phase 4.9 surface, hash-input variant added)**
+
+`record_conversion(api_key, ...)` now delegates to a new
+`record_conversion_for_hash(key_hash, ...)`. The Phase 7.4 webhook
+handler picks the variant matching the event's identity source. The
+on-disk row schema (`data/api_conversions.jsonl`) is unchanged —
+both paths land an `api_key_hash` row.
+
+**`is_stripe_configured()` widened**
+
+Now returns True if EITHER `STRIPE_API_KEY` (legacy) OR
+`STRIPE_SECRET_KEY` (Phase 7.3 preferred) is set. Operators
+migrating to the new env-var name no longer need to set both.
+
+**Auth precedence (unchanged)**
+
+Stripe still wins over manifest tier, regardless of which path
+populated the cache. A key promoted via the Phase 7.4 hash flow
+is indistinguishable from one promoted via the Phase 4.7 raw-key
+flow on the read side.
+
+**Privacy invariants pinned by tests**
+
+| Invariant | Pinned by |
+|---|---|
+| Raw API key never required for the Phase 7.4 promotion path | `TestPhase74WebhookHashPath::test_valid_key_hash_promotes` |
+| Premium cache contains only hashes after a hash-path event | `TestPhase74WebhookPersistence::test_premium_cache_contains_only_hash_after_hash_path` |
+| Planted PII (email, name, PAN, CVV) in the event never reaches the cache | `TestPhase74WebhookPersistence::test_planted_pii_in_event_does_not_reach_cache` |
+| Revoked hashes cannot be re-promoted by Stripe replay | `TestPhase74WebhookHashPath::test_revoked_key_hash_does_not_promote` |
+| Legacy `metadata[api_key]` flow still works | `TestPhase74LegacyApiKeyPathStillWorks` (2 tests) |
+| Hash-path cancellation/payment_failed correctly remove premium | `TestPhase74WebhookCancellationByHash` (2 tests) |
+| End-to-end /billing/checkout → webhook[key_hash] → premium | `TestPhase74CheckoutWebhookEndToEnd::test_checkout_then_webhook_promotes_to_premium` |
+
+`POST /billing/checkout` is now fully hash-only end-to-end:
+checkout → Stripe → webhook → premium cache. No raw key on the
+wire to Stripe; no raw key in the cache file; no raw key in any
+operator log.
+
+
+### Phase 8.1 — tier-aware usage enforcement
+
+Turns the product from "authenticated API" into "metered SaaS".
+A new `usage_enforcement_middleware` reads the existing Phase 4.6
+per-key usage log and rejects calls that would push the caller
+above their tier's daily request cap.
+
+**Env vars (all optional with sane defaults)**
+
+| Env var | Default | What it does |
+|---|---|---|
+| `TRADING_USAGE_ENFORCEMENT_ENABLED` | `true` | Disable the entire layer with `false`/`0`/`no`/`off`. |
+| `TRADING_FREE_DAILY_REQUEST_LIMIT` | `50` | Per-key per-UTC-day cap for free tier. Invalid → default. |
+| `TRADING_PREMIUM_DAILY_REQUEST_LIMIT` | `1000` | Per-key per-UTC-day cap for premium tier. Invalid → default. |
+| `TRADING_USAGE_LIMIT_EXEMPT_PATHS` | unset | Comma-separated extra exempt paths (joined with the default exempt set). |
+
+**Default exempt paths (no enforcement, no headers)**
+
+```
+/                                      (public landing)
+/health                                (liveness probe)
+/favicon.ico                           (Phase 7.1 browser noise)
+/apple-touch-icon.png                  (Phase 7.1 browser noise)
+/apple-touch-icon-precomposed.png      (Phase 7.1 browser noise)
+/webhook/stripe                        (Stripe → server webhook)
+```
+
+**Response headers (added on every non-exempt response from
+authenticated callers — both 2xx and 4xx route responses)**
+
+| Header | Value |
+|---|---|
+| `X-Usage-Limit` | the active tier cap |
+| `X-Usage-Remaining` | `max(0, limit - count_after_this_request)` |
+| `X-Usage-Tier` | `"free"` or `"premium"` |
+| `Retry-After` | (429 only) seconds until next UTC midnight |
+
+**Rejection contract**
+
+```
+HTTP/1.1 429 Too Many Requests
+X-Usage-Limit: 50
+X-Usage-Remaining: 0
+X-Usage-Tier: free
+Retry-After: 27384
+Content-Type: application/json
+
+{"detail": "usage limit reached — upgrade for higher limits"}
+```
+
+**Tier resolution & precedence (unchanged from Phase 7.4)**
+
+The middleware uses the same `_is_premium` resolver everything
+else uses, so a key that was promoted by the Stripe webhook (Phase
+7.0/7.4) is automatically billed against the premium cap on the
+very next request — no restart, no env edits.
+
+**Layering with Phase 5.4**
+
+The Phase 5.4 free-tier middleware (per-`/reports/*` sub-cap +
+older free-only daily cap with `X-Free-Tier-*` headers) is kept
+intact for backward compatibility. Phase 8.1 is registered to fire
+FIRST in the request pipeline so its 429 short-circuits when both
+would otherwise reject the same call. The two never produce
+conflicting responses on the same request.
+
+**Failure posture (best-effort, fail-open)**
+
+* Missing/empty/malformed usage log → `_count_free_tier_usage_today`
+  returns `(0, 0)` → enforcement treats the caller as having made
+  zero requests today (lets them through). Pinned by
+  `TestPhase81MissingUsageLogFailsOpen`.
+* Disabled toggle → middleware passes every request through with
+  no headers added. Pinned by
+  `TestPhase81EnforcementCanBeDisabled`.
+
+**Privacy invariants (every one tested)**
+
+* The usage log schema is unchanged — Phase 4.6 already stored
+  `key_hash` only, never the raw api_key. Pinned by
+  `TestPhase81UsageLogStoresHashOnly`.
+* Unauthenticated requests do NOT count against any user — the
+  middleware exits early when the bearer is missing or unknown.
+  Pinned by `TestPhase81NoCountForUnauthenticated`.
+* Stripe webhooks are exempt by path, even when called with a
+  forged `Authorization` header. Pinned by
+  `TestPhase81PublicPathsExempt::test_webhook_stripe_never_429s`.
+* No new mutating route added. Pinned by
+  `TestPhase81DoesNotIntroduceMutatingRoute`.
+
+
+### Phase 8.2 — feature-level tier differentiation
+
+Free vs premium are now meaningfully differentiated at the
+response level. The tier resolution path (Phase 6.2 / 7.0 / 7.4)
+is unchanged; Phase 8.2 only changes what tier-gated routes return
+once the caller is classified.
+
+**New helper**
+
+`_is_premium_user(request) -> bool` — fast tier classifier for
+route handlers. Reads ``request.state.api_key_tier`` (cached by
+``require_api_key``) first; falls back to extracting the bearer
+and consulting `_is_premium`. Returns False on any unauthenticated
+request, so callers can use it without a separate guard.
+
+**Differentiated endpoints**
+
+| Route | Free | Premium |
+|---|---|---|
+| `GET /reports/latest` | curated subset (high-level summary + upgrade hint) | full sanitised report |
+| `GET /reports/history` (new) | 403 with the documented gated response | `{"count": N, "dates": [...]}` |
+| `GET /dashboard` | banner + projected report (premium-only fields hidden) | full HTML dashboard |
+
+The free `/reports/latest` projection is driven by a fixed
+allow-list (``_FREE_REPORT_ALLOWED_FIELDS``):
+
+```
+report_type, report_date, scorer_fingerprint, totals,
+promotion_readiness
+```
+
+Anything outside that allow-list is dropped — a future schema
+addition cannot accidentally surface to free users. The free
+response also carries a small ``upgrade`` envelope so client UIs
+can render a consistent call-to-action:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "scorer_fingerprint": "...",
+  "totals": {"alpha_rows": 100, "buy_rows": 25, "skip_rows": 75},
+  "promotion_readiness": {"ready": true, "consecutive_passing_days": 21},
+  "tier": "free",
+  "upgrade": {
+    "detail": "premium feature — upgrade required",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+**Uniform 403 contract**
+
+Every premium-only feature uses the same helper:
+
+```
+HTTP/1.1 403 Forbidden
+X-Usage-Tier: free
+X-Usage-Limit: 50
+X-Usage-Remaining: 47
+Content-Type: application/json
+
+{"detail": "premium feature — upgrade required"}
+```
+
+The body string is the constant ``PREMIUM_FEATURE_DETAIL``;
+``X-Usage-Tier`` reflects the caller's actual tier so a client can
+branch without parsing the body. The Phase 8.1 usage headers ride
+along because the request DID authenticate — premium-feature 403s
+consume the caller's daily quota (otherwise free users could spam
+gated endpoints for free).
+
+**`/reports/history` route ordering**
+
+Registered BEFORE ``/reports/{date}`` so FastAPI's path matcher
+treats "history" as a literal segment, not a date path-param. A
+free caller hitting `/reports/history` gets the documented 403,
+not "invalid date". Pinned by
+`TestPhase82ReportsHistoryPremiumUser::test_history_does_not_collide_with_date_route`.
+
+**Boundary**
+
+* No new mutating routes — `/reports/history` is GET-only. Pinned
+  by `TestPhase82DoesNotIntroduceMutatingRoute`.
+* No new persistence — Phase 8.2 is read-only logic on top of
+  existing data files.
+* Raw API keys never appear in any Phase 8.2 response body or
+  header. Pinned by `TestPhase82NoRawKeyInResponses` (2 tests).
+* Phase 8.1 enforcement layer's 403/429 skip rule narrowed to
+  {401, 503} so Phase 8.2 gated 403s carry the usage headers
+  too — auth-failure responses still don't leak count to
+  unauthenticated callers.
+
+
+### Phase 8.3 — upgrade pressure system
+
+Converts the Phase 8.1 / 8.2 tier signals from passive ("here's
+your limit") into active ("here's a checkout URL — click to
+upgrade now"). One helper, three trigger points, zero new
+mutating routes.
+
+**Helper**
+
+`_build_upgrade_payload(request, *, reason, required, is_premium=None, key_hash=None) -> dict | None`
+
+* Returns ``None`` for premium callers (no upgrade needed) and on
+  any Stripe-side failure (so callers degrade gracefully).
+* Returns the documented dict for free callers when Stripe
+  Checkout creation succeeds:
+
+  ```json
+  {
+    "required":     true,
+    "reason":       "usage_limit",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint":         "upgrade for full access"
+  }
+  ```
+
+* The ``checkout_url`` is freshly minted via
+  ``billing.create_checkout_session_for_hash`` (Phase 7.3 —
+  hash-only metadata). It is **never** persisted by this helper or
+  any caller. Pinned by
+  `TestPhase83CheckoutUrlNotPersisted::test_url_absent_from_every_operator_log`.
+
+**Three trigger points**
+
+| Trigger | Status | `reason` | `required` | Source |
+|---|---|---|---|---|
+| Daily-cap exhausted | 429 | `usage_limit` | `true` | `usage_enforcement_middleware` (Phase 8.1) |
+| Premium-gated feature | 403 | `feature_locked` | `true` | `_premium_required_response` (replaces `_premium_required` from Phase 8.2) |
+| Free-tier curated body | 200 | `limited_access` | `false` | `/reports/latest` handler |
+
+The `required: true | false` flag is a UX hint:
+`true` means "the request was blocked"; `false` means "the
+response is a curated subset — the caller can still use it".
+
+**Body shapes (free user, Stripe configured)**
+
+429 — usage limit exhausted:
+
+```json
+{
+  "detail": "usage limit reached — upgrade for higher limits",
+  "upgrade": {
+    "required": true,
+    "reason": "usage_limit",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+403 — premium-only feature:
+
+```json
+{
+  "detail": "premium feature — upgrade required",
+  "upgrade": {
+    "required": true,
+    "reason": "feature_locked",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+200 — curated `/reports/latest`:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "scorer_fingerprint": "...",
+  "totals": {...},
+  "promotion_readiness": {...},
+  "tier": "free",
+  "upgrade": {
+    "required": false,
+    "reason": "limited_access",
+    "checkout_url": "https://checkout.stripe.com/c/cs_…",
+    "hint": "upgrade for full access"
+  }
+}
+```
+
+Premium callers receive the same base response WITHOUT the
+``upgrade`` key — no Stripe call is made on their behalf. Pinned
+by `TestPhase83Usage429UpgradePayload::test_premium_429_does_not_include_payload`
+and `TestPhase83ReportsLatestLimitedAccess::test_premium_reports_latest_omits_payload`.
+
+**Headers (unchanged)**
+
+The Phase 8.1 usage headers (`X-Usage-Limit`, `X-Usage-Remaining`,
+`X-Usage-Tier`, `Retry-After`) and the Phase 8.2 `X-Usage-Tier`
+on 403s ride along verbatim. The upgrade payload is body-only —
+intentionally NOT duplicated into headers.
+
+**Failure posture (every path tested)**
+
+* Stripe API non-2xx → log at DEBUG, return base response WITHOUT
+  the upgrade payload. Pinned by
+  `TestPhase83StripeFailureGracefulDegradation` (3 tests).
+* `TRADING_PUBLIC_BASE_URL` unset → no checkout possible → return
+  base response without the upgrade payload. Pinned by
+  `test_no_public_base_url_skips_payload`.
+* Premium short-circuits BEFORE any Stripe call. Pinned by
+  `test_premium_user_explicit_arg_skips_stripe`.
+
+**Performance posture**
+
+Every free-tier 429 / 403 / curated-200 response triggers ONE
+outbound Stripe POST. Operators uncomfortable with that
+trade-off can disable specific trigger points by:
+
+* `TRADING_USAGE_ENFORCEMENT_ENABLED=false` (kills the 429 path).
+* unsetting `TRADING_PUBLIC_BASE_URL` (skips all three Phase 8.3
+  payloads while preserving Phase 8.1/8.2 base behaviour).
+
+**Privacy invariants (every one tested)**
+
+* Raw API key never sent to Stripe (Phase 7.3 hash-only contract).
+  Pinned by
+  `test_free_429_includes_payload` (asserts
+  `metadata[api_key]` absent and `metadata[key_hash]` present).
+* Raw API key never appears in any Phase 8.3 response body or
+  header.
+* `checkout_url` never persisted to the manifest, revocation log,
+  usage log, audit log, Stripe premium cache, conversion log, or
+  upgrade-events log.
+* Premium callers never trigger a Stripe call from any of the
+  three trigger points.
+
+**Boundary**
+
+* No new HTTP routes — Phase 8.3 is helper code reused by existing
+  routes / middleware. Pinned by
+  `test_payload_does_not_introduce_mutating_route`.
+* `_premium_required` (Phase 8.2 raise-style) replaced by
+  `_premium_required_response` (Phase 8.3 return-style) so the
+  body can carry both `detail` and `upgrade`. The `detail`
+  constant is unchanged.
+* Phase 8.1 enforcement layer still applies to Phase 8.3 responses
+  — gated 429s still 429. Pinned by
+  `test_usage_enforcement_still_applies_after_payload_attached`.
+
+
+### Phase 8.4 — conversion-funnel tracking
+
+Three-stage upgrade funnel logged into the existing
+``data/api_upgrade_events.jsonl`` file (Phase 5.5/5.8 path,
+backward-compatible schema). One row per stage per user per
+trigger so an operator can answer:
+
+  * how many free users **saw** an upgrade prompt today
+  * how many of those **clicked** through to Checkout
+  * how many of those **completed** the subscription
+
+The funnel reuses the Phase 5.5 file but adds two operator-facing
+columns (``reason``, ``endpoint``); legacy Phase 5.5 events
+continue to use ``copy_variant_hash`` / ``ref_code``. Readers
+branch on ``event``.
+
+**Three new event constants**
+
+| Event | Fired from | When |
+|---|---|---|
+| ``upgrade_shown`` | ``server._build_upgrade_payload`` | a Phase 8.3 upgrade payload was attached to a response (one row per response, never duplicated). |
+| ``upgrade_clicked`` | ``server.billing_checkout`` handler | the caller successfully created a Stripe Checkout Session via ``POST /billing/checkout``. |
+| ``upgrade_completed`` | ``billing.handle_webhook_event`` | Stripe ``customer.subscription.created`` event flipped the key to premium. |
+
+**Helper signature**
+
+```python
+record_upgrade_funnel_event(
+    key_hash: str,                          # SHA-256[:32], hash-only
+    event: str,                             # one of the three constants
+    *,
+    reason:     Optional[str] = None,       # e.g. "usage_limit"
+    endpoint:   Optional[str] = None,       # e.g. "/reports/latest"
+    request_id: Optional[str] = None,
+    now:        Optional[datetime] = None,
+) -> dict
+```
+
+The helper accepts ONLY ``key_hash`` (the signature documents
+``key_hash``, not ``api_key``) — every call site in the codebase
+pre-hashes via Phase 7.4's ``_hash_api_key``. Operators MUST do
+the same. Reasons / endpoints are stripped + capped (64 / 128
+chars respectively) before persistence; blank values become
+``None``.
+
+**Persisted row shape**
+
+```json
+{
+  "timestamp":    "2026-04-25T14:30:00.000000Z",
+  "api_key_hash": "<SHA-256[:32]>",
+  "event":        "upgrade_shown",
+  "tier":         "free",
+  "request_id":   "<32-hex>" | null,
+  "reason":       "usage_limit" | "feature_locked" | "limited_access" | "checkout_initiated" | "stripe_webhook" | null,
+  "endpoint":     "/reports/latest" | "/reports/history" | "/billing/checkout" | "/webhook/stripe" | null
+}
+```
+
+**Sample funnel reads**
+
+A single free user hitting their daily cap, clicking the upgrade
+URL, paying through Stripe:
+
+```jsonl
+{"event":"upgrade_shown","reason":"usage_limit","endpoint":"/reports/latest","api_key_hash":"bcd5...","tier":"free",...}
+{"event":"upgrade_clicked","reason":"checkout_initiated","endpoint":"/billing/checkout","api_key_hash":"bcd5...","tier":"free",...}
+{"event":"upgrade_completed","reason":"stripe_webhook","endpoint":"/webhook/stripe","api_key_hash":"bcd5...","tier":"free",...}
+```
+
+**Funnel math**
+
+```
+shown    = count(distinct api_key_hash) where event = "upgrade_shown"
+clicked  = count(distinct api_key_hash) where event = "upgrade_clicked"
+completed= count(distinct api_key_hash) where event = "upgrade_completed"
+
+clickthrough_rate   = clicked   / shown
+conversion_rate     = completed / clicked
+overall_funnel_rate = completed / shown
+```
+
+Filter by ``reason`` to compare which trigger ("usage_limit",
+"feature_locked", "limited_access") drives the most upgrades, or
+by ``endpoint`` to see which gated route is the strongest funnel
+entrypoint.
+
+**Privacy invariants (every one tested)**
+
+* Raw API key never in the funnel log — pinned by
+  ``TestPhase84FunnelLeakGuard::test_no_raw_key_after_full_funnel``.
+* Legacy ``metadata[api_key]`` webhook path hashes the raw key
+  before logging — pinned by
+  ``test_webhook_legacy_api_key_path_emits_completed_with_hash``.
+* The funnel helper's signature is hash-only (``key_hash``, not
+  ``api_key``) — pinned by
+  ``TestPhase84RecordUpgradeFunnelEventSchema::test_records_documented_fields``.
+
+**Failure / dedup posture**
+
+* Funnel writer failures are best-effort — wrapped in try/except
+  at every call site so a disk failure NEVER breaks the user's
+  request. Pinned by
+  ``TestPhase84FunnelLoggingFailureDoesNotBreakRequest`` and
+  ``TestPhase84RecordUpgradeFunnelEventNoLeak::test_disk_failure_does_not_raise``.
+* Premium callers never emit any of the three events because the
+  Phase 8.3 helper short-circuits BEFORE the Stripe call AND
+  before the funnel write. Pinned by
+  ``test_premium_does_not_emit_shown``.
+* "No duplicate spam events in same request" is structurally
+  guaranteed — each event has exactly one call site per response
+  flow, so a single request produces at most one row per stage.
+  Pinned by ``test_no_dedupe_spam_on_single_response``.
+* Cancellation / payment-failure webhook events do NOT emit
+  ``upgrade_completed`` — pinned by
+  ``test_cancellation_does_not_emit_completed``.
+
+**Boundary**
+
+* No new HTTP route. Phase 8.4 is helper code wired into existing
+  routes / middleware / webhook.
+* The three new event constants extend the Phase 5.5
+  ``VALID_EVENTS`` set; the legacy ``record_upgrade_event`` and
+  the new ``record_upgrade_funnel_event`` share the same JSONL
+  file. Readers branch on ``event``.
+* No new operator log file. The default path
+  (``data/api_upgrade_events.jsonl``) and env var
+  (``TRADING_API_UPGRADE_EVENTS_LOG_PATH``) are unchanged.
+
+
+### Phase 9.1 — insight layer
+
+A small, deterministic insight builder that decorates the existing
+``/reports/latest`` JSON and the ``/dashboard`` HTML with an
+``insights`` field. Pure function — same inputs always produce the
+same outputs; no Stripe / network / time-of-day side effects.
+
+**Module**
+
+``trading_bot/api/insights.py`` — pure stdlib, imports nothing
+from FastAPI / structlog / the rest of ``trading_bot``. Two
+public entry points:
+
+```python
+build_insights(report, prev_report=None) -> list[dict]
+truncate_for_free(insights, *, max_count=FREE_INSIGHT_LIMIT) -> list[dict]
+```
+
+**Insight schema** (every entry conforms)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``id``         | ``str``                            | one of ``KNOWN_INSIGHT_IDS`` |
+| ``title``      | ``str``                            | one-line headline |
+| ``summary``    | ``str``                            | 1-2 sentence explanation |
+| ``confidence`` | ``float``                          | clamped to ``[0.0, 1.0]`` |
+| ``severity``   | ``"info"`` / ``"warn"`` / ``"critical"`` | ops attention level |
+| ``evidence``   | ``dict``                           | rule-specific supporting numbers |
+| ``action``     | ``str``                            | next-step hint for the operator |
+
+**Three deterministic rules**
+
+| ID                       | When it fires | Severity | Confidence basis |
+|---|---|---|---|
+| ``trend.buy_delta``      | both reports have ``totals.buy_rows`` | ``info``, or ``warn`` when buys drop ≥ 50% vs prior day | ``abs(delta) / prev`` clamped |
+| ``promotion.readiness``  | report has ``promotion_readiness`` | ``info`` when ready or building, ``warn`` when blocked | ``1.0`` ready / streak-scaled / ``0.8`` blocked |
+| ``regime.dominant``      | report has ``regime_stats`` with non-zero hits | ``info`` | dominance share |
+
+The output list is ordered ``[trend, readiness, regime]`` — fixed
+regardless of the input report. Rules with insufficient data
+silently drop themselves.
+
+**Tier-aware projection**
+
+* Premium → full ``insights`` list with full ``evidence`` per
+  entry.
+* Free → at most ``FREE_INSIGHT_LIMIT`` (``= 2``) entries; each
+  surviving entry's ``evidence`` is projected through a per-rule
+  allow-list:
+
+  | ID                       | Free-tier evidence keys |
+  |---|---|
+  | ``trend.buy_delta``      | ``delta``, ``direction`` |
+  | ``promotion.readiness``  | ``ready`` |
+  | ``regime.dominant``      | ``regime`` |
+
+  Insights with an unrecognised ``id`` are dropped entirely
+  (fail-closed for future rules without an allow-list).
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — best-effort prior-day load (falls
+  back to ``None`` on missing / parse error), then
+  ``build_insights`` → tier-aware truncation → ``insights`` field
+  on the response. Free response also still carries the
+  ``upgrade`` envelope (Phase 8.3) when Stripe is configured.
+* ``GET /dashboard`` — same prior-day load, same insights compute,
+  threaded through ``render_dashboard_html`` as a new optional
+  ``insights`` kwarg. Renderer adds an "Insights" ``<section>`` of
+  ``<li>`` entries with severity-tagged CSS classes
+  (``insight-info`` / ``insight-warn`` / ``insight-critical``).
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any insight or in any rendered HTML. Pinned by
+  ``TestPhase91ReportsLatestNoLeak::test_raw_key_absent_from_insights_response``.
+* The rule helpers consume only the sanitised report (Phase 4.0
+  ``_sanitize_report`` strips ``scorer_config`` / filesystem
+  paths). The insight layer cannot surface Core internals because
+  it can't see them.
+* Free tier truncation is mechanical — the allow-list lives next
+  to the rule definitions in ``insights.py`` so a new rule that
+  forgets its allow-list is dropped from free output.
+
+**Boundary**
+
+* No new HTTP route. Phase 9.1 is helper code wired into existing
+  routes / renderer. Pinned by
+  ``TestPhase91CrossCutting::test_no_new_mutating_route``.
+* No new logs. No new env vars.
+* Phase 8.1 / 8.2 / 8.3 / 8.4 still apply unchanged — the
+  ``insights`` field rides alongside the ``upgrade`` field, and a
+  429 from the usage layer short-circuits before the report
+  handler ever runs (so insights are simply not computed for
+  rate-limited requests).
+* Pure stdlib import — pinned by
+  ``tests/test_insights.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
+### Phase 9.2 — daily hook & retention
+
+A "what changed since yesterday" hook surfaced as a top-of-page
+banner on the dashboard and as a ``daily_hook`` field on the
+``/reports/latest`` JSON. Designed to drive repeat usage by
+making the day-over-day signal the very first thing a returning
+caller sees.
+
+**Module**
+
+``trading_bot/api/daily_hook.py`` — pure stdlib, imports nothing
+from FastAPI / structlog / the rest of ``trading_bot`` (not even
+``insights``; the trend insight is consumed by ID via the
+``insights`` argument). Two public entry points:
+
+```python
+build_daily_hook(report, prev_report, insights=None) -> dict | None
+truncate_for_free(hook) -> dict | None
+```
+
+**Hook schema** (every entry conforms when ``build_daily_hook``
+does not return ``None``)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``headline``   | ``str``                            | human-readable tagline ("Buys up 10 vs prior day") |
+| ``change``     | ``"up"`` / ``"down"`` / ``"flat"`` | direction |
+| ``magnitude``  | ``int``                            | absolute change |
+| ``confidence`` | ``float``                          | clamped to ``[0.0, 1.0]`` (premium only) |
+| ``since``      | ``str`` / ``None``                 | ISO date of the prior report |
+| ``driver``     | ``str``                            | ``"trend.buy_delta"`` or ``"totals.buy_rows"`` (premium only) |
+| ``cta``        | ``str``                            | stable "Open the dashboard for the full breakdown" |
+
+**Source preference order**
+
+1. **Phase 9.1 trend insight** (preferred) — when the ``insights``
+   list contains a ``trend.buy_delta`` entry with valid evidence,
+   the hook borrows its ``delta`` / ``direction`` / ``confidence``.
+   ``driver`` reports ``"trend.buy_delta"``.
+2. **Direct totals fallback** — when the insight is missing or
+   malformed, the hook falls back to a direct
+   ``totals.buy_rows`` delta. Confidence collapses to a fixed
+   ``0.4`` and ``driver`` reports ``"totals.buy_rows"``.
+3. **Hook absent** — when there's no prior-day report, or both
+   sources lack data, ``build_daily_hook`` returns ``None`` and
+   the consumer omits the field entirely.
+
+**Tier-aware projection**
+
+* Premium → full hook with all seven fields.
+* Free → ``confidence`` and ``driver`` dropped; the user-facing
+  fields (``headline``, ``change``, ``magnitude``, ``since``,
+  ``cta``) are kept verbatim.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — best-effort prior-day load (Phase 9.1
+  already does this), then ``build_daily_hook(curr, prev,
+  insights)`` → tier-aware truncation → ``daily_hook`` field on
+  the response. Field is OMITTED when the hook is ``None``.
+* ``GET /dashboard`` — same compute. The renderer adds an
+  ``<aside class="daily-hook daily-hook-{change}">`` block at the
+  top of the page (above the latest-report section). The aside
+  is OMITTED when the hook is ``None``. Both tiers see the same
+  markup; the underlying truncation is what differs.
+
+**Sample free response excerpt**
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "daily_hook": {
+    "headline": "Buys up 10 vs prior day",
+    "change": "up",
+    "magnitude": 10,
+    "since": "2026-04-24",
+    "cta": "Open the dashboard for the full breakdown"
+  },
+  "insights": [...],
+  "upgrade": {...}
+}
+```
+
+**Sample premium response excerpt**
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "daily_hook": {
+    "headline": "Buys up 10 vs prior day",
+    "change": "up",
+    "magnitude": 10,
+    "confidence": 0.5,
+    "since": "2026-04-24",
+    "driver": "trend.buy_delta",
+    "cta": "Open the dashboard for the full breakdown"
+  },
+  "insights": [...]
+}
+```
+
+**Sample dashboard banner HTML**
+
+```html
+<aside class="daily-hook daily-hook-up">
+  <strong>Buys up 10 vs prior day</strong>
+  <span class="daily-hook-since">since 2026-04-24</span>
+  <span class="daily-hook-cta">Open the dashboard for the full breakdown</span>
+</aside>
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any hook field or rendered HTML. Pinned by
+  ``TestPhase92NoLeak`` (2 tests).
+* Hook absent when prior-day report is missing — no synthetic
+  values, no bogus zeros. Pinned by
+  ``TestPhase92ReportsLatestHookAbsent`` (2 tests).
+* Free truncation is mechanical via the ``_FREE_HOOK_ALLOWLIST``
+  set, so any future field added to ``build_daily_hook`` stays
+  premium-only until its allow-list entry is added.
+
+**Boundary**
+
+* No new HTTP route. Phase 9.2 is helper code wired into existing
+  routes / renderer. Pinned by
+  ``TestPhase92CrossCutting::test_no_new_mutating_route``.
+* No new persistence — hook is computed per request from the
+  same files Phase 9.1 already reads.
+* No new env vars.
+* ``trading_bot/api/daily_hook.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_daily_hook.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
+### Phase 9.3 — stickiness loop
+
+Two retention signals derived from the same daily report data:
+
+  * **streak** — consecutive passing days from
+    ``promotion_readiness.consecutive_passing_days``. Surfaces as
+    a positive-reinforcement banner / JSON field whenever the
+    streak is ≥ 1 day.
+  * **nudge (missed_day)** — gap > 1 day between the latest two
+    report dates. Surfaces as a re-engagement banner / JSON field
+    when a returning user has missed at least one day.
+
+**Module**
+
+``trading_bot/api/stickiness.py`` — pure stdlib, imports nothing
+from FastAPI / structlog / the rest of ``trading_bot``. Four
+public entry points:
+
+```python
+build_streak(report, prev_report=None)        -> dict | None
+build_nudge(report, prev_report)              -> dict | None
+truncate_streak_for_free(streak)              -> dict | None
+truncate_nudge_for_free(nudge)                -> dict | None
+```
+
+**Streak schema**
+
+| Field | Type | Notes |
+|---|---|---|
+| ``days``           | ``int``  | ``promotion_readiness.consecutive_passing_days`` |
+| ``label``          | ``str``  | "5-day passing streak" |
+| ``milestone``      | ``bool`` | True iff ``days`` is in ``MILESTONE_DAYS`` |
+| ``next_milestone`` | ``int``  | next ladder rung (premium only) |
+
+The milestone ladder is fixed: ``(3, 5, 7, 10, 14, 21, 30, 60, 90,
+180, 365)``. Past 365 the helper extends by 30-day rungs so the
+streak always has a target to chase.
+
+**Nudge schema**
+
+| Field | Type | Notes |
+|---|---|---|
+| ``kind``         | ``"missed_day"``                  | only kind in 9.3 |
+| ``headline``     | ``str``                           | "You missed 2 days of reports." |
+| ``days_missed``  | ``int``                           | gap − 1 |
+| ``since``        | ``str``                           | ISO date of the prior report |
+| ``cta``          | ``str``                           | stable re-engagement prompt |
+
+**Source rules**
+
+* Streak fires from the current report alone — no prev needed.
+  Returns ``None`` when ``consecutive_passing_days`` is missing,
+  not an int, zero, or negative.
+* Nudge fires only when both reports have parseable
+  ``report_date`` strings AND the gap is ≥ 2 days. Same-day or
+  out-of-order dates return ``None``.
+* Both helpers are pure functions — same inputs always produce
+  the same outputs.
+
+**Tier-aware projection**
+
+* Streak: free callers get ``days`` / ``label`` / ``milestone``;
+  the forward-looking ``next_milestone`` stays premium.
+* Nudge: every field is user-facing, so free callers see the
+  full schema. The ``truncate_nudge_for_free`` helper still
+  exists as a defensive copy so a future premium-only field can
+  be added without churning the call sites.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — both fields attached when present.
+  Either field may be absent independently (e.g. a returning
+  user mid-streak: both present; a single-day deployment with
+  a streak: only ``streak``; a returning user whose run reset:
+  only ``nudge``).
+* ``GET /dashboard`` — two new ``<aside>`` banners. Render order
+  (top → bottom):
+  1. **nudge** — re-engagement message comes first when present.
+  2. **streak** — positive reinforcement.
+  3. **daily_hook** — yesterday-vs-today (Phase 9.2).
+  4. existing free-tier upgrade banner / report / insights /
+     experiments.
+
+  Banners are omitted entirely when the underlying signal is
+  ``None``. Both tiers see the same markup; the underlying
+  truncation is what differs.
+
+**Sample free response excerpt**
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "streak": {
+    "days": 5,
+    "label": "5-day passing streak",
+    "milestone": true
+  },
+  "nudge": {
+    "kind": "missed_day",
+    "headline": "You missed 2 days of reports.",
+    "days_missed": 2,
+    "since": "2026-04-22",
+    "cta": "Open the dashboard to see what changed while you were away"
+  },
+  "daily_hook": {...},
+  "insights": [...],
+  "upgrade": {...}
+}
+```
+
+**Sample premium response excerpt** — same fields plus
+``next_milestone`` on the streak.
+
+**Sample dashboard banner HTML**
+
+```html
+<aside class="nudge nudge-missed_day">
+  <strong>You missed 2 days of reports.</strong>
+  <span class="nudge-since">since 2026-04-22</span>
+  <span class="nudge-cta">Open the dashboard to see what changed while you were away</span>
+</aside>
+<aside class="streak streak-milestone">
+  <strong>5-day passing streak</strong>
+  <span class="streak-next">next milestone: 7 days</span>
+</aside>
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any streak / nudge field or rendered HTML.
+  Pinned by ``TestPhase93NoLeak`` (2 tests).
+* Both signals fail soft: missing data → ``None`` → field omitted
+  cleanly. No synthetic zeros, no fabricated dates.
+* Free truncation is mechanical via the per-helper allow-list
+  set, so any new field added to either schema stays premium-only
+  until its allow-list entry is added.
+
+**Boundary**
+
+* No new HTTP route. Phase 9.3 is helper code wired into existing
+  routes / renderer. Pinned by
+  ``TestPhase93CrossCutting::test_no_new_mutating_route``.
+* No new persistence — both signals are computed per request from
+  the same files Phase 9.1 / 9.2 already read.
+* No new env vars.
+* ``trading_bot/api/stickiness.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_stickiness.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
+### Phase 10.1 — shareability layer
+
+A small, stable copy-paste-ready ``share`` payload attached to
+each Phase 9.1 insight and to the Phase 9.2 daily hook so any
+caller can drop the text into a tweet, Slack, email, or any
+short-form channel without doing string-stitching of their own.
+
+**Module**
+
+``trading_bot/api/share.py`` — pure stdlib, imports nothing from
+FastAPI / structlog / the rest of ``trading_bot``. Two public
+entry points:
+
+```python
+build_insight_share(insight, *, is_premium, base_url)   -> dict | None
+build_daily_hook_share(hook,  *, is_premium, base_url)  -> dict | None
+```
+
+**Share schema** (every entry conforms when the helpers do not
+return ``None``)
+
+| Field | Type | Notes |
+|---|---|---|
+| ``text`` | ``str`` | short, human-readable, copy-paste-ready |
+| ``cta``  | ``str`` | stable ``"Try it yourself"`` |
+| ``url``  | ``str`` | the deployment's public URL (Phase 7.3 ``TRADING_PUBLIC_BASE_URL``), with trailing slashes stripped |
+
+**Source rules**
+
+* Insight share: keyed on the insight's ``id``. Three rule IDs
+  have copy:
+  * ``trend.buy_delta``
+  * ``promotion.readiness``
+  * ``regime.dominant``
+
+  Insights with an unrecognised ``id`` get no ``share`` field
+  (fail-closed for future rules without copy).
+* Daily-hook share: every hook with a ``change`` value gets copy.
+* Both helpers return ``None`` when ``TRADING_PUBLIC_BASE_URL`` is
+  unset / blank — without a public URL the share field can't link
+  anywhere, so the field is omitted entirely. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Tier-aware copy**
+
+Both tiers receive a ``share`` field with the same SHAPE; the
+``text`` is what differs:
+
+| Insight / hook | Free copy | Premium copy |
+|---|---|---|
+| ``trend.buy_delta`` (up 10, +50%) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%)." |
+| ``promotion.readiness`` (ready, 25 days) | "Momentum Trading Bot promotion gate is GREEN after 25 consecutive passing day(s)." | "Momentum Trading Bot: promotion gate READY after 25 consecutive passing day(s)." |
+| ``promotion.readiness`` (blocked, 0 days) | "Momentum Trading Bot promotion gate is currently blocked." | "Momentum Trading Bot: promotion gate BLOCKED — no passing streak yet." |
+| ``regime.dominant`` (trending, 12 hits, 80% share) | "Momentum Trading Bot: 'trending' regime led today's signals." | "Momentum Trading Bot: 'trending' regime dominated with 12 hits (80.0% share)." |
+| ``daily_hook`` (up 10) | "Buy signals up 10 vs prior day on Momentum Trading Bot." | "Momentum Trading Bot: Buys up 10 vs prior day (trending up)." |
+
+Premium copy carries the percent / share / streak figures so the
+text stands on its own as a social hook; free copy is the plain
+plain-language equivalent. The CTA and URL are identical.
+
+**Wired call sites**
+
+* ``GET /reports/latest`` — every insight returned in the
+  ``insights`` list is decorated via
+  ``_decorate_insights_with_share`` AFTER tier truncation, and
+  the daily hook is decorated via ``_decorate_daily_hook_with_share``.
+  The decoration helpers return a NEW list / dict (no mutation)
+  so a future serialiser can't accidentally see a share field on
+  a re-fetched insight.
+
+  Free callers see the share text matching what they receive in
+  the rest of the body (e.g. they don't see the percent figure
+  in their truncated trend insight, so the share text doesn't
+  include it either).
+* ``GET /dashboard`` — share is a JSON-payload concept; the HTML
+  dashboard does not surface it. (A future Phase 10.x can wire
+  share text into rendered banners if needed.)
+
+**Sample free response excerpt**
+
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "title": "Buy volume up vs prior day",
+      "summary": "Buys advanced 10 → 30 (was 20).",
+      "confidence": 0.5,
+      "severity": "info",
+      "evidence": {"delta": 10, "direction": "up"},
+      "action": "monitor for sustained improvement",
+      "share": {
+        "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      }
+    }
+  ],
+  "daily_hook": {
+    "headline":   "Buys up 10 vs prior day",
+    "change":     "up",
+    "magnitude":  10,
+    "since":      "2026-04-24",
+    "cta":        "Open the dashboard for the full breakdown",
+    "share": {
+      "text": "Buy signals up 10 vs prior day on Momentum Trading Bot.",
+      "cta":  "Try it yourself",
+      "url":  "https://momentum-trading-bot-production.up.railway.app"
+    }
+  }
+}
+```
+
+**Sample premium response excerpt**
+
+```json
+{
+  "insights": [
+    {
+      "id": "trend.buy_delta",
+      "evidence": {
+        "delta": 10, "direction": "up",
+        "curr_buy_rows": 30, "prev_buy_rows": 20,
+        "percent_change": 50.0
+      },
+      "share": {
+        "text": "Momentum Trading Bot: buy signals up 10 vs prior day (+50.0%).",
+        "cta":  "Try it yourself",
+        "url":  "https://momentum-trading-bot-production.up.railway.app"
+      },
+      "...": "..."
+    }
+  ]
+}
+```
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any ``share`` field. Pinned by
+  ``TestPhase101NoLeak::test_raw_key_absent_from_share_text``.
+* Share text never includes evidence the caller doesn't already
+  see — a free caller's trend share never carries the
+  percent-change figure that Phase 8.2 trims from their evidence.
+  Pinned by ``TestPhase101InsightShareFreeUser::test_free_share_text_uses_plain_copy``.
+* Share is omitted entirely when ``TRADING_PUBLIC_BASE_URL`` is
+  unset, so a misconfigured deployment can't surface a dangling
+  URL or a placeholder string. Pinned by
+  ``TestPhase101NoBaseUrlOmitsShare`` (2 tests).
+
+**Boundary**
+
+* No new HTTP route. Phase 10.1 is helper code wired into
+  existing routes. Pinned by
+  ``TestPhase101CrossCutting::test_no_new_mutating_route``.
+* No new persistence — share text is computed per request from
+  data the caller is already receiving.
+* No new env vars. ``TRADING_PUBLIC_BASE_URL`` is the same env
+  var Phase 7.3 / 8.3 already use.
+* ``trading_bot/api/share.py`` imports only stdlib + typing.
+  Pinned by
+  ``tests/test_share.py::TestBoundary::test_module_imports_only_stdlib_typing``.
+
+
+### Phase 10.2 — public entry layer
+
+Lets unauthenticated callers experience the product instantly,
+without a key. Two surfaces are widened:
+
+  * ``GET /`` — content-negotiated. HTML by default (Phase 5.2
+    landing page unchanged); JSON preview when the caller
+    explicitly sends ``Accept: application/json``.
+  * ``GET /reports/latest`` — when no ``Authorization`` header is
+    present, returns the same free-tier projection an
+    authenticated free user would get, plus ``preview: True`` and
+    a ``get_started`` block.
+
+A new soft-auth dependency drives both surfaces:
+
+```python
+optional_api_key(request, creds=Depends(_security)) -> Optional[str]
+```
+
+* ``creds is None`` (no header) → returns ``None``; route handler
+  branches into preview mode.
+* Header present → delegates to ``require_api_key``, which
+  preserves every existing failure mode unchanged (401 for a
+  non-Bearer scheme handled at the FastAPI layer; 403 for an
+  invalid / revoked token; 503 when the deployment isn't
+  configured for any auth source).
+
+The asymmetry is deliberate: an invalid header still rejects
+loudly. Preview mode is reserved for genuine "I'm just looking"
+traffic that doesn't try to authenticate at all.
+
+**`get_started` block**
+
+Stable shape returned alongside every preview surface:
+
+```json
+{
+  "label": "Get a free API key from the operator to unlock the full report.",
+  "endpoint": "/reports/latest",
+  "command": "python -m trading_bot.api.keys issue --tier free --label <your-label>"
+}
+```
+
+**Sample `GET /` JSON response**
+
+```bash
+curl -H "Accept: application/json" https://your-host.example.com/
+```
+
+```json
+{
+  "preview": true,
+  "get_started": {...},
+  "daily_hook": {
+    "headline":  "Buys up 10 vs prior day",
+    "change":    "up",
+    "magnitude": 10,
+    "since":     "2026-04-24",
+    "cta":       "Open the dashboard for the full breakdown",
+    "share":     {...}
+  },
+  "top_insight": {
+    "id":         "trend.buy_delta",
+    "title":      "Buy volume up vs prior day",
+    "summary":    "Buys advanced 10 → 30 (was 20).",
+    "evidence":   {"delta": 10, "direction": "up"},
+    "confidence": 0.5,
+    "severity":   "info",
+    "action":     "monitor for sustained improvement",
+    "share":      {...}
+  }
+}
+```
+
+The shape is deliberately tighter than ``/reports/latest`` —
+only the daily hook + the single top-priority insight, both
+through the free-tier projection. The full insight list and the
+Phase 9.3 streak / nudge fields stay on ``/reports/latest`` so
+``GET /`` remains a teaser.
+
+**Sample `GET /reports/latest` unauthenticated response**
+
+Same shape as the authenticated free response (Phase 8.2 / 9.x
+projections), with two additional fields:
+
+```json
+{
+  "report_type": "daily_alpha_validation",
+  "report_date": "2026-04-25",
+  "tier": "free",
+  "totals": {...},
+  "promotion_readiness": {...},
+  "insights": [...],
+  "daily_hook": {...},
+  "streak": {...},
+  "nudge": {...},
+  "preview": true,
+  "get_started": {...}
+}
+```
+
+The ``upgrade`` envelope (Phase 8.3 Stripe Checkout URL) is
+deliberately absent on the preview path — a caller without a key
+can't be promoted via Stripe Checkout yet (no key for the
+metadata). They first need to issue a key via the operator CLI;
+the ``get_started.command`` carries that exact instruction.
+
+**Authenticated callers**
+
+Authenticated free and authenticated premium responses are
+UNCHANGED. They never carry the ``preview`` / ``get_started``
+markers — those are exclusive to the public-entry surface.
+Pinned by ``test_authenticated_free_does_not_get_preview_marker``
+and ``test_authenticated_premium_does_not_get_preview_marker``.
+
+**Auth matrix**
+
+| Header | Result |
+|---|---|
+| (none) | 200 + preview + ``get_started`` |
+| ``Authorization: Basic …`` | 200 + preview (HTTPBearer treats non-Bearer as ``creds=None``) |
+| ``Authorization: Bearer <invalid>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <revoked>`` | 403 (Phase 6.2 unchanged) |
+| ``Authorization: Bearer <valid free>`` | 200 + free body (no preview marker) |
+| ``Authorization: Bearer <valid premium>`` | 200 + full body (no preview marker) |
+
+**Privacy invariants (every one tested)**
+
+* No raw API key in any preview body. Pinned by
+  ``TestPhase102NoLeak`` (2 tests).
+* Preview never surfaces premium-only fields (``tier_stats``,
+  ``reason_stats``, ``regime_stats``, ``decile_stats``,
+  ``shadow_filter_simulation``, ``guardrails``, ``sources``).
+  Pinned by ``test_preview_omits_premium_only_fields``.
+* Preview insight evidence uses the Phase 9.1 free allow-list
+  exactly. Pinned by
+  ``test_preview_insight_evidence_uses_free_allowlist``.
+* Preview never writes a usage-log row — the Phase 4.6
+  ``usage_middleware`` short-circuits when
+  ``request.state.api_key`` is unset, which it stays for unauth
+  requests. Pinned by
+  ``test_preview_does_not_count_against_usage``.
+* The Phase 4.2 per-IP rate limiter still applies to preview
+  traffic (60 req/min default), so a misbehaving client cannot
+  hammer the public surface without consequence.
+
+**Boundary**
+
+* No new HTTP route. ``GET /`` and ``GET /reports/latest``
+  are both pre-existing routes whose behaviour was widened.
+  Pinned by ``TestPhase102CrossCutting::test_no_new_mutating_route``.
+* No new persistence — preview is computed per request from the
+  same files Phase 9.x already reads.
+* No new env vars.
+* The ``optional_api_key`` dependency lives in ``server.py``
+  alongside ``require_api_key``; both delegate to the same
+  validation chain, only differing in their fail-OPEN-on-missing
+  posture.
 
 
 ## Phase 2.7 — dataset rotation (reference)

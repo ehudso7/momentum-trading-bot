@@ -82,6 +82,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -89,9 +90,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import structlog
-
-log = structlog.get_logger(__name__)
+from trading_bot.api import key_store
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +109,23 @@ VALID_TIERS: frozenset[str] = frozenset({TIER_FREE, TIER_PREMIUM})
 # returns 43 characters that are all in ``[A-Za-z0-9\-_]``.
 KEY_BYTES = 32
 
-# Phase 6.1 — reuse the Phase 5.1 growth ref_code sanitiser so the
-# manifest's ``ref_code`` field is byte-identical to whatever the
-# live ``?ref=`` middleware would have logged. Lazy attribute, but
-# we resolve at module load to fail fast if the import is broken.
-from trading_bot.api.growth import _sanitize_ref_code as _sanitize_ref_code  # noqa: E402
+# Phase 6.1 — ref_code sanitiser. Inlined (rather than imported from
+# trading_bot.api.growth) so the operator CLI stays dependency-free
+# and importable in environments that don't have the live API
+# server's logging stack (e.g. structlog) installed. Parity with the
+# growth-middleware sanitiser is enforced by
+# tests/test_keys.py::test_sanitiser_matches_growth_sanitiser.
+_REF_CODE_MAX_LENGTH = 64
+_REF_CODE_STRIP_RE = re.compile(r"[^A-Za-z0-9\-_:.]")
+
+
+def _sanitize_ref_code(raw: Optional[str]) -> str:
+    if raw is None:
+        return ""
+    s = str(raw)
+    if not s:
+        return ""
+    return _REF_CODE_STRIP_RE.sub("", s)[:_REF_CODE_MAX_LENGTH]
 
 _write_lock = threading.Lock()
 
@@ -637,6 +648,204 @@ def _list_cli(argv: list[str]) -> int:
     return 0
 
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.2 — bulk revocation cleanup helper
+# ---------------------------------------------------------------------------
+
+
+def _build_revoke_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys revoke",
+        description=(
+            "Append a single revocation row. Identify the target by "
+            "pre-hashed --key-hash OR raw --api-key (the helper hashes "
+            "internally and never persists the raw key). "
+            "The revocation log is the unambiguous kill switch — every "
+            "auth path checks it before consulting any manifest or env "
+            "premium list."
+        ),
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--key-hash", default=None,
+        help=(
+            "SHA-256(api_key)[:32] hash of the key to revoke. Use "
+            "this when you only have the hash on hand (e.g. from a "
+            "growth/audit/usage log)."
+        ),
+    )
+    group.add_argument(
+        "--api-key", default=None,
+        help=(
+            "Raw API key. The CLI hashes it locally to "
+            "SHA-256[:32] before writing. The raw value never "
+            "lands on disk."
+        ),
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional operator-facing free-text reason "
+            f"(capped at {key_store.REVOCATION_REASON_MAX_LENGTH} chars)."
+        ),
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help=(
+            "Override the revocation log path "
+            f"(default: ${key_store.KEYS_REVOKED_ENV_VAR} or "
+            f"{key_store.DEFAULT_KEYS_REVOKED_PATH})."
+        ),
+    )
+    return parser
+
+
+def _revoke_cli(argv: list[str]) -> int:
+    args = _build_revoke_parser().parse_args(argv)
+
+    if args.key_hash is not None:
+        target_hash = (args.key_hash or "").strip()
+        if not target_hash:
+            print(
+                "error: --key-hash must not be blank",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        # ``--api-key`` is mutually exclusive with ``--key-hash``;
+        # argparse already enforces "at least one is supplied".
+        raw = args.api_key or ""
+        if not raw.strip():
+            print(
+                "error: --api-key must not be blank",
+                file=sys.stderr,
+            )
+            return 2
+        target_hash = _hash_api_key(raw)
+        if not target_hash:
+            print(
+                "error: failed to derive key_hash from --api-key",
+                file=sys.stderr,
+            )
+            return 2
+
+    target = (
+        Path(args.revoked_path) if args.revoked_path else None
+    )
+    try:
+        record = key_store.append_revocation(
+            key_hash=target_hash, reason=args.reason, target=target,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — operator-facing surface
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    final_path = (
+        target if target is not None else key_store.revoked_path()
+    )
+    print("API key revoked:")
+    print(f"  revoked_path : {final_path}")
+    print(f"  key_hash     : {record['key_hash']}")
+    print(f"  timestamp    : {record['timestamp']}")
+    if record.get("reason"):
+        print(f"  reason       : {record['reason']}")
+    return 0
+
+
+def _build_revoke_many_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys revoke-many",
+        description=(
+            "Append one revocation row per --key-hash. Useful for "
+            "launch-day cleanup of test keys: pass every test hash "
+            "in one invocation. Duplicate hashes are accepted but "
+            "always materialise as 'revoked' on the read side."
+        ),
+    )
+    parser.add_argument(
+        "--key-hash", action="append", default=[], dest="key_hashes",
+        help=(
+            "SHA-256(api_key)[:32] hash to revoke. May be passed "
+            "multiple times. At least one is required."
+        ),
+    )
+    parser.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional operator-facing free-text reason applied to "
+            "every revocation row in this batch (capped at "
+            f"{key_store.REVOCATION_REASON_MAX_LENGTH} chars)."
+        ),
+    )
+    parser.add_argument(
+        "--revoked-path", default=None,
+        help=(
+            "Override the revocation log path "
+            f"(default: ${key_store.KEYS_REVOKED_ENV_VAR} or "
+            f"{key_store.DEFAULT_KEYS_REVOKED_PATH})."
+        ),
+    )
+    return parser
+
+
+def _revoke_many_cli(argv: list[str]) -> int:
+    args = _build_revoke_many_parser().parse_args(argv)
+
+    cleaned: list[str] = []
+    for raw in args.key_hashes:
+        h = (raw or "").strip()
+        if not h:
+            print(
+                "error: --key-hash entries must not be blank",
+                file=sys.stderr,
+            )
+            return 2
+        cleaned.append(h)
+    if not cleaned:
+        print(
+            "error: at least one --key-hash is required",
+            file=sys.stderr,
+        )
+        return 2
+
+    target = (
+        Path(args.revoked_path) if args.revoked_path else None
+    )
+
+    written: list[dict] = []
+    failed: list[tuple[str, str]] = []
+    for h in cleaned:
+        try:
+            record = key_store.append_revocation(
+                key_hash=h, reason=args.reason, target=target,
+            )
+            written.append(record)
+        except ValueError as exc:
+            failed.append((h, str(exc)))
+        except Exception as exc:  # noqa: BLE001 — operator-facing
+            failed.append((h, f"{type(exc).__name__}: {exc}"))
+
+    final_path = (
+        target if target is not None else key_store.revoked_path()
+    )
+    print("API key bulk revocation:")
+    print(f"  revoked_path  : {final_path}")
+    print(f"  reason        : {args.reason or '(none)'}")
+    print(f"  written       : {len(written)}")
+    for rec in written:
+        print(f"    - {rec['key_hash']}  at {rec['timestamp']}")
+    if failed:
+        print(f"  failed        : {len(failed)}")
+        for h, msg in failed:
+            print(f"    - {h}: {msg}")
+    return 0 if not failed else 1
+
+
 def _build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot.api.keys",
@@ -653,6 +862,16 @@ def _build_top_parser() -> argparse.ArgumentParser:
         help="Inspect the manifest with optional tier / ref filters.",
         add_help=False,
     )
+    subparsers.add_parser(
+        "revoke",
+        help="Append one revocation row by --key-hash or --api-key.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "revoke-many",
+        help="Append a revocation row for each --key-hash.",
+        add_help=False,
+    )
     return parser
 
 
@@ -667,11 +886,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _issue_cli(rest)
     if command == "list":
         return _list_cli(rest)
+    if command == "revoke":
+        return _revoke_cli(rest)
+    if command == "revoke-many":
+        return _revoke_many_cli(rest)
     if command in ("-h", "--help"):
         _build_top_parser().print_help()
         return 0
     print(f"error: unknown command '{command}'", file=sys.stderr)
-    print("available commands: issue, list", file=sys.stderr)
+    print(
+        "available commands: issue, list, revoke, revoke-many",
+        file=sys.stderr,
+    )
     return 2
 
 

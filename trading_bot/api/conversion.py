@@ -259,6 +259,42 @@ def record_conversion(
     if not api_key_hash:
         return {"action": "skipped", "reason": "hash_failed"}
 
+    return record_conversion_for_hash(
+        api_key_hash,
+        source=source,
+        price_id=price_id,
+        first_seen_timestamp=first_seen_timestamp,
+        usage_log_path=usage_log_path,
+        now=now,
+    )
+
+
+def record_conversion_for_hash(
+    key_hash: str,
+    *,
+    source: str = DEFAULT_CONVERSION_SOURCE,
+    price_id: Optional[str] = None,
+    first_seen_timestamp: Optional[str] = None,
+    usage_log_path: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """
+    Phase 7.4 — record a conversion using the SHA-256 hash directly.
+
+    Same return-value semantics as ``record_conversion``; the only
+    difference is the input. Used by the Stripe webhook when
+    ``metadata[key_hash]`` arrives without a raw api_key (Phase 7.3
+    ``POST /billing/checkout`` flow).
+
+    The raw API key is never required by this code path — by
+    construction, only the hash is in scope.
+    """
+    if not key_hash or not isinstance(key_hash, str):
+        return {"action": "skipped", "reason": "no_api_key"}
+    api_key_hash = key_hash.strip()
+    if not api_key_hash:
+        return {"action": "skipped", "reason": "no_api_key"}
+
     _ensure_cache_loaded()
 
     # Atomic check-and-reserve: under a single lock, either we see the
