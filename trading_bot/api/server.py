@@ -3017,6 +3017,21 @@ def latest_report(
     # nudge needs the prior report too.
     streak = build_streak(data, prev)
     nudge = build_nudge(data, prev)
+    # Phase 10.3 — first-touch attribution + share payload.
+    #   1. ``_emit_inbound_visit_event`` records an
+    #      ``inbound_visit`` row when ``?src=`` is present (and
+    #      sanitises it). Returns the cleaned src, or None.
+    #   2. ``_build_share_payload`` constructs the documented
+    #      response field and emits the ``share_generated`` row.
+    # Both are best-effort — telemetry failures never affect the
+    # outgoing response. ``share`` is None for unauthenticated
+    # callers (no key_hash to attribute).
+    inbound_src = _emit_inbound_visit_event(
+        request, endpoint="/reports/latest",
+    )
+    share = _build_share_payload(
+        request, endpoint="/reports/latest", src=inbound_src,
+    )
 
     if api_key is None:
         # Phase 10.2 — unauthenticated preview. Same projection +
