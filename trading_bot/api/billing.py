@@ -840,11 +840,17 @@ def create_checkout_session(
 ) -> dict:
     _validate_checkout_inputs(api_key, success_url, cancel_url)
 
-    stripe_secret = (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
-    price_id = (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
+    # Resolve through the preferred → legacy fallback so a deploy
+    # configured with only STRIPE_SECRET_KEY / STRIPE_PREMIUM_PRICE_ID
+    # (no legacy aliases) still creates checkout sessions cleanly.
+    stripe_secret = _resolve_stripe_secret()
+    price_id = _resolve_premium_price_id()
 
     if not stripe_secret:
-        raise BillingConfigError(f"{STRIPE_API_KEY_ENV_VAR} is not configured")
+        raise BillingConfigError(
+            f"{STRIPE_SECRET_KEY_ENV_VAR} (or fallback "
+            f"{STRIPE_API_KEY_ENV_VAR}) is not configured"
+        )
     if not price_id:
         raise BillingConfigError(
             f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} (or fallback "
