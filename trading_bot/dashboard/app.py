@@ -235,6 +235,28 @@ def create_app(state: DashboardState) -> FastAPI:
     return app
 
 
+def _resolve_dashboard_port(requested: int) -> int:
+    """
+    Defence-in-depth port resolver. ``trading_bot.main`` already
+    pipes ``$PORT`` through the argparse default — but a direct
+    caller of ``start_dashboard_server`` (tests, scripts) may pass
+    the legacy 8080 default explicitly. If ``$PORT`` is set AND
+    the caller didn't override the legacy default, prefer ``$PORT``.
+
+    A malformed ``$PORT`` falls back to the requested value (rather
+    than raising) so a typo in env config never bricks startup.
+    """
+    raw = os.environ.get("PORT")
+    if raw and requested == 8080:
+        try:
+            port = int(str(raw).strip())
+            if 1 <= port <= 65535:
+                return port
+        except (TypeError, ValueError):
+            pass
+    return requested
+
+
 def start_dashboard_server(
     state: DashboardState,
     host: str = "0.0.0.0",
@@ -243,18 +265,20 @@ def start_dashboard_server(
     """Start the dashboard server in a background daemon thread."""
     import uvicorn
 
+    resolved_port = _resolve_dashboard_port(port)
+
     app = create_app(state)
 
     def _run() -> None:
         uvicorn.run(
             app,
             host=host,
-            port=port,
+            port=resolved_port,
             log_level="warning",
             access_log=False,
         )
 
     thread = threading.Thread(target=_run, name="dashboard", daemon=True)
     thread.start()
-    log.info("dashboard.started", host=host, port=port)
+    log.info("dashboard.started", host=host, port=resolved_port)
     return thread

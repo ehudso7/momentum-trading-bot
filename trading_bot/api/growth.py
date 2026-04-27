@@ -169,17 +169,28 @@ def _load_dedup_cache(
     return out
 
 
-def _ensure_dedup_loaded() -> None:
-    """Rehydrate the dedup cache if the configured path has changed."""
+def _ensure_dedup_loaded(now: Optional[datetime] = None) -> None:
+    """
+    Rehydrate the dedup cache if the configured path has changed.
+
+    ``now`` controls the rehydration window (records older than
+    ``now - DEDUP_WINDOW_SECONDS`` are dropped). Passing the
+    caller's clock here keeps deterministic-time tests honest —
+    otherwise a test that seeds an event at a fixed UTC datetime
+    would start failing as wall-clock time drifts past the
+    seeded timestamp + 24h.
+    """
     global _dedup_loaded_from
     path = _growth_log_path()
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     with _write_lock:
         if _dedup_loaded_from != path:
             _dedup_cache.clear()
             _dedup_cache.update(
-                _load_dedup_cache(
-                    path, now=datetime.now(timezone.utc),
-                )
+                _load_dedup_cache(path, now=now),
             )
             _dedup_loaded_from = path
 
@@ -252,7 +263,11 @@ def record_growth_event(
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
 
-    _ensure_dedup_loaded()
+    # Pass the caller's clock through so the rehydration window
+    # uses the same "now" as the rest of this call. Otherwise a
+    # test that pins ``now`` to a fixed past datetime would see
+    # rehydration drop its own seeded events as wall-clock drifts.
+    _ensure_dedup_loaded(now=current)
     dedup_key = (hashed, cleaned)
     with _write_lock:
         previous = _dedup_cache.get(dedup_key)

@@ -26,6 +26,36 @@ log = structlog.get_logger(__name__)
 STRIPE_API_KEY_ENV_VAR = "STRIPE_API_KEY"
 STRIPE_WEBHOOK_SECRET_ENV_VAR = "STRIPE_WEBHOOK_SECRET"
 STRIPE_PRICE_ID_PREMIUM_ENV_VAR = "STRIPE_PRICE_ID_PREMIUM"
+
+# Preferred, more conventional env-var names. The legacy ones above
+# remain valid fallbacks so existing deployments keep working
+# without a coordinated env rotation.
+STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
+STRIPE_PREMIUM_PRICE_ID_ENV_VAR = "STRIPE_PREMIUM_PRICE_ID"
+
+
+def _resolve_stripe_secret() -> str:
+    """
+    Return the Stripe secret to use, preferring ``STRIPE_SECRET_KEY``
+    and falling back to ``STRIPE_API_KEY``. Empty string when neither
+    is set.
+    """
+    preferred = (os.getenv(STRIPE_SECRET_KEY_ENV_VAR, "") or "").strip()
+    if preferred:
+        return preferred
+    return (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
+
+
+def _resolve_premium_price_id() -> str:
+    """
+    Return the premium Stripe price id, preferring
+    ``STRIPE_PREMIUM_PRICE_ID`` and falling back to
+    ``STRIPE_PRICE_ID_PREMIUM``. Empty string when neither is set.
+    """
+    preferred = (os.getenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "") or "").strip()
+    if preferred:
+        return preferred
+    return (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
 STRIPE_PREMIUM_CACHE_ENV_VAR = "TRADING_STRIPE_PREMIUM_CACHE_PATH"
 DEFAULT_STRIPE_PREMIUM_CACHE_PATH = "data/stripe_premium_keys.json"
 
