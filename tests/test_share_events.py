@@ -18,16 +18,12 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 import threading
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from trading_bot.api import share_events as se
 from trading_bot.api.share_events import (
     DEFAULT_SHARE_EVENTS_LOG_PATH,
     EVENT_INBOUND_VISIT,
@@ -41,16 +37,9 @@ from trading_bot.api.share_events import (
     sanitize_src,
     summarize,
 )
-from trading_bot.api.server import (
-    API_KEY_ENV_VAR,
-    MANIFEST_PATH_ENV_VAR,
-    REPORTS_DIR_ENV_VAR,
-    app,
-)
 
 # Reuse the shared test report writer + auth fixtures.
 from tests.test_api_server import (
-    FREE_KEY,
     VALID_KEY,
     _write_report,
     authed_env,           # noqa: F401  — pytest fixture import

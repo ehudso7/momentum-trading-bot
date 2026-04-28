@@ -426,7 +426,7 @@ class BacktestEngine:
         lines.extend(
             [
                 "=" * 70,
-                f"  OVERALL",
+                "  OVERALL",
                 f"  Total P&L:       ${total_pnl:+,.2f}",
                 f"  Total Return:    {overall_return:+.2f}%",
                 f"  Total Trades:    {total_trades}",

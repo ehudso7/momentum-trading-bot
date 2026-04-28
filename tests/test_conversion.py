@@ -12,14 +12,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
-import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -28,7 +24,6 @@ from trading_bot.api import conversion
 from trading_bot.api.conversion import (
     CONVERSION_EVENT,
     CONVERSION_LOG_ENV_VAR,
-    DEFAULT_CONVERSION_LOG_PATH,
     DEFAULT_CONVERSION_SOURCE,
     USAGE_LOG_ENV_VAR,
     _hash_api_key,

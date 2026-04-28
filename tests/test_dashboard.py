@@ -8,13 +8,12 @@ endpoints using the httpx TestClient.
 from __future__ import annotations
 
 import threading
-from copy import deepcopy
 
 import pytest
 from fastapi.testclient import TestClient
 
 from trading_bot.dashboard.app import create_app
-from trading_bot.dashboard.state import DashboardSnapshot, DashboardState
+from trading_bot.dashboard.state import DashboardState
 
 
 # ---------------------------------------------------------------------------

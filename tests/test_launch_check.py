@@ -20,17 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
-from typing import Optional
 
-import pytest
-
-from trading_bot.api import launch_check
 from trading_bot.api.launch_check import (
     RAILWAY_ENV_VAR,
     REQUIRED_ENV_VARS,
-    CheckResult,
     main as launch_main,
     run_env_checks,
 )

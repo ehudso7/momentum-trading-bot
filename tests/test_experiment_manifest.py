@@ -16,20 +16,17 @@ Covers:
 
 from __future__ import annotations
 
-import io
 import json
 import subprocess
 import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
 import pytest
 
 from trading_bot.reporting import experiment_manifest as manifest_mod
 from trading_bot.reporting.experiment_manifest import (
-    DEFAULT_MANIFEST_PATH,
     SECRET_ENV_VARS,
     TRACKED_ENV_VARS,
     _extract_ab_summary,

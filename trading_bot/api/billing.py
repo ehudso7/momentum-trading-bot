@@ -1133,24 +1133,6 @@ def create_checkout_session(
     }
 
 
-STRIPE_SECRET_KEY_ENV_VAR = "STRIPE_SECRET_KEY"
-STRIPE_PREMIUM_PRICE_ID_ENV_VAR = "STRIPE_PREMIUM_PRICE_ID"
-
-
-def _resolve_stripe_secret() -> str:
-    primary = (os.getenv(STRIPE_SECRET_KEY_ENV_VAR, "") or "").strip()
-    if primary:
-        return primary
-    return (os.getenv(STRIPE_API_KEY_ENV_VAR, "") or "").strip()
-
-
-def _resolve_premium_price_id() -> str:
-    primary = (os.getenv(STRIPE_PREMIUM_PRICE_ID_ENV_VAR, "") or "").strip()
-    if primary:
-        return primary
-    return (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
-
-
 def create_checkout_session_for_hash(
     *,
     key_hash: str,

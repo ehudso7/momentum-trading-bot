@@ -7,8 +7,6 @@ sizing must be validated to prevent account blowup.
 
 from __future__ import annotations
 
-import pytest
-
 from trading_bot.config.settings import RiskConfig
 from trading_bot.models.domain import (
     OrderSide,

@@ -112,7 +112,6 @@ def compute_parabolic_sar(df: pd.DataFrame) -> pd.DataFrame:
     try:
         high = df["high"].values
         low = df["low"].values
-        close = df["close"].values
         n = len(high)
 
         psar = np.full(n, np.nan)

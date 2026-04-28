@@ -6,7 +6,6 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from trading_bot.config.settings import AppConfig
 from trading_bot.models.domain import (

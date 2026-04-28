@@ -1,9 +1,7 @@
 """Tests for backtesting and strategy data enhancements."""
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
-import pytest
 
 from trading_bot.strategies.premarket_profile import PremarketProfile
 from trading_bot.strategies.setup_tracker import SetupTracker
@@ -11,7 +9,6 @@ from trading_bot.strategies.setup_tracker import SetupTracker
 
 class TestPremarketProfile:
     def _make_bars(self, prices, volumes):
-        n = len(prices)
         return pd.DataFrame({
             "open": prices,
             "high": [p + 0.1 for p in prices],

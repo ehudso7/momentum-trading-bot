@@ -7,10 +7,9 @@ responses, position sizing advice, and daily plan generation.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 import pytz
 import pytest
@@ -407,7 +406,6 @@ class TestRecommendEntry:
     @patch("trading_bot.strategies.advisor.now_et", return_value=_morning_time())
     def test_confidence_clamped_between_0_and_1(self, mock_now):
         """Confidence is always bounded [0.0, 1.0] regardless of adjustments."""
-        signal = _make_signal(confidence=0.99)
         # High R:R and rvol should both boost, but confidence shouldn't exceed 1.0
         scan = _make_scan(relative_volume=20.0)
         signal_high_rr = _make_signal(

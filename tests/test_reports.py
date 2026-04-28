@@ -8,9 +8,6 @@ _max_consecutive_streaks() helper.
 
 from __future__ import annotations
 
-import math
-from datetime import datetime, timedelta
-
 import pytest
 
 from trading_bot.models.domain import JournalEntry

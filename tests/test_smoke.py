@@ -24,10 +24,8 @@ from typing import Optional
 
 import pytest
 
-from trading_bot.api import smoke
 from trading_bot.api.smoke import (
     DEFAULT_TIMEOUT_SECONDS,
-    CheckResult,
     _BOGUS_PROBE_KEY,
     _build_check_specs,
     _hash_api_key,

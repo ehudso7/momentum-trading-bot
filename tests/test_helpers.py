@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from unittest.mock import patch
 
-import pytest
 import pytz
 
 from trading_bot.utils.helpers import (
     _easter,
-    _nth_weekday,
-    _last_weekday,
     _nyse_holidays,
     _observe,
     is_market_holiday,
     is_market_open,
     is_near_close,
     is_premarket,
-    time_until_market_open,
 )
 
 ET = pytz.timezone("US/Eastern")

@@ -21,7 +21,6 @@ from typing import Iterable
 
 import pytest
 
-from trading_bot.analysis import alpha_report
 from trading_bot.analysis.alpha_report import (
     DECILE_LABELS,
     DEFAULT_MIN_REQUIRED_OUTCOMES,
@@ -1010,8 +1009,8 @@ def test_duplicate_header_rows_are_dropped(tmp_path: Path):
     """
     target = tmp_path / "merged.csv"
     header = ",".join(ALPHA_HEADERS)
-    row1 = f"2026-04-24 09:45:00,AAA,0.9,A,buy,0.8,trending_bullish,10,10,3,gap"
-    row2 = f"2026-04-25 09:45:00,BBB,0.7,B,buy,0.7,range_bound,8,5,2,gap"
+    row1 = "2026-04-24 09:45:00,AAA,0.9,A,buy,0.8,trending_bullish,10,10,3,gap"
+    row2 = "2026-04-25 09:45:00,BBB,0.7,B,buy,0.7,range_bound,8,5,2,gap"
     # Header appears TWICE — once at the top, and once again before row2
     content = "\n".join([header, row1, header, row2]) + "\n"
     target.write_text(content)

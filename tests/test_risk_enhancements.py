@@ -1,11 +1,5 @@
 """Tests for risk management enhancements."""
 from __future__ import annotations
-from datetime import datetime, timedelta
-from unittest.mock import patch
-
-import numpy as np
-import pandas as pd
-import pytest
 
 from trading_bot.risk.symbol_blacklist import SymbolBlacklist
 from trading_bot.risk.recovery import RecoveryMode

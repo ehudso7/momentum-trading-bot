@@ -462,7 +462,6 @@ import csv as _csv  # noqa: E402
 from trading_bot.core.alpha import (  # noqa: E402
     get_alpha_scorer_config,
     get_alpha_scorer_fingerprint,
-    AlphaLogger,
 )
 from trading_bot.core import alpha as alpha_mod  # noqa: E402
 
