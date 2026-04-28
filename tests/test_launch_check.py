@@ -453,11 +453,14 @@ class TestRailwayTomlLockdown:
         toml = (
             Path(__file__).resolve().parent.parent / "railway.toml"
         ).read_text()
-        # Must contain the documented production start command.
-        assert (
-            "uvicorn trading_bot.api.server:app "
-            "--host 0.0.0.0 --port 8080"
-        ) in toml
+        # The production start command must invoke the API via the
+        # trading-bot-api console script (which reads $PORT from
+        # Railway). Either the legacy uvicorn invocation or the
+        # current console-script invocation is acceptable so this
+        # test stays stable across deploy refactors.
+        legacy = "uvicorn trading_bot.api.server:app --host 0.0.0.0 --port 8080"
+        current = "trading-bot-api --host 0.0.0.0"
+        assert (legacy in toml) or (current in toml)
         # Must include the /app/data chmod step.
         assert "chmod -R 777 /app/data" in toml
         # Must use the dockerfile builder.

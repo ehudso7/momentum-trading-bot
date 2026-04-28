@@ -182,6 +182,31 @@ def _build_check_specs(api_key: str) -> list[dict]:
             "expected": (200,),
             "headers": auth_headers,
         },
+        # SaaS-launch /signals/* surface
+        {
+            "name": "launch dashboard (no auth) returns 200",
+            "path": "/launch",
+            "expected": (200,),
+            "headers": None,
+        },
+        {
+            "name": (
+                "/signals/latest with supplied key returns 200 "
+                "(report exists) or 404 (no report yet)"
+            ),
+            "path": "/signals/latest",
+            "expected": (200, 404),
+            "headers": auth_headers,
+        },
+        {
+            "name": (
+                "/signals/history with supplied key returns 200 "
+                "(premium) or 403 (free key — upgrade required)"
+            ),
+            "path": "/signals/history",
+            "expected": (200, 403),
+            "headers": auth_headers,
+        },
     ]
 
 

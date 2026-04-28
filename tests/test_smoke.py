@@ -90,6 +90,10 @@ def _all_green_responses(api_key: str) -> dict:
         ("/reports/latest", bogus):           (403, None),
         ("/reports/latest", auth):            (200, None),
         ("/dashboard", auth):                 (200, None),
+        # SaaS-launch additions
+        ("/launch", None):                    (200, None),
+        ("/signals/latest", auth):            (200, None),
+        ("/signals/history", auth):           (200, None),
     }
 
 
@@ -129,12 +133,19 @@ class TestCheckSpec:
     def test_six_checks_in_documented_order(self):
         specs = _build_check_specs("k")
         paths = [s["path"] for s in specs]
-        assert paths == [
+        # The first six entries are the original, documented surface.
+        # SaaS-launch checks (/launch, /signals/*) are appended after.
+        assert paths[:6] == [
             "/", "/health",
             "/reports/latest",   # no auth → 401
             "/reports/latest",   # bogus auth → 403/503
             "/reports/latest",   # good auth → 200/404
             "/dashboard",
+        ]
+        assert paths[6:] == [
+            "/launch",
+            "/signals/latest",
+            "/signals/history",
         ]
 
     def test_bogus_probe_is_hardcoded(self):
@@ -157,6 +168,10 @@ class TestCheckSpec:
         assert specs[3]["expected"] == (403, 503)
         assert specs[4]["expected"] == (200, 404)
         assert specs[5]["expected"] == (200,)
+        # SaaS-launch additions
+        assert specs[6]["expected"] == (200,)
+        assert specs[7]["expected"] == (200, 404)
+        assert specs[8]["expected"] == (200, 403)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +186,7 @@ class TestRunSmokeTestsAllGreen:
             base_url=BASE_URL, api_key=GOOD_KEY,
             timeout=5.0, http_get=fake,
         )
-        assert len(results) == 6
+        assert len(results) == 9
         assert all(r.passed for r in results)
         # Every check carried a 5-second timeout to the fetcher.
         assert all(c["timeout"] == 5.0 for c in fake.calls)
@@ -203,10 +218,10 @@ class TestRunSmokeTestsFailures:
         results = run_smoke_tests(
             base_url=BASE_URL, api_key=GOOD_KEY, http_get=fake,
         )
-        # Five PASS + one FAIL.
+        # Eight PASS + one FAIL (SaaS-launch added three checks).
         passed = [r for r in results if r.passed]
         failed = [r for r in results if not r.passed]
-        assert len(passed) == 5
+        assert len(passed) == 8
         assert len(failed) == 1
         assert failed[0].path == "/reports/latest"
         assert failed[0].actual == 500
@@ -374,7 +389,7 @@ class TestRenderingNeverPrintsRawKey:
         )
         out = capsys.readouterr().out
         assert "[PASS]" in out
-        assert "All 6 checks passed." in out
+        assert "All 9 checks passed." in out
 
     def test_text_render_failure_summary(self, capsys):
         responses = _all_green_responses(GOOD_KEY)
@@ -399,8 +414,8 @@ class TestJsonShape:
         payload = json.loads(capsys.readouterr().out)
         assert payload["base_url"] == BASE_URL
         assert payload["passed"] is True
-        assert payload["summary"] == {"total": 6, "passed": 6, "failed": 0}
-        assert len(payload["checks"]) == 6
+        assert payload["summary"] == {"total": 9, "passed": 9, "failed": 0}
+        assert len(payload["checks"]) == 9
         for check in payload["checks"]:
             assert set(check.keys()) == {
                 "name", "method", "path", "expected", "actual",

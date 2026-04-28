@@ -846,6 +846,121 @@ def _revoke_many_cli(argv: list[str]) -> int:
     return 0 if not failed else 1
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 (SaaS launch) — premium cache + webhook-events admin commands
+# ---------------------------------------------------------------------------
+
+
+def _premium_add_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys premium-add",
+        description=(
+            "Add an existing key (by hash) to the Stripe premium-cache. "
+            "Useful for granting premium without going through Checkout — "
+            "e.g. for an internal tester. The raw key is never accepted."
+        ),
+        add_help=True,
+    )
+    parser.add_argument(
+        "--key-hash", required=True,
+        help="The 32-char SHA-256(api_key)[:32] hash of the target key.",
+    )
+    args = parser.parse_args(argv)
+    h = (args.key_hash or "").strip()
+    if not h:
+        print("error: --key-hash must not be blank", file=sys.stderr)
+        return 2
+    from trading_bot.api import billing
+    billing.add_premium_hash(h)
+    print(f"premium added: {h}")
+    return 0
+
+
+def _premium_remove_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys premium-remove",
+        description="Remove a key (by hash) from the premium-cache.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--key-hash", required=True,
+        help="The 32-char SHA-256(api_key)[:32] hash of the target key.",
+    )
+    args = parser.parse_args(argv)
+    h = (args.key_hash or "").strip()
+    if not h:
+        print("error: --key-hash must not be blank", file=sys.stderr)
+        return 2
+    from trading_bot.api import billing
+    billing.remove_premium_hash(h)
+    print(f"premium removed: {h}")
+    return 0
+
+
+def _premium_check_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys premium-check",
+        description="Print whether a key (by hash) is in the premium cache.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--key-hash", required=True,
+        help="The 32-char SHA-256(api_key)[:32] hash of the target key.",
+    )
+    args = parser.parse_args(argv)
+    h = (args.key_hash or "").strip()
+    if not h:
+        print("error: --key-hash must not be blank", file=sys.stderr)
+        return 2
+    from trading_bot.api import billing
+    is_premium = billing.is_premium_hash(h)
+    print(
+        f"premium-check: hash={h} is_premium={'yes' if is_premium else 'no'}"
+    )
+    return 0 if is_premium else 1
+
+
+def _webhook_events_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m trading_bot.api.keys webhook-events",
+        description=(
+            "Print the most recent persisted Stripe webhook events. "
+            "The log NEVER contains raw API keys."
+        ),
+        add_help=True,
+    )
+    parser.add_argument(
+        "--limit", type=int, default=20,
+        help="How many recent events to display (default: 20).",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON instead of a formatted table.",
+    )
+    args = parser.parse_args(argv)
+    if args.limit <= 0:
+        print("error: --limit must be positive", file=sys.stderr)
+        return 2
+    from trading_bot.api import billing
+    rows = billing.recent_webhook_events(limit=args.limit)
+    if args.json:
+        print(json.dumps({"events": rows}, indent=2, default=str))
+        return 0
+    if not rows:
+        print("no persisted webhook events")
+        return 0
+    print(f"recent webhook events (showing {len(rows)}):")
+    for r in rows:
+        print(
+            f"  {r.get('processed_at', '')}  "
+            f"{r.get('type', '')}  "
+            f"{r.get('action', '')}  "
+            f"id={r.get('id', '')}  "
+            f"reason={r.get('reason', '')}"
+        )
+    return 0
+
+
 def _build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot.api.keys",
@@ -872,6 +987,26 @@ def _build_top_parser() -> argparse.ArgumentParser:
         help="Append a revocation row for each --key-hash.",
         add_help=False,
     )
+    subparsers.add_parser(
+        "premium-add",
+        help="Force-add a key (by hash) to the premium cache.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "premium-remove",
+        help="Remove a key (by hash) from the premium cache.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "premium-check",
+        help="Print whether a key (by hash) is currently premium.",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "webhook-events",
+        help="Print recent Stripe webhook events from the persistent log.",
+        add_help=False,
+    )
     return parser
 
 
@@ -890,12 +1025,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _revoke_cli(rest)
     if command == "revoke-many":
         return _revoke_many_cli(rest)
+    if command == "premium-add":
+        return _premium_add_cli(rest)
+    if command == "premium-remove":
+        return _premium_remove_cli(rest)
+    if command == "premium-check":
+        return _premium_check_cli(rest)
+    if command == "webhook-events":
+        return _webhook_events_cli(rest)
     if command in ("-h", "--help"):
         _build_top_parser().print_help()
         return 0
     print(f"error: unknown command '{command}'", file=sys.stderr)
     print(
-        "available commands: issue, list, revoke, revoke-many",
+        "available commands: issue, list, revoke, revoke-many, "
+        "premium-add, premium-remove, premium-check, webhook-events",
         file=sys.stderr,
     )
     return 2

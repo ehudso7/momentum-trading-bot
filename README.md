@@ -44,7 +44,54 @@ Automated momentum day-trading bot for US equities (NYSE/NASDAQ). Targets low-fl
 - **Realistic Paper Broker**: Slippage model, margin simulation, stale order cleanup
 - **Docker + Railway Ready**: Production Dockerfile with health checks, signal handling, non-root user
 
-## Quick Start
+## SaaS launch quickstart
+
+The repo also ships a public-facing trading-signal SaaS layer
+(`trading_bot.saas` + `trading_bot.api.server`) that exposes
+read-only signal recommendations behind an API-key + Stripe billing
+boundary. The SaaS layer is isolated from the live trading core —
+it never imports the scanner, the broker, or any execution module.
+
+The fastest path from "deployed" to "real users":
+
+```bash
+# 1. Install
+pip install -e ".[dev]"
+
+# 2. Sanity-check the billing env (never prints raw secrets)
+python -m scripts.billing_verification --strict
+
+# 3. Generate the first signal report
+TRADING_SAAS_DATA_MODE=demo python -m trading_bot.saas generate
+
+# 4. Issue a free API key (operator only — raw key printed once)
+python -m trading_bot.api.keys issue --tier free --label tester
+
+# 5. Run the smoke test against the deployed surface
+python -m trading_bot.api.smoke \
+    --base-url https://<your-host> \
+    --api-key  <issued-key>
+
+# 6. Inspect the persistent webhook event log (no raw keys logged)
+python -m trading_bot.api.keys webhook-events --limit 20
+```
+
+Useful URLs once deployed:
+
+| Path                     | Purpose                                |
+|--------------------------|----------------------------------------|
+| `GET /health`            | Liveness probe — no auth               |
+| `GET /launch`            | Public read-only product preview HTML  |
+| `GET /signals/latest`    | Latest signal report (free or premium) |
+| `GET /signals/history`   | Premium-only — list of report dates    |
+| `GET /signals/{date}`    | Premium-only — full report for a date  |
+| `POST /billing/checkout` | Authenticated free → premium upgrade   |
+| `POST /webhook/stripe`   | Stripe webhook (server-to-server only) |
+
+For the full operator runbook see [docs/LAUNCH_CHECKLIST.md](docs/LAUNCH_CHECKLIST.md)
+and [docs/stripe-zero-dollar-test.md](docs/stripe-zero-dollar-test.md).
+
+### Trading-core quick start (paper-trading)
 
 ### 1. Prerequisites
 

@@ -59,6 +59,13 @@ def _resolve_premium_price_id() -> str:
 STRIPE_PREMIUM_CACHE_ENV_VAR = "TRADING_STRIPE_PREMIUM_CACHE_PATH"
 DEFAULT_STRIPE_PREMIUM_CACHE_PATH = "data/stripe_premium_keys.json"
 
+# Phase 2 — persistent webhook-event log. Each successful (or
+# explicitly-ignored) call to ``handle_webhook_event`` appends a JSONL
+# row so a process restart cannot replay an already-processed event.
+STRIPE_WEBHOOK_EVENTS_ENV_VAR = "TRADING_STRIPE_WEBHOOK_EVENTS_PATH"
+DEFAULT_STRIPE_WEBHOOK_EVENTS_PATH = "data/stripe_webhook_events.jsonl"
+WEBHOOK_EVENT_LOG_TAIL_LIMIT = 200
+
 DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
 _ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset({"active", "trialing"})
 
@@ -68,6 +75,8 @@ _cache_loaded_from: Optional[Path] = None
 
 _processed_event_lock = threading.Lock()
 _processed_event_ids: set[str] = set()
+_processed_events_loaded_from: Optional[Path] = None
+_processed_events_load_mtime: Optional[float] = None
 
 _HASH_CHARS = frozenset("0123456789abcdef")
 
@@ -165,11 +174,14 @@ def _ensure_cache_loaded() -> None:
 
 def reset_cache_for_tests() -> None:
     global _cache_loaded_from
+    global _processed_events_loaded_from, _processed_events_load_mtime
     with _cache_lock:
         _cache.clear()
         _cache_loaded_from = None
     with _processed_event_lock:
         _processed_event_ids.clear()
+        _processed_events_loaded_from = None
+        _processed_events_load_mtime = None
 
 
 def add_premium_key(api_key: str) -> None:
@@ -504,15 +516,204 @@ def _stripe_event_id(event: dict) -> str:
     return str(event.get("id") or "").strip()
 
 
+def _webhook_events_path() -> Path:
+    return Path(
+        os.getenv(
+            STRIPE_WEBHOOK_EVENTS_ENV_VAR,
+            DEFAULT_STRIPE_WEBHOOK_EVENTS_PATH,
+        )
+    )
+
+
+def _file_mtime_or_none(path: Path) -> Optional[float]:
+    try:
+        return path.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _load_persistent_event_ids(path: Path) -> set[str]:
+    """
+    Read every previously-processed Stripe event id from the JSONL log.
+
+    Resilient to:
+      * missing file (returns empty set),
+      * blank lines,
+      * malformed JSON (single line skipped),
+      * non-dict rows (skipped),
+      * rows missing ``id`` (skipped).
+
+    Never raises.
+    """
+    out: set[str] = set()
+    try:
+        if not path.exists():
+            return out
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except Exception:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                eid = rec.get("id")
+                if isinstance(eid, str) and eid:
+                    out.add(eid)
+    except Exception as exc:
+        log.debug(
+            "billing.webhook_events_load_error",
+            path=str(path),
+            error=str(exc),
+        )
+    return out
+
+
+def _ensure_processed_events_loaded() -> None:
+    """
+    Lazily merge persistent event ids into the in-memory set.
+
+    Reloads when the underlying file's path or mtime changes — covers
+    test scenarios that swap the env var between cases.
+    """
+    global _processed_events_loaded_from, _processed_events_load_mtime
+    path = _webhook_events_path()
+    mtime = _file_mtime_or_none(path)
+    with _processed_event_lock:
+        if (
+            path == _processed_events_loaded_from
+            and mtime == _processed_events_load_mtime
+        ):
+            return
+        ids = _load_persistent_event_ids(path)
+        _processed_event_ids.update(ids)
+        _processed_events_loaded_from = path
+        _processed_events_load_mtime = mtime
+
+
+_webhook_event_write_lock = threading.Lock()
+
+
+def _persist_event_record(
+    *,
+    event_id: str,
+    event_type: str,
+    action: str,
+    reason: Optional[str] = None,
+    identity: Optional[str] = None,
+) -> None:
+    """
+    Append one row to the webhook-event log.
+
+    Schema (intentionally minimal — never includes the api_key, never
+    includes any Stripe customer/email/payment field):
+
+        {
+          "id":           "<stripe event id>",
+          "type":         "<stripe event type>",
+          "processed_at": "<ISO timestamp>",
+          "action":       "added" | "removed" | "ignored",
+          "reason":       "<short reason>",   # optional
+          "identity":     "key_hash" | "api_key" | "none"  # optional
+        }
+
+    Best-effort: every failure is caught and logged at DEBUG. Never
+    raises — a disk outage must not crash webhook handling.
+    """
+    if not event_id:
+        return
+    record: dict = {
+        "id": event_id,
+        "type": event_type or "",
+        "processed_at": _now_iso_utc(),
+        "action": action,
+    }
+    if reason:
+        record["reason"] = str(reason)[:200]
+    if identity:
+        record["identity"] = str(identity)[:32]
+    target = _webhook_events_path()
+    try:
+        line = json.dumps(record, sort_keys=False, default=str)
+    except Exception as exc:
+        log.debug("billing.webhook_event_serialize_error", error=str(exc))
+        return
+    with _webhook_event_write_lock:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as exc:
+            log.debug(
+                "billing.webhook_event_write_error",
+                path=str(target),
+                error=str(exc),
+            )
+
+
+def _now_iso_utc() -> str:
+    """ISO-8601 UTC timestamp matching the format used elsewhere in the codebase."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _mark_event_processed(event_id: str) -> bool:
+    """
+    Reserve ``event_id`` in the in-memory set.
+
+    Returns True the first time, False on any subsequent call (in
+    this process OR after a restart that reloaded the persistent
+    log). Empty/falsy event ids return True so events without an
+    id (theoretically Stripe shouldn't emit them) are processed
+    once.
+    """
     if not event_id:
         return True
 
+    _ensure_processed_events_loaded()
     with _processed_event_lock:
         if event_id in _processed_event_ids:
             return False
         _processed_event_ids.add(event_id)
         return True
+
+
+def recent_webhook_events(limit: int = 50) -> list[dict]:
+    """
+    Return up to ``limit`` of the most recent persisted webhook events.
+
+    Operator helper used by the admin CLI and the smoke tests. Never
+    returns api_keys (the schema doesn't store them); never raises.
+    """
+    if limit <= 0:
+        return []
+    path = _webhook_events_path()
+    rows: list[dict] = []
+    try:
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    rows.append(rec)
+    except Exception as exc:
+        log.debug(
+            "billing.webhook_events_tail_error",
+            path=str(path),
+            error=str(exc),
+        )
+        return []
+    return rows[-limit:]
 
 
 def _identity_from_event_or_client_reference(obj) -> tuple[Optional[str], Optional[str]]:
@@ -525,6 +726,15 @@ def _identity_from_event_or_client_reference(obj) -> tuple[Optional[str], Option
 
 
 def handle_webhook_event(event) -> dict:
+    """
+    Public entry point — persists the outcome (Phase 2 idempotency).
+
+    Wraps ``_handle_webhook_event_core`` so every non-duplicate
+    delivery appends a row to the persistent event log. The next
+    delivery of the same event id (in this process or after a
+    restart) is rejected by ``_mark_event_processed`` before reaching
+    the core handler.
+    """
     if not isinstance(event, dict):
         return {"action": "ignored", "reason": "not_a_dict"}
 
@@ -532,6 +742,8 @@ def handle_webhook_event(event) -> dict:
     event_type = str(event.get("type") or "")
 
     if event_id and not _mark_event_processed(event_id):
+        # Duplicate: do NOT re-persist (we already have a row), but
+        # do return a structured response.
         return {
             "id": event_id,
             "type": event_type,
@@ -539,6 +751,25 @@ def handle_webhook_event(event) -> dict:
             "reason": "duplicate_event",
         }
 
+    result = _handle_webhook_event_core(event, event_id, event_type)
+    # Persist exactly once per non-duplicate delivery.
+    if event_id:
+        _persist_event_record(
+            event_id=event_id,
+            event_type=event_type,
+            action=str(result.get("action") or "ignored"),
+            reason=result.get("reason"),
+            identity=result.get("identity"),
+        )
+    return result
+
+
+def _handle_webhook_event_core(
+    event: dict,
+    event_id: str,
+    event_type: str,
+) -> dict:
+    """Event-dispatch core. Pure routing — never persists."""
     data = event.get("data") or {}
     obj = data.get("object") if isinstance(data, dict) else None
 
