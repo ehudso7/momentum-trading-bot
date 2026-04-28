@@ -3,8 +3,14 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "/bin/sh -c \"chmod -R 777 /app/data || true && uvicorn trading_bot.api.server:app --host 0.0.0.0 --port 8080\""
+# Railway injects $PORT and routes the healthcheck to it. The
+# trading-bot-api console script (trading_bot/api/serve.py) reads $PORT
+# (fail-soft default 8080), so the container binds to whatever port
+# Railway assigned. The chmod handles a Railway volume that may be
+# remounted as root-owned at runtime, so the non-root botuser can still
+# write logs/manifests under /app/data.
+startCommand = "/bin/sh -c \"chmod -R 777 /app/data || true && exec trading-bot-api --host 0.0.0.0\""
 healthcheckPath = "/health"
-healthcheckTimeout = 5
+healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
