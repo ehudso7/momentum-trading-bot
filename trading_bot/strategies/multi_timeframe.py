@@ -1,9 +1,8 @@
 """Multi-timeframe confirmation for entry signals."""
 from __future__ import annotations
-from typing import Optional
 import pandas as pd
 import structlog
-from trading_bot.utils.indicators import compute_ema, compute_atr
+from trading_bot.utils.indicators import compute_ema
 
 log = structlog.get_logger(__name__)
 

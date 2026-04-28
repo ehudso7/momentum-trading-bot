@@ -1,6 +1,5 @@
 """Tests for compound mode and asymmetric R:R configuration."""
 from __future__ import annotations
-import pytest
 from trading_bot.risk.compound import CompoundMode
 from trading_bot.config.settings import ExitConfig
 

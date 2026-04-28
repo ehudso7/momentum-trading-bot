@@ -24,10 +24,7 @@ from typing import Iterable
 
 import pytest
 
-from trading_bot.analysis import pricing_report as pr
 from trading_bot.analysis.pricing_report import (
-    DEFAULT_CONVERSION_PATH,
-    DEFAULT_USAGE_PATH,
     REPORT_TYPE,
     TOP_PERCENTILES,
     _date_bucket,

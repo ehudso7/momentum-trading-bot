@@ -28,7 +28,6 @@ from typing import Optional
 
 import pytest
 
-from trading_bot.api import billing
 from trading_bot.api.billing import (
     DEFAULT_SIGNATURE_TOLERANCE_SECONDS,
     DEFAULT_STRIPE_PREMIUM_CACHE_PATH,
@@ -367,7 +366,6 @@ class TestPremiumCache:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         hashes = sorted([_hash("user-a"), _hash("user-b")])
         cache_file.write_text(json.dumps(hashes), encoding="utf-8")
-        mtime_before = cache_file.stat().st_mtime
         reset_cache_for_tests()
         # Looking up by the raw values still works.
         assert is_premium_via_stripe("user-a") is True
@@ -1312,8 +1310,6 @@ class TestPhase70HashOnlyPersistence:
 
 
 from trading_bot.api.billing import (  # noqa: E402
-    BillingAPIError,
-    BillingConfigError,
     STRIPE_PREMIUM_PRICE_ID_ENV_VAR,
     STRIPE_SECRET_KEY_ENV_VAR,
     create_checkout_session_for_hash,

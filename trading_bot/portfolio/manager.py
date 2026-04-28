@@ -9,7 +9,6 @@ including partial exits at R:R targets and trailing stop management.
 from __future__ import annotations
 
 import csv
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -240,7 +239,6 @@ class PortfolioManager:
             except Exception:
                 pass
             # Return zero-share position to indicate failure
-            from trading_bot.models.domain import SignalType
             return PositionInfo(
                 symbol=signal.symbol,
                 side=OrderSide.BUY,

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from trading_bot.config.settings import BrokerConfig, ScannerConfig
 from trading_bot.data.alpaca_screener import AlpacaScreener
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner

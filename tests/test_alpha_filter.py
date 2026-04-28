@@ -23,12 +23,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from trading_bot.core.alpha import (
-    FILTER_DEFAULT_ENABLED,
     FILTER_DEFAULT_MIN_TIER,
     FILTER_ENABLED_ENV_VAR,
     FILTER_MIN_TIER_ENV_VAR,
     AlphaFilter,
-    AlphaScore,
     FilterDecision,
     RuleBasedAlphaScorer,
     _resolve_filter_enabled,

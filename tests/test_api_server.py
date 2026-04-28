@@ -1143,12 +1143,10 @@ class TestDashboardRouteIsReadOnlyAgainstBoundary:
 # ===========================================================================
 
 
-from trading_bot.api import server as server_mod  # noqa: E402
 from trading_bot.api.server import (  # noqa: E402
     ALLOWED_ORIGINS_ENV_VAR,
     DEFAULT_RATE_LIMIT_PER_MINUTE,
     RATE_LIMIT_ENV_VAR,
-    SECURITY_HEADERS,
     _allowed_origins,
     _rate_limit_per_minute,
 )
@@ -2234,8 +2232,6 @@ class TestAuditFailureDoesNotFailRequest:
     def test_serialize_failure_does_not_break_request(
         self, client: TestClient, monkeypatch
     ):
-        original = srv.json.dumps
-
         def fail_dumps(*a, **kw):
             raise TypeError("cannot serialize (fake)")
 
@@ -2361,14 +2357,11 @@ class TestPhase44BoundaryUnchanged:
 # ===========================================================================
 
 
-from datetime import date as _date_phase45, timedelta as _td_phase45  # noqa: E402
+from datetime import date as _date_phase45  # noqa: E402
 
 from trading_bot.api.server import (  # noqa: E402
-    MAX_FREE_TIER_DAYS,
     MAX_FREE_TIER_EXPERIMENTS,
     PREMIUM_KEYS_ENV_VAR,
-    TIER_FREE,
-    TIER_PREMIUM,
     UPGRADE_REQUIRED_DETAIL,
     _free_date_allowed,
     _is_premium,
@@ -2954,7 +2947,6 @@ class TestPhase45BoundaryUnchanged:
 from trading_bot.api.server import (  # noqa: E402
     DEFAULT_USAGE_LOG_PATH,
     USAGE_LOG_ENV_VAR,
-    _append_usage_record,
     _hash_api_key,
 )
 
@@ -7580,7 +7572,6 @@ class TestPhase81DoesNotIntroduceMutatingRoute:
 
 from trading_bot.api.server import (  # noqa: E402
     PREMIUM_FEATURE_DETAIL,
-    PREMIUM_FEATURE_HINT,
     _FREE_REPORT_ALLOWED_FIELDS,
     _is_premium_user,
     _project_report_for_free,

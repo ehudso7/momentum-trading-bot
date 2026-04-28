@@ -72,8 +72,6 @@ from trading_bot.api.growth_intel import (
     REC_TIGHTEN_FREE_LIMIT,
 )
 from trading_bot.api.share_events import (
-    EVENT_INBOUND_VISIT,
-    EVENT_SHARE_GENERATED,
     SHARE_EVENTS_LOG_ENV_VAR,
 )
 from trading_bot.api.upgrade_events import (

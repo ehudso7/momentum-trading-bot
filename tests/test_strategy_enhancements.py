@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from trading_bot.strategies.multi_timeframe import MultiTimeframeConfirm
 from trading_bot.strategies.volume_profile import VolumeExhaustionDetector

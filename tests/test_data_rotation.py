@@ -25,7 +25,6 @@ from trading_bot.core.alpha import (
     ROTATION_DAILY,
     ROTATION_NONE,
     AlphaLogger,
-    AlphaScore,
     RuleBasedAlphaScorer,
 )
 from trading_bot.models.domain import FeatureSnapshot, SignalDecision

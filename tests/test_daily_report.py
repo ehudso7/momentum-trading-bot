@@ -18,7 +18,7 @@ import subprocess
 import sys
 from datetime import date as _date_type
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import pytest
 

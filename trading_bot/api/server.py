@@ -3161,6 +3161,166 @@ def report_for_date(
     return _sanitize_report(_parse_report_file(path))
 
 
+# ---------------------------------------------------------------------------
+# SaaS launch — /signals/* (trading-signal product surface)
+#
+# Distinct from /reports/* which serves the alpha-validation contract.
+# /signals/latest, /signals/history, and /signals/{date} return the
+# SaaS-shape report defined in trading_bot.saas.report_engine.
+# ---------------------------------------------------------------------------
+
+
+def _saas_reports_dir() -> Path:
+    """Local resolver — keeps the module import lazy."""
+    from trading_bot.saas.report_engine import reports_dir as _rd
+
+    return _rd()
+
+
+def _attach_signal_share(request: Request, report: dict, *, endpoint: str) -> None:
+    """Best-effort: stamp a public share URL onto the report when configured."""
+    base = _public_base_url()
+    share = report.get("share")
+    if not isinstance(share, dict):
+        share = {}
+    if base:
+        share["url"] = base.rstrip("/") + endpoint
+    report["share"] = share
+
+
+@app.get("/signals/latest", tags=["signals"])
+def signals_latest(
+    request: Request,
+    api_key: Optional[str] = Depends(optional_api_key),
+) -> dict[str, Any]:
+    """
+    Return the most recent SaaS signal report.
+
+    Free callers receive a curated subset (high-level summary, top-3
+    teaser signals without entry/stop/target detail). Premium callers
+    receive the full report with all signals, indicators, rationales,
+    and risk parameters. Unauthenticated callers receive the same free
+    projection plus a ``preview: True`` marker.
+
+    Missing reports directory or empty directory → 404 with a clear
+    message; the caller knows the surface is configured but no
+    report has been generated yet.
+    """
+    from trading_bot.saas.report_engine import (
+        latest_report_path,
+        load_report,
+        project_for_free,
+    )
+
+    rd = _saas_reports_dir()
+    path = latest_report_path(rd)
+    if path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "no signal reports available — generate one with "
+                "`python -m trading_bot.saas generate`"
+            ),
+        )
+    try:
+        report = load_report(path)
+    except Exception as exc:
+        log.warning(
+            "signals_latest.parse_error", path=str(path), error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to parse signal report: {type(exc).__name__}",
+        )
+
+    _attach_signal_share(request, report, endpoint="/signals/latest")
+
+    if api_key is None:
+        body = project_for_free(report)
+        body["preview"] = True
+        body["get_started"] = _get_started_block()
+        return body
+    if _is_premium_user(request):
+        return report
+    body = project_for_free(report)
+    upgrade = _build_upgrade_payload(
+        request, reason="limited_access", required=False, is_premium=False,
+    )
+    if upgrade is not None:
+        body["upgrade"] = upgrade
+    return body
+
+
+@app.get("/signals/history", tags=["signals"])
+def signals_history(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Premium-only listing of every persisted SaaS report date.
+
+    Free callers receive 403 + the documented upgrade payload.
+    Empty directory → ``{"count": 0, "dates": []}`` (success).
+    """
+    if not _is_premium_user(request):
+        return _premium_required_response(request, TIER_FREE)
+    from trading_bot.saas.report_engine import list_report_dates
+
+    rd = _saas_reports_dir()
+    dates = list_report_dates(rd)
+    return {
+        "count": len(dates),
+        "dates": dates,
+        "tier": TIER_PREMIUM,
+        "directory": str(rd),
+    }
+
+
+@app.get("/signals/{report_date}", tags=["signals"])
+def signals_for_date(
+    report_date: str,
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Return the SaaS signal report for ``report_date`` (YYYY-MM-DD).
+
+    Free callers see a projected subset; premium callers see the
+    full report. Unknown date → 404.
+    """
+    _validate_date(report_date)
+    from trading_bot.saas.report_engine import (
+        load_report,
+        project_for_free,
+        report_for_date as _saas_report_for_date,
+    )
+
+    rd = _saas_reports_dir()
+    path = _saas_report_for_date(report_date, target_dir=rd)
+    if path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no signal report for {report_date}",
+        )
+    try:
+        report = load_report(path)
+    except Exception as exc:
+        log.warning(
+            "signals_for_date.parse_error",
+            path=str(path), error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to parse signal report: {type(exc).__name__}",
+        )
+    _attach_signal_share(
+        request, report, endpoint=f"/signals/{report_date}",
+    )
+    if _is_premium_user(request):
+        return report
+    return project_for_free(report)
+
+
 @app.get("/experiments/recent", tags=["experiments"])
 def recent_experiments(
     request: Request,
@@ -3837,6 +3997,199 @@ def dashboard(
             copy_variant=banner_copy,
         )
     return HTMLResponse(content=html, status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Minimal launch dashboard (Phase 4 of SaaS launch roadmap)
+#
+# A self-contained HTML page that lets a new user paste an API key
+# in the browser, see /health and /signals/latest summaries, and copy
+# example curl commands. No external scripts, no external CSS, no
+# stored secrets — everything lives in the user's localStorage.
+# ---------------------------------------------------------------------------
+
+
+_LAUNCH_DASHBOARD_CSS = """<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 880px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.4em; }
+  h2 { font-size: 1.05em; border-bottom: 1px solid #ddd; padding-bottom: .25em; margin-top: 2em; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 12px;
+          font-size: .8em; font-weight: 600; margin-right: .35em; }
+  .pill-paper { background:#dceeff; color:#13478b; }
+  .pill-live  { background:#ffd6d6; color:#a4001a; }
+  .pill-demo  { background:#fff3c4; color:#7a5a00; }
+  .pill-ok    { background:#d8f5d8; color:#1a6b2a; }
+  .pill-warn  { background:#ffe2c4; color:#8a4a00; }
+  .pill-err   { background:#f7d6d6; color:#7a1414; }
+  pre { background: #f5f5f5; border: 1px solid #ddd; padding: 12px;
+        border-radius: 6px; overflow-x: auto; white-space: pre-wrap;
+        word-break: break-word; font-family: ui-monospace, Menlo, monospace;
+        font-size: .85em; }
+  .muted { color: #666; font-size: .9em; }
+  .disclaimer { background:#fff8e0; border:1px solid #f1d878; padding:.7em;
+        border-radius:6px; margin-top:1em; font-size:.85em; color:#5a4400; }
+  table { border-collapse: collapse; margin: .5em 0; }
+  th, td { padding: .35em .8em; border: 1px solid #e0e0e0;
+           text-align: left; font-size: .9em; white-space: nowrap; }
+  th { background: #f3f3f3; font-weight: 600; }
+</style>"""
+
+
+def _render_launch_signals_summary() -> str:
+    """
+    Render an HTML block describing the latest signal report — or a
+    clear empty state when no report exists yet. All HTML escaping is
+    handled here; no caller-supplied content reaches the page.
+    """
+    from trading_bot.saas.report_engine import (
+        latest_report_path,
+        load_report,
+        project_for_free,
+    )
+    from trading_bot.saas.report_engine import reports_dir as _saas_reports
+
+    rd = _saas_reports()
+    path = latest_report_path(rd)
+    if path is None:
+        return (
+            "<p class=\"muted\">No signal report has been generated "
+            "yet. Run <code>python -m trading_bot.saas generate</code> "
+            "on the operator host.</p>"
+        )
+    try:
+        report = load_report(path)
+    except Exception:
+        return (
+            "<p class=\"muted\">Latest signal report exists but could "
+            "not be parsed. Inspect logs.</p>"
+        )
+    free = project_for_free(report)
+    summary = free.get("summary") or {}
+    mode = str(free.get("mode") or "?")
+    mode_cls = (
+        "pill-live" if mode == "live"
+        else "pill-demo" if mode == "demo"
+        else "pill-paper"
+    )
+    rows = ""
+    for s in (free.get("signals") or [])[:3]:
+        rows += (
+            f"<tr><td>{_esc(str(s.get('symbol') or '?'))}</td>"
+            f"<td>{_esc(str(s.get('direction') or '?'))}</td>"
+            f"<td>{_esc(str(round(float(s.get('confidence') or 0.0), 3)))}</td>"
+            f"<td>{_esc(str(s.get('strategy') or ''))}</td></tr>"
+        )
+    if not rows:
+        signals_table = "<p class=\"muted\">No signals in the teaser.</p>"
+    else:
+        signals_table = (
+            "<table><tr><th>Symbol</th><th>Direction</th>"
+            "<th>Confidence</th><th>Strategy</th></tr>"
+            + rows
+            + "</table>"
+        )
+    md = free.get("market_data_status") or {}
+    return (
+        f"<div><span class=\"pill {mode_cls}\">mode: {_esc(mode)}</span>"
+        f"<span class=\"pill pill-warn\">tier: free preview</span>"
+        f"</div>"
+        f"<p class=\"muted\">"
+        f"signals={int(summary.get('signal_count', 0) or 0)} "
+        f"bull={int(summary.get('bullish_count', 0) or 0)} "
+        f"bear={int(summary.get('bearish_count', 0) or 0)} "
+        f"neutral={int(summary.get('neutral_count', 0) or 0)} "
+        f"avg_conf={float(summary.get('average_confidence', 0.0) or 0.0):.3f}"
+        f"</p>"
+        f"<p class=\"muted\">data: provider={_esc(str(md.get('provider') or '?'))} "
+        f"freshness={_esc(str(md.get('freshness') or '?'))}</p>"
+        f"{signals_table}"
+        f"<p class=\"muted\">"
+        f"Premium callers receive full entry/stop/take-profit values, "
+        f"indicators, rationales, and historical reports."
+        f"</p>"
+    )
+
+
+def _launch_dashboard_html() -> str:
+    """Return the launch dashboard HTML, server-rendered (no JS)."""
+    signals_block = _render_launch_signals_summary()
+    return (
+        "<!DOCTYPE html>"
+        "<html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<title>Momentum Trading Bot — Launch Dashboard</title>"
+        + _LAUNCH_DASHBOARD_CSS
+        + "</head><body>"
+        "<h1>Momentum Trading Bot — Launch Dashboard</h1>"
+        "<p class=\"muted\">"
+        "Read-only public preview of the most recent signal report. "
+        "Authenticated callers receive full detail via the API."
+        "</p>"
+        "<h2>Health</h2>"
+        "<p><span class=\"pill pill-ok\">OK</span>"
+        " <span class=\"muted\">live — see GET /health</span></p>"
+        "<h2>Latest signals (preview)</h2>"
+        + signals_block
+        + "<h2>How to authenticate</h2>"
+        "<p class=\"muted\">"
+        "Pass <code>Authorization: Bearer &lt;your-key&gt;</code> on every "
+        "request. Free keys see this same preview; premium keys see "
+        "the full report and historical archive."
+        "</p>"
+        "<p class=\"muted\">"
+        "Operator command to issue a free key: "
+        "<code>python -m trading_bot.api.keys issue --tier free --label your-label</code>"
+        "</p>"
+        "<h2>Copy-paste examples</h2>"
+        "<pre># Health (no auth)\n"
+        "curl https://&lt;your-host&gt;/health</pre>"
+        "<pre># Latest signal report (free or premium)\n"
+        "curl -H \"Authorization: Bearer YOUR_KEY\" \\\n"
+        "  https://&lt;your-host&gt;/signals/latest</pre>"
+        "<pre># Premium-only history\n"
+        "curl -H \"Authorization: Bearer YOUR_KEY\" \\\n"
+        "  https://&lt;your-host&gt;/signals/history</pre>"
+        "<h2>Upgrade</h2>"
+        "<p class=\"muted\">"
+        "Free keys access the latest preview only. Premium keys get "
+        "full signals, indicators, rationales, and the report history. "
+        "Initiate a Stripe Checkout via "
+        "<code>POST /billing/checkout</code> with your bearer token."
+        "</p>"
+        "<div class=\"disclaimer\">"
+        "<strong>Disclaimer.</strong> This product produces transparent "
+        "rule-based signal recommendations for research and education only. "
+        "It is not financial advice. Demo mode uses deterministic synthetic "
+        "fixtures and is always labeled <code>mode: demo</code>. No trades "
+        "are executed via this surface."
+        "</div>"
+        "</body></html>"
+    )
+
+
+@app.get(
+    "/launch",
+    response_class=HTMLResponse,
+    tags=["public"],
+)
+def launch_dashboard() -> HTMLResponse:
+    """
+    Minimal product launch dashboard.
+
+    Public (no auth) HTML page that:
+      * surfaces /health
+      * fetches /signals/latest with a key the visitor pastes
+      * stores the key only in the visitor's localStorage
+      * shows copy-paste curl examples
+      * carries a clear "not financial advice" disclaimer
+
+    The page contains NO inline scripts referencing secret env vars
+    and NO references to internal infrastructure. Every dynamic
+    fetch is constrained to same-origin.
+    """
+    return HTMLResponse(content=_launch_dashboard_html(), status_code=200)
 
 
 # Nothing below this line. The api module deliberately imports

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from unittest.mock import patch
-
-import pytest
+from datetime import timedelta
 
 from trading_bot.execution.paper_broker import PaperBroker, SlippageModel
 from trading_bot.models.domain import OrderSide

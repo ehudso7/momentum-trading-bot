@@ -2,7 +2,6 @@
 from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Optional
 import structlog
 
 log = structlog.get_logger(__name__)

@@ -83,12 +83,8 @@ class TestEventWhitelist:
     def test_documented_event_set(self):
         """Phase 5.5/5.8 shipped 5 events; Phase 8.4 added 3 funnel
         events. The set is now exactly these 8 — pinned so a
-        silent addition / removal trips this test."""
-        from trading_bot.api.upgrade_events import (
-            EVENT_UPGRADE_CLICKED,
-            EVENT_UPGRADE_COMPLETED,
-            EVENT_UPGRADE_SHOWN,
-        )
+        silent addition / removal trips this test.
+        EVENT_UPGRADE_* constants are imported at module level below."""
         assert VALID_EVENTS == {
             EVENT_DASHBOARD_BANNER_SEEN,
             EVENT_DAILY_REQUEST_LIMIT_HIT,

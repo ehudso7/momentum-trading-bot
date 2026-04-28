@@ -90,13 +90,6 @@ import structlog
 from trading_bot.api.growth_intel import (
     DEFAULT_MIN_IMPRESSIONS,
     DEFAULT_MIN_INBOUND,
-    PRIORITY_HIGH,
-    PRIORITY_LOW,
-    PRIORITY_MEDIUM,
-    REC_AMPLIFY_TOP_TRIGGER,
-    REC_DOUBLE_DOWN_SOURCE,
-    REC_FEATURE_TOP_INSIGHT,
-    REC_INSUFFICIENT_DATA,
     REC_TIGHTEN_FREE_LIMIT,
     generate_recommendations,
     summarize,
@@ -858,7 +851,7 @@ def format_rollout_plan_text(artifact: dict) -> str:
     if artifact.get("export_command"):
         lines.append(f"  {artifact['export_command']}")
     if artifact.get("rollback_command"):
-        lines.append(f"  # rollback")
+        lines.append("  # rollback")
         lines.append(f"  {artifact['rollback_command']}")
     lines.append(bar)
     return "\n".join(lines)

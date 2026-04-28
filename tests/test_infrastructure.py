@@ -1,7 +1,5 @@
 """Tests for infrastructure enhancements."""
 from __future__ import annotations
-import os
-import tempfile
 from datetime import date
 import pytest
 
@@ -80,8 +78,7 @@ class TestPersistentStore:
         )
         # Can't guarantee win_rate works due to date('now') in SQLite
         # but it shouldn't error
-        rate = store.get_symbol_win_rate("TSLA")
-        # rate could be 50.0 or None depending on date comparison
+        store.get_symbol_win_rate("TSLA")
     
     def test_equity_curve_empty(self, store):
         curve = store.get_equity_curve()
