@@ -39,4 +39,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["uvicorn", "trading_bot.api.server:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["trading-bot-api", "--host", "0.0.0.0"]
