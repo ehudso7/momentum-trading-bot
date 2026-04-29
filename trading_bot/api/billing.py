@@ -72,6 +72,7 @@ _ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset({"active", "trialing"}
 _cache_lock = threading.Lock()
 _cache: set[str] = set()
 _cache_loaded_from: Optional[Path] = None
+_cache_load_mtime: Optional[float] = None
 
 _processed_event_lock = threading.Lock()
 _processed_event_ids: set[str] = set()
@@ -163,13 +164,29 @@ def _load_and_migrate_cache(path: Path) -> set[str]:
 
 
 def _ensure_cache_loaded() -> None:
-    global _cache_loaded_from
+    """
+    Load (or reload) the premium-cache file into memory.
+
+    Re-reads when EITHER the configured path changes OR the file's
+    mtime moved — so an operator CLI in ``railway ssh`` that runs
+    ``premium-add`` / ``premium-remove`` is picked up by the live API
+    server on the very next request, without a restart. Mirrors the
+    Phase 6.2 manifest hot-reload pattern in
+    ``trading_bot.api.key_store``.
+    """
+    global _cache_loaded_from, _cache_load_mtime
     path = _cache_path()
+    mtime = _file_mtime_or_none(path)
     with _cache_lock:
-        if _cache_loaded_from != path:
-            _cache.clear()
-            _cache.update(_load_and_migrate_cache(path))
-            _cache_loaded_from = path
+        if (
+            _cache_loaded_from == path
+            and _cache_load_mtime == mtime
+        ):
+            return
+        _cache.clear()
+        _cache.update(_load_and_migrate_cache(path))
+        _cache_loaded_from = path
+        _cache_load_mtime = mtime
 
 
 def reset_cache_for_tests() -> None:

@@ -61,6 +61,7 @@ dev = [
 [project.scripts]
 trading-bot = "trading_bot.main:main"
 trading-bot-api = "trading_bot.api.serve:main"
+trading-bot-billing-verify = "trading_bot.admin.billing_verification:main"
 
 [tool.setuptools.packages.find]
 include = ["trading_bot*"]

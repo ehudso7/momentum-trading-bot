@@ -244,6 +244,61 @@ class TestEventLogContent:
 # ---------------------------------------------------------------------------
 
 
+class TestPremiumCacheCrossProcessHotReload:
+    """
+    Regression: the operator CLI in `railway ssh` writes to the
+    premium cache file. The live API server (a different process)
+    must pick up the change on the very next request without a
+    restart. Symptom of the original bug: `premium-add` worked
+    via CLI, in-process `premium-check` returned `is_premium=yes`,
+    but the live API still served `tier: free`.
+    """
+
+    def test_external_write_is_picked_up(
+        self, monkeypatch, isolated_billing_state,
+    ):
+        cache_path = isolated_billing_state["cache_path"]
+        sample_hash = "1234567890abcdef1234567890abcdef"
+
+        # Step 1: API server starts; nothing in cache yet.
+        billing.reset_cache_for_tests()
+        assert billing.is_premium_hash(sample_hash) is False
+
+        # Step 2: external process (CLI) writes the hash directly.
+        # We MUST advance the mtime — using write_text twice in the
+        # same fs-tick can hash to identical mtime on coarse FS clocks.
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps([sample_hash]) + "\n", encoding="utf-8")
+        # Bump mtime to a comfortably later value.
+        import os as _os
+        future = cache_path.stat().st_mtime + 5
+        _os.utime(cache_path, (future, future))
+
+        # Step 3: API server's next call must reload and see the hash.
+        # We do NOT call reset_cache_for_tests — that would mask the
+        # hot-reload by forcing a fresh load from scratch.
+        assert billing.is_premium_hash(sample_hash) is True
+
+    def test_external_remove_is_picked_up(
+        self, monkeypatch, isolated_billing_state,
+    ):
+        cache_path = isolated_billing_state["cache_path"]
+        sample_hash = "abababababababababababababababab"
+
+        # Seed: hash is in the cache.
+        billing.add_premium_hash(sample_hash)
+        assert billing.is_premium_hash(sample_hash) is True
+
+        # External process removes the hash by overwriting the file.
+        cache_path.write_text("[]\n", encoding="utf-8")
+        import os as _os
+        future = cache_path.stat().st_mtime + 5
+        _os.utime(cache_path, (future, future))
+
+        # Live API must see the removal.
+        assert billing.is_premium_hash(sample_hash) is False
+
+
 class TestPremiumCachePersistence:
     def test_cache_survives_in_memory_reset(
         self, monkeypatch, isolated_billing_state,

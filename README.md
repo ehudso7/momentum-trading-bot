@@ -59,7 +59,7 @@ The fastest path from "deployed" to "real users":
 pip install -e ".[dev]"
 
 # 2. Sanity-check the billing env (never prints raw secrets)
-python -m scripts.billing_verification --strict
+trading-bot-billing-verify --strict
 
 # 3. Generate the first signal report
 TRADING_SAAS_DATA_MODE=demo python -m trading_bot.saas generate
