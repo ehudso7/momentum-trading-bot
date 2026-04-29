@@ -1649,7 +1649,9 @@ class TestVerifyHashAgainstManifest:
 
 class TestAddRemovePremiumHash:
     def test_add_then_check(self, cache_file: Path):
-        h = "p" * 32
+        # Real hashes are lowercase hex. Using non-hex test data here
+        # would trip the legacy-string migration logic on reload.
+        h = "abcdef0123456789abcdef0123456789"
         add_premium_hash(h)
         assert is_premium_via_stripe("anything-with-this-hash") is False
         # is_premium_via_stripe takes a raw key — for the hash path,
@@ -1669,7 +1671,7 @@ class TestAddRemovePremiumHash:
         assert h in data
 
     def test_remove_then_check(self, cache_file: Path):
-        h = "r" * 32
+        h = "fedcba9876543210fedcba9876543210"
         add_premium_hash(h)
         from trading_bot.api.billing import is_premium_hash
         assert is_premium_hash(h) is True

@@ -29,6 +29,7 @@ These env vars must be set on the Railway service before launch.
 | `TRADING_PUBLIC_BASE_URL`            | Public origin (e.g. https://api.host)  |
 | `TRADING_API_KEYS_MANIFEST_PATH`     | (recommended) `/app/data/api_keys_manifest.jsonl` |
 | `TRADING_API_KEYS_REVOKED_PATH`      | (recommended) `/app/data/api_keys_revoked.jsonl`  |
+| `TRADING_API_REPORTS_DIR`            | `/app/data/reports` — required so `/reports/latest` finds the alpha reports on the volume rather than looking at the relative `./reports/` path |
 | `TRADING_STRIPE_PREMIUM_CACHE_PATH`  | `/app/data/stripe_premium_keys.json`   |
 | `TRADING_STRIPE_WEBHOOK_EVENTS_PATH` | `/app/data/stripe_webhook_events.jsonl`|
 | `TRADING_SAAS_REPORTS_DIR`           | `/app/data/saas_reports`               |
@@ -45,9 +46,9 @@ Optional (data provider — at least one):
 Run the safe verification script:
 
 ```bash
-python -m scripts.billing_verification
+trading-bot-billing-verify
 # or, for CI gating:
-python -m scripts.billing_verification --strict
+trading-bot-billing-verify --strict   # (or `python -m trading_bot.admin.billing_verification --strict`)
 ```
 
 The script never prints raw secrets. It will reject a mixed

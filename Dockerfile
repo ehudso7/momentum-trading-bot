@@ -17,6 +17,7 @@ RUN apt-get update \
 # Install Python dependencies first for better Docker layer caching
 COPY pyproject.toml README.md ./
 COPY trading_bot ./trading_bot
+COPY scripts ./scripts
 
 RUN pip install --upgrade pip \
     && pip install --no-cache-dir ".[dev]" \
