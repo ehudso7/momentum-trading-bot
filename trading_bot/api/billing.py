@@ -371,6 +371,8 @@ def _extract_identity_from_event_object(
     api_key: Optional[str] = None
     key_hash: Optional[str] = None
 
+    # For subscription objects, metadata is directly on the subscription
+    # This handles customer.subscription.created and similar events
     meta = obj.get("metadata")
     if isinstance(meta, dict):
         ak = meta.get("api_key")

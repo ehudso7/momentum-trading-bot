@@ -34,7 +34,8 @@ RUN useradd -m botuser \
     && chown -R botuser:botuser /app \
     && chmod -R 777 /app/data
 
-USER botuser
+# Don't switch to botuser - Railway needs root for volume permissions
+# USER botuser
 
 EXPOSE 8080
 
