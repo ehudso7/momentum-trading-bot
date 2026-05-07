@@ -1,0 +1,10 @@
+#!/usr/bin/expect -f
+
+set timeout 30
+
+spawn eas init
+
+expect "Would you like to automatically create an EAS project for @ehudso7/momentum-trading?"
+send "y\r"
+
+expect eof
