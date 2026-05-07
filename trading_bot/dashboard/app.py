@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from trading_bot.dashboard.state import DashboardState
+from trading_bot.api.mobile_routes import router as mobile_router
 
 log = structlog.get_logger(__name__)
 
@@ -48,11 +49,14 @@ def create_app(state: DashboardState) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_credentials=False,
-        allow_methods=["GET"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
         max_age=600,
     )
+
+    # Include mobile API routes
+    app.include_router(mobile_router)
 
     # --- Global error handler ---
     @app.exception_handler(Exception)

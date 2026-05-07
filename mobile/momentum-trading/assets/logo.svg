@@ -1,0 +1,52 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background gradient circle -->
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#10b981;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#10b981;stop-opacity:0.1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Main circle background -->
+  <circle cx="512" cy="512" r="480" fill="url(#bgGradient)"/>
+
+  <!-- Inner dark circle -->
+  <circle cx="512" cy="512" r="420" fill="#0A0E27" opacity="0.95"/>
+
+  <!-- Chart lines representing momentum -->
+  <path d="M 250 600 Q 350 550 400 450 T 500 400 Q 550 380 600 300 T 750 200"
+        stroke="#10b981" stroke-width="12" fill="none" stroke-linecap="round"/>
+
+  <!-- Gradient fill under the chart -->
+  <path d="M 250 600 Q 350 550 400 450 T 500 400 Q 550 380 600 300 T 750 200 L 750 700 L 250 700 Z"
+        fill="url(#chartGradient)" opacity="0.3"/>
+
+  <!-- Upward arrow indicating growth -->
+  <path d="M 680 250 L 730 200 L 730 250 L 780 250 L 730 200 L 680 250 Z"
+        fill="#10b981" stroke="#10b981" stroke-width="8" stroke-linejoin="round"/>
+
+  <!-- M letter for Momentum -->
+  <path d="M 300 750 L 300 550 L 400 650 L 500 550 L 500 750
+           M 550 750 L 550 550 L 650 650 L 750 550 L 750 750"
+        stroke="#ffffff" stroke-width="20" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Trading candles -->
+  <rect x="380" y="480" width="20" height="80" fill="#ef4444" rx="2"/>
+  <rect x="385" y="460" width="10" height="120" fill="#ef4444" opacity="0.5"/>
+
+  <rect x="430" y="440" width="20" height="60" fill="#10b981" rx="2"/>
+  <rect x="435" y="420" width="10" height="100" fill="#10b981" opacity="0.5"/>
+
+  <rect x="480" y="460" width="20" height="70" fill="#10b981" rx="2"/>
+  <rect x="485" y="450" width="10" height="90" fill="#10b981" opacity="0.5"/>
+
+  <!-- Dots representing data points -->
+  <circle cx="350" cy="550" r="8" fill="#ffffff"/>
+  <circle cx="450" cy="450" r="8" fill="#ffffff"/>
+  <circle cx="550" cy="380" r="8" fill="#ffffff"/>
+  <circle cx="650" cy="300" r="8" fill="#ffffff"/>
+</svg>
