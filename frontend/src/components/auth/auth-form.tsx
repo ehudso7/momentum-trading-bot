@@ -36,7 +36,7 @@ export function AuthForm({ mode }: AuthFormProps) {
       const supabase = createClient();
 
       if (mode === "signup") {
-        const { error } = await supabase.auth.signUp({
+        const { data, error } = await supabase.auth.signUp({
           email,
           password,
           options: {
@@ -45,7 +45,28 @@ export function AuthForm({ mode }: AuthFormProps) {
           },
         });
         if (error) throw error;
-        setMessage("Check your email to confirm your account.");
+
+        // Supabase autoconfirm is enabled — session returned means instant access
+        if (data.session) {
+          router.push("/");
+          router.refresh();
+          return;
+        }
+
+        // Fallback: try signing in (handles autoconfirm without session in response)
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+        if (!signInError) {
+          router.push("/");
+          router.refresh();
+          return;
+        }
+
+        setMessage(
+          "Account created. You can sign in now — no email confirmation required."
+        );
       } else {
         const { error } = await supabase.auth.signInWithPassword({
           email,
