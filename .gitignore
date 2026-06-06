@@ -54,3 +54,4 @@ coverage.xml
 # mypy
 .mypy_cache/
 .vercel
+vercel.json
