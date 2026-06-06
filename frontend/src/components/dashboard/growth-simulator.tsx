@@ -294,7 +294,7 @@ export function GrowthSimulator({ status, currentEquity }: GrowthSimulatorProps)
             With compound mode enabled and disciplined execution, small edges become life-changing over time.
             The real "AI" is the combination of the strategy + risk engine + your consistency.
           </div>
-          <Button size="sm" variant="secondary" onClick={resetToDefaults} className="shrink-0">
+          <Button size="sm" variant="outline" onClick={resetToDefaults} className="shrink-0">
             Reset to Peak Defaults
           </Button>
         </div>
