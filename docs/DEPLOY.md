@@ -96,11 +96,64 @@ Expected response:
 {"status":"ok","service":"momentum-trading-bot-analytics","timestamp":"..."}
 ```
 
-### API Key Setup
+### Get Your API Key for MomentumForge AI (Do This Now)
 
-1. Set `TRADING_API_KEY` on Railway
-2. In the frontend, go to Profile → API Key and paste your key
-3. Premium signals will unlock with a premium-tier key
+**The absolute fastest way to a working key:**
+
+```bash
+# 1. Generate the key + get perfect copy-paste instructions
+python scripts/momentumforge_api_key.py
+```
+
+The script prints:
+- A brand new secure key
+- The exact Railway Variables command / UI steps (quick `TRADING_API_KEY` method)
+- The exact command to run inside a Railway Shell if you want the full production manifest system
+
+**Manual quick path (no script):**
+
+1. Generate any strong random string (or use the one printed by the script above).
+2. In Railway → your service → **Variables**:
+   - Name: `TRADING_API_KEY`
+   - Value: `the-key-you-just-generated`
+3. Redeploy.
+4. In MomentumForge AI frontend:
+   - Go to **Profile** (or `/profile`)
+   - Paste the exact same key into the API Key box
+   - Click **Save**
+5. Click the **"Test connection"** button right there in the form.
+
+After this the frontend can call your Railway signals, reports, and the live trading dashboard.
+
+For multiple users / revocation / premium tiers later, re-run the script — it will show you the production manifest commands using your `/app/data` volume.
+
+> The key is stored only in the browser (localStorage) and sent as `Authorization: Bearer ...`. Never commit it.
+
+### PEAK EXPERIENCE: Watch Your Money Grow Exponentially (MomentumForge AI)
+
+Once connected:
+
+1. Run the core worker:
+   ```bash
+   trading-bot --mode paper --dashboard-port 8080
+   ```
+
+2. Run the peaked MomentumForge AI frontend (`cd frontend && npm run dev`).
+
+3. In the AI dashboard you now have the **Growth Simulator** — the crown jewel.
+   - Live exponential projections using real compound math (see `trading_bot/risk/compound.py`).
+   - Tune win rate / R:R / trade frequency to see different futures.
+   - 12-month trajectory chart.
+   - "Time to 2x" calculator.
+
+4. Run the ultimate launcher for the full peaked test flow:
+   ```bash
+   python3 scripts/peak_momentumforge.py
+   ```
+
+This gives you copy-paste commands for everything + explains how the AI layer + core bot work together so you can "set it and watch (paper) money grow".
+
+The MomentumForge AI frontend is now the god-tier interface that does the intelligence, projections, and beautiful monitoring while the battle-tested core bot does the safe execution.
 
 ## 5. Stripe Webhook
 

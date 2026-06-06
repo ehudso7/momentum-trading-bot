@@ -8,6 +8,7 @@ import { StatsCards } from "@/components/dashboard/stats-cards";
 import { Scanner } from "@/components/dashboard/scanner";
 import { Portfolio } from "@/components/dashboard/portfolio";
 import { EquityChart } from "@/components/dashboard/equity-chart";
+import { GrowthSimulator } from "@/components/dashboard/growth-simulator";
 import { ModeToggle } from "@/components/dashboard/mode-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +19,7 @@ import {
   fetchPositions,
   fetchTrades,
 } from "@/lib/api";
+import { TrendingUp } from "lucide-react";
 import { exportDashboardPDF } from "@/lib/pdf-export";
 import type {
   BotStatus,
@@ -79,6 +81,8 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
     if (results[3].status === "fulfilled") setTrades(results[3].value);
     if (results[4].status === "fulfilled") setEquity(results[4].value);
   }, []);
+
+  const currentEquity = status?.equity ?? (equity.length > 0 ? equity[equity.length - 1].equity : 100000);
 
   useEffect(() => {
     loadData().finally(() => setLoading(false));
@@ -180,8 +184,45 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
           <EquityChart data={equity} loading={loading} />
         </div>
 
-        <div className="mt-6">
-          <Portfolio positions={positions} loading={loading} />
+        {/* === PEAK MOMENTUMFORGE AI: EXPONENTIAL GROWTH ENGINE === */}
+        <div className="mt-2">
+          <GrowthSimulator status={status} currentEquity={currentEquity} />
+        </div>
+
+        <div className="mt-6 grid gap-6 lg:grid-cols-5">
+          <div className="lg:col-span-3">
+            <Portfolio positions={positions} loading={loading} />
+          </div>
+          <div className="lg:col-span-2">
+            {/* MomentumForge AI Intelligence Layer — the "AI doing the work" */}
+            <div className="h-full rounded-xl border border-white/10 bg-[#0a0b14] p-5">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
+                <TrendingUp className="h-4 w-4 text-amber-400" /> Forge Intelligence — AI Layer
+              </div>
+              <div className="space-y-3 text-sm">
+                <div className="rounded-lg bg-white/[0.02] p-3">
+                  <div className="text-xs text-zinc-400">Market Regime</div>
+                  <div className="font-mono text-lg font-semibold text-white">{status?.regime || "unknown"}</div>
+                  <div className="mt-1 text-xs text-emerald-400">Strategy parameters auto-adjusted for edge preservation + compounding.</div>
+                </div>
+                {report && report.signals?.length > 0 && (
+                  <div className="rounded-lg bg-white/[0.02] p-3">
+                    <div className="text-xs text-zinc-400 mb-1">Top Momentum Setups (from SaaS AI)</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {report.signals.slice(0, 4).map((s: any, i: number) => (
+                        <span key={i} className="rounded bg-white/5 px-2 py-0.5 text-xs font-medium text-white/90">
+                          {s.symbol} <span className="text-amber-400">{((s.confidence || 0) * 100).toFixed(0)}%</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div className="text-[11px] text-zinc-500 pt-1">
+                  MomentumForge AI turns scanner + regime + advisor output into intelligence and exponential projections. The core bot executes with iron risk rails (circuit breaker first, hard time exit, position sizing).
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </main>
     </div>

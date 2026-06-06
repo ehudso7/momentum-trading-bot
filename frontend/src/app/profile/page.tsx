@@ -70,6 +70,7 @@ export default async function ProfilePage() {
           <CardContent>
             <p className="mb-4 text-sm text-zinc-400">
               Connect to your Railway backend for premium signal access.
+              Use the helper below or run <code className="text-xs">python scripts/momentumforge_api_key.py</code> for perfect instructions.
             </p>
             <ApiKeyForm />
           </CardContent>

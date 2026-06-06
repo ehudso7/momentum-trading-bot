@@ -819,10 +819,12 @@ def require_api_key(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "API key not configured on server; set TRADING_API_KEY, "
-                "TRADING_API_PREMIUM_KEYS, or issue a key via "
-                "`python -m trading_bot.api.keys issue` before "
-                "accepting requests"
+                "API key not configured on server. "
+                "Quick fix: set TRADING_API_KEY in Railway Variables. "
+                "Best experience: run `python scripts/momentumforge_api_key.py` "
+                "(or `python -m trading_bot.api.keys issue --tier free --label you`) "
+                "inside a Railway Shell against your /app/data volume. "
+                "Then paste the printed key into MomentumForge AI → Profile → API Key."
             ),
         )
     if creds is None:
