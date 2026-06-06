@@ -141,7 +141,7 @@ export function ApiKeyForm() {
               </ol>
 
               <div className="mt-3 flex flex-wrap gap-2">
-                <Button size="sm" variant="secondary" onClick={generateAndShow}>
+                <Button size="sm" variant="outline" onClick={generateAndShow}>
                   Generate a fresh key + show Railway command
                 </Button>
                 {generatedKey && (
