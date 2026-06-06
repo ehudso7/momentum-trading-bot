@@ -28,6 +28,10 @@ ENV/
 frontend/node_modules/
 frontend/.next/
 frontend/.vercel/
+.vercel/
+
+# Supabase local
+supabase/.temp/
 
 # Data & logs
 /data/
@@ -49,3 +53,4 @@ coverage.xml
 
 # mypy
 .mypy_cache/
+.vercel
