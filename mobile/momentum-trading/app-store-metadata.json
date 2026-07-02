@@ -1,24 +1,25 @@
 {
+  "_note": "Metadata rewritten 2026-07-03 for App Store 3.2.1 compliance. Removed order-placement language, accuracy claims (95%, unlimited signals), and 'trading platform' framing. Positioning: educational market intelligence + AI signals. Execution happens on the user's own broker via deep-link (see TradingScreen.tsx). Copy modeled on TipRanks + TradingView App Store listings which have been approved under 3.2.1 for years.",
   "ios": {
-    "name": "Momentum Trading Pro",
-    "subtitle": "Professional Trading Platform",
-    "description": "Momentum Trading Pro is the ultimate trading platform for serious investors. Access real-time market data, advanced AI-powered signals, and institutional-grade analytics.\n\nKey Features:\n• Real-time market data streaming\n• AI-powered trading signals with 95% accuracy\n• Advanced portfolio analytics and risk management\n• Social trading - copy successful traders\n• Cryptocurrency trading support\n• Automated portfolio rebalancing\n• Tax-loss harvesting\n• Dark mode support\n• Face ID/Touch ID security\n\nBuilt for traders who demand the best. Join thousands of successful traders using our platform to maximize their returns.\n\nSubscription Options:\n• Free: Basic features and limited signals\n• Premium ($29.99/month): Unlimited signals, advanced analytics\n• Enterprise: Custom pricing for institutions\n\nTerms of Use: https://momentum-trading-bot-production.up.railway.app/terms\nPrivacy Policy: https://momentum-trading-bot-production.up.railway.app/privacy",
-    "keywords": "trading,stocks,investing,finance,portfolio,signals,crypto,forex,options,analysis",
-    "categories": ["FINANCE", "BUSINESS"],
+    "name": "Momentum — Market Intelligence",
+    "subtitle": "AI signals and market insights",
+    "description": "Momentum is an educational market-intelligence app for individual investors who want AI-assisted context before they make their own decisions. It surfaces daily headline analysis, watchlist alerts, and signal ideas with confidence bands and written rationales — then hands you off to the brokerage account you already use to execute.\n\nWhat you get:\n• Daily AI market summary written by Claude Sonnet 4.6\n• Watchlist with price alerts and news deltas\n• Signal ideas with confidence band and thesis text\n• Portfolio view (link your existing broker via read-only)\n• Charts and technicals for the symbols you follow\n• Deep-link to Robinhood, Webull, Interactive Brokers, or Fidelity to trade\n\nImportant — please read:\n• Momentum is not a broker-dealer and is not registered as an investment adviser.\n• Momentum does not place orders on your behalf. Every trade is executed by you, in your own regulated brokerage account.\n• Signals and analysis are impersonal educational content, published on a regular schedule for the entire subscriber base. They are not personalized investment advice.\n• Investing involves risk of loss. Past performance does not guarantee future results.\n\nSubscription options (auto-renewing):\n• Free — daily summary, 3 signal ideas per day, delayed data.\n• Pro ($9.99/month or $99/year) — real-time data, unlimited signals, watchlist alerts.\n• Elite ($29.99/month or $249/year) — priority signal delivery, backtest credits, AI post-mortem on your closed trades.\n\nTerms of Use: https://momentum-trading-bot-production.up.railway.app/terms\nPrivacy Policy: https://momentum-trading-bot-production.up.railway.app/privacy",
+    "keywords": "market intelligence,stock signals,ai analysis,investing news,watchlist,portfolio,charts,finance,education",
+    "categories": ["FINANCE", "NEWS"],
     "price": "Free",
     "inAppPurchases": true,
-    "ageRating": "4+",
-    "copyright": "© 2024 Momentum Trading Pro",
+    "ageRating": "17+",
+    "copyright": "© 2026 Momentum",
     "supportUrl": "https://momentum-trading-bot-production.up.railway.app/support",
     "marketingUrl": "https://momentum-trading-bot-production.up.railway.app",
     "privacyUrl": "https://momentum-trading-bot-production.up.railway.app/privacy"
   },
   "android": {
-    "name": "Momentum Trading Pro",
-    "shortDescription": "Professional trading platform with AI-powered signals",
-    "fullDescription": "Momentum Trading Pro is the ultimate trading platform for serious investors. Access real-time market data, advanced AI-powered signals, and institutional-grade analytics.\n\nKey Features:\n• Real-time market data streaming with nanosecond precision\n• AI-powered trading signals with 95% accuracy\n• Advanced portfolio analytics and risk management\n• Social trading - copy successful traders\n• Cryptocurrency trading across major exchanges\n• Automated portfolio rebalancing with tax optimization\n• Tax-loss harvesting\n• Dark mode support\n• Biometric security\n• Push notifications for important signals\n\nAdvanced Trading Tools:\n• Technical indicators (200+ indicators)\n• Options flow analysis\n• Dark pool activity monitoring\n• Market regime detection\n• Risk parity optimization\n• Monte Carlo simulations\n• Stress testing scenarios\n\nBuilt for traders who demand the best. Join thousands of successful traders using our platform to maximize their returns.\n\nSubscription Options:\n• Free: Basic features and limited signals\n• Premium ($29.99/month): Unlimited signals, advanced analytics\n• Enterprise: Custom pricing for institutions\n\nAll subscriptions include:\n- Real-time data\n- Portfolio tracking\n- Basic analytics\n- Email support\n\nPremium features:\n- Unlimited AI signals\n- Advanced risk analytics\n- Priority support\n- API access\n\nNote: Trading involves risk. Past performance does not guarantee future results. Please trade responsibly.",
+    "name": "Momentum — Market Intelligence",
+    "shortDescription": "AI-assisted market summaries and signal ideas — you trade on your own broker",
+    "fullDescription": "Momentum is an educational market-intelligence app for individual investors. Read AI-authored market summaries, browse signal ideas with confidence bands and written rationales, and track your watchlist — then execute in the brokerage account you already use.\n\nWhat you get:\n• Daily AI market summary\n• Watchlist with price alerts and news deltas\n• Signal ideas with confidence band and thesis text\n• Portfolio view (read-only link to your existing broker)\n• Charts and technicals for the symbols you follow\n• Deep-link to Robinhood, Webull, Interactive Brokers, and Fidelity to trade\n\nImportant — please read:\n• Momentum is not a broker-dealer and is not registered as an investment adviser.\n• Momentum does not place orders on your behalf. Every trade is executed by you, in your own regulated brokerage account.\n• Signals and analysis are impersonal educational content, published on a regular schedule for the entire subscriber base. They are not personalized investment advice.\n• Investing involves risk of loss. Past performance does not guarantee future results.\n\nSubscription options (auto-renewing):\n• Free — daily summary, 3 signal ideas per day, delayed data.\n• Pro ($9.99/month or $99/year) — real-time data, unlimited signals, watchlist alerts.\n• Elite ($29.99/month or $249/year) — priority signal delivery, backtest credits, AI post-mortem on your closed trades.",
     "category": "FINANCE",
-    "contentRating": "Everyone",
+    "contentRating": "Mature 17+",
     "price": "Free",
     "inAppPurchases": true,
     "websiteUrl": "https://momentum-trading-bot-production.up.railway.app",
@@ -28,20 +29,20 @@
   "screenshots": {
     "ios": [
       "screenshots/ios/home.png",
-      "screenshots/ios/portfolio.png",
-      "screenshots/ios/trading.png",
       "screenshots/ios/signals.png",
+      "screenshots/ios/portfolio.png",
+      "screenshots/ios/broker-handoff.png",
       "screenshots/ios/charts.png"
     ],
     "android": [
       "screenshots/android/home.png",
-      "screenshots/android/portfolio.png",
-      "screenshots/android/trading.png",
       "screenshots/android/signals.png",
+      "screenshots/android/portfolio.png",
+      "screenshots/android/broker-handoff.png",
       "screenshots/android/charts.png"
     ]
   },
   "releaseNotes": {
-    "1.0.0": "Initial release with full trading capabilities, AI signals, and portfolio management."
+    "1.0.0": "Momentum launches as an educational market-intelligence app. Read AI-authored market summaries and signal ideas, then execute in the brokerage account you already use."
   }
 }

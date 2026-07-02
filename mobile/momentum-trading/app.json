@@ -1,13 +1,13 @@
 {
   "expo": {
-    "name": "Momentum Trading Pro",
+    "name": "Momentum",
     "slug": "momentum-trading",
     "version": "1.0.0",
     "orientation": "portrait",
     "scheme": "momentum-trading",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -16,7 +16,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.momentumtrading.pro",
-      "buildNumber": "1",
+      "buildNumber": "6",
       "infoPlist": {
         "NSCameraUsageDescription": "Allow camera access to scan documents and verify identity",
         "NSFaceIDUsageDescription": "Allow Face ID for secure authentication",
@@ -68,7 +68,8 @@
       "expo-dev-client",
       "expo-notifications",
       "expo-secure-store",
-      "expo-updates"
+      "expo-updates",
+      "expo-status-bar"
     ],
     "extra": {
       "apiUrl": "https://momentum-trading-bot-production.up.railway.app",

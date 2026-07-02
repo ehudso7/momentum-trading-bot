@@ -67,17 +67,22 @@ class ApiService {
     return this.client.get(`/performance?period=${period}`);
   }
 
-  // Trading endpoints
-  async placeOrder(order: any) {
-    return this.client.post('/orders', order);
-  }
+  // Trading endpoints — REMOVED.
+  //
+  // Momentum's iOS app is positioned as an educational market-intelligence
+  // product (see AUDIT sheet Momentum_Trading, App Store Guideline 3.2.1
+  // pivot). The mobile client does NOT place, cancel, or route orders.
+  // Users execute in their own regulated brokerage account via broker
+  // deep-links from TradingScreen. If you find yourself wanting to re-add
+  // placeOrder / getOrders / cancelOrder to this SDK, stop and re-read the
+  // audit — the codebase is on the wrong side of App Review 3.2.1 without
+  // a registered broker-dealer entity.
 
-  async getOrders() {
-    return this.client.get('/orders');
-  }
-
-  async cancelOrder(orderId: string) {
-    return this.client.delete(`/orders/${orderId}`);
+  async getOrderHistory() {
+    // Read-only order history from the user's linked broker (via Plaid /
+    // SnapTrade pass-through), NOT Momentum's own order routing. Safe to
+    // expose because it is a fetch, not an execute.
+    return this.client.get('/orders/history');
   }
 
   // Signals endpoints

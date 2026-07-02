@@ -1,3 +1,26 @@
+/**
+ * TradingScreen — "Trade on your broker" hand-off (App Store 3.2.1 compliant).
+ *
+ * This screen intentionally does NOT place orders. Momentum is positioned as
+ * an AI market-intelligence and signals product; execution happens on the
+ * user's own regulated broker. Rationale (see AUDIT sheet Momentum_Trading):
+ *
+ *   Apple App Review Guideline 3.2.1: apps used for financial trading,
+ *   investing, or money management must be submitted by the regulated
+ *   financial institution performing those services. A generic developer
+ *   entity that ships an in-app order-placement flow gets rejected.
+ *
+ * The pattern here mirrors TipRanks and TradingView on iOS: the user reads
+ * the signal + thesis + confidence band in-app, then taps a broker deep-link
+ * (Robinhood, Webull, Interactive Brokers, Fidelity) to execute in their own
+ * regulated account. No fund custody, no order routing, no advice claim.
+ *
+ * Investment Advisers Act 1940 posture: content is impersonal, published on
+ * a regular schedule, and does not constitute personalized advice — the
+ * "publisher's exclusion" rationale used by Motley Fool / Seeking Alpha.
+ * Ship with disclaimers visible and never suggest an action for a specific
+ * user's specific account.
+ */
 import React, { useState } from 'react';
 import {
   View,
@@ -5,12 +28,12 @@ import {
   ScrollView,
   StyleSheet,
   TouchableOpacity,
-  TextInput,
+  Linking,
   Alert,
   Dimensions,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
@@ -19,86 +42,119 @@ import { api } from '../services/api';
 
 const { width } = Dimensions.get('window');
 
+// --------------------------------------------------------------------------
+// Broker deep-link registry.
+//
+// Each broker exposes a universal link that opens the broker's app to the
+// symbol's trade ticket. If the app is not installed, iOS falls through to
+// the broker's website via the same URL. Users complete the transaction in
+// their own regulated brokerage account; Momentum never touches funds or
+// orders. Adding a broker here surfaces it in the "Trade on your broker"
+// panel below — no other UI work is required.
+// --------------------------------------------------------------------------
+type Broker = {
+  key: string;
+  name: string;
+  color: string;
+  buildUrl: (symbol: string) => string;
+};
+
+const BROKERS: Broker[] = [
+  {
+    key: 'robinhood',
+    name: 'Robinhood',
+    color: '#00C805',
+    buildUrl: (symbol) => `https://robinhood.com/stocks/${symbol}`,
+  },
+  {
+    key: 'webull',
+    name: 'Webull',
+    color: '#0074E4',
+    buildUrl: (symbol) => `https://www.webull.com/quote/${symbol}`,
+  },
+  {
+    key: 'ibkr',
+    name: 'Interactive Brokers',
+    color: '#B00E1E',
+    buildUrl: (symbol) => `https://www.interactivebrokers.com/en/trading/orders.php?symbol=${symbol}`,
+  },
+  {
+    key: 'fidelity',
+    name: 'Fidelity',
+    color: '#568203',
+    buildUrl: (symbol) => `https://digital.fidelity.com/prgw/digital/research/quote/dashboard/summary?symbol=${symbol}`,
+  },
+];
+
 export default function TradingScreen() {
   const { theme } = useTheme();
-  const { subscribe, lastMessage } = useWebSocket();
-  const queryClient = useQueryClient();
+  const { subscribe } = useWebSocket();
 
   const [selectedSymbol, setSelectedSymbol] = useState('AAPL');
-  const [orderType, setOrderType] = useState('market');
-  const [side, setSide] = useState('buy');
-  const [quantity, setQuantity] = useState('10');
-  const [price, setPrice] = useState('');
 
   React.useEffect(() => {
     subscribe(`market:${selectedSymbol}`);
   }, [selectedSymbol, subscribe]);
 
-  const { data: marketData } = useQuery({
+  useQuery({
     queryKey: ['market', selectedSymbol],
     queryFn: () => api.getMarketData(selectedSymbol),
   });
-
-  const { data: orders } = useQuery({
-    queryKey: ['orders'],
-    queryFn: api.getOrders,
-  });
-
-  const placeOrderMutation = useMutation({
-    mutationFn: api.placeOrder,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['orders'] });
-      queryClient.invalidateQueries({ queryKey: ['portfolio'] });
-      Alert.alert('Success', 'Order placed successfully');
-      setQuantity('10');
-      setPrice('');
-    },
-    onError: (error: any) => {
-      Alert.alert('Error', error.message || 'Failed to place order');
-    },
-  });
-
-  const handlePlaceOrder = () => {
-    if (!quantity || (orderType === 'limit' && !price)) {
-      Alert.alert('Error', 'Please fill in all required fields');
-      return;
-    }
-
-    const order = {
-      symbol: selectedSymbol,
-      side,
-      type: orderType,
-      quantity: parseFloat(quantity),
-      price: orderType === 'limit' ? parseFloat(price) : undefined,
-    };
-
-    placeOrderMutation.mutate(order);
-  };
 
   const watchlist = ['AAPL', 'TSLA', 'NVDA', 'MSFT', 'GOOGL', 'AMZN'];
 
   const chartData = {
     labels: ['9:30', '10:00', '10:30', '11:00', '11:30', '12:00'],
-    datasets: [{
-      data: [150, 152, 148, 155, 153, 157],
-    }],
+    datasets: [{ data: [150, 152, 148, 155, 153, 157] }],
   };
 
-  const mockOrders = [
-    { id: '1', symbol: 'AAPL', side: 'buy', quantity: 10, price: 150.25, status: 'filled' },
-    { id: '2', symbol: 'TSLA', side: 'sell', quantity: 5, price: 250.00, status: 'pending' },
-    { id: '3', symbol: 'NVDA', side: 'buy', quantity: 15, price: 520.75, status: 'filled' },
-  ];
+  // Handle broker deep-link. Try to open the broker's app or website; if the
+  // system rejects the URL for any reason we surface a friendly explanation
+  // rather than crashing.
+  const openBroker = async (broker: Broker) => {
+    const url = broker.buildUrl(selectedSymbol);
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) {
+        Alert.alert(
+          `${broker.name} isn't available`,
+          `We couldn't open ${broker.name} on this device. Try opening ${broker.name} directly in your browser.`,
+        );
+        return;
+      }
+      await Linking.openURL(url);
+    } catch (err) {
+      Alert.alert(
+        'Could not open broker',
+        err instanceof Error ? err.message : 'Please try again.',
+      );
+    }
+  };
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <ScrollView showsVerticalScrollIndicator={false}>
         {/* Header */}
         <View style={styles.header}>
-          <Text style={[styles.title, { color: theme.text }]}>Trading</Text>
-          <TouchableOpacity style={styles.searchButton}>
-            <Text style={[styles.searchIcon, { color: theme.textSecondary }]}>🔍</Text>
-          </TouchableOpacity>
+          <Text style={[styles.title, { color: theme.text }]}>Trade</Text>
+        </View>
+
+        {/* Non-advice disclaimer.
+            Rendered at the top of every visit to the Trade tab so it is
+            impossible to reach the broker hand-offs without seeing it.
+            Wording follows the Motley Fool / Seeking Alpha "publisher's
+            exclusion" pattern under the Investment Advisers Act 1940. */}
+        <View style={[styles.disclaimer, { backgroundColor: theme.card, borderColor: theme.border }]}>
+          <Text style={[styles.disclaimerLabel, { color: theme.textSecondary }]}>
+            Educational information, not personalized advice
+          </Text>
+          <Text style={[styles.disclaimerBody, { color: theme.text }]}>
+            Momentum publishes impersonal market intelligence and signals for
+            educational purposes only. It is not a broker-dealer, is not
+            registered as an investment adviser, and does not place orders on
+            your behalf. Use your own regulated brokerage account and consult a
+            licensed professional before acting.
+          </Text>
         </View>
 
         {/* Watchlist */}
@@ -115,7 +171,8 @@ export default function TradingScreen() {
               style={[
                 styles.watchlistItem,
                 {
-                  backgroundColor: selectedSymbol === symbol ? theme.primary : theme.card,
+                  backgroundColor:
+                    selectedSymbol === symbol ? theme.primary : theme.card,
                 },
               ]}
             >
@@ -130,7 +187,12 @@ export default function TradingScreen() {
               <Text
                 style={[
                   styles.watchlistPrice,
-                  { color: selectedSymbol === symbol ? 'rgba(255,255,255,0.8)' : theme.textSecondary },
+                  {
+                    color:
+                      selectedSymbol === symbol
+                        ? 'rgba(255,255,255,0.8)'
+                        : theme.textSecondary,
+                  },
                 ]}
               >
                 $150.25
@@ -147,11 +209,8 @@ export default function TradingScreen() {
           ))}
         </ScrollView>
 
-        {/* Current Stock Info */}
-        <LinearGradient
-          colors={['#667eea', '#764ba2']}
-          style={styles.stockCard}
-        >
+        {/* Current stock info */}
+        <LinearGradient colors={['#667eea', '#764ba2']} style={styles.stockCard}>
           <View style={styles.stockHeader}>
             <View>
               <Text style={styles.stockSymbol}>{selectedSymbol}</Text>
@@ -186,7 +245,7 @@ export default function TradingScreen() {
         {/* Chart */}
         <View style={[styles.chartCard, { backgroundColor: theme.card }]}>
           <Text style={[styles.sectionTitle, { color: theme.text }]}>
-            Price Chart - {selectedSymbol}
+            Price Chart — {selectedSymbol}
           </Text>
 
           <LineChart
@@ -199,7 +258,7 @@ export default function TradingScreen() {
               backgroundGradientTo: theme.card,
               decimalPlaces: 2,
               color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
-              labelColor: (opacity = 1) => theme.textSecondary,
+              labelColor: () => theme.textSecondary,
               style: { borderRadius: 16 },
               propsForDots: {
                 r: '4',
@@ -212,168 +271,59 @@ export default function TradingScreen() {
           />
         </View>
 
-        {/* Order Form */}
-        <View style={[styles.orderCard, { backgroundColor: theme.card }]}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>Place Order</Text>
+        {/* Trade on your broker — hand-off panel replaces the previous
+            in-app order form. Each card deep-links to the corresponding
+            broker's ticket for the selected symbol. */}
+        <View style={[styles.brokerCard, { backgroundColor: theme.card }]}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>
+            Trade on your broker
+          </Text>
+          <Text style={[styles.brokerSubtitle, { color: theme.textSecondary }]}>
+            Open {selectedSymbol} in the brokerage account you already use.
+            Momentum does not route or execute orders.
+          </Text>
 
-          {/* Order Type Selector */}
-          <View style={styles.orderTypeContainer}>
-            {['buy', 'sell'].map((type) => (
+          <View style={styles.brokerList}>
+            {BROKERS.map((broker) => (
               <TouchableOpacity
-                key={type}
-                onPress={() => setSide(type)}
+                key={broker.key}
+                onPress={() => openBroker(broker)}
                 style={[
-                  styles.orderTypeButton,
-                  {
-                    backgroundColor: side === type ?
-                      (type === 'buy' ? '#10b981' : '#ef4444') : theme.background,
-                  },
+                  styles.brokerItem,
+                  { backgroundColor: theme.background, borderColor: theme.border },
                 ]}
+                accessibilityRole="button"
+                accessibilityLabel={`Open ${broker.name} to trade ${selectedSymbol}`}
               >
-                <Text
-                  style={[
-                    styles.orderTypeText,
-                    { color: side === type ? '#fff' : theme.text },
-                  ]}
-                >
-                  {type.toUpperCase()}
+                <View style={[styles.brokerBadge, { backgroundColor: broker.color }]}>
+                  <Text style={styles.brokerBadgeText}>
+                    {broker.name.charAt(0)}
+                  </Text>
+                </View>
+                <View style={styles.brokerText}>
+                  <Text style={[styles.brokerName, { color: theme.text }]}>
+                    {broker.name}
+                  </Text>
+                  <Text style={[styles.brokerAction, { color: theme.textSecondary }]}>
+                    Open {selectedSymbol} ticket
+                  </Text>
+                </View>
+                <Text style={[styles.brokerChevron, { color: theme.textSecondary }]}>
+                  ›
                 </Text>
               </TouchableOpacity>
             ))}
           </View>
-
-          {/* Market/Limit Selector */}
-          <View style={styles.orderTypeContainer}>
-            {['market', 'limit'].map((type) => (
-              <TouchableOpacity
-                key={type}
-                onPress={() => setOrderType(type)}
-                style={[
-                  styles.orderTypeButton,
-                  {
-                    backgroundColor: orderType === type ? theme.primary : theme.background,
-                  },
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.orderTypeText,
-                    { color: orderType === type ? '#fff' : theme.text },
-                  ]}
-                >
-                  {type.toUpperCase()}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          {/* Quantity Input */}
-          <View style={styles.inputContainer}>
-            <Text style={[styles.inputLabel, { color: theme.text }]}>Quantity</Text>
-            <TextInput
-              style={[styles.input, { backgroundColor: theme.background, color: theme.text }]}
-              value={quantity}
-              onChangeText={setQuantity}
-              placeholder="Number of shares"
-              placeholderTextColor={theme.textSecondary}
-              keyboardType="numeric"
-            />
-          </View>
-
-          {/* Price Input (for limit orders) */}
-          {orderType === 'limit' && (
-            <View style={styles.inputContainer}>
-              <Text style={[styles.inputLabel, { color: theme.text }]}>Price</Text>
-              <TextInput
-                style={[styles.input, { backgroundColor: theme.background, color: theme.text }]}
-                value={price}
-                onChangeText={setPrice}
-                placeholder="Limit price"
-                placeholderTextColor={theme.textSecondary}
-                keyboardType="numeric"
-              />
-            </View>
-          )}
-
-          {/* Order Summary */}
-          <View style={[styles.orderSummary, { backgroundColor: theme.background }]}>
-            <View style={styles.summaryRow}>
-              <Text style={[styles.summaryLabel, { color: theme.textSecondary }]}>
-                Estimated Total
-              </Text>
-              <Text style={[styles.summaryValue, { color: theme.text }]}>
-                ${((parseFloat(quantity) || 0) * 150.25).toFixed(2)}
-              </Text>
-            </View>
-          </View>
-
-          {/* Place Order Button */}
-          <TouchableOpacity
-            onPress={handlePlaceOrder}
-            disabled={placeOrderMutation.isPending}
-            style={[
-              styles.placeOrderButton,
-              { opacity: placeOrderMutation.isPending ? 0.6 : 1 }
-            ]}
-          >
-            <LinearGradient
-              colors={side === 'buy' ? ['#10b981', '#059669'] : ['#ef4444', '#dc2626']}
-              style={styles.placeOrderGradient}
-            >
-              <Text style={styles.placeOrderText}>
-                {placeOrderMutation.isPending ? 'Placing...' : `${side.toUpperCase()} ${selectedSymbol}`}
-              </Text>
-            </LinearGradient>
-          </TouchableOpacity>
         </View>
 
-        {/* Recent Orders */}
-        <View style={[styles.ordersCard, { backgroundColor: theme.card }]}>
-          <View style={styles.ordersHeader}>
-            <Text style={[styles.sectionTitle, { color: theme.text }]}>Recent Orders</Text>
-            <TouchableOpacity>
-              <Text style={[styles.viewAll, { color: theme.primary }]}>View All</Text>
-            </TouchableOpacity>
-          </View>
-
-          {mockOrders.map((order) => (
-            <View
-              key={order.id}
-              style={[styles.orderItem, { borderBottomColor: theme.border }]}
-            >
-              <View style={styles.orderLeft}>
-                <Text style={[styles.orderSymbol, { color: theme.text }]}>
-                  {order.symbol}
-                </Text>
-                <Text style={[styles.orderType, { color: theme.textSecondary }]}>
-                  {order.side.toUpperCase()}
-                </Text>
-              </View>
-
-              <View style={styles.orderCenter}>
-                <Text style={[styles.orderQuantity, { color: theme.text }]}>
-                  {order.quantity} shares
-                </Text>
-                <Text style={[styles.orderPrice, { color: theme.textSecondary }]}>
-                  @ ${order.price}
-                </Text>
-              </View>
-
-              <View style={styles.orderRight}>
-                <Text
-                  style={[
-                    styles.orderStatus,
-                    {
-                      color: order.status === 'filled' ? '#10b981' : '#f59e0b',
-                      backgroundColor: order.status === 'filled' ? 'rgba(16, 185, 129, 0.1)' : 'rgba(245, 158, 11, 0.1)',
-                    },
-                  ]}
-                >
-                  {order.status}
-                </Text>
-              </View>
-            </View>
-          ))}
+        {/* Footer disclaimer — repeated at the bottom so it is visible
+            regardless of how far a user has scrolled. */}
+        <View style={styles.footerNote}>
+          <Text style={[styles.footerText, { color: theme.textSecondary }]}>
+            Signals, prices, and news are provided for informational and
+            educational purposes only. Past performance does not guarantee
+            future results. Investing involves risk of loss.
+          </Text>
         </View>
 
         <View style={{ height: 100 }} />
@@ -397,243 +347,170 @@ const styles = StyleSheet.create({
     fontSize: 28,
     fontWeight: 'bold',
   },
-  searchButton: {
-    padding: 8,
+  disclaimer: {
+    marginHorizontal: 20,
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 8,
   },
-  searchIcon: {
-    fontSize: 20,
+  disclaimerLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 6,
+  },
+  disclaimerBody: {
+    fontSize: 12,
+    lineHeight: 18,
   },
   watchlist: {
-    paddingLeft: 20,
+    marginTop: 12,
   },
   watchlistContent: {
-    paddingRight: 20,
+    paddingHorizontal: 20,
+    gap: 10,
   },
   watchlistItem: {
-    padding: 16,
-    marginRight: 12,
+    padding: 12,
     borderRadius: 12,
-    minWidth: 80,
+    minWidth: 90,
     alignItems: 'center',
   },
   watchlistSymbol: {
     fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 4,
+    fontWeight: '700',
   },
   watchlistPrice: {
     fontSize: 12,
-    marginBottom: 2,
+    marginTop: 4,
   },
   watchlistChange: {
-    fontSize: 11,
-    fontWeight: '500',
+    fontSize: 12,
+    marginTop: 2,
+    fontWeight: '600',
   },
   stockCard: {
     margin: 20,
     padding: 20,
-    borderRadius: 20,
-    elevation: 5,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
+    borderRadius: 16,
   },
   stockHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    marginBottom: 20,
   },
   stockSymbol: {
-    color: '#fff',
     fontSize: 24,
-    fontWeight: 'bold',
+    fontWeight: '700',
+    color: '#fff',
   },
   stockCompany: {
-    color: 'rgba(255, 255, 255, 0.8)',
-    fontSize: 14,
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.8)',
+    marginTop: 2,
   },
   stockPriceContainer: {
     alignItems: 'flex-end',
   },
   stockPrice: {
+    fontSize: 24,
+    fontWeight: '700',
     color: '#fff',
-    fontSize: 28,
-    fontWeight: 'bold',
   },
   stockChange: {
-    color: '#10b981',
-    fontSize: 14,
-    fontWeight: '500',
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.9)',
+    marginTop: 2,
   },
   stockStats: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    marginTop: 16,
   },
   stockStat: {
     alignItems: 'center',
   },
   stockStatLabel: {
-    color: 'rgba(255, 255, 255, 0.8)',
-    fontSize: 12,
-    marginBottom: 4,
+    fontSize: 11,
+    color: 'rgba(255,255,255,0.7)',
   },
   stockStatValue: {
+    fontSize: 13,
     color: '#fff',
-    fontSize: 16,
     fontWeight: '600',
+    marginTop: 2,
   },
   chartCard: {
-    margin: 20,
-    marginTop: 0,
-    padding: 20,
-    borderRadius: 20,
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.22,
-    shadowRadius: 2.22,
-  },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 15,
-  },
-  chart: {
-    marginLeft: -10,
+    marginHorizontal: 20,
+    padding: 16,
     borderRadius: 16,
-  },
-  orderCard: {
-    margin: 20,
-    marginTop: 0,
-    padding: 20,
-    borderRadius: 20,
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.22,
-    shadowRadius: 2.22,
-  },
-  orderTypeContainer: {
-    flexDirection: 'row',
-    marginBottom: 20,
-    gap: 8,
-  },
-  orderTypeButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  orderTypeText: {
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  inputContainer: {
     marginBottom: 16,
   },
-  inputLabel: {
-    fontSize: 14,
-    fontWeight: '500',
-    marginBottom: 8,
-  },
-  input: {
-    height: 48,
-    borderRadius: 8,
-    paddingHorizontal: 12,
+  sectionTitle: {
     fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 12,
   },
-  orderSummary: {
+  chart: {
+    borderRadius: 12,
+  },
+  brokerCard: {
+    marginHorizontal: 20,
     padding: 16,
+    borderRadius: 16,
+    marginBottom: 16,
+  },
+  brokerSubtitle: {
+    fontSize: 12,
+    marginBottom: 12,
+    lineHeight: 18,
+  },
+  brokerList: {
+    gap: 10,
+  },
+  brokerItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    gap: 12,
+  },
+  brokerBadge: {
+    width: 36,
+    height: 36,
     borderRadius: 8,
-    marginBottom: 20,
-  },
-  summaryRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  summaryLabel: {
-    fontSize: 14,
-  },
-  summaryValue: {
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  placeOrderButton: {
-    marginBottom: 10,
-  },
-  placeOrderGradient: {
-    paddingVertical: 16,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  placeOrderText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  ordersCard: {
-    margin: 20,
-    marginTop: 0,
-    padding: 20,
-    borderRadius: 20,
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.22,
-    shadowRadius: 2.22,
-  },
-  ordersHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 15,
-  },
-  viewAll: {
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  orderItem: {
-    flexDirection: 'row',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-  },
-  orderLeft: {
-    flex: 1,
-  },
-  orderSymbol: {
-    fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 2,
-  },
-  orderType: {
-    fontSize: 12,
-  },
-  orderCenter: {
-    flex: 1,
-    alignItems: 'center',
-  },
-  orderQuantity: {
-    fontSize: 14,
-    fontWeight: '500',
-    marginBottom: 2,
-  },
-  orderPrice: {
-    fontSize: 12,
-  },
-  orderRight: {
-    flex: 1,
-    alignItems: 'flex-end',
     justifyContent: 'center',
+    alignItems: 'center',
   },
-  orderStatus: {
+  brokerBadgeText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 16,
+  },
+  brokerText: {
+    flex: 1,
+  },
+  brokerName: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  brokerAction: {
     fontSize: 12,
-    fontWeight: '500',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    overflow: 'hidden',
-    textAlign: 'center',
+    marginTop: 2,
+  },
+  brokerChevron: {
+    fontSize: 24,
+    marginRight: 6,
+  },
+  footerNote: {
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+  },
+  footerText: {
+    fontSize: 11,
+    lineHeight: 16,
   },
 });
