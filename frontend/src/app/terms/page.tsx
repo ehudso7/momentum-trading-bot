@@ -30,7 +30,7 @@ export default function TermsPage() {
               1. What {SITE_NAME} is
             </h2>
             <p>
-              {SITE_NAME} provides market analytics, momentum signals, paper-trading
+              {SITE_NAME}{" "}provides market analytics, momentum signals, paper-trading
               tooling, and portfolio monitoring for US equities. The service is
               provided by the operator of this site (&quot;we&quot;, &quot;us&quot;). By creating an
               account or using the service you agree to these terms.
