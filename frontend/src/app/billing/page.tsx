@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import { PricingCards } from "@/components/billing/pricing-cards";
+import { CheckoutConfirmation } from "@/components/billing/checkout-confirmation";
+import { ManageSubscriptionButton } from "@/components/billing/manage-subscription-button";
 
 export default async function BillingPage({
   searchParams,
@@ -32,9 +34,12 @@ export default async function BillingPage({
         </div>
 
         {isSuccess && (
-          <div className="mb-6 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-center text-sm text-emerald-400">
-            🎉 Payment successful! Your plan has been upgraded. Thank you for supporting MomentumForge AI.
-          </div>
+          <>
+            <div className="mb-6 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-center text-sm text-emerald-400">
+              🎉 Payment successful! Thank you for supporting MomentumForge AI.
+            </div>
+            <CheckoutConfirmation />
+          </>
         )}
         {isCancel && (
           <div className="mb-6 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-center text-sm text-amber-400">
@@ -43,6 +48,10 @@ export default async function BillingPage({
         )}
 
         <PricingCards />
+
+        <div className="mt-10">
+          <ManageSubscriptionButton />
+        </div>
       </div>
     </div>
   );

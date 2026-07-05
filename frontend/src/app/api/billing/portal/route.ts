@@ -6,6 +6,14 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
+/**
+ * POST /api/billing/portal
+ *
+ * Creates a Stripe customer portal session for the authenticated user.
+ * The Stripe customer is resolved exclusively from the user's
+ * app_metadata (written by the Stripe webhook) — customer IDs are never
+ * accepted from the request, so users can only ever open their own portal.
+ */
 export async function POST(request: Request) {
   if (!stripe) {
     return NextResponse.json({ error: "Stripe not configured" }, { status: 503 });
@@ -20,17 +28,28 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { customerId } = await request.json();
-  if (!customerId) {
-    return NextResponse.json({ error: "customerId required" }, { status: 400 });
+  const customerId = user.app_metadata?.stripe_customer_id;
+  if (typeof customerId !== "string" || customerId.length === 0) {
+    return NextResponse.json(
+      {
+        error:
+          "No billing profile found for this account. Complete a checkout first — the subscription portal becomes available after your first payment.",
+      },
+      { status: 404 }
+    );
   }
 
   const origin = request.headers.get("origin") ?? "http://localhost:3000";
 
-  const session = await stripe.billingPortal.sessions.create({
-    customer: customerId,
-    return_url: `${origin}/billing`,
-  });
-
-  return NextResponse.json({ url: session.url });
+  try {
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${origin}/billing`,
+    });
+    return NextResponse.json({ url: session.url });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Failed to create portal session";
+    return NextResponse.json({ error: message }, { status: 502 });
+  }
 }

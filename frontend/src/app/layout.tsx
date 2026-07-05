@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ServiceWorkerRegister } from "@/components/pwa/service-worker-register";
+import { SiteFooter } from "@/components/site-footer";
 import {
   SITE_DESCRIPTION,
   SITE_NAME,
@@ -90,7 +91,8 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        {children}
+        <div className="flex-1">{children}</div>
+        <SiteFooter />
         <ServiceWorkerRegister />
       </body>
     </html>

@@ -1,4 +1,8 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
+import {
+  createClient as createSupabaseBrowserClient,
+  isSupabaseConfigured,
+} from "@/lib/supabase/client";
 import type {
   BotStatus,
   EquityPoint,
@@ -146,11 +150,53 @@ export async function fetchEquityHistory(): Promise<EquityPoint[]> {
   }
 }
 
-export async function createCheckoutSession(): Promise<{
+export type CheckoutPlan = "pro" | "elite";
+
+export interface CheckoutSession {
   checkout_url: string;
   checkout_session_id: string;
-}> {
-  const { data } = await backend.post("/billing/checkout");
+}
+
+export interface BillingStatus {
+  tier: "free" | "premium";
+  premium: boolean;
+  plan_source: string;
+}
+
+async function getSupabaseUserId(): Promise<string | undefined> {
+  if (typeof window === "undefined" || !isSupabaseConfigured()) {
+    return undefined;
+  }
+  try {
+    const supabase = createSupabaseBrowserClient();
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    return session?.user.id ?? undefined;
+  } catch {
+    // Logged out or Supabase unavailable — checkout still works keyed on
+    // the API key alone; the webhook just can't tag the Supabase user.
+    return undefined;
+  }
+}
+
+export async function createCheckoutSession(
+  plan: CheckoutPlan
+): Promise<CheckoutSession> {
+  const supabaseUserId = await getSupabaseUserId();
+  const body: { plan: CheckoutPlan; supabase_user_id?: string } = { plan };
+  if (supabaseUserId) {
+    body.supabase_user_id = supabaseUserId;
+  }
+  const { data } = await backend.post<CheckoutSession>(
+    "/billing/checkout",
+    body
+  );
+  return data;
+}
+
+export async function fetchBillingStatus(): Promise<BillingStatus> {
+  const { data } = await backend.get<BillingStatus>("/billing/status");
   return data;
 }
 

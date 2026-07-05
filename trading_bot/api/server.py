@@ -41,6 +41,7 @@ Run with:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -56,16 +57,22 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from trading_bot.api import key_store
 from trading_bot.api.billing import (
     BillingAPIError,
     BillingConfigError,
+    DEFAULT_CHECKOUT_PLAN,
     STRIPE_WEBHOOK_SECRET_ENV_VAR,
+    VALID_CHECKOUT_PLANS,
+    add_premium_hash,
     create_checkout_session_for_hash,
     handle_webhook_event,
+    is_premium_hash,
     is_premium_via_stripe,
     is_stripe_configured,
+    remove_premium_hash,
     verify_webhook_signature,
 )
 from trading_bot.api.insights import build_insights, truncate_for_free
@@ -2854,9 +2861,77 @@ def _build_checkout_redirect_urls() -> tuple[str, str]:
     return (base + success_path, base + cancel_path)
 
 
+class CheckoutRequest(BaseModel):
+    """
+    Phase 11 — OPTIONAL JSON body for ``POST /billing/checkout``.
+
+    * ``plan`` — ``"pro"`` | ``"elite"``. Selects the Stripe price
+      id (``STRIPE_PRO_PRICE_ID`` / ``STRIPE_ELITE_PRICE_ID``, each
+      falling back to ``STRIPE_PREMIUM_PRICE_ID``). Omitted → the
+      legacy premium price with the default plan name (``"pro"``)
+      in the session metadata.
+    * ``supabase_user_id`` — opaque frontend identity forwarded to
+      Stripe metadata so the frontend's Supabase-side webhook can
+      also fulfil the purchase. Optional; sanitised before use.
+
+    A request with NO body at all keeps the exact pre-Phase-11
+    behaviour.
+    """
+
+    plan: Optional[str] = None
+    supabase_user_id: Optional[str] = None
+
+
+def _validated_checkout_plan(raw_plan: Optional[str]) -> Optional[str]:
+    """
+    Normalise + validate the requested plan. ``None`` passes through
+    (legacy single-plan behaviour); anything else must be a member
+    of ``VALID_CHECKOUT_PLANS`` or the request is rejected with 422.
+    """
+    if raw_plan is None:
+        return None
+    plan = str(raw_plan).strip().lower()
+    if plan not in VALID_CHECKOUT_PLANS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"invalid plan {raw_plan!r}: must be one of "
+                f"{sorted(VALID_CHECKOUT_PLANS)}"
+            ),
+        )
+    return plan
+
+
+def _validated_supabase_user_id(raw: Optional[str]) -> Optional[str]:
+    """
+    Sanitise the optional ``supabase_user_id``. Empty / whitespace
+    values become ``None``; anything longer than 128 chars or
+    outside the safe charset (alnum, dash, underscore, ``@``, ``.``)
+    is rejected with 422 — the value lands in Stripe metadata and
+    must never be a free-form injection vector.
+    """
+    if raw is None:
+        return None
+    sid = str(raw).strip()
+    if not sid:
+        return None
+    if len(sid) > PROVISION_USER_REF_MAX_LENGTH or not (
+        _PROVISION_USER_REF_RE.match(sid)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "invalid supabase_user_id: must be 1-128 chars from "
+                "[A-Za-z0-9@._-]"
+            ),
+        )
+    return sid
+
+
 @app.post("/billing/checkout", tags=["billing"])
 def billing_checkout(
     request: Request,
+    body: Optional[CheckoutRequest] = None,
     api_key: str = Depends(require_api_key),
 ) -> dict[str, Any]:
     """
@@ -2869,14 +2944,30 @@ def billing_checkout(
       2. If the caller is already premium, return 409 — there's
          nothing to upgrade. The customer should manage the existing
          subscription via the Stripe customer portal (separate flow).
-      3. Build Stripe Checkout success/cancel URLs from
+      3. Fail-closed fulfilment guard: the caller's key hash MUST be
+         present (and not revoked) in the issuance manifest — the
+         same check the Stripe webhook applies before granting
+         premium. A caller authenticated via the ``TRADING_API_KEY``
+         env var (or any other non-manifest source) is rejected with
+         409 BEFORE any money can change hands, because the webhook
+         would silently ignore their payment.
+      4. Phase 11 — resolve the optional ``plan`` body field to a
+         Stripe price id (see ``CheckoutRequest``); invalid plans →
+         422. No body / no plan keeps the legacy premium price.
+      5. Build Stripe Checkout success/cancel URLs from
          ``TRADING_PUBLIC_BASE_URL`` + the optional path env vars.
-      4. Call ``billing.create_checkout_session_for_hash`` with the
-         hash. The raw key is never forwarded to Stripe.
-      5. Return ``checkout_session_id``, ``checkout_url``,
-         ``key_hash``, ``tier_to``. The session URL is short-lived
-         and is NOT persisted to any operator log.
+      6. Call ``billing.create_checkout_session_for_hash`` with the
+         hash (plus plan / supabase_user_id metadata). The raw key
+         is never forwarded to Stripe.
+      7. Return ``checkout_session_id``, ``checkout_url``,
+         ``key_hash``, ``tier_to``, ``plan``. The session URL is
+         short-lived and is NOT persisted to any operator log.
     """
+    plan = _validated_checkout_plan(body.plan if body is not None else None)
+    supabase_user_id = _validated_supabase_user_id(
+        body.supabase_user_id if body is not None else None,
+    )
+
     # Phase 6.2 always sets api_key_hash on request.state when auth
     # succeeded; the explicit hash() call is defensive in case a
     # future refactor unsets it.
@@ -2900,12 +2991,37 @@ def billing_checkout(
             ),
         )
 
+    # Fail-closed fulfilment guard (fixes the P1 "pay but receive
+    # nothing" path): the webhook only grants premium to hashes it
+    # can verify against the manifest, so refuse to create a session
+    # for any key the webhook would ignore.
+    if (
+        key_store.lookup_key_hash(key_hash) is None
+        or key_store.is_revoked(key_hash)
+    ):
+        log.warning(
+            "billing.checkout_rejected_non_manifest_key",
+            key_hash=key_hash,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "this API key was not issued through the key manifest, "
+                "so a completed payment could not be fulfilled "
+                "automatically. Provision a personal API key first "
+                "(profile page → API key, backed by POST "
+                "/keys/provision) and retry checkout with that key."
+            ),
+        )
+
     try:
         success_url, cancel_url = _build_checkout_redirect_urls()
         result = create_checkout_session_for_hash(
             key_hash=key_hash,
             success_url=success_url,
             cancel_url=cancel_url,
+            plan=plan,
+            supabase_user_id=supabase_user_id,
         )
     except HTTPException:
         raise
@@ -2950,6 +3066,314 @@ def billing_checkout(
         "checkout_url": result["checkout_url"],
         "key_hash": result["key_hash"],
         "tier_to": result["tier_to"],
+        "plan": result.get("plan", plan or DEFAULT_CHECKOUT_PLAN),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — GET /billing/status (authenticated tier probe)
+#
+# Cheap read-only endpoint the frontend polls after Stripe redirects
+# back to the success page: "has my payment actually been fulfilled?"
+# Everything it returns was already computed by ``require_api_key``.
+# ---------------------------------------------------------------------------
+
+PLAN_SOURCE_MANIFEST = "manifest"
+PLAN_SOURCE_ENV_KEY = "env_key"
+PLAN_SOURCE_PREMIUM_ALLOWLIST = "premium_allowlist"
+
+
+@app.get("/billing/status", tags=["billing"])
+def billing_status(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Return the authenticated caller's current billing tier.
+
+    Response::
+
+        {
+          "tier":        "free" | "premium",
+          "premium":     bool,
+          "plan_source": "manifest" | "env_key" | "premium_allowlist"
+        }
+
+    * ``tier`` is the value ``require_api_key`` already resolved and
+      stashed on ``request.state.api_key_tier`` — no re-hashing, no
+      extra manifest reads on the happy path.
+    * ``plan_source`` names WHERE the key comes from (mirrors the
+      Phase 6.2 auth precedence): the operator premium allowlist
+      (``TRADING_API_PREMIUM_KEYS``), the issuance manifest, or the
+      legacy single-tenant ``TRADING_API_KEY`` env var.
+    """
+    tier = getattr(
+        getattr(request, "state", None), "api_key_tier", None,
+    )
+    if tier not in (TIER_FREE, TIER_PREMIUM):
+        # Defensive — require_api_key always sets the tier; fall back
+        # to the classifier rather than guessing.
+        tier = (
+            TIER_PREMIUM
+            if _is_premium(api_key, request=request)
+            else TIER_FREE
+        )
+
+    if api_key in _premium_keys_set():
+        plan_source = PLAN_SOURCE_PREMIUM_ALLOWLIST
+    elif key_store.verify_api_key(api_key) is not None:
+        plan_source = PLAN_SOURCE_MANIFEST
+    else:
+        plan_source = PLAN_SOURCE_ENV_KEY
+
+    return {
+        "tier": tier,
+        "premium": tier == TIER_PREMIUM,
+        "plan_source": plan_source,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — POST /keys/provision (frontend-driven key issuance)
+#
+# Self-serve free-tier key issuance for the trusted frontend backend
+# (e.g. a Next.js route handler acting on behalf of a signed-in
+# Supabase user). NOT a public sign-up endpoint:
+#
+#   * the caller must present ``X-Provision-Secret`` matching the
+#     ``TRADING_PROVISION_SECRET`` env var — a server-to-server
+#     shared secret, never shipped to browsers;
+#   * when the env var is unset the endpoint fails closed with 503
+#     (same posture as the Stripe webhook);
+#   * the endpoint deliberately does NOT require an API key — its
+#     whole job is to mint the caller's first key.
+#
+# Idempotency / rotation: the manifest stores only label HASHES, so
+# a repeat call for the same ``user_ref`` cannot "find and return"
+# the previous key. Instead the endpoint ROTATES: any live manifest
+# key carrying the canonical label ``user:<user_ref>`` is revoked
+# before the new key is issued, so one user never accumulates live
+# keys. If a rotated-out key was premium (Stripe premium cache),
+# premium is carried over to the new key — rotation must never
+# destroy a paid entitlement.
+#
+# Rate limiting: the Phase 4.2 per-IP fixed-window middleware applies
+# to this path like every other route, bounding brute-force attempts
+# against the provision secret.
+# ---------------------------------------------------------------------------
+
+PROVISION_SECRET_ENV_VAR = "TRADING_PROVISION_SECRET"
+PROVISION_SECRET_HEADER = "X-Provision-Secret"
+PROVISION_LABEL_PREFIX = "user:"
+PROVISION_USER_REF_MAX_LENGTH = 128
+PROVISION_LABEL_MAX_LENGTH = 128
+# Safe charset for user_ref (and supabase_user_id): alnum, dash,
+# underscore, ``@`` and ``.`` — covers UUIDs, emails, and every other
+# opaque id shape the frontend can reasonably send.
+_PROVISION_USER_REF_RE = re.compile(r"^[A-Za-z0-9@._-]+$")
+
+# Serialises the scan → issue → revoke sequence so two concurrent
+# provision calls for the same user_ref cannot both see "no previous
+# key" and leave two live keys behind.
+_provision_lock = threading.Lock()
+
+
+class ProvisionRequest(BaseModel):
+    """
+    Body for ``POST /keys/provision``.
+
+    * ``user_ref`` — REQUIRED opaque stable id (e.g. the Supabase
+      user id). 1-128 chars from ``[A-Za-z0-9@._-]``.
+    * ``label`` — optional human-facing note. Accepted for API-shape
+      stability but intentionally NOT folded into the manifest
+      label: the manifest stores only ``SHA-256(label)[:32]``, and
+      rotation matches on that exact hash — a caller-varying label
+      would silently break the "one live key per user" guarantee.
+      The canonical manifest label is always ``user:<user_ref>``.
+      (Raw labels are never persisted anywhere by Phase 6.0 design.)
+    """
+
+    user_ref: str
+    label: Optional[str] = None
+
+
+def _require_provision_secret(request: Request) -> None:
+    """
+    Dependency guard for ``POST /keys/provision``.
+
+    * ``TRADING_PROVISION_SECRET`` unset/blank → 503 fail-closed,
+      naming the missing env var (documented deployment style).
+    * Header missing or mismatched → 403. The two cases share one
+      detail string so the response cannot be used as an oracle for
+      "is the header at least present?".
+
+    Runs as a dependency (not handler code) so it rejects BEFORE the
+    request body is parsed/validated.
+    """
+    secret = (os.getenv(PROVISION_SECRET_ENV_VAR, "") or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "key provisioning not configured: "
+                f"{PROVISION_SECRET_ENV_VAR} is unset"
+            ),
+        )
+    presented = request.headers.get(PROVISION_SECRET_HEADER, "") or ""
+    if not presented or not hmac.compare_digest(
+        presented.encode("utf-8"), secret.encode("utf-8"),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="invalid provision secret",
+        )
+
+
+def _validated_user_ref(raw: str) -> str:
+    """Strip + validate ``user_ref``; reject with 422 on any failure."""
+    user_ref = (raw or "").strip()
+    if (
+        not user_ref
+        or len(user_ref) > PROVISION_USER_REF_MAX_LENGTH
+        or not _PROVISION_USER_REF_RE.match(user_ref)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "invalid user_ref: must be 1-128 chars from "
+                "[A-Za-z0-9@._-]"
+            ),
+        )
+    return user_ref
+
+
+@app.post("/keys/provision", tags=["keys"])
+def provision_key(
+    body: ProvisionRequest,
+    _guard: None = Depends(_require_provision_secret),
+) -> dict[str, Any]:
+    """
+    Issue (or rotate) the free-tier API key for one frontend user.
+
+    Request body::
+
+        {"user_ref": "<opaque stable id>", "label": "<optional>"}
+
+    Response 200::
+
+        {"api_key": "<raw key — returned ONCE, never persisted>",
+         "tier": "free" | "premium",
+         "rotated": bool}
+
+    Behaviour:
+      1. Scan the manifest for live (non-revoked) keys whose
+         ``label_hash`` matches the canonical label
+         ``user:<user_ref>``.
+      2. Issue a NEW free-tier key with that canonical label via the
+         Phase 6.0 issuance machinery (manifest row appended, raw
+         key never persisted).
+      3. If any rotated-out key was premium in the Stripe premium
+         cache, carry premium over to the new key's hash (and drop
+         the stale hash from the cache).
+      4. Revoke every previously-live key for this user — rotation
+         semantics, so a repeat call never leaves two live keys.
+
+    The raw key appears ONLY in this response body. Response bodies
+    are never logged or audited (the Phase 4.4/4.6 middlewares log
+    method/path/status only).
+    """
+    user_ref = _validated_user_ref(body.user_ref)
+    if body.label is not None and len(body.label) > PROVISION_LABEL_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"invalid label: must be at most "
+                f"{PROVISION_LABEL_MAX_LENGTH} chars"
+            ),
+        )
+
+    # Lazy import — keeps the operator CLI's module out of the hot
+    # request path for every other endpoint (same style as the
+    # upgrade-events / conversion imports).
+    from trading_bot.api.keys import (
+        _hash_label,
+        _read_manifest_records,
+        issue_key,
+    )
+
+    canonical_label = f"{PROVISION_LABEL_PREFIX}{user_ref}"
+    label_hash = _hash_label(canonical_label)
+
+    with _provision_lock:
+        # 1. Find every live key previously provisioned for this user.
+        previous_hashes: list[str] = []
+        for rec in _read_manifest_records(key_store.manifest_path()):
+            if rec.get("label_hash") != label_hash:
+                continue
+            kh = rec.get("key_hash")
+            if not isinstance(kh, str) or not kh:
+                continue
+            if key_store.is_revoked(kh):
+                continue
+            if kh not in previous_hashes:
+                previous_hashes.append(kh)
+
+        carry_premium = any(is_premium_hash(kh) for kh in previous_hashes)
+
+        # 2. Issue the replacement BEFORE revoking — if issuance
+        # fails the user's existing key must keep working.
+        try:
+            result = issue_key(tier=TIER_FREE, label=canonical_label)
+        except Exception as exc:
+            log.error(
+                "keys.provision_issue_failed",
+                label_hash=label_hash,
+                error_type=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="key provisioning failed: could not write manifest",
+            )
+        new_hash = result["key_hash"]
+
+        # 3. Premium carry-over: entitlement follows the user, not
+        # the rotated-out credential.
+        if carry_premium:
+            add_premium_hash(new_hash)
+
+        # 4. Rotate out every previous live key. Revocation failures
+        # are logged loudly but do NOT fail the request — the new key
+        # is already live and returning 5xx here would strand it.
+        rotated = False
+        for kh in previous_hashes:
+            try:
+                key_store.append_revocation(
+                    key_hash=kh,
+                    reason="rotated via /keys/provision",
+                )
+                rotated = True
+                if carry_premium:
+                    remove_premium_hash(kh)
+            except Exception as exc:
+                log.error(
+                    "keys.provision_revoke_failed",
+                    key_hash=kh,
+                    error_type=type(exc).__name__,
+                )
+
+    tier = TIER_PREMIUM if carry_premium else TIER_FREE
+    log.info(
+        "keys.provisioned",
+        key_hash=new_hash,
+        label_hash=label_hash,
+        tier=tier,
+        rotated=rotated,
+        rotated_out=len(previous_hashes),
+    )
+    return {
+        "api_key": result["api_key"],
+        "tier": tier,
+        "rotated": rotated,
     }
 
 

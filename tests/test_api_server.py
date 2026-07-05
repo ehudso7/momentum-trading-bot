@@ -730,6 +730,7 @@ class TestBoundaryEnforcement:
                 assert (method, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"non-read-only route detected: {method} {path}"
                 assert method == "POST", (
                     f"/webhook/stripe may only accept POST, got {method}"
@@ -1533,6 +1534,7 @@ class TestPhase42BoundaryUnchanged:
                 assert (m, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"non-read-only method introduced: {m} {path}"
 
     def test_forbidden_imports_still_enforced(self):
@@ -1802,6 +1804,7 @@ class TestLandingPageBoundaryUnchanged:
                 assert (m, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"non-read-only method introduced: {m} {path}"
 
     def test_landing_route_accepts_only_get_head_options(self):
@@ -2330,6 +2333,7 @@ class TestPhase44BoundaryUnchanged:
                 assert (m, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"non-read-only method introduced: {m} {path}"
 
     def test_audit_never_writes_report_or_experiment_contents(
@@ -2920,6 +2924,7 @@ class TestPhase45BoundaryUnchanged:
                 assert (m, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"non-read-only method introduced: {m} {path}"
 
     def test_forbidden_imports_still_clean(self):
@@ -3289,6 +3294,7 @@ class TestPhase46BoundaryUnchanged:
                 assert (m, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"non-read-only method: {m} {path}"
 
     def test_forbidden_imports_still_clean_after_phase_4_6(self):
@@ -3771,7 +3777,7 @@ class TestWebhookNeverPersistsSensitiveData:
 class TestPhase47Boundary:
     def test_only_non_read_verb_is_post_webhook_stripe(self):
         # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -4082,6 +4088,7 @@ class TestPhase52DoesNotAddNewMutatingRoute:
                 assert (m, path) in {
                     ("POST", "/webhook/stripe"),
                     ("POST", "/billing/checkout"),
+                    ("POST", "/keys/provision"),
                 }, f"Phase 5.2 introduced a non-read verb: {m} {path}"
 
     def test_root_accepts_only_get_head_options(self):
@@ -4672,7 +4679,7 @@ class TestPhase54BoundaryUnchanged:
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
         # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -5069,7 +5076,7 @@ class TestPhase55Boundary:
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
         # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -5480,7 +5487,7 @@ class TestPhase57BoundaryUnchanged:
 
     def test_only_non_read_verb_is_still_post_webhook_stripe(self):
         # Phase 7.3 added POST /billing/checkout — allow both, reject anything else.
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -7553,7 +7560,7 @@ class TestPhase81DoesNotIntroduceMutatingRoute:
         """Phase 8.1 is middleware — it must not register any new
         HTTP route. The single-mutating-route invariant remains
         POST /webhook/stripe + POST /billing/checkout."""
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -7996,7 +8003,7 @@ class TestPhase82DoesNotIntroduceMutatingRoute:
     def test_no_new_mutating_route(self):
         """Phase 8.2 only adds a GET route — the single-mutating-route
         invariant remains POST /webhook/stripe + POST /billing/checkout."""
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -8504,7 +8511,7 @@ class TestPhase83CrossCutting:
 
     def test_payload_does_not_introduce_mutating_route(self):
         """Phase 8.3 is helper code — no new HTTP route."""
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -9164,7 +9171,7 @@ class TestPhase91DashboardInsights:
 class TestPhase91CrossCutting:
     def test_no_new_mutating_route(self):
         """Phase 9.1 is helper code — no new HTTP routes."""
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -9415,7 +9422,7 @@ class TestPhase92NoLeak:
 
 class TestPhase92CrossCutting:
     def test_no_new_mutating_route(self):
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -9750,7 +9757,7 @@ class TestPhase93NoLeak:
 
 class TestPhase93CrossCutting:
     def test_no_new_mutating_route(self):
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -9984,7 +9991,7 @@ class TestPhase101NoLeak:
 
 class TestPhase101CrossCutting:
     def test_no_new_mutating_route(self):
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""
@@ -10312,7 +10319,7 @@ class TestPhase102NoLeak:
 
 class TestPhase102CrossCutting:
     def test_no_new_mutating_route(self):
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
             path = getattr(route, "path", "") or ""

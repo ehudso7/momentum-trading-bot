@@ -20,6 +20,7 @@ import {
   fetchTrades,
 } from "@/lib/api";
 import { TrendingUp } from "lucide-react";
+import { useAutoProvisionApiKey } from "@/lib/use-api-key";
 import { exportDashboardPDF } from "@/lib/pdf-export";
 import type {
   BotStatus,
@@ -35,6 +36,9 @@ interface DashboardClientProps {
 }
 
 export function DashboardClient({ userEmail }: DashboardClientProps) {
+  // Signed-in users with no stored API key get one provisioned automatically
+  useAutoProvisionApiKey(Boolean(userEmail));
+
   const [backendOnline, setBackendOnline] = useState(false);
   const [mode, setMode] = useState<TradingMode>("paper");
   const [status, setStatus] = useState<BotStatus | null>(null);
@@ -85,9 +89,20 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
   const currentEquity = status?.equity ?? (equity.length > 0 ? equity[equity.length - 1].equity : 100000);
 
   useEffect(() => {
-    loadData().finally(() => setLoading(false));
-    const interval = setInterval(loadData, 60000);
-    return () => clearInterval(interval);
+    let cancelled = false;
+    const initialLoad = async () => {
+      try {
+        await loadData();
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void initialLoad();
+    const interval = setInterval(() => void loadData(), 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [loadData]);
 
   const handleRefresh = async () => {
@@ -209,7 +224,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
                   <div className="rounded-lg bg-white/[0.02] p-3">
                     <div className="text-xs text-zinc-400 mb-1">Top Momentum Setups (from SaaS AI)</div>
                     <div className="flex flex-wrap gap-1.5">
-                      {report.signals.slice(0, 4).map((s: any, i: number) => (
+                      {report.signals.slice(0, 4).map((s, i) => (
                         <span key={i} className="rounded bg-white/5 px-2 py-0.5 text-xs font-medium text-white/90">
                           {s.symbol} <span className="text-amber-400">{((s.confidence || 0) * 100).toFixed(0)}%</span>
                         </span>

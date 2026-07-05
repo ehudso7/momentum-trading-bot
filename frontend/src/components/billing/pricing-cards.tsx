@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Check, Crown, Sparkles, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { createCheckoutSession } from "@/lib/api";
+import { ApiError, createCheckoutSession } from "@/lib/api";
 import type { SubscriptionTier } from "@/types";
 
 const TIERS: SubscriptionTier[] = [
@@ -50,19 +50,24 @@ export function PricingCards() {
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const handleUpgrade = async (tierId: string) => {
+  const handleUpgrade = async (tierId: SubscriptionTier["id"]) => {
     if (tierId === "free") return;
     setLoading(tierId);
     setError(null);
     try {
-      const { checkout_url } = await createCheckoutSession();
-      window.location.href = checkout_url;
+      const { checkout_url } = await createCheckoutSession(tierId);
+      window.location.assign(checkout_url);
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Checkout failed. Ensure your API key is configured."
-      );
+      if (err instanceof ApiError && err.status === 409) {
+        // Backend can't fulfill checkout for this key (e.g. already premium)
+        setError(err.detail ?? err.message);
+      } else {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Checkout failed. Ensure your API key is configured."
+        );
+      }
     } finally {
       setLoading(null);
     }

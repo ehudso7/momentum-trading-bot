@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { getApiKey, setApiKey, fetchHealth } from "@/lib/api";
+import { ApiError, getApiKey, setApiKey, fetchHealth } from "@/lib/api";
+import { provisionApiKey } from "@/lib/use-api-key";
 
 export function ApiKeyForm() {
   const [key, setKey] = useState("");
@@ -12,9 +13,21 @@ export function ApiKeyForm() {
   const [testMessage, setTestMessage] = useState("");
   const [showHowTo, setShowHowTo] = useState(false);
   const [generatedKey, setGeneratedKey] = useState("");
+  const [provisioning, setProvisioning] = useState(false);
+  const [provisionMessage, setProvisionMessage] = useState<
+    { kind: "success" | "error"; text: string } | null
+  >(null);
 
   useEffect(() => {
-    setKey(getApiKey() ?? "");
+    // Seed the input from localStorage after mount (external store sync);
+    // deferred to a microtask so hydration output stays deterministic.
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) setKey(getApiKey() ?? "");
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleSave = () => {
@@ -38,16 +51,46 @@ export function ApiKeyForm() {
       await fetchHealth();
       setTestStatus("success");
       setTestMessage("✅ Connection successful! Your Railway backend accepted the key.");
-    } catch (err: any) {
+    } catch (err: unknown) {
       setTestStatus("error");
-      const status = err?.status ?? 0;
+      const status = err instanceof ApiError ? err.status : 0;
+      const detail = err instanceof ApiError ? err.detail : undefined;
       if (status === 401 || status === 403) {
         setTestMessage("❌ Invalid or rejected key (401/403). Double-check you pasted the full key and that TRADING_API_KEY (or the manifest) is set correctly on Railway.");
       } else if (status === 503) {
         setTestMessage("❌ Backend says no API key is configured on the server yet (503). Set TRADING_API_KEY on Railway or run the issuance command.");
       } else {
-        setTestMessage(`❌ Connection failed (${status || "network"}). ${err?.detail || "Check your Railway backend is running and reachable."}`);
+        setTestMessage(`❌ Connection failed (${status || "network"}). ${detail || "Check your Railway backend is running and reachable."}`);
       }
+    }
+  };
+
+  // Server-side provisioning — issues (or rotates) the account's key via
+  // the backend and stores it locally in one click.
+  const handleGenerateKey = async () => {
+    setProvisioning(true);
+    setProvisionMessage(null);
+    try {
+      const result = await provisionApiKey();
+      setKey(result.api_key);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2200);
+      setProvisionMessage({
+        kind: "success",
+        text: result.rotated
+          ? "New key generated and saved — your previous key has been replaced and will no longer work."
+          : "Key generated and saved to this browser.",
+      });
+    } catch (err: unknown) {
+      setProvisionMessage({
+        kind: "error",
+        text:
+          err instanceof Error
+            ? err.message
+            : "Key generation failed. Sign in and try again.",
+      });
+    } finally {
+      setProvisioning(false);
     }
   };
 
@@ -100,6 +143,37 @@ export function ApiKeyForm() {
           <Button onClick={handleSave} className="min-w-[92px]">
             {saved ? "Saved ✓" : "Save"}
           </Button>
+        </div>
+
+        <div className="mt-3 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm text-zinc-300">
+              Signed in? Generate your key automatically — no Railway steps
+              needed.
+            </div>
+            <Button
+              size="sm"
+              onClick={handleGenerateKey}
+              disabled={provisioning}
+            >
+              {provisioning ? "Generating..." : "Generate key"}
+            </Button>
+          </div>
+          <p className="mt-2 text-[11px] text-amber-400/90">
+            Warning: generating a new key replaces your old one — any other
+            browser or device using the previous key will need this new key.
+          </p>
+          {provisionMessage && (
+            <div
+              className={`mt-2 rounded-md border px-3 py-2 text-sm ${
+                provisionMessage.kind === "success"
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                  : "border-red-500/40 bg-red-500/10 text-red-400"
+              }`}
+            >
+              {provisionMessage.text}
+            </div>
+          )}
         </div>
 
         {testStatus !== "idle" && (
@@ -160,7 +234,7 @@ export function ApiKeyForm() {
                   </Button>
                   <div className="mt-2 text-[10px] text-zinc-500">
                     CLI one-liner (if you have Railway CLI):<br />
-                    <code className="text-amber-300">railway variables --set TRADING_API_KEY="{generatedKey}"</code>
+                    <code className="text-amber-300">railway variables --set TRADING_API_KEY=&quot;{generatedKey}&quot;</code>
                   </div>
                 </div>
               )}

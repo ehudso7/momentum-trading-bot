@@ -49,12 +49,13 @@ export async function POST(request: NextRequest) {
     case "checkout.session.completed": {
       const session = event.data.object as Stripe.Checkout.Session;
       const userId = session.metadata?.supabase_user_id;
+      const plan = session.metadata?.plan || "pro";
       if (supabase && userId && session.customer) {
         await supabase.auth.admin.updateUserById(userId, {
           app_metadata: {
             stripe_customer_id: session.customer,
             subscription_status: "active",
-            plan: "pro",
+            plan,
           },
         });
       }
@@ -70,11 +71,16 @@ export async function POST(request: NextRequest) {
           (u) => u.app_metadata?.stripe_customer_id === customerId
         );
         if (user) {
+          const existingPlan =
+            typeof user.app_metadata?.plan === "string" &&
+            user.app_metadata.plan !== "free"
+              ? user.app_metadata.plan
+              : "pro";
           await supabase.auth.admin.updateUserById(user.id, {
             app_metadata: {
               ...user.app_metadata,
               subscription_status: subscription.status,
-              plan: subscription.status === "active" ? "pro" : "free",
+              plan: subscription.status === "active" ? existingPlan : "free",
             },
           });
         }

@@ -1,7 +1,6 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { motion } from "framer-motion";
 import {
   Area,
   AreaChart,
@@ -11,10 +10,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { TrendingUp, Rocket, Target, Calendar } from "lucide-react";
+import { Rocket, Target, Calendar } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { formatCurrency, formatPercent } from "@/lib/utils";
+import { formatCurrency } from "@/lib/utils";
 import type { BotStatus } from "@/types";
 
 interface GrowthSimulatorProps {
@@ -292,7 +291,7 @@ export function GrowthSimulator({ status, currentEquity }: GrowthSimulatorProps)
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/10 bg-white/[0.015] p-3 text-xs">
           <div className="text-zinc-400">
             With compound mode enabled and disciplined execution, small edges become life-changing over time.
-            The real "AI" is the combination of the strategy + risk engine + your consistency.
+            The real &ldquo;AI&rdquo; is the combination of the strategy + risk engine + your consistency.
           </div>
           <Button size="sm" variant="outline" onClick={resetToDefaults} className="shrink-0">
             Reset to Peak Defaults

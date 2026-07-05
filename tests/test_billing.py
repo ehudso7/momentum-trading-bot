@@ -1091,7 +1091,7 @@ class TestPhase48NoNewApiRoute:
     def test_only_non_read_verb_is_still_webhook_stripe(self):
         """The only mutating routes are POST /webhook/stripe (Phase 4.7)
         and POST /billing/checkout (Phase 7.3). Anything else is a regression."""
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
         from trading_bot.api.server import app
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()
@@ -1368,6 +1368,10 @@ class TestCreateCheckoutSessionForHash:
             "checkout_url": "https://checkout.stripe.com/c/cs_test_phase73",
             "key_hash": "a" * 32,
             "tier_to": "premium",
+            # Phase 11 — the resolved plan name is part of the
+            # documented result (defaults to "pro" when no plan is
+            # requested).
+            "plan": "pro",
         }
 
     def test_metadata_contains_key_hash_not_raw_key(

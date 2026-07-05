@@ -444,19 +444,31 @@ class TestBoundary:
 
 class TestRailwayTomlLockdown:
     def test_railway_toml_has_production_start_command(self):
-        toml = (
-            Path(__file__).resolve().parent.parent / "railway.toml"
-        ).read_text()
+        repo_root = Path(__file__).resolve().parent.parent
+        toml = (repo_root / "railway.toml").read_text()
         # The production start command must invoke the API via the
         # trading-bot-api console script (which reads $PORT from
-        # Railway). Either the legacy uvicorn invocation or the
-        # current console-script invocation is acceptable so this
-        # test stays stable across deploy refactors.
+        # Railway). Acceptable shapes, so this test stays stable
+        # across deploy refactors:
+        #   * the legacy inline uvicorn invocation;
+        #   * the inline console-script invocation;
+        #   * a startCommand that delegates to
+        #     scripts/railway_start.sh — in which case the SCRIPT
+        #     must carry the same invariants (console script +
+        #     /app/data chmod).
         legacy = "uvicorn trading_bot.api.server:app --host 0.0.0.0 --port 8080"
         current = "trading-bot-api --host 0.0.0.0"
-        assert (legacy in toml) or (current in toml)
-        # Must include the /app/data chmod step.
-        assert "chmod -R 777 /app/data" in toml
+        if "railway_start.sh" in toml:
+            start_sh = (
+                repo_root / "scripts" / "railway_start.sh"
+            ).read_text()
+            assert current in start_sh
+            # Must include the /app/data chmod step.
+            assert "chmod -R 777 /app/data" in start_sh
+        else:
+            assert (legacy in toml) or (current in toml)
+            # Must include the /app/data chmod step.
+            assert "chmod -R 777 /app/data" in toml
         # Must use the dockerfile builder.
         assert 'builder = "DOCKERFILE"' in toml
         # Health probe pointed at /health.
@@ -491,6 +503,7 @@ class TestNoNewPublicEndpoints:
     _ALLOWED_MUTATING_ROUTES: frozenset[tuple[str, str]] = frozenset({
         ("POST", "/webhook/stripe"),
         ("POST", "/billing/checkout"),
+        ("POST", "/keys/provision"),
     })
 
     def test_only_mutating_routes_are_documented_ones(self):

@@ -7,6 +7,7 @@ import { Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { createClient, isSupabaseConfigured } from "@/lib/supabase/client";
+import { provisionApiKeyIfMissing } from "@/lib/use-api-key";
 
 interface AuthFormProps {
   mode: "login" | "signup";
@@ -48,6 +49,9 @@ export function AuthForm({ mode }: AuthFormProps) {
 
         // Supabase autoconfirm is enabled — session returned means instant access
         if (data.session) {
+          // Fire-and-forget: issue the user's backend API key without
+          // blocking navigation (dashboard retries if this misses).
+          provisionApiKeyIfMissing();
           router.push("/");
           router.refresh();
           return;
@@ -59,6 +63,7 @@ export function AuthForm({ mode }: AuthFormProps) {
           password,
         });
         if (!signInError) {
+          provisionApiKeyIfMissing();
           router.push("/");
           router.refresh();
           return;
@@ -76,6 +81,8 @@ export function AuthForm({ mode }: AuthFormProps) {
           // Surface a user-friendly message instead of raw fetch error
           throw new Error(error.message || "Sign in failed. Check your credentials and Supabase configuration.");
         }
+        // Fire-and-forget key provisioning — never blocks navigation
+        provisionApiKeyIfMissing();
         router.push("/");
         router.refresh();
       }

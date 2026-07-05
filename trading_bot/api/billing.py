@@ -56,6 +56,57 @@ def _resolve_premium_price_id() -> str:
     if preferred:
         return preferred
     return (os.getenv(STRIPE_PRICE_ID_PREMIUM_ENV_VAR, "") or "").strip()
+
+
+# Phase 11 — tier-aware checkout plans. Each named plan resolves to
+# its own Stripe price-id env var and FALLS BACK to the premium price
+# id (``STRIPE_PREMIUM_PRICE_ID`` / legacy ``STRIPE_PRICE_ID_PREMIUM``)
+# when the plan-specific var is unset, so single-price deployments
+# keep working without any new configuration.
+STRIPE_PRO_PRICE_ID_ENV_VAR = "STRIPE_PRO_PRICE_ID"
+STRIPE_ELITE_PRICE_ID_ENV_VAR = "STRIPE_ELITE_PRICE_ID"
+CHECKOUT_PLAN_PRO = "pro"
+CHECKOUT_PLAN_ELITE = "elite"
+VALID_CHECKOUT_PLANS: frozenset[str] = frozenset(
+    {CHECKOUT_PLAN_PRO, CHECKOUT_PLAN_ELITE},
+)
+DEFAULT_CHECKOUT_PLAN = CHECKOUT_PLAN_PRO
+
+_PLAN_PRICE_ENV_VARS: dict[str, str] = {
+    CHECKOUT_PLAN_PRO: STRIPE_PRO_PRICE_ID_ENV_VAR,
+    CHECKOUT_PLAN_ELITE: STRIPE_ELITE_PRICE_ID_ENV_VAR,
+}
+
+
+def resolve_price_id_for_plan(plan: Optional[str]) -> str:
+    """
+    Resolve the Stripe price id for a checkout ``plan``.
+
+    * ``None`` → the premium price id (legacy single-plan behaviour).
+    * ``"pro"`` → ``STRIPE_PRO_PRICE_ID``, falling back to the
+      premium price id when unset.
+    * ``"elite"`` → ``STRIPE_ELITE_PRICE_ID``, falling back to the
+      premium price id when unset.
+
+    Returns the empty string when nothing resolves (the caller is
+    responsible for the fail-closed error naming the missing env
+    vars). Raises ``ValueError`` for an unknown plan name — callers
+    validate first, so this only fires on a programming error.
+    """
+    if plan is None:
+        return _resolve_premium_price_id()
+    env_var = _PLAN_PRICE_ENV_VARS.get(plan)
+    if env_var is None:
+        raise ValueError(
+            f"invalid plan {plan!r}; must be one of "
+            f"{sorted(VALID_CHECKOUT_PLANS)}"
+        )
+    specific = (os.getenv(env_var, "") or "").strip()
+    if specific:
+        return specific
+    return _resolve_premium_price_id()
+
+
 STRIPE_PREMIUM_CACHE_ENV_VAR = "TRADING_STRIPE_PREMIUM_CACHE_PATH"
 DEFAULT_STRIPE_PREMIUM_CACHE_PATH = "data/stripe_premium_keys.json"
 
@@ -1157,8 +1208,29 @@ def create_checkout_session_for_hash(
     key_hash: str,
     success_url: str,
     cancel_url: str,
+    plan: Optional[str] = None,
+    supabase_user_id: Optional[str] = None,
     http_post: Optional[HttpPoster] = None,
 ) -> dict:
+    """
+    Create a Stripe Checkout Session identified by ``key_hash`` only.
+
+    Phase 11 additions (both optional, both backward-compatible):
+
+    * ``plan`` — ``"pro"`` | ``"elite"``. Resolves the price id via
+      ``resolve_price_id_for_plan`` (plan-specific env var, falling
+      back to the premium price id). ``None`` keeps the legacy
+      single-plan behaviour. The resolved plan name (default
+      ``"pro"``) is always attached as ``metadata[plan]`` so the
+      fulfilment side can differentiate tiers.
+    * ``supabase_user_id`` — opaque frontend identity forwarded as
+      ``metadata[supabase_user_id]`` so a Supabase-side webhook can
+      also fulfil the purchase. Never required; never validated
+      here beyond emptiness (the API layer sanitises it).
+
+    The existing ``key_hash`` / ``tier_from`` / ``tier_to`` metadata
+    is unchanged.
+    """
     if not key_hash or not isinstance(key_hash, str) or not key_hash.strip():
         raise ValueError("key_hash is required")
     if not success_url or not str(success_url).strip():
@@ -1175,19 +1247,34 @@ def create_checkout_session_for_hash(
                 f"{name} contains forbidden whitespace / control characters"
             )
 
+    plan_normalized: Optional[str] = None
+    if plan is not None:
+        plan_normalized = str(plan).strip().lower()
+        if plan_normalized not in VALID_CHECKOUT_PLANS:
+            raise ValueError(
+                f"invalid plan {plan!r}; must be one of "
+                f"{sorted(VALID_CHECKOUT_PLANS)}"
+            )
+
     stripe_secret = _resolve_stripe_secret()
-    price_id = _resolve_premium_price_id()
+    price_id = resolve_price_id_for_plan(plan_normalized)
 
     if not stripe_secret:
         raise BillingConfigError(
             f"{STRIPE_SECRET_KEY_ENV_VAR} is not configured"
         )
     if not price_id:
+        if plan_normalized is not None:
+            raise BillingConfigError(
+                f"{_PLAN_PRICE_ENV_VARS[plan_normalized]} (and fallback "
+                f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR}) is not configured"
+            )
         raise BillingConfigError(
             f"{STRIPE_PREMIUM_PRICE_ID_ENV_VAR} is not configured"
         )
 
     key_hash = key_hash.strip()
+    metadata_plan = plan_normalized or DEFAULT_CHECKOUT_PLAN
 
     data = {
         "mode": "subscription",
@@ -1199,10 +1286,18 @@ def create_checkout_session_for_hash(
         "metadata[key_hash]": key_hash,
         "metadata[tier_from]": "free",
         "metadata[tier_to]": "premium",
+        "metadata[plan]": metadata_plan,
         "subscription_data[metadata][key_hash]": key_hash,
         "subscription_data[metadata][tier_from]": "free",
         "subscription_data[metadata][tier_to]": "premium",
+        "subscription_data[metadata][plan]": metadata_plan,
     }
+
+    if supabase_user_id:
+        sid = str(supabase_user_id).strip()
+        if sid:
+            data["metadata[supabase_user_id]"] = sid
+            data["subscription_data[metadata][supabase_user_id]"] = sid
 
     poster = http_post if http_post is not None else _post_to_stripe
     payload = poster(
@@ -1226,6 +1321,7 @@ def create_checkout_session_for_hash(
         "checkout_url": checkout_url,
         "key_hash": key_hash,
         "tier_to": "premium",
+        "plan": metadata_plan,
     }
 
 

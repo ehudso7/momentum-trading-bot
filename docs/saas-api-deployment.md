@@ -118,7 +118,15 @@ Set the platform's `healthcheckPath` to `/health`.
 |---|---|
 | `STRIPE_SECRET_KEY` (preferred) or `STRIPE_API_KEY` (legacy fallback) | Outbound Stripe REST auth. |
 | `STRIPE_WEBHOOK_SECRET` | HMAC secret for `POST /webhook/stripe` signature verification. |
-| `STRIPE_PREMIUM_PRICE_ID` (preferred) or `STRIPE_PRICE_ID_PREMIUM` (legacy fallback) | Premium price id used by `create_checkout_session`. |
+| `STRIPE_PREMIUM_PRICE_ID` (preferred) or `STRIPE_PRICE_ID_PREMIUM` (legacy fallback) | Premium price id used by `create_checkout_session`. Also the fallback price for both named plans below. |
+| `STRIPE_PRO_PRICE_ID` | Price id for `POST /billing/checkout` with body `{"plan": "pro"}`. Falls back to `STRIPE_PREMIUM_PRICE_ID` when unset. |
+| `STRIPE_ELITE_PRICE_ID` | Price id for `POST /billing/checkout` with body `{"plan": "elite"}`. Falls back to `STRIPE_PREMIUM_PRICE_ID` when unset. |
+
+### Required for frontend self-serve key provisioning (Phase 11)
+
+| Var | Purpose |
+|---|---|
+| `TRADING_PROVISION_SECRET` | Server-to-server shared secret for `POST /keys/provision` (sent as the `X-Provision-Secret` header by the frontend backend, never by browsers). Unset → the endpoint fails closed with 503; wrong/missing header → 403. Generate with `openssl rand -hex 32`. |
 
 Both legacy and preferred names continue to work — see
 `docs/stripe-zero-dollar-test.md` for the test-mode runbook that
