@@ -45,7 +45,7 @@ export function EquityChart({ data, loading }: EquityChartProps) {
           </div>
         )}
         {!loading && chartData.length > 0 && (
-          <div className="h-64 w-full">
+          <div className="h-64 w-full min-h-[256px]" style={{ minHeight: '256px' }}>
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chartData}>
                 <defs>

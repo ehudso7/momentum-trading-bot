@@ -25,6 +25,7 @@ import threading
 from pathlib import Path
 
 import structlog
+from dotenv import load_dotenv
 
 from trading_bot.config.settings import AppConfig, RunMode
 from trading_bot.dashboard.state import DashboardState
@@ -1501,6 +1502,12 @@ def main() -> None:
         help="Reset paper trading account to default $100K balance, then exit",
     )
     args = parser.parse_args()
+
+    # Load .env from the working directory so the documented quickstart
+    # (cp .env.example .env, fill in keys) actually provides POLYGON_API_KEY /
+    # ALPACA_API_KEY / ALPACA_API_SECRET to AppConfig.from_yaml, which reads
+    # them via os.getenv. Real environment variables always win.
+    load_dotenv(override=False)
 
     # Load config
     config = AppConfig.from_yaml(args.config)

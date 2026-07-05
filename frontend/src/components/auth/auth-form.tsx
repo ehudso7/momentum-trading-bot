@@ -72,7 +72,10 @@ export function AuthForm({ mode }: AuthFormProps) {
           email,
           password,
         });
-        if (error) throw error;
+        if (error) {
+          // Surface a user-friendly message instead of raw fetch error
+          throw new Error(error.message || "Sign in failed. Check your credentials and Supabase configuration.");
+        }
         router.push("/");
         router.refresh();
       }

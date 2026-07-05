@@ -255,11 +255,11 @@ export function GrowthSimulator({ status, currentEquity }: GrowthSimulatorProps)
         </div>
 
         {/* Beautiful Projection Curve */}
-        <div className="h-64 w-full rounded-xl bg-black/40 p-3">
+        <div className="h-64 w-full min-h-[256px] rounded-xl bg-black/40 p-3" style={{ minHeight: '256px' }}>
           <div className="mb-1 flex items-center gap-2 text-xs uppercase tracking-widest text-zinc-400">
             <Calendar className="h-3.5 w-3.5" /> 12-Month Base Case Trajectory
           </div>
-          <ResponsiveContainer width="100%" height="90%">
+          <ResponsiveContainer width="100%" height="100%" minHeight={200}>
             <AreaChart data={curveData}>
               <defs>
                 <linearGradient id="projGradient" x1="0" y1="0" x2="0" y2="1">

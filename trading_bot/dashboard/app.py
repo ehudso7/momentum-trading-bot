@@ -74,11 +74,14 @@ def create_app(state: DashboardState) -> FastAPI:
     # ------------------------------------------------------------------
 
     @app.get("/healthz")
+    @app.get("/health")
     async def liveness() -> dict[str, Any]:
         """Liveness probe: is the process alive?
 
         Keep simple — no external dependency checks.
         Used by Docker HEALTHCHECK and orchestrator liveness probes.
+        /health is an alias so PaaS healthchecks shared with the SaaS
+        API service (railway.toml healthcheckPath) work unchanged.
         """
         return {
             "status": "alive",

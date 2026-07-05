@@ -2,7 +2,15 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import { PricingCards } from "@/components/billing/pricing-cards";
 
-export default function BillingPage() {
+export default async function BillingPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}) {
+  const { checkout } = await searchParams;
+  const isSuccess = checkout === "success";
+  const isCancel = checkout === "cancel";
+
   return (
     <div className="min-h-screen bg-[#0a0b14]">
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
@@ -22,6 +30,18 @@ export default function BillingPage() {
             Unlock full momentum signals and premium features
           </p>
         </div>
+
+        {isSuccess && (
+          <div className="mb-6 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-center text-sm text-emerald-400">
+            🎉 Payment successful! Your plan has been upgraded. Thank you for supporting MomentumForge AI.
+          </div>
+        )}
+        {isCancel && (
+          <div className="mb-6 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-center text-sm text-amber-400">
+            Checkout canceled. You can try again anytime.
+          </div>
+        )}
+
         <PricingCards />
       </div>
     </div>
