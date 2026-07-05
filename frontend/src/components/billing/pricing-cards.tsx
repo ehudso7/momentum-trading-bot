@@ -1,22 +1,32 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Check, Crown, Sparkles, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ApiError, createCheckoutSession } from "@/lib/api";
+import {
+  ApiError,
+  createCheckoutSession,
+  fetchBillingStatus,
+  getApiKey,
+} from "@/lib/api";
+import type { PlanTier } from "@/lib/api";
+import { ManageSubscriptionButton } from "@/components/billing/manage-subscription-button";
 import type { SubscriptionTier } from "@/types";
 
+// Feature lists mirror the entitlements enforced by the backend
+// (rate limits, report history windows, experiment caps, signal detail).
 const TIERS: SubscriptionTier[] = [
   {
     id: "free",
     name: "Free",
     price: 0,
     features: [
-      "3 signals per day (preview)",
-      "Basic scanner access",
+      "Truncated signal previews",
+      "3-day report history",
+      "3 experiments",
+      "60 API requests/min",
       "Paper trading dashboard",
-      "50 API requests/day",
     ],
   },
   {
@@ -26,9 +36,9 @@ const TIERS: SubscriptionTier[] = [
     highlighted: true,
     features: [
       "Full signal details (entry/stop/target)",
-      "Signal history access",
-      "Unlimited scanner",
-      "Priority API access",
+      "30-day report history",
+      "25 experiments",
+      "120 API requests/min",
       "PDF report exports",
     ],
   },
@@ -38,10 +48,12 @@ const TIERS: SubscriptionTier[] = [
     price: 99,
     features: [
       "Everything in Pro",
+      "Elite insights on every report",
+      "Unlimited report history",
+      "Unlimited experiments",
+      "300 API requests/min (priority)",
       "Live trading signals",
-      "Custom alerts",
-      "API key management",
-      "Dedicated support",
+      "Custom alerts & dedicated support",
     ],
   },
 ];
@@ -49,18 +61,42 @@ const TIERS: SubscriptionTier[] = [
 export function PricingCards() {
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showPortalPath, setShowPortalPath] = useState(false);
+  const [currentPlan, setCurrentPlan] = useState<PlanTier | null>(null);
+
+  useEffect(() => {
+    // Plan-aware rendering only when this browser holds an API key —
+    // anonymous visitors just see the plain pricing grid.
+    if (!getApiKey()) return;
+    let cancelled = false;
+    void fetchBillingStatus()
+      .then((status) => {
+        if (!cancelled) setCurrentPlan(status.plan);
+      })
+      .catch(() => {
+        // Invalid key or backend unreachable — fall back to anonymous view.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const subscribed = currentPlan === "pro" || currentPlan === "elite";
 
   const handleUpgrade = async (tierId: SubscriptionTier["id"]) => {
     if (tierId === "free") return;
     setLoading(tierId);
     setError(null);
+    setShowPortalPath(false);
     try {
       const { checkout_url } = await createCheckoutSession(tierId);
       window.location.assign(checkout_url);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        // Backend can't fulfill checkout for this key (e.g. already premium)
+        // Already subscribed — the backend routes plan switches through
+        // the Stripe billing portal, so surface that path directly.
         setError(err.detail ?? err.message);
+        setShowPortalPath(true);
       } else {
         setError(
           err instanceof Error
@@ -73,31 +109,59 @@ export function PricingCards() {
     }
   };
 
+  const buttonLabel = (tier: SubscriptionTier): string => {
+    if (loading === tier.id) return "Redirecting...";
+    if (currentPlan === tier.id || (tier.id === "free" && !subscribed)) {
+      return "Current Plan";
+    }
+    if (tier.id === "free") return "Included";
+    if (subscribed) return "Switch plan";
+    return `Upgrade to ${tier.name}`;
+  };
+
   const icons = { free: Zap, pro: Crown, elite: Sparkles };
 
   return (
     <div>
       {error && (
         <div className="mb-6 rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-center text-sm text-red-300">
-          {error}
+          <p>{error}</p>
+          {showPortalPath && (
+            <div className="mt-3 flex flex-col items-center gap-2">
+              <p className="text-xs text-zinc-400">
+                Plan changes for an active subscription go through the billing
+                portal:
+              </p>
+              <ManageSubscriptionButton />
+            </div>
+          )}
         </div>
       )}
       <div className="grid gap-6 md:grid-cols-3">
         {TIERS.map((tier) => {
           const Icon = icons[tier.id];
+          const isCurrent = currentPlan === tier.id;
           return (
             <Card
               key={tier.id}
               className={
-                tier.highlighted
-                  ? "relative border-cyan-500/30 shadow-cyan-500/10"
-                  : ""
+                isCurrent
+                  ? "relative border-emerald-500/30 shadow-emerald-500/10"
+                  : tier.highlighted
+                    ? "relative border-cyan-500/30 shadow-cyan-500/10"
+                    : ""
               }
             >
-              {tier.highlighted && (
-                <div className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-1 text-xs font-medium text-white">
-                  Most Popular
+              {isCurrent ? (
+                <div className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-r from-emerald-500 to-teal-600 px-3 py-1 text-xs font-medium text-white">
+                  Current plan
                 </div>
+              ) : (
+                tier.highlighted && (
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-1 text-xs font-medium text-white">
+                    Most Popular
+                  </div>
+                )
               )}
               <CardHeader className="text-center">
                 <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-white/5">
@@ -122,16 +186,16 @@ export function PricingCards() {
                   ))}
                 </ul>
                 <Button
-                  variant={tier.highlighted ? "default" : "outline"}
+                  variant={
+                    tier.highlighted && !isCurrent ? "default" : "outline"
+                  }
                   className="w-full"
-                  disabled={tier.id === "free" || loading === tier.id}
+                  disabled={
+                    tier.id === "free" || isCurrent || loading === tier.id
+                  }
                   onClick={() => handleUpgrade(tier.id)}
                 >
-                  {tier.id === "free"
-                    ? "Current Plan"
-                    : loading === tier.id
-                      ? "Redirecting..."
-                      : `Upgrade to ${tier.name}`}
+                  {buttonLabel(tier)}
                 </Button>
               </CardContent>
             </Card>

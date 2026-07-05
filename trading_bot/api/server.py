@@ -68,6 +68,7 @@ from trading_bot.api.billing import (
     VALID_CHECKOUT_PLANS,
     add_premium_hash,
     create_checkout_session_for_hash,
+    get_plan_for_hash,
     handle_webhook_event,
     is_premium_hash,
     is_premium_via_stripe,
@@ -75,7 +76,11 @@ from trading_bot.api.billing import (
     remove_premium_hash,
     verify_webhook_signature,
 )
-from trading_bot.api.insights import build_insights, truncate_for_free
+from trading_bot.api.insights import (
+    build_elite_extras,
+    build_insights,
+    truncate_for_free,
+)
 from trading_bot.api.daily_hook import (
     build_daily_hook,
     truncate_for_free as _truncate_hook_for_free,
@@ -114,6 +119,52 @@ TIER_PREMIUM = "premium"
 MAX_FREE_TIER_DAYS = 3            # /reports/{date} window for free tier
 MAX_FREE_TIER_EXPERIMENTS = 3     # /experiments/* cap for free tier
 UPGRADE_REQUIRED_DETAIL = "upgrade required for full access"
+
+# Phase 12 — distinct paid plans. ``request.state.api_key_tier`` now
+# resolves to "free" | "pro" | "elite"; the legacy "premium" label
+# survives only as (a) the manifest tier value written by
+# ``python -m trading_bot.api.keys issue --tier premium`` (mapped to
+# plan "pro" at resolution time), and (b) the billing-class label in
+# the usage log / X-Usage-Tier header, whose "free"/"premium"
+# vocabulary is a persisted analytics format consumed by the pricing
+# and channel reports.
+TIER_PRO = "pro"
+TIER_ELITE = "elite"
+PAID_TIERS: frozenset[str] = frozenset({TIER_PRO, TIER_ELITE})
+# Operator allow-list of elite keys, mirroring TRADING_API_PREMIUM_KEYS
+# (which maps to plan "pro"). A key present in both lists is elite.
+ELITE_KEYS_ENV_VAR = "TRADING_API_ELITE_KEYS"
+
+# Per-minute rate limits by tier. Each tier env var falls back to the
+# base TRADING_API_RATE_LIMIT_PER_MINUTE, then to the tier default.
+RATE_LIMIT_FREE_ENV_VAR = "TRADING_API_RATE_LIMIT_PER_MINUTE_FREE"
+RATE_LIMIT_PRO_ENV_VAR = "TRADING_API_RATE_LIMIT_PER_MINUTE_PRO"
+RATE_LIMIT_ELITE_ENV_VAR = "TRADING_API_RATE_LIMIT_PER_MINUTE_ELITE"
+DEFAULT_RATE_LIMITS_PER_MINUTE: dict[str, int] = {
+    TIER_FREE: 60,
+    TIER_PRO: 120,
+    TIER_ELITE: 300,
+}
+_RATE_LIMIT_TIER_ENV_VARS: dict[str, str] = {
+    TIER_FREE: RATE_LIMIT_FREE_ENV_VAR,
+    TIER_PRO: RATE_LIMIT_PRO_ENV_VAR,
+    TIER_ELITE: RATE_LIMIT_ELITE_ENV_VAR,
+}
+
+# Reports window (days) and experiments cap by tier. ``None`` means
+# unlimited — the elite tier has no window and no cap.
+MAX_PRO_TIER_DAYS = 30
+MAX_PRO_TIER_EXPERIMENTS = 25
+TIER_REPORT_WINDOW_DAYS: dict[str, Optional[int]] = {
+    TIER_FREE: MAX_FREE_TIER_DAYS,
+    TIER_PRO: MAX_PRO_TIER_DAYS,
+    TIER_ELITE: None,
+}
+TIER_EXPERIMENT_LIMITS: dict[str, Optional[int]] = {
+    TIER_FREE: MAX_FREE_TIER_EXPERIMENTS,
+    TIER_PRO: MAX_PRO_TIER_EXPERIMENTS,
+    TIER_ELITE: None,
+}
 
 # Phase 5.4 — free-tier daily usage caps (reversible via env vars).
 # Both caps are hard ceilings on a per-key / per-UTC-day basis. They
@@ -288,6 +339,65 @@ def _rate_limit_per_minute() -> int:
     if n <= 0:
         return DEFAULT_RATE_LIMIT_PER_MINUTE
     return n
+
+
+def _parse_positive_int_or_none(raw: Optional[str]) -> Optional[int]:
+    """``None`` for unset / blank / non-int / non-positive values."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return n
+
+
+def _rate_limit_for_tier(tier: Optional[str]) -> int:
+    """
+    Phase 12 — tier-resolved per-minute budget.
+
+    Resolution order (fail-closed at every step, like
+    ``_rate_limit_per_minute``):
+
+      1. the tier-specific env var
+         (``TRADING_API_RATE_LIMIT_PER_MINUTE_FREE`` / ``_PRO`` /
+         ``_ELITE``);
+      2. the base ``TRADING_API_RATE_LIMIT_PER_MINUTE`` env var;
+      3. the tier default (free 60, pro 120, elite 300).
+
+    Unknown tier labels resolve as free — an unauthenticated or
+    bogus caller must never receive a paid budget.
+    """
+    t = _canonical_tier(tier) or TIER_FREE
+    n = _parse_positive_int_or_none(
+        os.getenv(_RATE_LIMIT_TIER_ENV_VARS[t]),
+    )
+    if n is not None:
+        return n
+    n = _parse_positive_int_or_none(os.getenv(RATE_LIMIT_ENV_VAR))
+    if n is not None:
+        return n
+    return DEFAULT_RATE_LIMITS_PER_MINUTE[t]
+
+
+def _canonical_tier(value: object) -> Optional[str]:
+    """
+    Map any historical / external tier label onto the Phase 12
+    vocabulary: "free" | "pro" | "elite". The legacy "premium"
+    label (manifest tier value, pre-Phase-12 cached state) maps to
+    "pro" — the cheapest paid plan — so it stays paid without ever
+    being silently promoted to elite. Anything else → ``None``.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    if v in (TIER_FREE, TIER_PRO, TIER_ELITE):
+        return v
+    if v == TIER_PREMIUM:
+        return TIER_PRO
+    return None
 
 
 def _allowed_origins() -> list[str]:
@@ -590,25 +700,72 @@ def _premium_keys_set() -> set[str]:
     return {k.strip() for k in raw.split(",") if k.strip()}
 
 
+def _elite_keys_set() -> set[str]:
+    """
+    Phase 12 — parse the elite-keys env var
+    (``TRADING_API_ELITE_KEYS``) into a set. Empty/unset → empty
+    set. A key in this list resolves to plan "elite" even when it
+    also appears in ``TRADING_API_PREMIUM_KEYS``.
+    """
+    raw = os.getenv(ELITE_KEYS_ENV_VAR, "") or ""
+    if not raw.strip():
+        return set()
+    return {k.strip() for k in raw.split(",") if k.strip()}
+
+
+def _resolve_paid_plan(
+    api_key: Optional[str],
+    key_hash: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Phase 12 — resolve the paid plan ("pro" | "elite") for a key,
+    or ``None`` when the key carries no paid entitlement.
+
+    Precedence (mirrors the Phase 6.2 auth precedence exactly, so a
+    cancelled Stripe subscription cannot be silently reinstated by
+    the same key also appearing in the manifest as premium):
+
+      1. Stripe entitlement cache (when Stripe is configured) —
+         plan comes from the plan-aware v2 cache; legacy flat-list
+         entries load as "pro".
+      2. ``TRADING_API_ELITE_KEYS`` allow-list → "elite".
+      3. ``TRADING_API_PREMIUM_KEYS`` allow-list → "pro".
+      4. Manifest entry with ``tier="premium"`` (not revoked) → "pro".
+      5. Otherwise → ``None``.
+    """
+    if not api_key:
+        return None
+    if is_stripe_configured():
+        h = key_hash or key_store.hash_api_key(api_key)
+        plan = get_plan_for_hash(h) if h else None
+        if plan is not None:
+            return _canonical_tier(plan) or TIER_PRO
+    if api_key in _elite_keys_set():
+        return TIER_ELITE
+    if api_key in _premium_keys_set():
+        return TIER_PRO
+    entry = key_store.verify_api_key(api_key)
+    if entry is not None and entry.tier == TIER_PREMIUM:
+        return TIER_PRO
+    return None
+
+
 def _is_premium(
     api_key: Optional[str],
     request: Optional[Request] = None,
 ) -> bool:
     """
-    True iff the supplied key is premium.
+    True iff the supplied key is paid (plan "pro" OR "elite").
 
-    Precedence (Phase 6.2):
+    Precedence (Phase 6.2, extended by Phase 12):
       1. If a request is supplied AND ``require_api_key`` already
          resolved the tier, honour the cached value on
-         ``request.state.api_key_tier``. This avoids re-hashing /
-         re-reading the manifest for every helper that asks.
-      2. If Stripe is configured AND the cache shows this api_key
-         as having an active subscription → premium.
-      3. If the key is in ``TRADING_API_PREMIUM_KEYS`` → premium
-         (operator override; works even when Stripe is configured).
-      4. If the manifest entry for this key has tier="premium" AND
-         the key has not been revoked → premium.
-      5. Otherwise → free / not premium.
+         ``request.state.api_key_tier``. Any paid label ("pro",
+         "elite", or the legacy "premium") counts; "free" is a
+         definitive no. This avoids re-hashing / re-reading the
+         manifest for every helper that asks.
+      2. Otherwise defer to ``_resolve_paid_plan`` (Stripe cache →
+         elite allow-list → premium allow-list → manifest premium).
 
     A revoked key is never premium (the manifest path checks revocation).
     Empty / None input → False.
@@ -619,24 +776,45 @@ def _is_premium(
         cached = getattr(
             getattr(request, "state", None), "api_key_tier", None,
         )
-        if cached == TIER_PREMIUM:
+        canonical = _canonical_tier(cached)
+        if canonical in PAID_TIERS:
             return True
-        if cached == TIER_FREE:
+        if canonical == TIER_FREE:
             return False
-    if is_stripe_configured() and is_premium_via_stripe(api_key):
-        return True
-    if api_key in _premium_keys_set():
-        return True
-    entry = key_store.verify_api_key(api_key)
-    if entry is not None and entry.tier == TIER_PREMIUM:
-        return True
-    return False
+    return _resolve_paid_plan(api_key) is not None
+
+
+def _request_tier(
+    request: Optional[Request],
+    api_key: Optional[str] = None,
+) -> str:
+    """
+    Phase 12 — resolve the caller's tier ("free" | "pro" | "elite")
+    for entitlement decisions.
+
+    Prefers the value ``require_api_key`` cached on
+    ``request.state.api_key_tier`` (legacy "premium" maps to "pro");
+    otherwise falls back to re-resolving from the bearer / supplied
+    key. Anonymous or unknown callers are "free".
+    """
+    if request is not None:
+        cached = getattr(
+            getattr(request, "state", None), "api_key_tier", None,
+        )
+        canonical = _canonical_tier(cached)
+        if canonical is not None:
+            return canonical
+    if not api_key and request is not None:
+        api_key = _extract_bearer_token(request)
+    if not api_key:
+        return TIER_FREE
+    return _resolve_paid_plan(api_key) or TIER_FREE
 
 
 def _is_known_key(api_key: Optional[str]) -> bool:
     """
     True iff ``api_key`` would be accepted by ``require_api_key``
-    (free or premium, env-backed or manifest-backed). Used by the
+    (free or paid, env-backed or manifest-backed). Used by the
     free-tier middleware to decide whether to enforce or fall
     through; the actual authentication still happens at the route
     dependency.
@@ -649,6 +827,8 @@ def _is_known_key(api_key: Optional[str]) -> bool:
     if configured and api_key == configured:
         return True
     if api_key in _premium_keys_set():
+        return True
+    if api_key in _elite_keys_set():
         return True
     if is_stripe_configured() and is_premium_via_stripe(api_key):
         return True
@@ -794,18 +974,20 @@ def require_api_key(
     `Authorization: Bearer <token>` header. Returns the validated
     token string so handlers can read it (e.g., for tier classification).
 
-    Accepted tokens (Phase 6.2 precedence):
+    Accepted tokens (Phase 6.2 precedence; Phase 12 resolves the
+    tier to "free" | "pro" | "elite"):
       1. Revoked manifest hash → 403 (rejected before any other check
          so a revoked key cannot be reinstated by also appearing in
          the env-var lists).
       2. ``TRADING_API_KEY`` exact match → free tier.
-      3. ``TRADING_API_PREMIUM_KEYS`` membership → premium tier.
-      4. Stripe-cached active subscription (when Stripe is
-         configured) → premium tier.
-      5. Manifest entry (``data/api_keys_manifest.jsonl``) with
-         ``tier="premium"`` → premium tier.
-      6. Manifest entry with ``tier="free"`` → free tier.
-      7. Otherwise → 403.
+      3. ``TRADING_API_ELITE_KEYS`` membership → elite tier.
+      4. ``TRADING_API_PREMIUM_KEYS`` membership → pro tier.
+      5. Stripe-cached active subscription (when Stripe is
+         configured) → the cached plan ("pro" | "elite").
+      6. Manifest entry (``data/api_keys_manifest.jsonl``) with
+         ``tier="premium"`` → pro tier.
+      7. Manifest entry with ``tier="free"`` → free tier.
+      8. Otherwise → 403.
 
     Failure modes:
       - 503 when no env keys AND no usable manifest entries — fail-closed.
@@ -820,7 +1002,7 @@ def require_api_key(
     in-memory state — it is not logged and not persisted.
     """
     configured = (os.getenv(API_KEY_ENV_VAR, "") or "").strip()
-    premium_keys = _premium_keys_set()
+    premium_keys = _premium_keys_set() | _elite_keys_set()
     manifest_active = key_store.has_active_keys()
     if not configured and not premium_keys and not manifest_active:
         raise HTTPException(
@@ -856,24 +1038,25 @@ def require_api_key(
             detail="Invalid API key",
         )
 
-    # Precedence (Phase 6.2):
-    #   1. Stripe active/cache → premium  (so a cancelled Stripe
-    #      subscription cannot be silently reinstated by the same
-    #      key also appearing in the manifest as premium)
-    #   2. env premium list   → premium  (operator override)
-    #   3. manifest premium   → premium  (CLI-issued)
-    #   4. manifest free      → free     (CLI-issued)
-    #   5. env single key     → free     (legacy single-tenant deploy)
-    #   6. otherwise          → 403
-    resolved_tier: Optional[str] = None
-    if is_stripe_configured() and is_premium_via_stripe(presented):
-        resolved_tier = TIER_PREMIUM
-    elif presented in premium_keys:
-        resolved_tier = TIER_PREMIUM
-    else:
+    # Precedence (Phase 6.2, plan-aware since Phase 12):
+    #   1. Stripe active/cache → plan "pro"|"elite"  (so a cancelled
+    #      Stripe subscription cannot be silently reinstated by the
+    #      same key also appearing in the manifest as premium)
+    #   2. env elite list     → elite  (operator override)
+    #   3. env premium list   → pro    (operator override)
+    #   4. manifest premium   → pro    (CLI-issued)
+    #   5. manifest free      → free   (CLI-issued)
+    #   6. env single key     → free   (legacy single-tenant deploy)
+    #   7. otherwise          → 403
+    resolved_tier: Optional[str] = _resolve_paid_plan(
+        presented, key_hash=presented_hash,
+    )
+    if resolved_tier is None:
         entry = key_store.verify_api_key(presented)
         if entry is not None:
-            resolved_tier = entry.tier
+            # Paid manifest tiers were already handled by
+            # ``_resolve_paid_plan`` — anything left is free.
+            resolved_tier = TIER_FREE
         elif configured and presented == configured:
             resolved_tier = TIER_FREE
 
@@ -1014,10 +1197,11 @@ def _today_utc() -> _date_type:
     return datetime.now(timezone.utc).date()
 
 
-def _free_date_allowed(date_str: str) -> bool:
+def _date_within_window(date_str: str, window_days: int) -> bool:
     """
-    Free tier may access dates within the last MAX_FREE_TIER_DAYS days
-    (today + the previous N-1). Older dates and future dates are blocked.
+    Whether ``date_str`` falls inside the last ``window_days`` days
+    (today + the previous N-1). Older dates and future dates are
+    outside the window.
     """
     try:
         target = _date_type.fromisoformat(date_str)
@@ -1027,7 +1211,15 @@ def _free_date_allowed(date_str: str) -> bool:
         return True
     today = _today_utc()
     delta_days = (today - target).days
-    return 0 <= delta_days < MAX_FREE_TIER_DAYS
+    return 0 <= delta_days < window_days
+
+
+def _free_date_allowed(date_str: str) -> bool:
+    """
+    Free tier may access dates within the last MAX_FREE_TIER_DAYS days
+    (today + the previous N-1). Older dates and future dates are blocked.
+    """
+    return _date_within_window(date_str, MAX_FREE_TIER_DAYS)
 
 
 def _enforce_free_limits(
@@ -1038,39 +1230,69 @@ def _enforce_free_limits(
     explicit_limit: Optional[int] = None,
     request: Optional[Request] = None,
     api_key: Optional[str] = None,
+    tier: Optional[str] = None,
 ) -> None:
     """
     Raise HTTP 403 with the documented "upgrade required for full
-    access" message when a free-tier request exceeds the per-endpoint
-    cap. Premium requests are short-circuit no-ops.
+    access" message when a request exceeds its tier's per-endpoint
+    cap.
+
+    Phase 12 — per-tier entitlements (``TIER_REPORT_WINDOW_DAYS`` /
+    ``TIER_EXPERIMENT_LIMITS``):
+
+      * free  → 3-day report window, experiments capped at 3;
+      * pro   → 30-day report window, experiments capped at 25;
+      * elite → unlimited (short-circuit no-op).
+
+    Backward compatibility: callers that pass only the legacy
+    ``is_premium`` flag keep the pre-Phase-12 semantics — premium
+    means unlimited. Pass ``tier`` explicitly to get the pro window.
 
     Parameters (all optional — pass only those relevant to the route):
-      date_requested  : YYYY-MM-DD asked for; rejected if outside free window.
+      date_requested  : YYYY-MM-DD asked for; rejected if outside window.
       n_experiments   : 1-indexed nth-most-recent experiment; rejected if > cap.
       explicit_limit  : caller-supplied `?limit=` value; rejected if > cap.
       request         : (Phase 5.5) enables upgrade-event telemetry.
       api_key         : (Phase 5.5) enables upgrade-event telemetry.
+      tier            : (Phase 12) "free" | "pro" | "elite".
     """
-    if is_premium:
+    if tier is not None:
+        effective_tier = _canonical_tier(tier) or TIER_FREE
+    elif is_premium:
+        # Legacy call shape: premium == unlimited (pre-Phase-12).
         return
-    if date_requested is not None and not _free_date_allowed(date_requested):
+    else:
+        effective_tier = TIER_FREE
+
+    window_days = TIER_REPORT_WINDOW_DAYS.get(effective_tier)
+    experiments_cap = TIER_EXPERIMENT_LIMITS.get(effective_tier)
+    if window_days is None and experiments_cap is None:
+        # Elite — unlimited on both axes.
+        return
+
+    if (
+        date_requested is not None
+        and window_days is not None
+        and not _date_within_window(date_requested, window_days)
+    ):
         _emit_upgrade_event(request, api_key, "old_report_blocked")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=UPGRADE_REQUIRED_DETAIL,
         )
-    if n_experiments is not None and n_experiments > MAX_FREE_TIER_EXPERIMENTS:
-        _emit_upgrade_event(request, api_key, "experiment_limit_blocked")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=UPGRADE_REQUIRED_DETAIL,
-        )
-    if explicit_limit is not None and explicit_limit > MAX_FREE_TIER_EXPERIMENTS:
-        _emit_upgrade_event(request, api_key, "experiment_limit_blocked")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=UPGRADE_REQUIRED_DETAIL,
-        )
+    if experiments_cap is not None:
+        if n_experiments is not None and n_experiments > experiments_cap:
+            _emit_upgrade_event(request, api_key, "experiment_limit_blocked")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=UPGRADE_REQUIRED_DETAIL,
+            )
+        if explicit_limit is not None and explicit_limit > experiments_cap:
+            _emit_upgrade_event(request, api_key, "experiment_limit_blocked")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=UPGRADE_REQUIRED_DETAIL,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1119,13 +1341,17 @@ def _is_premium_user(request: Request) -> bool:
 
     Returns False on any unauthenticated request, so callers can use
     this in /-style public handlers without a separate guard.
+
+    Phase 12 — any paid label counts: "pro", "elite", or the legacy
+    "premium" (mapped to "pro" by ``_canonical_tier``).
     """
     cached = getattr(
         getattr(request, "state", None), "api_key_tier", None,
     )
-    if cached == TIER_PREMIUM:
+    canonical = _canonical_tier(cached)
+    if canonical in PAID_TIERS:
         return True
-    if cached == TIER_FREE:
+    if canonical == TIER_FREE:
         return False
     api_key = _extract_bearer_token(request)
     if not api_key:
@@ -1643,8 +1869,20 @@ app = FastAPI(
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    """Reject clients that exceed the per-minute budget."""
-    limit = _rate_limit_per_minute()
+    """
+    Reject clients that exceed the per-minute budget.
+
+    Phase 12 — the budget is resolved per request from the caller's
+    tier: free 60 / pro 120 / elite 300 by default, each overridable
+    via ``TRADING_API_RATE_LIMIT_PER_MINUTE_FREE`` / ``_PRO`` /
+    ``_ELITE`` with the base ``TRADING_API_RATE_LIMIT_PER_MINUTE``
+    as the shared fallback. Anonymous and unknown-key callers get
+    the free budget. The bucket keying (per client IP, fixed
+    60-second window) is unchanged.
+    """
+    api_key = _extract_bearer_token(request)
+    tier = _resolve_paid_plan(api_key) if api_key else None
+    limit = _rate_limit_for_tier(tier or TIER_FREE)
     client_ip = _client_ip(request)
     now = time.time()
     # Fixed 60-second window keyed by wall-clock minute.
@@ -2706,9 +2944,13 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
       catches every failure and never raises into this handler.
 
     Handled event types:
-      - customer.subscription.created (adds premium on active/trialing)
-      - customer.subscription.deleted (removes premium)
-      - invoice.payment_failed         (removes premium immediately)
+      - checkout.session.completed     (grants the plan from metadata[plan])
+      - customer.subscription.created (grants on active/trialing)
+      - customer.subscription.updated (refreshes on active/trialing —
+                                        never loses the stored plan;
+                                        removes on any other status)
+      - customer.subscription.deleted (removes the entitlement)
+      - invoice.payment_failed         (removes the entitlement immediately)
     """
     secret = (os.getenv(STRIPE_WEBHOOK_SECRET_ENV_VAR, "") or "").strip()
     if not secret:
@@ -2983,6 +3225,22 @@ def billing_checkout(
         )
 
     if _is_premium(api_key, request=request):
+        # Phase 12 — plan-aware 409. A paid caller asking for the
+        # OTHER plan is trying to switch, not to buy a second
+        # subscription: point them at the billing portal.
+        current_plan = _request_tier(request, api_key)
+        if current_plan not in PAID_TIERS:
+            current_plan = TIER_PRO
+        if plan is not None and plan != current_plan:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"this key is already on the '{current_plan}' plan; "
+                    f"to switch to '{plan}', use the billing portal "
+                    "(\"Manage subscription\") — creating a second "
+                    "subscription is not supported"
+                ),
+            )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -3091,44 +3349,48 @@ def billing_status(
     """
     Return the authenticated caller's current billing tier.
 
-    Response::
+    Response (Phase 12 shape — ``tier`` now names the plan)::
 
         {
-          "tier":        "free" | "premium",
-          "premium":     bool,
+          "tier":        "free" | "pro" | "elite",
+          "premium":     bool,   # true for pro AND elite
+          "plan":        "free" | "pro" | "elite",  # == tier
           "plan_source": "manifest" | "env_key" | "premium_allowlist"
         }
 
     * ``tier`` is the value ``require_api_key`` already resolved and
       stashed on ``request.state.api_key_tier`` — no re-hashing, no
       extra manifest reads on the happy path.
+    * ``premium`` is kept for the existing frontend poller: it is
+      true whenever the caller is on ANY paid plan.
+    * ``plan`` duplicates ``tier`` (paid plans) / "free" so clients
+      can pin against an explicitly plan-named field.
     * ``plan_source`` names WHERE the key comes from (mirrors the
-      Phase 6.2 auth precedence): the operator premium allowlist
-      (``TRADING_API_PREMIUM_KEYS``), the issuance manifest, or the
-      legacy single-tenant ``TRADING_API_KEY`` env var.
+      Phase 6.2 auth precedence): the operator allowlists
+      (``TRADING_API_PREMIUM_KEYS`` / ``TRADING_API_ELITE_KEYS``),
+      the issuance manifest, or the legacy single-tenant
+      ``TRADING_API_KEY`` env var.
     """
-    tier = getattr(
-        getattr(request, "state", None), "api_key_tier", None,
+    tier = _canonical_tier(
+        getattr(getattr(request, "state", None), "api_key_tier", None),
     )
-    if tier not in (TIER_FREE, TIER_PREMIUM):
+    if tier is None:
         # Defensive — require_api_key always sets the tier; fall back
         # to the classifier rather than guessing.
-        tier = (
-            TIER_PREMIUM
-            if _is_premium(api_key, request=request)
-            else TIER_FREE
-        )
+        tier = _request_tier(request, api_key)
 
-    if api_key in _premium_keys_set():
+    if api_key in _premium_keys_set() or api_key in _elite_keys_set():
         plan_source = PLAN_SOURCE_PREMIUM_ALLOWLIST
     elif key_store.verify_api_key(api_key) is not None:
         plan_source = PLAN_SOURCE_MANIFEST
     else:
         plan_source = PLAN_SOURCE_ENV_KEY
 
+    premium = tier in PAID_TIERS
     return {
         "tier": tier,
-        "premium": tier == TIER_PREMIUM,
+        "premium": premium,
+        "plan": tier if premium else TIER_FREE,
         "plan_source": plan_source,
     }
 
@@ -3262,7 +3524,7 @@ def provision_key(
     Response 200::
 
         {"api_key": "<raw key — returned ONCE, never persisted>",
-         "tier": "free" | "premium",
+         "tier": "free" | "pro" | "elite",
          "rotated": bool}
 
     Behaviour:
@@ -3318,7 +3580,22 @@ def provision_key(
             if kh not in previous_hashes:
                 previous_hashes.append(kh)
 
-        carry_premium = any(is_premium_hash(kh) for kh in previous_hashes)
+        # Phase 12 — carry the PLAN, not just premium-ness. When a
+        # user somehow has multiple live paid keys the richest plan
+        # wins (elite > pro) so rotation can never downgrade.
+        carry_plan: Optional[str] = None
+        for kh in previous_hashes:
+            plan = get_plan_for_hash(kh)
+            if plan == TIER_ELITE:
+                carry_plan = TIER_ELITE
+                break
+            if plan is not None and carry_plan is None:
+                carry_plan = plan
+        carry_premium = carry_plan is not None or any(
+            is_premium_hash(kh) for kh in previous_hashes
+        )
+        if carry_premium and carry_plan is None:
+            carry_plan = TIER_PRO
 
         # 2. Issue the replacement BEFORE revoking — if issuance
         # fails the user's existing key must keep working.
@@ -3336,10 +3613,10 @@ def provision_key(
             )
         new_hash = result["key_hash"]
 
-        # 3. Premium carry-over: entitlement follows the user, not
-        # the rotated-out credential.
+        # 3. Premium carry-over: entitlement (including the plan)
+        # follows the user, not the rotated-out credential.
         if carry_premium:
-            add_premium_hash(new_hash)
+            add_premium_hash(new_hash, plan=carry_plan or TIER_PRO)
 
         # 4. Rotate out every previous live key. Revocation failures
         # are logged loudly but do NOT fail the request — the new key
@@ -3361,7 +3638,7 @@ def provision_key(
                     error_type=type(exc).__name__,
                 )
 
-    tier = TIER_PREMIUM if carry_premium else TIER_FREE
+    tier = (carry_plan or TIER_PRO) if carry_premium else TIER_FREE
     log.info(
         "keys.provisioned",
         key_hash=new_hash,
@@ -3502,6 +3779,15 @@ def latest_report(
             data["nudge"] = nudge
         if share is not None:
             data["share"] = share
+        # Phase 12 — elite callers additionally receive the
+        # ``elite`` block: real data the insight rules compute but
+        # drop from their evidence (the full regime ranking, the
+        # day-over-day trend detail). Omitted when the report has
+        # nothing to say — the block is never fabricated.
+        if _request_tier(request, api_key) == TIER_ELITE:
+            elite_block = build_elite_extras(data, prev)
+            if elite_block is not None:
+                data["elite"] = elite_block
         return data
     free_body = _project_report_for_free(data)
     free_body["insights"] = _decorate_insights_with_share(
@@ -3567,16 +3853,21 @@ def report_for_date(
     """
     Return the daily report for the given YYYY-MM-DD.
 
-    Free-tier accounts may request only dates within the last
-    `MAX_FREE_TIER_DAYS` (default: today and the previous two).
-    Older dates → 403 with the documented upgrade message.
+    Phase 12 — per-tier report windows:
+      * free  → last `MAX_FREE_TIER_DAYS` (3: today + previous two);
+      * pro   → last `MAX_PRO_TIER_DAYS` (30);
+      * elite → unlimited.
+    Dates outside the caller's window → 403 with the documented
+    upgrade message.
     """
     _validate_date(date)
+    tier = _request_tier(request, api_key)
     _enforce_free_limits(
         is_premium=_is_premium(api_key, request=request),
         date_requested=date,
         request=request,
         api_key=api_key,
+        tier=tier,
     )
     path = _reports_dir() / f"alpha_report_{date}.json"
     if not path.exists():
@@ -3757,15 +4048,17 @@ def recent_experiments(
     Return the last N experiment manifest records.
 
     - Default `limit=10`, maximum `100`.
-    - Free tier: when no `?limit=` is supplied, results are
-      silently capped at MAX_FREE_TIER_EXPERIMENTS (3). When a free
-      caller EXPLICITLY passes `?limit=` greater than the cap they
-      get a 403 with the documented upgrade message — this
-      distinguishes "I just want recent activity" from "I want more
-      than my tier allows".
+    - Phase 12 per-tier caps (``TIER_EXPERIMENT_LIMITS``): free 3,
+      pro 25, elite unlimited. When no `?limit=` is supplied,
+      results are silently capped at the caller's tier cap. When a
+      capped-tier caller EXPLICITLY passes `?limit=` greater than
+      their cap they get a 403 with the documented upgrade message —
+      this distinguishes "I just want recent activity" from "I want
+      more than my tier allows".
     - Empty manifest → `{"count": 0, "records": []}`.
     """
     is_premium = _is_premium(api_key, request=request)
+    tier = _request_tier(request, api_key)
     # Detect EXPLICIT use of the query param via raw query string —
     # FastAPI cannot distinguish a default from an explicit value
     # equal to the default.
@@ -3775,9 +4068,11 @@ def recent_experiments(
         explicit_limit=explicit_limit,
         request=request,
         api_key=api_key,
+        tier=tier,
     )
+    tier_cap = TIER_EXPERIMENT_LIMITS.get(tier)
     effective_limit = (
-        limit if is_premium else min(limit, MAX_FREE_TIER_EXPERIMENTS)
+        limit if tier_cap is None else min(limit, tier_cap)
     )
     records = _read_manifest_records(_manifest_path())
     tail = records[-effective_limit:] if effective_limit > 0 else records
@@ -3795,8 +4090,8 @@ def experiment_by_index(
     Return the nth-most-recent experiment manifest record.
 
     - `n=1` is the most recent; `n=2` is the one before; etc.
-    - Free tier: `n` must be ≤ `MAX_FREE_TIER_EXPERIMENTS` (3);
-      otherwise 403.
+    - Phase 12 per-tier caps: `n` must be ≤ the caller's tier cap
+      (free 3, pro 25, elite unlimited); otherwise 403.
     """
     if n < 1:
         raise HTTPException(
@@ -3808,6 +4103,7 @@ def experiment_by_index(
         n_experiments=n,
         request=request,
         api_key=api_key,
+        tier=_request_tier(request, api_key),
     )
     records = _read_manifest_records(_manifest_path())
     if not records:

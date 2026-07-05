@@ -157,11 +157,20 @@ export interface CheckoutSession {
   checkout_session_id: string;
 }
 
+export type PlanTier = "free" | "pro" | "elite";
+
 export interface BillingStatus {
-  tier: "free" | "premium";
+  tier: PlanTier;
   premium: boolean;
+  plan: PlanTier;
   plan_source: string;
 }
+
+export const PLAN_LABELS: Record<PlanTier, string> = {
+  free: "Free",
+  pro: "Pro",
+  elite: "Elite",
+};
 
 async function getSupabaseUserId(): Promise<string | undefined> {
   if (typeof window === "undefined" || !isSupabaseConfigured()) {

@@ -1,10 +1,24 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ApiError, getApiKey, setApiKey, fetchHealth } from "@/lib/api";
+import {
+  ApiError,
+  getApiKey,
+  setApiKey,
+  fetchHealth,
+  fetchBillingStatus,
+  PLAN_LABELS,
+} from "@/lib/api";
+import type { PlanTier } from "@/lib/api";
 import { provisionApiKey } from "@/lib/use-api-key";
+
+const TIER_BADGE_STYLES: Record<PlanTier, string> = {
+  free: "border-zinc-500/40 bg-zinc-500/10 text-zinc-300",
+  pro: "border-cyan-500/40 bg-cyan-500/10 text-cyan-300",
+  elite: "border-violet-500/40 bg-violet-500/10 text-violet-300",
+};
 
 export function ApiKeyForm() {
   const [key, setKey] = useState("");
@@ -17,23 +31,42 @@ export function ApiKeyForm() {
   const [provisionMessage, setProvisionMessage] = useState<
     { kind: "success" | "error"; text: string } | null
   >(null);
+  const [tier, setTier] = useState<PlanTier | null>(null);
+
+  // Best-effort tier lookup for the badge next to the key status; clears
+  // the badge when there is no key or the backend rejects it.
+  const refreshTier = useCallback(async () => {
+    if (!getApiKey()) {
+      setTier(null);
+      return;
+    }
+    try {
+      const status = await fetchBillingStatus();
+      setTier(status.plan);
+    } catch {
+      setTier(null);
+    }
+  }, []);
 
   useEffect(() => {
     // Seed the input from localStorage after mount (external store sync);
     // deferred to a microtask so hydration output stays deterministic.
     let cancelled = false;
     void Promise.resolve().then(() => {
-      if (!cancelled) setKey(getApiKey() ?? "");
+      if (cancelled) return;
+      setKey(getApiKey() ?? "");
+      void refreshTier();
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshTier]);
 
   const handleSave = () => {
     setApiKey(key || null);
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
+    void refreshTier();
   };
 
   const handleTest = async () => {
@@ -51,6 +84,7 @@ export function ApiKeyForm() {
       await fetchHealth();
       setTestStatus("success");
       setTestMessage("✅ Connection successful! Your Railway backend accepted the key.");
+      void refreshTier();
     } catch (err: unknown) {
       setTestStatus("error");
       const status = err instanceof ApiError ? err.status : 0;
@@ -81,6 +115,7 @@ export function ApiKeyForm() {
           ? "New key generated and saved — your previous key has been replaced and will no longer work."
           : "Key generated and saved to this browser.",
       });
+      void refreshTier();
     } catch (err: unknown) {
       setProvisionMessage({
         kind: "error",
@@ -118,11 +153,18 @@ export function ApiKeyForm() {
       {/* Current key + primary actions */}
       <div>
         <div className="mb-2 flex items-center justify-between">
-          <div className="text-sm text-zinc-400">
+          <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-400">
             {currentSavedKey ? (
-              <>Saved key (masked): <span className="font-mono text-zinc-300">{currentSavedKey.slice(0, 8)}••••{currentSavedKey.slice(-4)}</span></>
+              <span>Saved key (masked): <span className="font-mono text-zinc-300">{currentSavedKey.slice(0, 8)}••••{currentSavedKey.slice(-4)}</span></span>
             ) : (
-              "No key saved yet in this browser"
+              <span>No key saved yet in this browser</span>
+            )}
+            {currentSavedKey && tier && (
+              <span
+                className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${TIER_BADGE_STYLES[tier]}`}
+              >
+                {PLAN_LABELS[tier]}
+              </span>
             )}
           </div>
           {currentSavedKey && (

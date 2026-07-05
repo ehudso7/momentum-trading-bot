@@ -317,4 +317,8 @@ class TestPremiumCachePersistence:
         path = isolated_billing_state["cache_path"]
         contents = path.read_text(encoding="utf-8").strip()
         parsed = json.loads(contents)
-        assert parsed == [sample_hash]
+        # Phase 12 — v2 plan-aware envelope.
+        assert parsed == {
+            "version": 2,
+            "hashes": {sample_hash: {"plan": "pro"}},
+        }

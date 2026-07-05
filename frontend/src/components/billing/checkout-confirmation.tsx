@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import { CheckCircle, Clock } from "lucide-react";
 import { LoadingSpinner } from "@/components/ui/loading";
-import { fetchBillingStatus, getApiKey } from "@/lib/api";
+import { fetchBillingStatus, getApiKey, PLAN_LABELS } from "@/lib/api";
+import type { PlanTier } from "@/lib/api";
 import { provisionApiKey } from "@/lib/use-api-key";
 
 const POLL_INTERVAL_MS = 2_000;
@@ -14,10 +15,11 @@ type ConfirmationState = "confirming" | "active" | "delayed";
 /**
  * Shown after a Stripe checkout completes. Polls the backend billing
  * status (Bearer auth from the locally stored API key) every 2s for up
- * to 30s, confirming that the premium entitlement has landed.
+ * to 30s, confirming that the paid-plan entitlement has landed.
  */
 export function CheckoutConfirmation() {
   const [state, setState] = useState<ConfirmationState>("confirming");
+  const [plan, setPlan] = useState<PlanTier | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -41,7 +43,16 @@ export function CheckoutConfirmation() {
         try {
           const status = await fetchBillingStatus();
           if (status.premium) {
-            if (!cancelled) setState("active");
+            if (!cancelled) {
+              // `plan` distinguishes pro vs elite; fall back to a generic
+              // "Premium" label if an older backend omits it.
+              setPlan(
+                status.plan === "pro" || status.plan === "elite"
+                  ? status.plan
+                  : null
+              );
+              setState("active");
+            }
             return;
           }
         } catch {
@@ -59,12 +70,18 @@ export function CheckoutConfirmation() {
   }, []);
 
   if (state === "active") {
+    const planLabel = plan ? PLAN_LABELS[plan] : "Premium";
+    const unlocked =
+      plan === "elite"
+        ? "full signals, elite insights, and priority access are unlocked."
+        : plan === "pro"
+          ? "full signal details and Pro features are unlocked."
+          : "full signals and premium features are unlocked.";
     return (
       <div className="mb-6 flex items-center justify-center gap-2 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-sm text-emerald-400">
         <CheckCircle className="h-4 w-4 shrink-0" />
         <span>
-          Premium active <span aria-hidden>✓</span> — full signals and premium
-          features are unlocked.
+          {planLabel} active <span aria-hidden>✓</span> — {unlocked}
         </span>
       </div>
     );

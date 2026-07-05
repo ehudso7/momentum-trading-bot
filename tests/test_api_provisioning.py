@@ -403,7 +403,8 @@ class TestProvisionPremiumCarryOver:
 
         second = _provision(client).json()
         second_hash = key_store.hash_api_key(second["api_key"])
-        assert second["tier"] == "premium"
+        # Phase 12 — a legacy premium entitlement carries as plan "pro".
+        assert second["tier"] == "pro"
         assert second["rotated"] is True
         assert billing.is_premium_hash(second_hash) is True
         # Stale hash dropped from the cache; old key revoked anyway.
@@ -426,8 +427,9 @@ class TestProvisionPremiumCarryOver:
         )
         assert r.status_code == 200
         assert r.json() == {
-            "tier": "premium",
+            "tier": "pro",
             "premium": True,
+            "plan": "pro",
             "plan_source": "manifest",
         }
 
@@ -692,6 +694,7 @@ class TestBillingStatus:
         assert r.json() == {
             "tier": "free",
             "premium": False,
+            "plan": "free",
             "plan_source": "manifest",
         }
 
@@ -702,9 +705,11 @@ class TestBillingStatus:
             headers={"Authorization": f"Bearer {raw}"},
         )
         assert r.status_code == 200
+        # Phase 12 — a manifest tier="premium" key resolves to plan "pro".
         assert r.json() == {
-            "tier": "premium",
+            "tier": "pro",
             "premium": True,
+            "plan": "pro",
             "plan_source": "manifest",
         }
 
@@ -718,6 +723,7 @@ class TestBillingStatus:
         assert r.json() == {
             "tier": "free",
             "premium": False,
+            "plan": "free",
             "plan_source": "env_key",
         }
 
@@ -728,9 +734,11 @@ class TestBillingStatus:
             headers={"Authorization": "Bearer allowlisted-key"},
         )
         assert r.status_code == 200
+        # Phase 12 — TRADING_API_PREMIUM_KEYS maps to plan "pro".
         assert r.json() == {
-            "tier": "premium",
+            "tier": "pro",
             "premium": True,
+            "plan": "pro",
             "plan_source": "premium_allowlist",
         }
 
@@ -746,9 +754,11 @@ class TestBillingStatus:
             headers={"Authorization": f"Bearer {raw}"},
         )
         assert r.status_code == 200
+        # Phase 12 — a legacy flat-list Stripe-cache entry is plan "pro".
         assert r.json() == {
-            "tier": "premium",
+            "tier": "pro",
             "premium": True,
+            "plan": "pro",
             "plan_source": "manifest",
         }
 
@@ -806,4 +816,7 @@ class TestProvisionCheckoutFulfilmentJourney:
         )
         assert r.status_code == 200
         assert r.json()["premium"] is True
-        assert r.json()["tier"] == "premium"
+        # Phase 12 — the elite plan purchased at checkout survives
+        # webhook fulfilment and shows up on the status probe.
+        assert r.json()["tier"] == "elite"
+        assert r.json()["plan"] == "elite"

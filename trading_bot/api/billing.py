@@ -72,6 +72,30 @@ VALID_CHECKOUT_PLANS: frozenset[str] = frozenset(
 )
 DEFAULT_CHECKOUT_PLAN = CHECKOUT_PLAN_PRO
 
+# Phase 12 — plan-aware entitlements. Every hash in the premium cache
+# now carries a plan ("pro" | "elite"). The plan vocabulary is shared
+# with the checkout plans above.
+PLAN_PRO = CHECKOUT_PLAN_PRO
+PLAN_ELITE = CHECKOUT_PLAN_ELITE
+VALID_PLANS: frozenset[str] = VALID_CHECKOUT_PLANS
+DEFAULT_PLAN = DEFAULT_CHECKOUT_PLAN
+PREMIUM_CACHE_FORMAT_VERSION = 2
+
+
+def _normalize_plan(plan: object) -> str:
+    """
+    Coerce ``plan`` into a member of ``VALID_PLANS``, falling back
+    to ``DEFAULT_PLAN`` ("pro") for anything unrecognised. Fail-safe
+    rather than fail-closed on purpose: an unknown plan label on an
+    existing entitlement must degrade to the cheapest PAID plan, not
+    silently destroy a paid entitlement.
+    """
+    if isinstance(plan, str):
+        p = plan.strip().lower()
+        if p in VALID_PLANS:
+            return p
+    return DEFAULT_PLAN
+
 _PLAN_PRICE_ENV_VARS: dict[str, str] = {
     CHECKOUT_PLAN_PRO: STRIPE_PRO_PRICE_ID_ENV_VAR,
     CHECKOUT_PLAN_ELITE: STRIPE_ELITE_PRICE_ID_ENV_VAR,
@@ -121,7 +145,11 @@ DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
 _ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset({"active", "trialing"})
 
 _cache_lock = threading.Lock()
-_cache: set[str] = set()
+# Phase 12 — hash → plan ("pro" | "elite"). Loading transparently
+# accepts the legacy on-disk format (flat JSON list of hashes → plan
+# "pro"); saving always writes the v2 envelope:
+#     {"version": 2, "hashes": {"<hash>": {"plan": "pro"|"elite"}}}
+_cache: dict[str, str] = {}
 _cache_loaded_from: Optional[Path] = None
 _cache_load_mtime: Optional[float] = None
 
@@ -159,36 +187,52 @@ def _cache_path() -> Path:
     )
 
 
-def _read_raw_cache_entries(path: Path) -> Optional[list]:
+def _read_raw_cache(path: Path):
+    """Parse the cache file. Returns the raw JSON value or ``None``."""
     try:
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         log.debug("billing.cache_load_error", path=str(path), error=str(exc))
         return None
-    if not isinstance(data, list):
-        return None
-    return data
 
 
-def _save_cache(path: Path, hashes: set[str]) -> None:
+def _save_cache(path: Path, entries: dict[str, str]) -> None:
+    """
+    Persist the v2 plan-aware envelope::
+
+        {"version": 2, "hashes": {"<hash>": {"plan": "pro"|"elite"}}}
+
+    Every save writes v2 — a legacy flat-list file is therefore
+    migrated transparently on the next save after load.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(sorted(hashes))
+        payload = json.dumps(
+            {
+                "version": PREMIUM_CACHE_FORMAT_VERSION,
+                "hashes": {
+                    h: {"plan": _normalize_plan(p)}
+                    for h, p in sorted(entries.items())
+                },
+            },
+            sort_keys=False,
+        )
         path.write_text(payload + "\n", encoding="utf-8")
     except Exception as exc:
         log.debug("billing.cache_save_error", path=str(path), error=str(exc))
 
 
-def _load_and_migrate_cache(path: Path) -> set[str]:
-    raw = _read_raw_cache_entries(path)
-    if raw is None:
-        return set()
-
-    hashes: set[str] = set()
-    needs_migration = False
-
+def _entries_from_legacy_list(raw: list) -> tuple[dict[str, str], bool]:
+    """
+    Legacy format — a flat JSON list of hashes (or, pre-Phase-7.0,
+    raw API keys). Every entry maps to plan "pro". Returns
+    ``(entries, had_raw_keys)`` — raw keys force an immediate
+    re-save so plaintext keys never linger on disk.
+    """
+    entries: dict[str, str] = {}
+    had_raw_keys = False
     for v in raw:
         if not v:
             continue
@@ -196,22 +240,72 @@ def _load_and_migrate_cache(path: Path) -> set[str]:
         if not s:
             continue
         if _looks_like_hash(s):
-            hashes.add(s.lower())
+            entries[s.lower()] = DEFAULT_PLAN
         else:
             hashed = _hash_api_key(s)
             if hashed:
-                hashes.add(hashed)
-            needs_migration = True
+                entries[hashed] = DEFAULT_PLAN
+            had_raw_keys = True
+    return entries, had_raw_keys
 
-    if needs_migration:
-        _save_cache(path, hashes)
+
+def _entries_from_v2(raw: dict) -> dict[str, str]:
+    """
+    Parse the v2 envelope. Malformed rows are skipped; a missing or
+    unknown plan degrades to ``DEFAULT_PLAN`` so an entitlement is
+    never destroyed by a bad plan label.
+    """
+    entries: dict[str, str] = {}
+    hashes = raw.get("hashes")
+    if not isinstance(hashes, dict):
+        return entries
+    for key_hash, meta in hashes.items():
+        if not isinstance(key_hash, str):
+            continue
+        h = key_hash.strip()
+        if not h:
+            continue
+        if not _looks_like_hash(h):
+            hashed = _hash_api_key(h)
+            if not hashed:
+                continue
+            h = hashed
+        plan = meta.get("plan") if isinstance(meta, dict) else None
+        entries[h.lower()] = _normalize_plan(plan)
+    return entries
+
+
+def _load_and_migrate_cache(path: Path) -> dict[str, str]:
+    raw = _read_raw_cache(path)
+    if raw is None:
+        return {}
+
+    if isinstance(raw, dict):
+        if raw.get("version") == PREMIUM_CACHE_FORMAT_VERSION:
+            return _entries_from_v2(raw)
+        # Unknown dict shape — treated as empty (fail-closed), same
+        # as the pre-Phase-12 behaviour for non-list content.
+        return {}
+
+    if not isinstance(raw, list):
+        return {}
+
+    entries, had_raw_keys = _entries_from_legacy_list(raw)
+
+    if had_raw_keys:
+        # Pre-Phase-7.0 file with raw API keys on disk: re-save
+        # immediately (now in v2 form) so the plaintext never
+        # survives another process lifetime.
+        _save_cache(path, entries)
         log.info(
             "billing.cache_migrated_to_hashes",
             path=str(path),
-            entries=len(hashes),
+            entries=len(entries),
         )
+    # A pure hashed legacy list is left on disk untouched; the next
+    # save (add/remove) rewrites it in the v2 envelope.
 
-    return hashes
+    return entries
 
 
 def _ensure_cache_loaded() -> None:
@@ -252,16 +346,23 @@ def reset_cache_for_tests() -> None:
         _processed_events_load_mtime = None
 
 
-def add_premium_key(api_key: str) -> None:
+def add_premium_key(api_key: str, plan: str = DEFAULT_PLAN) -> None:
     if not api_key:
         return
     key_hash = _hash_api_key(api_key)
     if not key_hash:
         return
-    add_premium_hash(key_hash)
+    add_premium_hash(key_hash, plan=plan)
 
 
-def add_premium_hash(key_hash: str) -> None:
+def add_premium_hash(key_hash: str, plan: str = DEFAULT_PLAN) -> None:
+    """
+    Grant (or re-plan) a paid entitlement for ``key_hash``.
+
+    ``plan`` is validated against ``VALID_PLANS`` ("pro" | "elite");
+    anything else falls back to "pro" so legacy single-argument
+    callers keep their exact pre-Phase-12 behaviour.
+    """
     if not key_hash or not isinstance(key_hash, str):
         return
     h = key_hash.strip()
@@ -270,8 +371,8 @@ def add_premium_hash(key_hash: str) -> None:
     _ensure_cache_loaded()
     path = _cache_path()
     with _cache_lock:
-        _cache.add(h)
-        _save_cache(path, set(_cache))
+        _cache[h] = _normalize_plan(plan)
+        _save_cache(path, dict(_cache))
 
 
 def remove_premium_key(api_key: str) -> None:
@@ -292,14 +393,36 @@ def remove_premium_hash(key_hash: str) -> None:
     _ensure_cache_loaded()
     path = _cache_path()
     with _cache_lock:
-        _cache.discard(h)
-        _save_cache(path, set(_cache))
+        _cache.pop(h, None)
+        _save_cache(path, dict(_cache))
 
 
 def current_premium_key_hashes() -> set[str]:
     _ensure_cache_loaded()
     with _cache_lock:
         return set(_cache)
+
+
+def get_plan_for_hash(key_hash: Optional[str]) -> Optional[str]:
+    """
+    Return the plan ("pro" | "elite") for ``key_hash``, or ``None``
+    when the hash has no paid entitlement.
+    """
+    if not key_hash or not isinstance(key_hash, str):
+        return None
+    h = key_hash.strip()
+    if not h:
+        return None
+    _ensure_cache_loaded()
+    with _cache_lock:
+        return _cache.get(h)
+
+
+def get_plan_for_key(api_key: Optional[str]) -> Optional[str]:
+    """``get_plan_for_hash`` for callers that hold the raw key."""
+    if not api_key:
+        return None
+    return get_plan_for_hash(_hash_api_key(api_key))
 
 
 def current_premium_keys() -> set[str]:
@@ -520,6 +643,63 @@ def _fetch_identity_from_customer(
             error=str(exc),
         )
         return (None, None)
+
+
+def _extract_plan_from_event_object(obj) -> Optional[str]:
+    """
+    Phase 12 — pull the checkout plan out of a Stripe event object.
+
+    Sources (first hit wins):
+      1. ``object.metadata.plan`` — set by
+         ``create_checkout_session_for_hash`` on the Checkout Session.
+      2. ``object.subscription_details.metadata.plan`` — invoices.
+      3. ``object.items.data[0].price.metadata.plan`` is deliberately
+         NOT consulted; the price object is Stripe-side config, not
+         our fulfilment contract.
+
+    Returns a member of ``VALID_PLANS`` or ``None`` when no valid
+    plan is present — the caller decides the fallback (default
+    "pro" for fresh grants, preserve-existing for updates).
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    candidates: list[object] = []
+    meta = obj.get("metadata")
+    if isinstance(meta, dict):
+        candidates.append(meta.get("plan"))
+    subscription_details = obj.get("subscription_details")
+    if isinstance(subscription_details, dict):
+        sd_meta = subscription_details.get("metadata")
+        if isinstance(sd_meta, dict):
+            candidates.append(sd_meta.get("plan"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            plan = candidate.strip().lower()
+            if plan in VALID_PLANS:
+                return plan
+    return None
+
+
+def _plan_for_grant(obj, key_hash: Optional[str]) -> str:
+    """
+    Resolve the plan to store when a webhook event grants (or
+    refreshes) an entitlement:
+
+      1. valid ``metadata.plan`` on the event object;
+      2. the plan already stored for ``key_hash`` (an update event
+         without plan metadata must never downgrade an elite key);
+      3. ``DEFAULT_PLAN`` ("pro").
+    """
+    plan = _extract_plan_from_event_object(obj)
+    if plan:
+        return plan
+    if key_hash:
+        existing = get_plan_for_hash(key_hash.strip())
+        if existing:
+            return existing
+    return DEFAULT_PLAN
 
 
 def _extract_price_id_from_event_object(obj) -> Optional[str]:
@@ -856,6 +1036,9 @@ def _handle_webhook_event_core(
                 "reason": "no_identity_on_event",
             }
 
+        grant_hash = key_hash if use_hash else _hash_api_key(api_key)
+        plan = _plan_for_grant(obj, grant_hash)
+
         if use_hash:
             if not _verify_hash_against_manifest(key_hash):  # type: ignore[arg-type]
                 return {
@@ -865,7 +1048,7 @@ def _handle_webhook_event_core(
                     "reason": "key_not_in_manifest_or_revoked",
                     "identity": identity_source,
                 }
-            add_premium_hash(key_hash)  # type: ignore[arg-type]
+            add_premium_hash(key_hash, plan=plan)  # type: ignore[arg-type]
             funnel_hash = key_hash
         else:
             if not _verify_against_manifest(api_key):  # type: ignore[arg-type]
@@ -876,7 +1059,7 @@ def _handle_webhook_event_core(
                     "reason": "key_not_in_manifest_or_revoked",
                     "identity": identity_source,
                 }
-            add_premium_key(api_key)  # type: ignore[arg-type]
+            add_premium_key(api_key, plan=plan)  # type: ignore[arg-type]
             funnel_hash = _hash_api_key(api_key)
 
         _record_conversion_and_funnel(
@@ -892,9 +1075,13 @@ def _handle_webhook_event_core(
             "type": event_type,
             "action": "added",
             "identity": identity_source,
+            "plan": plan,
         }
 
-    if event_type == "customer.subscription.created":
+    if event_type in (
+        "customer.subscription.created",
+        "customer.subscription.updated",
+    ):
         if not api_key and not key_hash:
             return {
                 "id": event_id,
@@ -908,12 +1095,35 @@ def _handle_webhook_event_core(
         ).lower()
 
         if sub_status not in _ACTIVE_SUBSCRIPTION_STATUSES:
+            if event_type == "customer.subscription.updated":
+                # Phase 12 — a subscription that moved to a
+                # non-active status (past_due, canceled, unpaid,
+                # incomplete_expired, paused…) loses its paid
+                # entitlement, mirroring the deleted handler.
+                if use_hash:
+                    remove_premium_hash(key_hash)  # type: ignore[arg-type]
+                else:
+                    remove_premium_key(api_key)  # type: ignore[arg-type]
+                return {
+                    "id": event_id,
+                    "type": event_type,
+                    "action": "removed",
+                    "reason": f"status={sub_status or 'unknown'}",
+                    "identity": identity_source,
+                }
             return {
                 "id": event_id,
                 "type": event_type,
                 "action": "ignored",
                 "reason": f"status={sub_status or 'unknown'}",
             }
+
+        # Active/trialing — grant (created) or refresh (updated).
+        # ``_plan_for_grant`` prefers the event's metadata plan and
+        # otherwise PRESERVES the stored plan, so a plan-less
+        # subscription.updated can never downgrade an elite key.
+        grant_hash = key_hash if use_hash else _hash_api_key(api_key)
+        plan = _plan_for_grant(obj, grant_hash)
 
         if use_hash:
             if not _verify_hash_against_manifest(key_hash):  # type: ignore[arg-type]
@@ -924,7 +1134,7 @@ def _handle_webhook_event_core(
                     "reason": "key_not_in_manifest_or_revoked",
                     "identity": identity_source,
                 }
-            add_premium_hash(key_hash)  # type: ignore[arg-type]
+            add_premium_hash(key_hash, plan=plan)  # type: ignore[arg-type]
             funnel_hash = key_hash
         else:
             if not _verify_against_manifest(api_key):  # type: ignore[arg-type]
@@ -935,22 +1145,24 @@ def _handle_webhook_event_core(
                     "reason": "key_not_in_manifest_or_revoked",
                     "identity": identity_source,
                 }
-            add_premium_key(api_key)  # type: ignore[arg-type]
+            add_premium_key(api_key, plan=plan)  # type: ignore[arg-type]
             funnel_hash = _hash_api_key(api_key)
 
-        _record_conversion_and_funnel(
-            api_key=api_key,
-            key_hash=key_hash,
-            use_hash=use_hash,
-            obj=obj,
-            funnel_hash=funnel_hash,
-        )
+        if event_type == "customer.subscription.created":
+            _record_conversion_and_funnel(
+                api_key=api_key,
+                key_hash=key_hash,
+                use_hash=use_hash,
+                obj=obj,
+                funnel_hash=funnel_hash,
+            )
 
         return {
             "id": event_id,
             "type": event_type,
             "action": "added",
             "identity": identity_source,
+            "plan": plan,
         }
 
     if event_type == "customer.subscription.deleted":

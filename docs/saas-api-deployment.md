@@ -138,17 +138,40 @@ uses a $0 monthly price for safe end-to-end checkout validation.
 |---|---|---|
 | `PORT` | `8080` | Platform-injected port. Honoured by `trading-bot-api`. |
 | `HOST` | `0.0.0.0` | Bind host. |
-| `TRADING_API_PREMIUM_KEYS` | (empty) | Comma-separated allow-list of premium-tier keys (Phase 4.5). |
+| `TRADING_API_PREMIUM_KEYS` | (empty) | Comma-separated allow-list of paid keys (Phase 4.5). Phase 12: resolves to plan `pro`. |
+| `TRADING_API_ELITE_KEYS` | (empty) | Phase 12 — comma-separated allow-list of `elite`-plan keys. A key in both lists is elite. |
+| `TRADING_API_RATE_LIMIT_PER_MINUTE` | `60` | Base per-minute rate limit; Phase 12 uses it as the shared fallback for all three tier limits. |
+| `TRADING_API_RATE_LIMIT_PER_MINUTE_FREE` | `60` | Phase 12 — free-tier per-minute limit. Falls back to `TRADING_API_RATE_LIMIT_PER_MINUTE`, then 60. |
+| `TRADING_API_RATE_LIMIT_PER_MINUTE_PRO` | `120` | Phase 12 — pro-tier per-minute limit. Falls back to `TRADING_API_RATE_LIMIT_PER_MINUTE`, then 120. |
+| `TRADING_API_RATE_LIMIT_PER_MINUTE_ELITE` | `300` | Phase 12 — elite-tier per-minute limit. Falls back to `TRADING_API_RATE_LIMIT_PER_MINUTE`, then 300. |
 | `TRADING_API_USAGE_LOG_PATH` | `data/api_usage.jsonl` | Per-key usage log path (Phase 4.6). |
 | `TRADING_API_AUDIT_LOG_PATH` | `data/api_access_audit.jsonl` | Audit log path (Phase 4.4). |
 | `TRADING_API_REPORTS_DIR` | `reports` | Where the daily validation reports live. |
 | `TRADING_API_MANIFEST_PATH` | `data/alpha_experiments.jsonl` | Experiment manifest (Phase 3.6). |
-| `TRADING_STRIPE_PREMIUM_CACHE_PATH` | `data/stripe_premium_keys.json` | Webhook-driven premium-key cache. |
+| `TRADING_STRIPE_PREMIUM_CACHE_PATH` | `data/stripe_premium_keys.json` | Webhook-driven entitlement cache. Phase 12 v2 format: `{"version": 2, "hashes": {"<hash>": {"plan": "pro"\|"elite"}}}`. The legacy flat-list format (a JSON array of hashes) is still read transparently — every legacy entry loads as plan `pro` — and the file is rewritten in v2 form on the next entitlement change. No manual migration is needed. |
 | `TRADING_FREE_MAX_REQUESTS_PER_DAY` | `50` | Phase 5.4 free-tier daily request cap. |
 | `TRADING_FREE_MAX_REPORT_CALLS` | `10` | Phase 5.4 free-tier report-calls cap. |
 | `TRADING_UPGRADE_BANNER_COPY` | (default copy) | Phase 5.7 dashboard banner override. |
 | `TRADING_LIMIT_HIT_COPY` | (default copy) | Phase 5.7 429 detail override. |
 | `TRADING_REPORT_LIMIT_COPY` | (default copy) | Phase 5.7 403 detail override. |
+
+### Tier entitlement matrix (Phase 12)
+
+API keys resolve to one of three tiers — `free`, `pro`, `elite`
+(`GET /billing/status` reports the resolved tier; the legacy
+`premium` boolean stays true for both paid plans):
+
+| Entitlement | free | pro | elite |
+|---|---|---|---|
+| Rate limit (per minute) | 60 | 120 | 300 |
+| `/reports/{date}` window | 3 days | 30 days | unlimited |
+| `/experiments/*` cap | 3 | 25 | unlimited |
+| Insights | truncated | full | full + `elite` block |
+| Daily free-tier usage caps | enforced | exempt | exempt |
+
+Plan switching (`pro` ↔ `elite`) goes through the Stripe billing
+portal ("Manage subscription") — `POST /billing/checkout` refuses to
+create a second subscription for an already-paid key (409).
 
 ---
 

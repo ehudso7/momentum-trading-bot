@@ -315,7 +315,11 @@ class TestPremiumCache:
         assert cache_file.exists()
         body = cache_file.read_text("utf-8")
         data = json.loads(body)
-        assert data == [_hash("user-123")]
+        # Phase 12 — v2 plan-aware envelope; the default plan is "pro".
+        assert data == {
+            "version": 2,
+            "hashes": {_hash("user-123"): {"plan": "pro"}},
+        }
         # The raw value must NOT appear on disk.
         assert "user-123" not in body
 
@@ -353,11 +357,16 @@ class TestPremiumCache:
         assert is_premium_via_stripe("pre-existing-a") is True
         assert is_premium_via_stripe("pre-existing-b") is True
         assert is_premium_via_stripe("not-there") is False
-        # And the on-disk file has been rewritten with hashes only.
+        # And the on-disk file has been rewritten (v2 envelope) with
+        # hashes only — every legacy entry loads as plan "pro".
         rewritten = json.loads(cache_file.read_text("utf-8"))
-        assert set(rewritten) == {
+        assert rewritten["version"] == 2
+        assert set(rewritten["hashes"]) == {
             _hash("pre-existing-a"), _hash("pre-existing-b"),
         }
+        assert all(
+            meta == {"plan": "pro"} for meta in rewritten["hashes"].values()
+        )
         assert "pre-existing-a" not in cache_file.read_text("utf-8")
 
     def test_cache_reload_from_disk_already_hashed(self, cache_file: Path):
@@ -1669,10 +1678,10 @@ class TestAddRemovePremiumHash:
         body = cache_file.read_text("utf-8")
         # The hash IS on disk, but no raw key (we never had one).
         assert h in body
-        # And the documented schema is preserved.
+        # And the documented v2 schema is preserved.
         data = json.loads(body)
-        assert isinstance(data, list)
-        assert h in data
+        assert data["version"] == 2
+        assert data["hashes"][h] == {"plan": "pro"}
 
     def test_remove_then_check(self, cache_file: Path):
         h = "fedcba9876543210fedcba9876543210"
@@ -1886,7 +1895,7 @@ class TestPhase74WebhookPersistence:
         # Hash present, nothing else.
         assert h in body
         data = json.loads(body)
-        assert data == [h]
+        assert data == {"version": 2, "hashes": {h: {"plan": "pro"}}}
 
     def test_planted_pii_in_event_does_not_reach_cache(
         self, cache_file: Path,

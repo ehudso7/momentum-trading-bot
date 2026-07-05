@@ -417,7 +417,13 @@ class TestReportsLatest:
 
 
 class TestReportByDate:
-    def test_returns_matching_date(self, client: TestClient, authed_env):
+    def test_returns_matching_date(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        # Phase 12 — unlimited report history is an ELITE entitlement
+        # (pro is windowed to 30 days); the fixture date is fixed, so
+        # pin the key to elite for the full-access baseline.
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         _write_report(authed_env["reports_dir"], "2026-04-24")
         resp = client.get(
             "/reports/2026-04-24",
@@ -426,7 +432,10 @@ class TestReportByDate:
         assert resp.status_code == 200
         assert resp.json()["report_date"] == "2026-04-24"
 
-    def test_missing_date_returns_404(self, client: TestClient, authed_env):
+    def test_missing_date_returns_404(
+        self, client: TestClient, authed_env, monkeypatch,
+    ):
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         authed_env["reports_dir"].mkdir()
         resp = client.get(
             "/reports/2026-04-24",
@@ -561,8 +570,11 @@ class TestExperimentByIndex:
         assert resp.json()["report_date"] == "2026-04-04"
 
     def test_n_out_of_range_returns_404(
-        self, client: TestClient, authed_env
+        self, client: TestClient, authed_env, monkeypatch,
     ):
+        # Phase 12 — n=99 exceeds the pro cap (25); the uncapped
+        # baseline is the elite tier.
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         records = [
             _sample_manifest_record(f"2026-04-{d:02d}") for d in range(1, 4)
         ]
@@ -621,8 +633,11 @@ class TestSaasBoundarySanitization:
         assert body["scorer_fingerprint"] == "a" * 64
 
     def test_report_response_strips_filesystem_paths_from_sources(
-        self, client: TestClient, authed_env
+        self, client: TestClient, authed_env, monkeypatch,
     ):
+        # Phase 12 — the fixed fixture date sits outside the pro
+        # 30-day window; use elite for the full-access baseline.
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         _write_report(authed_env["reports_dir"], "2026-04-24")
         resp = client.get(
             "/reports/2026-04-24",
@@ -2533,6 +2548,9 @@ class TestReportsDateFreeTier:
     def test_premium_user_can_access_old_date(
         self, client: TestClient, free_env, monkeypatch
     ):
+        # Phase 12 — unlimited history is the ELITE entitlement
+        # (pro gets a 30-day window; see TestPhase12ReportWindows).
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
         _write_report(free_env["reports_dir"], "2025-01-01")
         resp = client.get(
@@ -2544,6 +2562,7 @@ class TestReportsDateFreeTier:
     def test_premium_user_can_access_future_date(
         self, client: TestClient, free_env, monkeypatch
     ):
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         self._set_today(monkeypatch, _date_phase45(2026, 4, 24))
         _write_report(free_env["reports_dir"], "2030-01-01")
         resp = client.get(
@@ -2659,8 +2678,11 @@ class TestExperimentsRecentTier:
         assert resp.json()["count"] == 10
 
     def test_premium_user_can_request_50(
-        self, client: TestClient, free_env
+        self, client: TestClient, free_env, monkeypatch
     ):
+        # Phase 12 — limit=50 exceeds the pro cap (25); uncapped
+        # listing is the elite entitlement.
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         self._seed(free_env["manifest"], 80)
         resp = client.get(
             "/experiments/recent?limit=50",
@@ -2726,9 +2748,13 @@ class TestExperimentByIndexTier:
         assert resp.status_code == 200
 
     def test_premium_user_n_too_large_still_404(
-        self, client: TestClient, free_env
+        self, client: TestClient, free_env, monkeypatch
     ):
-        """Premium past the manifest length still hits the documented 404."""
+        """Paid past the manifest length still hits the documented 404.
+
+        Phase 12 — n=99 exceeds the pro cap, so the uncapped probe
+        uses an elite key."""
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         self._seed(free_env["manifest"], 5)
         resp = client.get(
             "/experiments/99",
@@ -3545,11 +3571,14 @@ class TestWebhookUpdatesAccess:
         assert resp.status_code == 403
 
         # Now Stripe delivers the subscription.created webhook.
+        # Phase 12 — the probe date (2025-01-01) sits outside the pro
+        # 30-day window, so the fulfilled plan must be elite for the
+        # unlimited-access assertion below.
         body = json.dumps({
             "type": "customer.subscription.created",
             "data": {"object": {
                 "status": "active",
-                "metadata": {"api_key": api_key},
+                "metadata": {"api_key": api_key, "plan": "elite"},
             }},
         }).encode("utf-8")
         sig = _sign_stripe_webhook(body, STRIPE_TEST_SECRET)
@@ -3574,8 +3603,9 @@ class TestWebhookUpdatesAccess:
         api_key = stripe_env["api_key"]
         _write_report(stripe_env["reports_dir"], "2025-01-01")
 
-        # Become premium.
-        _billing.add_premium_key(api_key)
+        # Become paid — elite, since the probe date is outside the
+        # pro 30-day window (Phase 12).
+        _billing.add_premium_key(api_key, plan="elite")
 
         from trading_bot.api import server as srv
         srv._today_utc = lambda: _date_phase45(2026, 4, 24)
@@ -3638,19 +3668,23 @@ class TestFallbackToEnvVar:
     def test_env_var_premium_works_when_stripe_not_configured(
         self, client: TestClient, free_env
     ):
-        """free_env has TRADING_API_PREMIUM_KEYS=VALID_KEY and Stripe unset."""
-        _write_report(free_env["reports_dir"], "2025-01-01")
+        """free_env has TRADING_API_PREMIUM_KEYS=VALID_KEY and Stripe unset.
+
+        Phase 12 — the env premium list maps to plan "pro" (30-day
+        report window), so probe a date inside that window but
+        outside the free 3-day window."""
+        _write_report(free_env["reports_dir"], "2026-04-20")
         from trading_bot.api import server as srv
         srv._today_utc = lambda: _date_phase45(2026, 4, 24)
-        # VALID_KEY is premium via env var.
+        # VALID_KEY is paid (pro) via env var.
         resp = client.get(
-            "/reports/2025-01-01",
+            "/reports/2026-04-20",
             headers={"Authorization": f"Bearer {VALID_KEY}"},
         )
         assert resp.status_code == 200
-        # FREE_KEY is NOT premium.
+        # FREE_KEY is NOT paid — 4 days back exceeds the free window.
         resp = client.get(
-            "/reports/2025-01-01",
+            "/reports/2026-04-20",
             headers={"Authorization": f"Bearer {FREE_KEY}"},
         )
         assert resp.status_code == 403
@@ -3673,14 +3707,16 @@ class TestFallbackToEnvVar:
         monkeypatch.setenv(MANIFEST_PATH_ENV_VAR, str(tmp_path / "m.jsonl"))
         _billing.reset_cache_for_tests()
 
-        _write_report(tmp_path / "reports", "2025-01-01")
+        # Phase 12 — env premium == plan "pro" (30-day window); probe
+        # a date inside it but outside the free window.
+        _write_report(tmp_path / "reports", "2026-04-20")
         from trading_bot.api import server as srv
         srv._today_utc = lambda: _date_phase45(2026, 4, 24)
 
         # ops-override-key works via env var even though it's not
         # in the Stripe cache.
         resp = client.get(
-            "/reports/2025-01-01",
+            "/reports/2026-04-20",
             headers={"Authorization": "Bearer ops-override-key"},
         )
         assert resp.status_code == 200
@@ -3688,14 +3724,18 @@ class TestFallbackToEnvVar:
     def test_stripe_cache_wins_for_customers_not_in_env(
         self, client: TestClient, stripe_env
     ):
-        """Stripe cache grants premium to a key not in TRADING_API_PREMIUM_KEYS."""
+        """Stripe cache grants premium to a key not in TRADING_API_PREMIUM_KEYS.
+
+        Phase 12 — a plan-less cache entry loads as "pro" (30-day
+        window), so probe a date inside that window but outside the
+        free window."""
         api_key = stripe_env["api_key"]
         _billing.add_premium_key(api_key)
-        _write_report(stripe_env["reports_dir"], "2025-01-01")
+        _write_report(stripe_env["reports_dir"], "2026-04-20")
         from trading_bot.api import server as srv
         srv._today_utc = lambda: _date_phase45(2026, 4, 24)
         resp = client.get(
-            "/reports/2025-01-01",
+            "/reports/2026-04-20",
             headers={"Authorization": f"Bearer {api_key}"},
         )
         assert resp.status_code == 200
@@ -4939,7 +4979,11 @@ class TestPhase55OldReportBlockedEvent:
 
     def test_premium_user_old_report_does_not_log(
         self, client: TestClient, free_env, upgrade_events_path: Path,
+        monkeypatch,
     ):
+        # Phase 12 — 2020-01-01 sits outside even the pro window, so
+        # the "paid users are never nagged" guarantee is elite's.
+        monkeypatch.setenv("TRADING_API_ELITE_KEYS", VALID_KEY)
         free_env["reports_dir"].mkdir(parents=True, exist_ok=True)
         resp = client.get(
             "/reports/2020-01-01",

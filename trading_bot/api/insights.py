@@ -377,6 +377,81 @@ def build_insights(
     return insights
 
 
+def build_elite_extras(
+    report: Optional[dict],
+    prev_report: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Phase 12 — the elite-tier ``elite`` block.
+
+    Surfaces REAL data the insight rules already compute but drop
+    from their emitted evidence — nothing here is fabricated:
+
+    * ``regime_ranking`` — the FULL sorted (regime, hits, share)
+      ranking. ``_regime_insight`` computes every pair but emits
+      only the dominant regime and the single runner-up.
+    * ``trend_detail`` — the raw day-over-day buy-rows comparison
+      (both sides + delta + percent change). ``truncate_for_free``
+      strips all of it for free callers; the elite block gives it a
+      stable top-level home independent of the insight list.
+
+    Returns ``None`` when the report offers neither source, so the
+    caller can omit the block instead of emitting an empty object.
+    Pure function — no I/O; inputs are never mutated.
+    """
+    if not isinstance(report, dict):
+        return None
+
+    extras: dict = {}
+
+    regime_stats = report.get("regime_stats")
+    if isinstance(regime_stats, dict) and regime_stats:
+        pairs: list[tuple[str, int]] = []
+        for name, value in regime_stats.items():
+            if isinstance(value, dict):
+                hits = _safe_int(value.get("hits"))
+            else:
+                hits = _safe_int(value)
+            if hits > 0:
+                pairs.append((str(name), hits))
+        if pairs:
+            pairs.sort(key=lambda kv: (-kv[1], kv[0]))
+            total_hits = sum(h for _, h in pairs)
+            extras["regime_ranking"] = [
+                {
+                    "regime": name,
+                    "hits": hits,
+                    "share": (
+                        round(hits / total_hits, 4) if total_hits else 0.0
+                    ),
+                }
+                for name, hits in pairs
+            ]
+
+    if isinstance(prev_report, dict):
+        curr_totals = report.get("totals")
+        prev_totals = prev_report.get("totals")
+        if (
+            isinstance(curr_totals, dict)
+            and isinstance(prev_totals, dict)
+            and "buy_rows" in curr_totals
+            and "buy_rows" in prev_totals
+        ):
+            curr_n = _safe_int(curr_totals.get("buy_rows"))
+            prev_n = _safe_int(prev_totals.get("buy_rows"))
+            delta = curr_n - prev_n
+            extras["trend_detail"] = {
+                "curr_buy_rows": curr_n,
+                "prev_buy_rows": prev_n,
+                "delta": delta,
+                "percent_change": (
+                    round(100.0 * delta / prev_n, 2) if prev_n > 0 else None
+                ),
+            }
+
+    return extras or None
+
+
 def truncate_for_free(
     insights: list[dict],
     *,
