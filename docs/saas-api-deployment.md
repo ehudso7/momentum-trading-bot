@@ -154,6 +154,7 @@ uses a $0 monthly price for safe end-to-end checkout validation.
 | `TRADING_UPGRADE_BANNER_COPY` | (default copy) | Phase 5.7 dashboard banner override. |
 | `TRADING_LIMIT_HIT_COPY` | (default copy) | Phase 5.7 429 detail override. |
 | `TRADING_REPORT_LIMIT_COPY` | (default copy) | Phase 5.7 403 detail override. |
+| `SENTRY_DSN` | (unset) | Optional Sentry error tracking. When set, `trading-bot-api` (and the bot CLI) initialise sentry-sdk at boot with `traces_sample_rate=0.05`, `environment` from `RAILWAY_ENVIRONMENT_NAME` (default `local`), and `release` from `RAILWAY_GIT_COMMIT_SHA` when Railway provides it. FastAPI is auto-instrumented. Unset → strict no-op (sentry-sdk is never even imported). |
 
 ### Tier entitlement matrix (Phase 12)
 

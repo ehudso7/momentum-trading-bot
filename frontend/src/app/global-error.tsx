@@ -1,5 +1,8 @@
 "use client";
 
+import { useEffect } from "react";
+import * as Sentry from "@sentry/nextjs";
+
 export default function GlobalError({
   error,
   reset,
@@ -7,6 +10,11 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  useEffect(() => {
+    // No-op when NEXT_PUBLIC_SENTRY_DSN is unset (Sentry init is disabled).
+    Sentry.captureException(error);
+  }, [error]);
+
   return (
     <html lang="en">
       <body

@@ -150,6 +150,73 @@ export async function fetchEquityHistory(): Promise<EquityPoint[]> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Viral loop — public signal share cards (/s/<token>)
+// ---------------------------------------------------------------------------
+
+/** Sanitized public snapshot served by GET /share/signal/{token}. */
+export interface SharedSignal {
+  symbol: string;
+  direction: "bullish" | "bearish" | "neutral";
+  /** 0-100 momentum score (confidence × 100). */
+  score: number;
+  /** Momentum % vs the 50-day SMA; null when unavailable. */
+  gap_pct: number | null;
+  regime: string;
+  date: string | null;
+  referrer_label: string | null;
+  token?: string;
+  expires_at?: string;
+}
+
+/** Response of the authenticated POST /share/signal. */
+export interface SignalShareLink {
+  token: string;
+  /** Frontend path serving the public card, e.g. "/s/<token>". */
+  path: string;
+  share_url: string | null;
+  expires_at: string;
+  signal: SharedSignal;
+}
+
+const SHARE_TOKEN_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/**
+ * Mint a public share link for one signal in the latest report.
+ * Requires the stored API key (the axios interceptor attaches it).
+ */
+export async function createSignalShareLink(
+  symbol: string,
+  label?: string
+): Promise<SignalShareLink> {
+  const body: { symbol: string; label?: string } = { symbol };
+  if (label) body.label = label;
+  const { data } = await backend.post<SignalShareLink>("/share/signal", body);
+  return data;
+}
+
+/**
+ * Server-safe fetch of a shared signal card — PUBLIC endpoint, no
+ * API key. Used by the /s/[token] page and its OG image. Invalid,
+ * unknown, and expired tokens all resolve to null (the caller
+ * renders a tasteful fallback card, never an error page).
+ */
+export async function fetchSharedSignal(
+  token: string
+): Promise<SharedSignal | null> {
+  if (!SHARE_TOKEN_RE.test(token)) return null;
+  try {
+    const res = await fetch(
+      `${RAILWAY_BACKEND}/share/signal/${encodeURIComponent(token)}`,
+      { next: { revalidate: 300 } }
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as SharedSignal;
+  } catch {
+    return null;
+  }
+}
+
 export type CheckoutPlan = "pro" | "elite";
 
 export interface CheckoutSession {

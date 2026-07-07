@@ -1100,7 +1100,7 @@ class TestPhase48NoNewApiRoute:
     def test_only_non_read_verb_is_still_webhook_stripe(self):
         """The only mutating routes are POST /webhook/stripe (Phase 4.7)
         and POST /billing/checkout (Phase 7.3). Anything else is a regression."""
-        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision")}
+        allowed = {("POST", "/webhook/stripe"), ("POST", "/billing/checkout"), ("POST", "/keys/provision"), ("POST", "/share/signal")}
         from trading_bot.api.server import app
         for route in app.routes:
             methods = getattr(route, "methods", None) or set()

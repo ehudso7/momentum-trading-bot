@@ -4038,6 +4038,237 @@ def signals_for_date(
     return project_for_free(report)
 
 
+# ---------------------------------------------------------------------------
+# Phase 10.4 — tokenised public share links (viral signal cards)
+# ---------------------------------------------------------------------------
+
+#: Symbols accepted by ``POST /share/signal`` — mirrors the SaaS
+#: universe sanitiser (real US tickers, incl. preferred-share
+#: suffixes; fail-closed on anything else).
+_SHARE_SYMBOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,7}$")
+
+#: Public share cards are immutable snapshots — let CDNs and the
+#: frontend cache them briefly without any auth-context risk (the
+#: payload never varies by caller and carries no premium fields).
+_SHARE_PUBLIC_CACHE_CONTROL = "public, max-age=300, s-maxage=300"
+
+#: Frontend path serving the public card for one token.
+_SHARE_FRONTEND_PATH_PREFIX = "/s/"
+
+SHARE_FRONTEND_BASE_URL_ENV_VAR = "TRADING_SHARE_BASE_URL"
+
+
+class ShareSignalRequest(BaseModel):
+    """
+    Body for ``POST /share/signal``.
+
+    * ``symbol`` — REQUIRED ticker present in the latest signal
+      report (case-insensitive).
+    * ``label`` — optional public display label for the sharer
+      (e.g. a handle). Sanitised + capped by
+      ``share_links.sanitize_referrer_label``; NEVER an email or
+      any other PII by contract — the sanitiser strips ``@`` and
+      everything outside its safe set.
+    """
+
+    symbol: str
+    label: Optional[str] = None
+
+
+def _share_frontend_base() -> str:
+    """
+    Base URL for outbound share links: the dedicated share base
+    when set, else the existing public base, else "" (the caller
+    composes an absolute URL from its own origin).
+    """
+    dedicated = (
+        os.getenv(SHARE_FRONTEND_BASE_URL_ENV_VAR, "") or ""
+    ).strip()
+    if dedicated:
+        return dedicated.rstrip("/")
+    return (
+        (os.getenv(PUBLIC_BASE_URL_ENV_VAR, "") or "").strip().rstrip("/")
+    )
+
+
+def _load_latest_saas_report() -> dict:
+    """Shared loader for the share endpoints — 404/500 like /signals."""
+    from trading_bot.saas.report_engine import latest_report_path, load_report
+
+    rd = _saas_reports_dir()
+    path = latest_report_path(rd)
+    if path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "no signal reports available — generate one with "
+                "`python -m trading_bot.saas generate`"
+            ),
+        )
+    try:
+        return load_report(path)
+    except Exception as exc:
+        log.warning(
+            "share_signal.parse_error", path=str(path), error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to parse signal report: {type(exc).__name__}",
+        )
+
+
+@app.post("/share/signal", tags=["share"])
+def create_signal_share_link(
+    body: ShareSignalRequest,
+    request: Request,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Mint a public share token for one signal in the LATEST report.
+
+    Auth required (any tier — sharing is the free tier's superpower
+    too). The stored snapshot is sanitised at WRITE time: no entry /
+    stop / target / indicators / rationale ever reaches the store,
+    so the public read path cannot leak premium data by construction.
+
+    Response 200::
+
+        {"token": "...", "path": "/s/<token>",
+         "share_url": "<base>/s/<token>" | null,
+         "expires_at": "...Z",
+         "signal": {symbol, direction, score, gap_pct, regime,
+                    date, referrer_label}}
+
+    404 — no reports yet, or the symbol is not in the latest report.
+    503 — the link store could not be written (token would be dead).
+    """
+    from trading_bot.api import share_links
+
+    raw_symbol = (body.symbol or "").strip()
+    if not _SHARE_SYMBOL_RE.match(raw_symbol):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "invalid symbol: must be 1-8 chars, letters/digits/./-"
+            ),
+        )
+    symbol = raw_symbol.upper()
+
+    report = _load_latest_saas_report()
+    signal = next(
+        (
+            s for s in (report.get("signals") or [])
+            if isinstance(s, dict)
+            and str(s.get("symbol") or "").upper() == symbol
+        ),
+        None,
+    )
+    if signal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no signal for {symbol} in the latest report",
+        )
+
+    key_hash = _hash_api_key(api_key)
+    try:
+        record = share_links.create_share_link(
+            key_hash=key_hash,
+            signal=signal,
+            report=report,
+            referrer_label=body.label,
+        )
+    except OSError as exc:
+        log.error(
+            "share_signal.store_write_failed",
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="share link store unavailable — try again shortly",
+        )
+
+    token = record["token"]
+    # Phase 10.3 telemetry — best-effort, never affects the response.
+    try:
+        from trading_bot.api.share_events import (
+            EVENT_SHARE_GENERATED, record_share_event,
+        )
+        record_share_event(
+            key_hash=key_hash,
+            type=EVENT_SHARE_GENERATED,
+            endpoint="/share/signal",
+            src=token,
+            request_id=getattr(
+                getattr(request, "state", None), "request_id", None,
+            ),
+        )
+    except Exception as exc:
+        log.debug("share_events.share_generated_emit_error", error=str(exc))
+
+    frontend_path = _SHARE_FRONTEND_PATH_PREFIX + token
+    base = _share_frontend_base()
+    return {
+        "token": token,
+        "path": frontend_path,
+        "share_url": (base + frontend_path) if base else None,
+        "expires_at": record["expires_at"],
+        "signal": record["signal"],
+    }
+
+
+@app.get("/share/signal/{token}", tags=["share", "public"])
+def get_shared_signal(
+    token: str,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    """
+    PUBLIC — resolve a share token to its sanitised signal card.
+
+    No API key required: the stored snapshot contains only
+    ``{symbol, direction, score, gap_pct, regime, date,
+    referrer_label}`` — premium fields were never persisted. The
+    response is CDN-cacheable (``Cache-Control: public``) because
+    it is identical for every caller.
+
+    Malformed, unknown, and expired tokens all return the same 404
+    so the endpoint cannot be used as an existence oracle.
+    """
+    from trading_bot.api import share_links
+
+    record = share_links.lookup_share_link(token)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="share link not found or expired",
+        )
+
+    # Attribute the inbound view to the SHARER's key hash — the
+    # existing Phase 10.3 machinery joins share_generated and
+    # inbound_visit rows on the src token. Best-effort telemetry.
+    try:
+        from trading_bot.api.share_events import (
+            EVENT_INBOUND_VISIT, record_share_event,
+        )
+        record_share_event(
+            key_hash=str(record.get("api_key_hash") or ""),
+            type=EVENT_INBOUND_VISIT,
+            endpoint="/share/signal",
+            src=str(record.get("token") or ""),
+            request_id=getattr(
+                getattr(request, "state", None), "request_id", None,
+            ),
+        )
+    except Exception as exc:
+        log.debug("share_events.inbound_visit_emit_error", error=str(exc))
+
+    response.headers["Cache-Control"] = _SHARE_PUBLIC_CACHE_CONTROL
+    signal = dict(record["signal"])
+    signal["token"] = record.get("token")
+    signal["expires_at"] = record.get("expires_at")
+    return signal
+
+
 @app.get("/experiments/recent", tags=["experiments"])
 def recent_experiments(
     request: Request,

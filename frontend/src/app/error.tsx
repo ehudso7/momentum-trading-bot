@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import * as Sentry from "@sentry/nextjs";
 import { AlertTriangle } from "lucide-react";
 
 export default function ErrorBoundary({
@@ -12,6 +13,8 @@ export default function ErrorBoundary({
 }) {
   useEffect(() => {
     console.error("[app-error]", error);
+    // No-op when NEXT_PUBLIC_SENTRY_DSN is unset (Sentry init is disabled).
+    Sentry.captureException(error);
   }, [error]);
 
   return (

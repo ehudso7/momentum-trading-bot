@@ -5,6 +5,7 @@ import { ArrowDownRight, ArrowUpRight, Minus, Radar } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { LoadingState, ErrorState } from "@/components/ui/loading";
+import { ShareButton } from "@/components/share/share-button";
 import type { Signal, SignalReport } from "@/types";
 
 interface ScannerProps {
@@ -98,6 +99,7 @@ export function Scanner({ report, loading, error, onRetry }: ScannerProps) {
                   <Badge variant={directionVariant(signal.direction)}>
                     {(signal.confidence * 100).toFixed(0)}%
                   </Badge>
+                  <ShareButton symbol={signal.symbol} />
                 </div>
               </motion.div>
             ))}

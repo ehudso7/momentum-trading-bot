@@ -1509,6 +1509,15 @@ def main() -> None:
     # them via os.getenv. Real environment variables always win.
     load_dotenv(override=False)
 
+    # Optional Sentry error tracking — initialised BEFORE the trading
+    # loop starts so circuit-breaker halts, broker failures, and tick
+    # errors are captured. Strict no-op when SENTRY_DSN is unset
+    # (sentry_sdk is not even imported); load_dotenv above lets a
+    # .env-provided SENTRY_DSN work too.
+    from trading_bot.utils.sentry import init_sentry
+
+    init_sentry()
+
     # Load config
     config = AppConfig.from_yaml(args.config)
     config.run_mode = RunMode(args.mode)

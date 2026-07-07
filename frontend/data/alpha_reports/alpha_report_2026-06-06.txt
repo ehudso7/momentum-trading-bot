@@ -1,0 +1,77 @@
+==============================================================================
+DAILY ALPHA VALIDATION REPORT — 2026-06-06
+Scorer fingerprint: 8c61963d3becf76c218724c49340221d1a3786110cf15a610fe5549a41b77a8b
+==============================================================================
+==============================================================================
+ALPHA ANALYSIS REPORT (Phase 2.5)
+==============================================================================
+Sources:
+  alpha_scores   exists=False files=0   rows=0      requested=data/alpha_scores_2026-06-06.csv
+  decision_log   exists=False files=0   rows=0      requested=data/decision_log_2026-06-06.csv
+  journal        exists=True  files=1   rows=0      requested=data/journal.csv
+Join tolerance: 5 minutes
+
+Totals:
+  alpha_rows     = 0
+  buy_rows       = 0
+  skip_rows      = 0
+  journal_trades = 0
+  matched_trades = 0
+
+By tier:
+  tier                          count   buy  skip  avg_score  outcomes  win_rate    avg_pnl   avg_R
+  -------------------------------------------------------------------------------------------------
+  A                                 0     0     0        n/a         0       n/a        n/a     n/a
+  B                                 0     0     0        n/a         0       n/a        n/a     n/a
+  C                                 0     0     0        n/a         0       n/a        n/a     n/a
+  D                                 0     0     0        n/a         0       n/a        n/a     n/a
+  F                                 0     0     0        n/a         0       n/a        n/a     n/a
+
+By reason (top first):
+  reason                        count   buy  skip  avg_score  outcomes  win_rate    avg_pnl   avg_R
+  -------------------------------------------------------------------------------------------------
+  (no data)
+
+By regime:
+  regime                        count   buy  skip  avg_score  outcomes  win_rate    avg_pnl   avg_R
+  -------------------------------------------------------------------------------------------------
+  (no data)
+
+By score decile:
+  decile                        count   buy  skip  avg_score  outcomes  win_rate    avg_pnl   avg_R
+  -------------------------------------------------------------------------------------------------
+  0.0-0.1                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.1-0.2                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.2-0.3                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.3-0.4                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.4-0.5                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.5-0.6                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.6-0.7                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.7-0.8                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.8-0.9                           0     0     0        n/a         0       n/a        n/a     n/a
+  0.9-1.0                           0     0     0        n/a         0       n/a        n/a     n/a
+
+Shadow filter simulation:
+  threshold allowed_buys blocked_buys  a_out     a_wr      a_pnl     a_R  b_out     b_wr      b_pnl     b_R
+  ---------------------------------------------------------------------------------------------------------
+  A only              0            0      0      n/a        n/a     n/a      0      n/a        n/a     n/a
+  A+B                 0            0      0      n/a        n/a     n/a      0      n/a        n/a     n/a
+  A+B+C               0            0      0      n/a        n/a     n/a      0      n/a        n/a     n/a
+
+Promotion readiness:
+  status      = not_ready
+  outcomes    = 0/100 required
+  explanation = Insufficient outcomes (0/100) to assess.
+  A/B tiers   : outcomes=0    win_rate=n/a avg_R=n/a
+  C/D/F tiers : outcomes=0    win_rate=n/a avg_R=n/a
+
+Notes:
+  - alpha_scores.csv not found — report is empty
+  - decision_log.csv not found — reason stats may be limited
+==============================================================================
+
+Alpha guardrails:
+  status             = insufficient_data
+  recommended_action = keep the paper alpha filter disabled and let more trades accumulate before judging performance
+  reasons:
+    - only 0 matched trades (need >= 20)

@@ -504,6 +504,7 @@ class TestNoNewPublicEndpoints:
         ("POST", "/webhook/stripe"),
         ("POST", "/billing/checkout"),
         ("POST", "/keys/provision"),
+        ("POST", "/share/signal"),
     })
 
     def test_only_mutating_routes_are_documented_ones(self):

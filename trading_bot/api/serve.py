@@ -25,8 +25,10 @@ CLI argument resolution order (highest priority first):
     3. Hard-coded default (``8080`` / ``0.0.0.0`` / ``info``).
 
 Env vars consumed:
-    PORT       — port to bind (PaaS convention).
-    HOST       — host to bind (defaults to 0.0.0.0).
+    PORT        — port to bind (PaaS convention).
+    HOST        — host to bind (defaults to 0.0.0.0).
+    SENTRY_DSN  — optional; enables Sentry error tracking (strict
+                  no-op when unset, see trading_bot.utils.sentry).
 
 Env vars NOT consumed by this entry point:
     Anything Stripe / billing / auth — those are read at request
@@ -174,6 +176,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.dry_run:
         return 0
+
+    # Optional Sentry error tracking. Strict no-op when SENTRY_DSN
+    # is unset (sentry_sdk is not even imported). Initialised before
+    # the app import so FastAPI is auto-instrumented by the SDK's
+    # default integrations. Placed after --dry-run so smoke checks
+    # stay side-effect free.
+    from trading_bot.utils.sentry import init_sentry
+
+    init_sentry()
 
     # Lazy-import uvicorn so the dry-run / argparse paths don't
     # require it (helps tests in environments without uvicorn).
