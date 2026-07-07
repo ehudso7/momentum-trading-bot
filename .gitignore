@@ -35,6 +35,7 @@ supabase/.temp/
 
 # Data & logs
 /data/
+frontend/data/
 *.csv
 *.log
 
