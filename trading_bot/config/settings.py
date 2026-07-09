@@ -105,6 +105,10 @@ class ExitConfig(BaseModel):
     scale_out_ratios: list[float] = Field(
         default_factory=lambda: [0.25, 0.25, 0.25, 0.25]
     )
+    # NOTE: the production bot loads scale_out_rr_targets from config.yaml,
+    # where the first target is >= 1.5 to clear the strategy entry gate (a
+    # first target < 1.5 makes the bot unable to enter any trade). This bare
+    # default is used only by default-constructed configs / tests.
     scale_out_rr_targets: list[float] = Field(
         default_factory=lambda: [1.0, 2.0, 3.0]
     )

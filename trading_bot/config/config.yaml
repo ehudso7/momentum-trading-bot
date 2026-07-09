@@ -80,8 +80,12 @@ exit:
     - 0.33                       # 33% at second target
     - 0.33                       # remainder trailed
   scale_out_rr_targets:          # R:R targets for scale-outs
-    - 0.75                       # First exit at 0.75R (bank profit quickly)
-    - 1.5                        # Second exit at 1.5R (before momentum fades)
+    # NOTE: the first target defines the signal's reward:risk ratio, and the
+    # strategy's entry gate (pullback_vwap.py) rejects any signal whose first
+    # target is below 1.5R. A first target < 1.5 makes the bot structurally
+    # unable to enter ANY trade. Keep the first value >= 1.5.
+    - 1.5                        # First exit at 1.5R (clears the entry gate)
+    - 3.0                        # Second exit at 3.0R (let momentum run)
   trailing_stop_atr_multiplier: 1.2
   trailing_stop_breakeven_buffer_pct: 0.3
   hard_time_exit: "15:50"       # Flat by 3:50 PM ET

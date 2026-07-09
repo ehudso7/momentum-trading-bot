@@ -1548,7 +1548,11 @@ def main() -> None:
         from trading_bot.dashboard.app import start_dashboard_server
 
         dashboard_state = DashboardState()
-        start_dashboard_server(dashboard_state, port=args.dashboard_port)
+        start_dashboard_server(
+            dashboard_state,
+            port=args.dashboard_port,
+            journal_path=config.journal_csv_path,
+        )
         print(f"  Dashboard: http://localhost:{args.dashboard_port}")
 
     # Create and run bot

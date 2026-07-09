@@ -20,17 +20,43 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from trading_bot.dashboard.state import DashboardState
+from trading_bot.analytics.performance import compute_performance, rolling
 from trading_bot.api.mobile_routes import router as mobile_router
 
 log = structlog.get_logger(__name__)
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
+_DEFAULT_JOURNAL_PATH = "data/journal.csv"
 _START_TIME = datetime.now(timezone.utc)
 
 _dashboard_state: DashboardState | None = None
 
 
-def create_app(state: DashboardState) -> FastAPI:
+def _read_journal_trades(journal_path: str) -> list[dict[str, Any]]:
+    """Read closed trades from the CSV journal.
+
+    Returns an empty list when the journal is missing, empty, or header-only.
+    Never raises — a broken/absent journal must degrade to the honest
+    zero-trade scorecard, not a 500.
+    """
+    import csv
+
+    path = Path(journal_path)
+    if not path.is_file():
+        return []
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            return [dict(row) for row in reader]
+    except Exception as e:  # pragma: no cover - defensive I/O guard
+        log.error("dashboard.journal_read_error", path=str(path), error=str(e))
+        return []
+
+
+def create_app(
+    state: DashboardState,
+    journal_path: str = _DEFAULT_JOURNAL_PATH,
+) -> FastAPI:
     """Create the FastAPI app wired to the given state container."""
     global _dashboard_state
     _dashboard_state = state
@@ -186,6 +212,38 @@ def create_app(state: DashboardState) -> FastAPI:
         snap = state.get_snapshot()
         return snap.equity_history
 
+    @app.get("/api/performance")
+    async def api_performance() -> dict[str, Any]:
+        """Honest live performance scorecard from the trade journal.
+
+        Reads closed trades from the CSV journal and the equity curve from
+        the dashboard state, then returns an HONEST scorecard that loudly
+        signals when the sample is too small to be statistically meaningful.
+        A missing/empty journal degrades gracefully to the zeroed struct
+        (HTTP 200), never a 500.
+        """
+        snap = state.get_snapshot()
+        trades = _read_journal_trades(journal_path)
+        equity_curve = [
+            (p.get("timestamp"), p.get("equity")) for p in snap.equity_history
+        ]
+        starting_equity = (
+            snap.starting_equity if snap.starting_equity and snap.starting_equity > 0
+            else 100_000.0
+        )
+        card = compute_performance(
+            trades,
+            equity_curve=equity_curve or None,
+            starting_equity=starting_equity,
+        )
+        # Enrich with the rolling series so the UI can chart an emerging edge.
+        # Additive at the endpoint layer — compute_performance's contract
+        # (and its tests) stay untouched.
+        card["rolling"] = rolling(
+            trades, window=20, starting_equity=starting_equity
+        )
+        return card
+
     @app.get("/api/health")
     async def api_health() -> dict[str, Any]:
         """System health metrics."""
@@ -268,13 +326,14 @@ def start_dashboard_server(
     state: DashboardState,
     host: str = "0.0.0.0",
     port: int = 8080,
+    journal_path: str = _DEFAULT_JOURNAL_PATH,
 ) -> threading.Thread:
     """Start the dashboard server in a background daemon thread."""
     import uvicorn
 
     resolved_port = _resolve_dashboard_port(port)
 
-    app = create_app(state)
+    app = create_app(state, journal_path=journal_path)
 
     def _run() -> None:
         uvicorn.run(

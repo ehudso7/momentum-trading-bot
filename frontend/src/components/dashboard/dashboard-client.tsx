@@ -8,6 +8,7 @@ import { StatsCards } from "@/components/dashboard/stats-cards";
 import { Scanner } from "@/components/dashboard/scanner";
 import { Portfolio } from "@/components/dashboard/portfolio";
 import { EquityChart } from "@/components/dashboard/equity-chart";
+import { PerformanceScorecard } from "@/components/dashboard/performance-scorecard";
 import { GrowthSimulator } from "@/components/dashboard/growth-simulator";
 import { ModeToggle } from "@/components/dashboard/mode-toggle";
 import { Button } from "@/components/ui/button";
@@ -16,8 +17,10 @@ import {
   fetchEquityHistory,
   fetchHealth,
   fetchLatestSignals,
+  fetchPerformance,
   fetchPositions,
   fetchTrades,
+  type PerformanceScorecard as PerformanceScorecardData,
 } from "@/lib/api";
 import { TrendingUp } from "lucide-react";
 import { useAutoProvisionApiKey } from "@/lib/use-api-key";
@@ -46,6 +49,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
   const [positions, setPositions] = useState<Position[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
+  const [performance, setPerformance] = useState<PerformanceScorecardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [scannerError, setScannerError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -64,6 +68,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
       fetchPositions(),
       fetchTrades(),
       fetchEquityHistory(),
+      fetchPerformance(),
     ]);
 
     if (results[0].status === "fulfilled") {
@@ -84,6 +89,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
     if (results[2].status === "fulfilled") setPositions(results[2].value);
     if (results[3].status === "fulfilled") setTrades(results[3].value);
     if (results[4].status === "fulfilled") setEquity(results[4].value);
+    if (results[5].status === "fulfilled") setPerformance(results[5].value);
   }, []);
 
   const currentEquity = status?.equity ?? (equity.length > 0 ? equity[equity.length - 1].equity : 100000);
@@ -197,6 +203,10 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
             onRetry={handleRefresh}
           />
           <EquityChart data={equity} loading={loading} />
+        </div>
+
+        <div className="mt-6">
+          <PerformanceScorecard data={performance} loading={loading} />
         </div>
 
         {/* === PEAK MOMENTUMFORGE AI: EXPONENTIAL GROWTH ENGINE === */}

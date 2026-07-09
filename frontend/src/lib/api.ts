@@ -151,6 +151,110 @@ export async function fetchEquityHistory(): Promise<EquityPoint[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Performance Scorecard — honest strategy edge metrics (GET /api/performance)
+// ---------------------------------------------------------------------------
+
+/** One row of the per-setup breakdown table. */
+export interface PerformanceSetupBreakdown {
+  setup: string;
+  trades: number;
+  win_rate: number;
+  /** Ratio of gross wins to gross losses; null when undefined (no losses). */
+  profit_factor: number | null;
+  expectancy_per_trade: number;
+}
+
+/** One point of the rolling win-rate / expectancy / equity series. */
+export interface PerformanceRollingPoint {
+  index: number;
+  win_rate: number;
+  expectancy: number;
+  equity: number;
+}
+
+/**
+ * Honest performance summary returned by GET /api/performance.
+ * Mirrors the bot dashboard service response exactly. When the strategy
+ * has not traded (or the sample is thin) the metric fields are still
+ * present but must not be read as a proven edge — consult
+ * `is_statistically_significant` and `confidence_note` first.
+ */
+export interface PerformanceScorecard {
+  trade_count: number;
+  closed_trades: number;
+  win_rate: number;
+  wins: number;
+  losses: number;
+  avg_win: number;
+  avg_loss: number;
+  largest_win: number;
+  largest_loss: number;
+  /** Gross wins / gross losses; null when undefined (e.g. no losses yet). */
+  profit_factor: number | null;
+  expectancy_per_trade: number;
+  expectancy_r: number;
+  avg_rr: number;
+  total_pnl: number;
+  total_return_pct: number;
+  max_drawdown_pct: number;
+  sharpe_ratio: number;
+  sortino_ratio: number;
+  avg_hold_minutes: number;
+  by_setup: PerformanceSetupBreakdown[];
+  sample_size: number;
+  min_sample_for_confidence: number;
+  is_statistically_significant: boolean;
+  confidence_note: string;
+  rolling: PerformanceRollingPoint[];
+}
+
+/**
+ * Raw wire shape from the bot dashboard: `by_setup` is an object keyed by
+ * signal type, and `rolling` points use `trade_number`. We normalize both to
+ * the array/`index` shape the UI consumes.
+ */
+interface RawPerformance
+  extends Omit<PerformanceScorecard, "by_setup" | "rolling"> {
+  by_setup: Record<string, Omit<PerformanceSetupBreakdown, "setup">> | PerformanceSetupBreakdown[];
+  rolling?: Array<
+    Partial<PerformanceRollingPoint> & { trade_number?: number }
+  >;
+}
+
+function normalizePerformance(raw: RawPerformance): PerformanceScorecard {
+  const by_setup: PerformanceSetupBreakdown[] = Array.isArray(raw.by_setup)
+    ? raw.by_setup
+    : Object.entries(raw.by_setup ?? {}).map(([setup, stats]) => ({
+        setup,
+        trades: stats.trades ?? 0,
+        win_rate: stats.win_rate ?? 0,
+        profit_factor: stats.profit_factor ?? null,
+        expectancy_per_trade: stats.expectancy_per_trade ?? 0,
+      }));
+
+  const rolling: PerformanceRollingPoint[] = (raw.rolling ?? []).map((p, i) => ({
+    index: p.index ?? p.trade_number ?? i + 1,
+    win_rate: p.win_rate ?? 0,
+    expectancy: p.expectancy ?? 0,
+    equity: p.equity ?? 0,
+  }));
+
+  return { ...(raw as unknown as PerformanceScorecard), by_setup, rolling };
+}
+
+export async function fetchPerformance(): Promise<PerformanceScorecard | null> {
+  try {
+    const { data } = await dashboard.get<RawPerformance>("/api/performance");
+    return normalizePerformance(data);
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 404 || error.status === 0)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Viral loop — public signal share cards (/s/<token>)
 // ---------------------------------------------------------------------------
 
