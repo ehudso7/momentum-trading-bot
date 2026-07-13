@@ -38,5 +38,13 @@
   {
     "path": "tests/test_upgrade_events.py",
     "reason": "Canary marker fixture MARKER_RAW_API_KEY; not a real key."
+  },
+  {
+    "path": "docs/CORE_CONTROL.md",
+    "reason": "Sample CLI output block in docs: api_key_hash shows an example 32-hex hash value next to synthetic cs_test_a1b2c3... Stripe ids. A key hash in documentation sample output, not a credential."
+  },
+  {
+    "path": "trading_bot/api/server.py",
+    "reason": "False positive: PROVISION_SECRET_ENV_VAR = \"TRADING_PROVISION_SECRET\" assigns the environment variable NAME (a 24-char identifier), not a secret value. No credential present."
   }
 ]

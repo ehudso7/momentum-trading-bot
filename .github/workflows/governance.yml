@@ -47,7 +47,7 @@ jobs:
           # their contents are covered by the secret pattern scan below.
           bad=$(git ls-files \
             | grep -Ei '(^|/)\.env(\.[A-Za-z0-9._-]+)?$|credentials|\.pem$|\.p12$|id_rsa' \
-            | grep -viE '\.env\.(example|sample|template)$|\.(md|ts|tsx|js|jsx|mjs|cjs|py|go|rb|java|rs|kt|swift)$' || true)
+            | grep -viE '\.(example|sample|template)$|\.(md|ts|tsx|js|jsx|mjs|cjs|py|go|rb|java|rs|kt|swift)$' || true)
           if [ -n "$bad" ] && [ -f .governance/audit-allowlist.json ]; then
             allowed=$(jq -r '.[] | select(.reason != null and .reason != "") | .path' .governance/audit-allowlist.json)
             for p in $(printf '%s\n' "$bad" | grep -Fxf <(printf '%s\n' "$allowed") || true); do
@@ -77,6 +77,40 @@ jobs:
                 echo "(allowlisted) secret-pattern match in $f — reason recorded in .governance/audit-allowlist.json"
               else
                 echo "::error::possible committed secret in $f (pattern match; value not printed)" >&2
+                fail=1
+              fi
+            fi
+          done < <(git ls-files)
+          exit $fail
+
+      - name: Assigned-secret content scan (covers *.example templates)
+        run: |
+          # Sensitive-name assignments (SECRET/TOKEN/API_KEY/PASSWORD/PRIVATE_KEY/
+          # ENCRYPTION_KEY/CLIENT_SECRET variants) carrying credential-like values:
+          # hex >= 32 or base64ish/random >= 24, quoted or unquoted. Template
+          # FILENAMES may be exempt from the filename check above, but their
+          # CONTENTS are always scanned here. Unmistakable placeholders
+          # (example/placeholder/changeme/your_/<...>/${...}/empty) are ignored.
+          # Values are NEVER printed. Allowlist (with written reasons) may
+          # suppress a path; suppressed paths are still reported.
+          allowed=""
+          if [ -f .governance/audit-allowlist.json ]; then
+            allowed=$(jq -r '.[] | select(.reason != null and .reason != "") | .path' .governance/audit-allowlist.json)
+          fi
+          q="'"
+          name_re="(^|[^A-Za-z0-9])[A-Za-z0-9_]*(SECRET|TOKEN|API_?KEY|APIKEY|PASSWORD|PASSWD|PRIVATE_?KEY|ENCRYPTION_?KEY|CLIENT_?SECRET)[A-Za-z0-9_]*"
+          val_re="[[:space:]]*[:=][[:space:]]*[\"$q]?[A-Za-z0-9+/=_-]{24,}[\"$q]?[,;]?([[:space:]]|\$)"
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            case "$f" in *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.ico|*.woff*|*.lock|*lock.yaml|*lock.json) continue;; esac
+            if LC_ALL=C grep -oiE "${name_re}${val_re}" "$f" 2>/dev/null \
+                 | grep -viE 'example|placeholder|replace|change[-_]?me|your[-_]|dummy|sample|fixture|not[-_]?a[-_]?real|__generate_me__|xxxx|todo|fixme|redacted|insert[-_]' \
+                 | grep -q .; then
+              if printf '%s\n' "$allowed" | grep -Fxq "$f"; then
+                echo "(allowlisted) assigned secret value in $f — reason recorded in .governance/audit-allowlist.json"
+              else
+                echo "::error::possible assigned secret value in $f (pattern match; value not printed)" >&2
                 fail=1
               fi
             fi
