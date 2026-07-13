@@ -109,7 +109,7 @@ jobs:
             # suppress a credential-like value. Values stay in shell variables
             # and are never printed.
             matches=$(LC_ALL=C grep -oiE "${name_re}${val_re}" "$f" 2>/dev/null || true)
-            values=$(printf '%s\n' "$matches" | sed -E "s/^.*[:=][[:space:]]*[\"$q]?//; s/[\"$q]?[,;]?[[:space:]]*\$//")
+            values=$(printf '%s\n' "$matches" | sed -E "s/^[^:=]*[:=][[:space:]]*[\"$q]?//; s/[\"$q]?[,;]?[[:space:]]*\$//")
             if printf '%s\n' "$values" \
                  | grep -viE 'example|placeholder|replace|change[-_]?me|your[-_]|dummy|sample|fixture|not[-_]?a[-_]?real|__generate_me__|xxxx|todo|fixme|redacted|insert[-_]' \
                  | grep -qE '^([0-9a-fA-F]{32,}|[A-Za-z0-9+/=_-]{24,})$'; then
