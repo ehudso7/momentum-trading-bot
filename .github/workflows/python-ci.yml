@@ -1,0 +1,95 @@
+# Python CI for ehudso7/momentum-trading-bot
+#
+# Runs the real pytest suite for the trading bot in a FORCED paper /
+# simulation posture. This workflow deliberately:
+#   * requires NO brokerage credentials (no ALPACA_* / POLYGON_* secrets),
+#   * exports the repo's real mode env vars to pin paper mode,
+#   * fails closed if anything tries to enable live trading in CI,
+#   * never places a real order (paper mode uses the in-memory PaperBroker;
+#     live mode is the only path that constructs AlpacaBroker, and it is
+#     blocked here).
+#
+# Reproducibility note: this repo has no dependency lock file
+# (no requirements*.txt / poetry.lock / Pipfile.lock). Dependencies are
+# declared in pyproject.toml. We install with the repo's documented command
+# `pip install -e ".[dev]"`, pin the pip/setuptools/wheel toolchain, and use
+# pip's built-in cache keyed on pyproject.toml for run-to-run stability.
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No repository secrets are referenced anywhere in this workflow: CI runs
+# with zero brokerage credentials by construction.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (paper mode)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Versions declared in pyproject.toml (requires-python >=3.10;
+        # classifiers list 3.10, 3.11, 3.12).
+        python-version: ["3.10", "3.11", "3.12"]
+
+    env:
+      # Repo's ACTUAL mode env vars (env_prefix "TRADING_", nested delim "__").
+      # These force paper/simulation mode and keep the broker in paper mode.
+      TRADING_RUN_MODE: paper
+      TRADING_BROKER__ALPACA_PAPER: "true"
+      # Deterministic, offline-friendly logging.
+      TRADING_LOG_LEVEL: WARNING
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Fail closed if live trading is configured in CI
+        # Defense in depth: CI must never run in live mode and must never
+        # carry brokerage credentials. Any of these conditions aborts the job
+        # BEFORE dependencies are installed or tests run.
+        run: |
+          set -euo pipefail
+          if [ "${TRADING_RUN_MODE:-paper}" = "live" ]; then
+            echo "::error::TRADING_RUN_MODE=live is forbidden in CI"
+            exit 1
+          fi
+          if [ "${TRADING_BROKER__ALPACA_PAPER:-true}" != "true" ]; then
+            echo "::error::TRADING_BROKER__ALPACA_PAPER must be true in CI"
+            exit 1
+          fi
+          # Presence of any real brokerage credential is a hard failure — CI
+          # requires none and must not carry them. (Names only; never echo values.)
+          for var in ALPACA_API_KEY ALPACA_API_SECRET POLYGON_API_KEY \
+                     TRADING_BROKER__ALPACA_API_KEY TRADING_BROKER__ALPACA_API_SECRET; do
+            if [ -n "${!var:-}" ]; then
+              echo "::error::$var is set in CI; brokerage credentials are forbidden here"
+              exit 1
+            fi
+          done
+          echo "Paper-mode guard passed: no live config, no brokerage credentials."
+
+      - name: Install toolchain and dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade "pip==24.2" "setuptools==75.1.0" "wheel==0.44.0"
+          # Repo's documented install command (CLAUDE.md quick start).
+          pip install -e ".[dev]"
+
+      - name: Run test suite (paper mode, no credentials)
+        # pyproject [tool.pytest.ini_options] sets testpaths=tests and
+        # addopts="-v --tb=short", so `pytest` runs the real suite.
+        run: |
+          set -euo pipefail
+          pytest
