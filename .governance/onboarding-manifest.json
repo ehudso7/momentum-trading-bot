@@ -1,0 +1,52 @@
+{
+  "governance_version": "1.0.0",
+  "repo": "ehudso7/momentum-trading-bot",
+  "profile": "regulated-data",
+  "generated_at": "2026-07-12",
+  "files_added": [
+    {
+      "path": "GEMINI.md",
+      "sha256": "8f7ed04b8afc137636f7cd65ead04cceb411f8516c364268b788cd5cedb1d487"
+    },
+    {
+      "path": ".github/copilot-instructions.md",
+      "sha256": "2de75544a44adbe5d9c3a8e12ab5fb7beb6d0b1687bdde056ae6e97dda198cad"
+    },
+    {
+      "path": ".github/workflows/governance.yml",
+      "sha256": "8b73e8b82cd4c2fb93ac0139a11c18bd60d9605472f91bdc2637a2103bb6b40b"
+    },
+    {
+      "path": "PRD.md",
+      "sha256": "3f0c48429277d3fc929aeabd61ee5da6645f96c29c3e11b1a0dacf3353927ff5"
+    },
+    {
+      "path": "ARCHITECTURE.md",
+      "sha256": "622bbff2a2d3ee3825558a5d3fa54ad0220a09728f990fc3e4d8d9e1e81aef7d"
+    },
+    {
+      "path": "SECURITY.md",
+      "sha256": "7a679af8cb9677e725d0892b01539adfdd622c836a06d96006419307c795c3ea"
+    },
+    {
+      "path": "TESTING.md",
+      "sha256": "5593d28ddcee7bf60c503160192eb943f8aff10e75bd217b7605cb11d6635273"
+    },
+    {
+      "path": "KNOWN_LIMITATIONS.md",
+      "sha256": "83aed1cb4d3fb51bc18e03d461254868892cbb1b0a21c37f8774b90e7d5aa84e"
+    },
+    {
+      "path": "docs/adr/0000-template.md",
+      "sha256": "f62a550e95de18e6ab9eec4496fe00c9ec78d3a7806507109401e39036d28f17"
+    },
+    {
+      "path": "docs/planning/EXECUTION_PLAN_TEMPLATE.md",
+      "sha256": "c2d72551a6c4d1de1c0eb012ae9f66eb3973cd7d6df5b83e2350bcda0f302e69"
+    }
+  ],
+  "files_skipped_existing": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ]
+}

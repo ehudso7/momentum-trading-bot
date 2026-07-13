@@ -1,0 +1,42 @@
+[
+  {
+    "path": "tests/test_alpaca_screener.py",
+    "reason": "Test fixture uses the documentation placeholder your_alpaca_api_key_here — not a credential."
+  },
+  {
+    "path": "tests/test_api_provisioning.py",
+    "reason": "Provisioning tests use a deliberately fake fixture value (phase11-provision-...-XYZ)."
+  },
+  {
+    "path": "tests/test_api_server.py",
+    "reason": "Fixtures such as attempted-token-WRONG_ABC_XYZ, a whsec_..._for_tests_only value, and DO_NOT_LEAK_BANNER_COPY_PHASE58 — fake values used to assert secrets never leak into responses/logs."
+  },
+  {
+    "path": "tests/test_billing.py",
+    "reason": "Stripe webhook fixture value whsec_..._do_not_use_in_prod — explicitly fake test value."
+  },
+  {
+    "path": "tests/test_billing_persistence.py",
+    "reason": "Canary marker value sk_..._should_NOT_appear_in_log asserting the key is redacted from logs; not a real key."
+  },
+  {
+    "path": "tests/test_config_validation.py",
+    "reason": "Uses the documentation placeholder your_alpaca_api_key_here to test config validation — not a credential."
+  },
+  {
+    "path": "tests/test_conversion.py",
+    "reason": "Fixture markers user-key-UNIQUE_MARKER_ABC and whsec_for_tests_only — fake values for conversion-funnel tests."
+  },
+  {
+    "path": "tests/test_elite_tier.py",
+    "reason": "Elite-tier provisioning tests use a deliberately fake fixture value (phase12-provision-...-XYZ)."
+  },
+  {
+    "path": "tests/test_keys.py",
+    "reason": "Adversarial canary marker HOSTILE_RAW_KEY_DO_NOT_LEAK asserting raw keys never leak; not a real key."
+  },
+  {
+    "path": "tests/test_upgrade_events.py",
+    "reason": "Canary marker fixture MARKER_RAW_API_KEY; not a real key."
+  }
+]
