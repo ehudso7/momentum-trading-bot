@@ -104,9 +104,15 @@ jobs:
           while IFS= read -r f; do
             [ -f "$f" ] || continue
             case "$f" in *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.ico|*.woff*|*.lock|*lock.yaml|*lock.json) continue;; esac
-            if LC_ALL=C grep -oiE "${name_re}${val_re}" "$f" 2>/dev/null \
+            # Placeholder filtering applies to the assigned VALUE only — a
+            # placeholder-looking VARIABLE NAME (SAMPLE_SECRET=...) must never
+            # suppress a credential-like value. Values stay in shell variables
+            # and are never printed.
+            matches=$(LC_ALL=C grep -oiE "${name_re}${val_re}" "$f" 2>/dev/null || true)
+            values=$(printf '%s\n' "$matches" | sed -E "s/^.*[:=][[:space:]]*[\"$q]?//; s/[\"$q]?[,;]?[[:space:]]*\$//")
+            if printf '%s\n' "$values" \
                  | grep -viE 'example|placeholder|replace|change[-_]?me|your[-_]|dummy|sample|fixture|not[-_]?a[-_]?real|__generate_me__|xxxx|todo|fixme|redacted|insert[-_]' \
-                 | grep -q .; then
+                 | grep -qE '^([0-9a-fA-F]{32,}|[A-Za-z0-9+/=_-]{24,})$'; then
               if printf '%s\n' "$allowed" | grep -Fxq "$f"; then
                 echo "(allowlisted) assigned secret value in $f — reason recorded in .governance/audit-allowlist.json"
               else
