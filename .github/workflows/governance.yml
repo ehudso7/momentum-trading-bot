@@ -22,22 +22,32 @@ jobs:
           done
           exit $missing
 
-      - name: No unfilled template placeholders
+      - name: No unfilled template placeholders in governance files
         run: |
-          if grep -rnE '\{\{[A-Za-z0-9_]+\}\}' --include='*.md' \
-               --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=build .; then
-            echo "::error::unfilled {{ }} template placeholders found in Markdown files"
-            exit 1
-          fi
+          # Scope: files the governance generator wrote (recorded in the onboarding
+          # manifest) — repo docs may legitimately show {{ }} syntax (i18n, mustache).
+          fail=0
+          for f in $(jq -r '.files_added[].path' .governance/onboarding-manifest.json 2>/dev/null || \
+                     echo "AGENTS.md CLAUDE.md GEMINI.md .github/copilot-instructions.md"); do
+            [ -f "$f" ] || continue
+            case "$f" in *.md) ;; *) continue;; esac
+            if grep -nE '\{\{[A-Za-z0-9_]+\}\}' "$f"; then
+              echo "::error::unfilled {{ }} template placeholder in governance file $f"
+              fail=1
+            fi
+          done
+          exit $fail
 
       - name: No tracked .env or credential files
         run: |
           # .env.example/.env.sample/.env.template are legitimate committed templates.
           # Reviewed false positives (with written reasons) may be suppressed via
           # .governance/audit-allowlist.json; suppressed paths are still printed.
+          # Source-code and doc files are excluded from the FILENAME heuristic —
+          # their contents are covered by the secret pattern scan below.
           bad=$(git ls-files \
             | grep -Ei '(^|/)\.env(\.[A-Za-z0-9._-]+)?$|credentials|\.pem$|\.p12$|id_rsa' \
-            | grep -viE '\.env\.(example|sample|template)$|\.md$' || true)
+            | grep -viE '\.env\.(example|sample|template)$|\.(md|ts|tsx|js|jsx|mjs|cjs|py|go|rb|java|rs|kt|swift)$' || true)
           if [ -n "$bad" ] && [ -f .governance/audit-allowlist.json ]; then
             allowed=$(jq -r '.[] | select(.reason != null and .reason != "") | .path' .governance/audit-allowlist.json)
             for p in $(printf '%s\n' "$bad" | grep -Fxf <(printf '%s\n' "$allowed") || true); do
@@ -51,14 +61,24 @@ jobs:
 
       - name: Secret pattern scan (tracked text files)
         run: |
-          # Names of patterns only; values are never printed.
+          # Names of patterns only; values are never printed. Reviewed false
+          # positives (with written reasons) may be suppressed via
+          # .governance/audit-allowlist.json; suppressed paths are still printed.
+          allowed=""
+          if [ -f .governance/audit-allowlist.json ]; then
+            allowed=$(jq -r '.[] | select(.reason != null and .reason != "") | .path' .governance/audit-allowlist.json)
+          fi
           fail=0
           while IFS= read -r f; do
             [ -f "$f" ] || continue
             case "$f" in *.png|*.jpg|*.jpeg|*.gif|*.pdf|*.ico|*.woff*|*.lock|*lock.yaml|*lock.json) continue;; esac
             if LC_ALL=C grep -qE 'AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|sk_live_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' "$f"; then
-              echo "::error::possible committed secret in $f (pattern match; value not printed)" >&2
-              fail=1
+              if printf '%s\n' "$allowed" | grep -Fxq "$f"; then
+                echo "(allowlisted) secret-pattern match in $f — reason recorded in .governance/audit-allowlist.json"
+              else
+                echo "::error::possible committed secret in $f (pattern match; value not printed)" >&2
+                fail=1
+              fi
             fi
           done < <(git ls-files)
           exit $fail

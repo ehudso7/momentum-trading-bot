@@ -14,7 +14,7 @@
     },
     {
       "path": ".github/workflows/governance.yml",
-      "sha256": "8b73e8b82cd4c2fb93ac0139a11c18bd60d9605472f91bdc2637a2103bb6b40b"
+      "sha256": "e41d15abf7cc326b47a6b44983b6dec12696eca321e21bba921e0f3ed01b6086"
     },
     {
       "path": "PRD.md",
