@@ -1,5 +1,4 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import { ServiceWorkerRegister } from "@/components/pwa/service-worker-register";
 import { SiteFooter } from "@/components/site-footer";
 import {
@@ -9,16 +8,6 @@ import {
   SITE_URL,
 } from "@/lib/site";
 import "./globals.css";
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
@@ -30,17 +19,15 @@ export const metadata: Metadata = {
   applicationName: SITE_NAME,
   keywords: [
     "momentum trading",
-    "trading signals",
-    "AI trading",
+    "paper trading",
     "stock scanner",
     "day trading dashboard",
     "low-float gappers",
   ],
-  manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "MomentumForge",
+    title: "MomentumForge Private",
   },
   openGraph: {
     type: "website",
@@ -61,14 +48,11 @@ export const metadata: Metadata = {
   // Icons (favicon.ico, icon.svg, apple-icon.png) are emitted by the
   // app/ file conventions, which take priority over config-based icons.
   robots: {
-    index: true,
-    follow: true,
+    index: false,
+    follow: false,
     googleBot: {
-      index: true,
-      follow: true,
-      "max-image-preview": "large",
-      "max-snippet": -1,
-      "max-video-preview": -1,
+      index: false,
+      follow: false,
     },
   },
 };
@@ -86,10 +70,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
+    <html lang="en" className="h-full antialiased">
       <body className="min-h-full flex flex-col">
         <div className="flex-1">{children}</div>
         <SiteFooter />

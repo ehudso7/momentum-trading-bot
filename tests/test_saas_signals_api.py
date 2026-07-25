@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from datetime import date as today_date
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,7 @@ def clean_env(monkeypatch, tmp_path_factory):
         "TRADING_FREE_DAILY_REQUEST_LIMIT",
         "TRADING_PREMIUM_DAILY_REQUEST_LIMIT",
         "TRADING_USAGE_LIMIT_EXEMPT_PATHS",
+        "TRADING_PRIVATE_MODE",
         SAAS_DIR_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
@@ -111,7 +113,8 @@ def _write_signal_report(saas_dir: Path, date: str, *, mode: str = "demo") -> Pa
         "mode": mode,
         "universe": ["AAPL", "MSFT"],
         "market_data_status": {
-            "provider": "demo", "freshness": "today", "errors": [],
+            "provider": "demo" if mode == "demo" else "alpaca",
+            "freshness": "today", "errors": [],
         },
         "summary": {
             "signal_count": 2, "bullish_count": 1, "bearish_count": 1,
@@ -220,6 +223,38 @@ class TestSignalsLatest:
         assert body.get("preview") is True
         assert body["premium"]["has_full_access"] is False
         assert "get_started" in body
+
+    def test_private_mode_rejects_demo_report(self, client, monkeypatch, tmp_path):
+        saas_dir = _premium_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("TRADING_PRIVATE_MODE", "true")
+        _write_signal_report(saas_dir, today_date.today().isoformat(), mode="demo")
+
+        response = client.get(
+            "/signals/latest",
+            headers={"Authorization": f"Bearer {VALID_PREMIUM}"},
+        )
+
+        assert response.status_code == 503
+        assert "demo_report_blocked" in response.json()["detail"]
+
+    def test_private_mode_serves_current_real_report(
+        self, client, monkeypatch, tmp_path,
+    ):
+        saas_dir = _premium_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("TRADING_PRIVATE_MODE", "true")
+        _write_signal_report(
+            saas_dir,
+            today_date.today().isoformat(),
+            mode="paper",
+        )
+
+        response = client.get(
+            "/signals/latest",
+            headers={"Authorization": f"Bearer {VALID_PREMIUM}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["market_data_status"]["provider"] == "alpaca"
 
 
 # ---------------------------------------------------------------------------

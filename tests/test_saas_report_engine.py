@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from trading_bot.saas import REPORT_SCHEMA_VERSION
 from trading_bot.saas.market_data import (
     PROVIDER_ALPACA,
@@ -357,6 +359,25 @@ class TestSelectedProvider:
         env = {"TRADING_SAAS_DATA_MODE": "demo", "POLYGON_API_KEY": "abc"}
         assert selected_provider(env=env) == PROVIDER_DEMO
 
+    def test_explicit_alpaca_overrides_polygon(self):
+        env = {
+            "TRADING_SAAS_DATA_MODE": "alpaca",
+            "POLYGON_API_KEY": "polygon",
+            "ALPACA_API_KEY": "alpaca",
+            "ALPACA_API_SECRET": "secret",
+        }
+        assert selected_provider(env=env) == PROVIDER_ALPACA
+
+    def test_explicit_provider_fails_closed_when_credentials_missing(self):
+        assert selected_provider(env={"TRADING_SAAS_DATA_MODE": "polygon"}) == ""
+
+    def test_unknown_explicit_provider_fails_closed(self):
+        env = {
+            "TRADING_SAAS_DATA_MODE": "made-up",
+            "POLYGON_API_KEY": "polygon",
+        }
+        assert selected_provider(env=env) == ""
+
 
 class TestFetchDemoBars:
     def test_demo_returns_deterministic_bars(self):
@@ -376,3 +397,37 @@ class TestFetchDemoBars:
         bars, err = fetch_daily_bars("", provider=PROVIDER_DEMO)
         assert bars == []
         assert err == "empty_symbol"
+
+
+def test_polygon_fetch_constructs_client_with_data_config(monkeypatch):
+    from trading_bot.data import polygon_client
+    from trading_bot.saas.market_data import _fetch_polygon
+
+    observed: dict[str, str] = {}
+
+    class FakePolygonClient:
+        def __init__(self, config):
+            observed["key"] = config.polygon_api_key.get_secret_value()
+
+        def get_aggregates(self, **_kwargs):
+            return pd.DataFrame(
+                [
+                    {
+                        "open": 99.0,
+                        "high": 101.0,
+                        "low": 98.0,
+                        "close": 100.0,
+                        "volume": 1_000_000.0,
+                    }
+                ],
+                index=pd.to_datetime(["2026-07-20"], utc=True),
+            )
+
+    monkeypatch.setenv("POLYGON_API_KEY", "real-key-shape")
+    monkeypatch.setattr(polygon_client, "PolygonClient", FakePolygonClient)
+
+    bars, error = _fetch_polygon("AAPL", 90)
+
+    assert error is None
+    assert observed == {"key": "real-key-shape"}
+    assert bars[0]["close"] == 100.0

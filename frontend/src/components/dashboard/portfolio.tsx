@@ -55,29 +55,23 @@ export function Portfolio({ positions, loading }: PortfolioProps) {
                     </td>
                     <td className="py-3 pr-4">
                       <Badge
-                        variant={
-                          pos.side?.toLowerCase() === "long"
-                            ? "success"
-                            : "danger"
-                        }
+                        variant="success"
                       >
-                        {pos.side}
+                        LONG
                       </Badge>
                     </td>
-                    <td className="py-3 pr-4 text-zinc-300">{pos.qty}</td>
+                    <td className="py-3 pr-4 text-zinc-300">{pos.shares_remaining}</td>
                     <td className="py-3 pr-4 text-zinc-300">
                       {formatCurrency(pos.entry_price)}
                     </td>
                     <td
                       className={`py-3 font-medium ${
-                        (pos.unrealized_pnl ?? 0) >= 0
+                        pos.pnl_unrealized >= 0
                           ? "text-emerald-400"
                           : "text-red-400"
                       }`}
                     >
-                      {pos.unrealized_pnl != null
-                        ? formatCurrency(pos.unrealized_pnl)
-                        : "—"}
+                      {formatCurrency(pos.pnl_unrealized)}
                     </td>
                   </motion.tr>
                 ))}

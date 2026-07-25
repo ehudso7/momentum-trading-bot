@@ -35,6 +35,9 @@ class DashboardSnapshot:
     # Trades
     journal_entries: list[dict[str, Any]] = field(default_factory=list)
 
+    # Latest real-data scanner observations (not trade recommendations)
+    scanner_candidates: list[dict[str, Any]] = field(default_factory=list)
+
     # Circuit breaker
     circuit_breaker: dict[str, Any] = field(default_factory=dict)
 
@@ -58,6 +61,7 @@ class DashboardSnapshot:
 
     # Metadata
     run_mode: str = "paper"
+    broker_provider: str = "unknown"
     last_updated: str | None = None
     bot_running: bool = False
     last_error: str | None = None
@@ -83,6 +87,8 @@ class DashboardState:
         health: dict[str, Any],
         regime: str | None,
         run_mode: str,
+        broker_provider: str = "unknown",
+        scanner_candidates: list[dict[str, Any]] | None = None,
         market_status: str = "unknown",
         market_status_detail: str = "",
         last_error: str | None = None,
@@ -112,6 +118,7 @@ class DashboardState:
                 buying_power=buying_power,
                 open_positions=open_positions,
                 journal_entries=journal_entries,
+                scanner_candidates=scanner_candidates or [],
                 circuit_breaker=circuit_breaker,
                 health=health,
                 regime=regime,
@@ -122,6 +129,7 @@ class DashboardState:
                 rejected_by_stage=rejected_by_stage or {},
                 rejected_signals=rejected_signals or [],
                 run_mode=run_mode,
+                broker_provider=broker_provider,
                 last_updated=now_str,
                 bot_running=True,
                 last_error=last_error,

@@ -138,6 +138,19 @@ class TestAPIEndpoints:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    def test_candidates_empty_and_truthfully_labeled(self, client: TestClient):
+        resp = client.get("/api/candidates")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 0
+        assert body["candidates"] == []
+        assert "not win probabilities" in body["disclaimer"]
+
+    def test_live_readiness_fails_closed_without_trades(self, client: TestClient):
+        resp = client.get("/api/live-readiness")
+        assert resp.status_code == 200
+        assert resp.json()["ready"] is False
+
     def test_equity_history_empty(self, client: TestClient):
         resp = client.get("/api/equity-history")
         assert resp.status_code == 200
@@ -214,3 +227,28 @@ class TestDashboardState:
         snap1.open_positions.append({"symbol": "FAKE"})
         snap2 = dashboard_state.get_snapshot()
         assert len(snap2.open_positions) == 1  # Unaffected
+
+
+class TestPrivateDashboardAuthentication:
+    def test_private_mode_requires_configured_key(
+        self, monkeypatch: pytest.MonkeyPatch, dashboard_state: DashboardState
+    ):
+        monkeypatch.setenv("TRADING_PRIVATE_MODE", "true")
+        monkeypatch.delenv("TRADING_DASHBOARD_API_KEY", raising=False)
+        private_client = TestClient(create_app(dashboard_state))
+        assert private_client.get("/health").status_code == 200
+        assert private_client.get("/api/status").status_code == 503
+
+    def test_private_mode_rejects_wrong_key_and_accepts_owner_key(
+        self, monkeypatch: pytest.MonkeyPatch, dashboard_state: DashboardState
+    ):
+        monkeypatch.setenv("TRADING_PRIVATE_MODE", "true")
+        monkeypatch.setenv("TRADING_DASHBOARD_API_KEY", "owner-secret")
+        private_client = TestClient(create_app(dashboard_state))
+        assert private_client.get("/api/status").status_code == 401
+        assert private_client.get(
+            "/api/status", headers={"Authorization": "Bearer wrong"}
+        ).status_code == 401
+        assert private_client.get(
+            "/api/status", headers={"Authorization": "Bearer owner-secret"}
+        ).status_code == 200

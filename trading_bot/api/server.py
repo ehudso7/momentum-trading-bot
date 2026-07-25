@@ -104,6 +104,8 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 API_KEY_ENV_VAR = "TRADING_API_KEY"
+PRIVATE_MODE_ENV_VAR = "TRADING_PRIVATE_MODE"
+PUBLIC_PRODUCT_ENABLED_ENV_VAR = "TRADING_PUBLIC_PRODUCT_ENABLED"
 REPORTS_DIR_ENV_VAR = "TRADING_API_REPORTS_DIR"
 MANIFEST_PATH_ENV_VAR = "TRADING_API_MANIFEST_PATH"
 
@@ -111,6 +113,21 @@ MANIFEST_PATH_ENV_VAR = "TRADING_API_MANIFEST_PATH"
 ALLOWED_ORIGINS_ENV_VAR = "TRADING_API_ALLOWED_ORIGINS"
 RATE_LIMIT_ENV_VAR = "TRADING_API_RATE_LIMIT_PER_MINUTE"
 DEFAULT_RATE_LIMIT_PER_MINUTE = 60
+
+
+def _private_mode_enabled() -> bool:
+    private_requested = (
+        os.getenv(PRIVATE_MODE_ENV_VAR) or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if private_requested:
+        return True
+    public_product_enabled = (
+        os.getenv(PUBLIC_PRODUCT_ENABLED_ENV_VAR) or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    # Missing or malformed configuration is private. A future public product
+    # requires a separate affirmative gate; setting private=false alone is not
+    # sufficient to expose product routes.
+    return not public_product_enabled
 
 # Phase 4.5 — access tiers (free vs premium).
 PREMIUM_KEYS_ENV_VAR = "TRADING_API_PREMIUM_KEYS"
@@ -1845,6 +1862,35 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+@app.middleware("http")
+async def private_mode_middleware(request: Request, call_next):
+    """Apply the private owner boundary inside audit and rate-limit layers.
+
+    This middleware is intentionally registered first. Starlette runs later
+    registrations outside earlier ones, so rejected authentication attempts
+    are still rate limited, request logged, audited, CORS processed, and given
+    the global security headers.
+    """
+    if not _private_mode_enabled() or request.url.path == "/health":
+        return await call_next(request)
+
+    configured = (os.getenv(API_KEY_ENV_VAR) or "").strip()
+    if not configured:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "private API authentication is not configured"},
+        )
+
+    presented = _extract_bearer_token(request)
+    if not presented or not hmac.compare_digest(presented, configured):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "private owner authentication required"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -3949,6 +3995,19 @@ def signals_latest(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"failed to parse signal report: {type(exc).__name__}",
         )
+
+    if _private_mode_enabled():
+        from trading_bot.saas.scheduler import validate_private_report
+
+        valid, reason = validate_private_report(report)
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "private signal report is unavailable until current "
+                    f"real market data passes validation ({reason})"
+                ),
+            )
 
     _attach_signal_share(request, report, endpoint="/signals/latest")
 

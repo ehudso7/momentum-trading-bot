@@ -203,6 +203,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     else:
         from trading_bot.api.server import app
+        from trading_bot.saas.scheduler import start_report_scheduler
+
+        # Real report generation is opt-in and refuses demo/missing providers.
+        # The daemon performs an immediate check, then refreshes on the
+        # configured interval without blocking API liveness.
+        start_report_scheduler()
         uvicorn.run(
             app,
             host=host, port=port,

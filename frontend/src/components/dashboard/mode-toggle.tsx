@@ -7,9 +7,10 @@ interface ModeToggleProps {
   mode: TradingMode;
   botRunning?: boolean;
   regime?: string;
+  brokerProvider?: string;
 }
 
-export function ModeToggle({ mode, botRunning, regime }: ModeToggleProps) {
+export function ModeToggle({ mode, botRunning, regime, brokerProvider }: ModeToggleProps) {
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
       <div className="flex items-center gap-2">
@@ -31,6 +32,14 @@ export function ModeToggle({ mode, botRunning, regime }: ModeToggleProps) {
           <span className="text-sm text-zinc-400">Regime</span>
           <Badge variant="neutral" className="capitalize">
             {regime}
+          </Badge>
+        </div>
+      )}
+      {brokerProvider && (
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-zinc-400">Broker</span>
+          <Badge variant={brokerProvider === "alpaca_paper" ? "success" : "warning"} className="capitalize">
+            {brokerProvider.replaceAll("_", " ")}
           </Badge>
         </div>
       )}

@@ -41,23 +41,78 @@ export interface SignalReport {
   };
 }
 
+export interface ScannerCandidate {
+  symbol: string;
+  price: number;
+  gap_pct: number;
+  relative_volume: number;
+  float_shares: number | null;
+  volume: number;
+  prev_close: number;
+  catalyst: string | null;
+  scanner_score: number;
+  observed_at: string;
+}
+
+export interface ScannerCandidateReport {
+  observed_at: string | null;
+  market_status: string;
+  run_mode: TradingMode;
+  broker_provider: string;
+  count: number;
+  candidates: ScannerCandidate[];
+  disclaimer: string;
+}
+
+export interface LiveReadiness {
+  ready: boolean;
+  checks: Record<string, boolean>;
+  reasons: string[];
+  metrics: {
+    closed_trades: number;
+    trading_days: number;
+    expectancy_per_trade: number;
+    profit_factor: number | null;
+    max_drawdown_pct: number;
+  };
+  criteria: {
+    minimum_closed_trades: number;
+    minimum_trading_days: number;
+    minimum_profit_factor: number;
+    maximum_drawdown_pct: number;
+  };
+}
+
 export interface Position {
   symbol: string;
-  qty: number;
-  side: string;
+  signal_type: string;
   entry_price: number;
-  current_price?: number;
-  unrealized_pnl?: number;
-  unrealized_pnl_pct?: number;
+  current_price: number;
+  shares: number;
+  shares_remaining: number;
+  stop_price: number;
+  pnl_unrealized: number;
+  pnl_realized: number;
+  trailing_stop_active: boolean;
+  trailing_stop_price: number | null;
+  entry_time: string;
 }
 
 export interface Trade {
+  date: string;
   symbol: string;
   side: string;
-  qty: number;
-  price: number;
-  pnl?: number;
-  timestamp: string;
+  signal_type: string;
+  entry_price: number;
+  exit_price: number;
+  shares: number;
+  pnl: number;
+  rr_ratio: number;
+  hold_time_minutes: number;
+  entry_time: string;
+  exit_time: string;
+  exit_reason: string;
+  notes: string;
 }
 
 export interface EquityPoint {
@@ -73,13 +128,16 @@ export interface BotStatus {
   buying_power: number;
   regime: string;
   run_mode: TradingMode;
+  broker_provider: string;
   circuit_breaker: Record<string, unknown>;
   health: Record<string, unknown>;
   market_status: string;
+  market_status_detail?: string;
   open_positions_count: number;
   total_trades_today: number;
   last_updated: string;
   bot_running: boolean;
+  last_error?: string | null;
 }
 
 export interface SubscriptionTier {

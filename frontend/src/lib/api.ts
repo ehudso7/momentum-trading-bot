@@ -8,6 +8,8 @@ import type {
   EquityPoint,
   HealthResponse,
   Position,
+  LiveReadiness,
+  ScannerCandidateReport,
   SignalReport,
   Trade,
 } from "@/types";
@@ -42,16 +44,6 @@ function createClient(baseURL: string): AxiosInstance {
     baseURL,
     timeout: 15000,
     headers: { "Content-Type": "application/json" },
-  });
-
-  client.interceptors.request.use((config) => {
-    if (typeof window !== "undefined") {
-      const apiKey = localStorage.getItem("mf_api_key");
-      if (apiKey) {
-        config.headers.Authorization = `Bearer ${apiKey}`;
-      }
-    }
-    return config;
   });
 
   client.interceptors.response.use(
@@ -94,6 +86,16 @@ export async function fetchHealth(): Promise<HealthResponse> {
 
 export async function fetchLatestSignals(): Promise<SignalReport> {
   const { data } = await backend.get<SignalReport>("/signals/latest");
+  return data;
+}
+
+export async function fetchScannerCandidates(): Promise<ScannerCandidateReport> {
+  const { data } = await dashboard.get<ScannerCandidateReport>("/api/candidates");
+  return data;
+}
+
+export async function fetchLiveReadiness(): Promise<LiveReadiness> {
+  const { data } = await dashboard.get<LiveReadiness>("/api/live-readiness");
   return data;
 }
 

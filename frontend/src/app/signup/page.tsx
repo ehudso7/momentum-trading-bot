@@ -1,12 +1,13 @@
 import { Suspense } from "react";
+import { redirect } from "next/navigation";
 import { AuthForm } from "@/components/auth/auth-form";
 import { RefCapture } from "@/components/share/ref-capture";
+import { isPrivateMode } from "@/lib/access-policy";
 
 export default function SignupPage() {
+  if (isPrivateMode()) redirect("/login");
   return (
     <>
-      {/* Viral loop: persist ?ref=<token> from shared signal cards
-          (first touch) so the referral survives the auth redirect. */}
       <Suspense fallback={null}>
         <RefCapture />
       </Suspense>

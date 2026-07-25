@@ -9,28 +9,25 @@ import { Scanner } from "@/components/dashboard/scanner";
 import { Portfolio } from "@/components/dashboard/portfolio";
 import { EquityChart } from "@/components/dashboard/equity-chart";
 import { PerformanceScorecard } from "@/components/dashboard/performance-scorecard";
-import { GrowthSimulator } from "@/components/dashboard/growth-simulator";
+import { LiveReadinessCard } from "@/components/dashboard/live-readiness-card";
 import { ModeToggle } from "@/components/dashboard/mode-toggle";
 import { Button } from "@/components/ui/button";
 import {
   fetchBotStatus,
   fetchEquityHistory,
-  fetchHealth,
-  fetchLatestSignals,
+  fetchLiveReadiness,
   fetchPerformance,
   fetchPositions,
-  fetchTrades,
+  fetchScannerCandidates,
   type PerformanceScorecard as PerformanceScorecardData,
 } from "@/lib/api";
-import { TrendingUp } from "lucide-react";
-import { useAutoProvisionApiKey } from "@/lib/use-api-key";
 import { exportDashboardPDF } from "@/lib/pdf-export";
 import type {
   BotStatus,
   EquityPoint,
   Position,
-  SignalReport,
-  Trade,
+  LiveReadiness,
+  ScannerCandidateReport,
   TradingMode,
 } from "@/types";
 
@@ -39,60 +36,52 @@ interface DashboardClientProps {
 }
 
 export function DashboardClient({ userEmail }: DashboardClientProps) {
-  // Signed-in users with no stored API key get one provisioned automatically
-  useAutoProvisionApiKey(Boolean(userEmail));
-
   const [backendOnline, setBackendOnline] = useState(false);
   const [mode, setMode] = useState<TradingMode>("paper");
   const [status, setStatus] = useState<BotStatus | null>(null);
-  const [report, setReport] = useState<SignalReport | null>(null);
+  const [report, setReport] = useState<ScannerCandidateReport | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
-  const [trades, setTrades] = useState<Trade[]>([]);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [performance, setPerformance] = useState<PerformanceScorecardData | null>(null);
+  const [liveReadiness, setLiveReadiness] = useState<LiveReadiness | null>(null);
   const [loading, setLoading] = useState(true);
   const [scannerError, setScannerError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const loadData = useCallback(async () => {
-    try {
-      await fetchHealth();
-      setBackendOnline(true);
-    } catch {
-      setBackendOnline(false);
-    }
-
     const results = await Promise.allSettled([
-      fetchLatestSignals(),
       fetchBotStatus(),
+      fetchScannerCandidates(),
       fetchPositions(),
-      fetchTrades(),
       fetchEquityHistory(),
       fetchPerformance(),
+      fetchLiveReadiness(),
     ]);
 
     if (results[0].status === "fulfilled") {
-      setReport(results[0].value);
-      setMode(results[0].value.mode);
+      setStatus(results[0].value);
+      setBackendOnline(Boolean(results[0].value));
+      if (results[0].value) setMode(results[0].value.run_mode);
+    } else {
+      setBackendOnline(false);
+    }
+
+    if (results[1].status === "fulfilled") {
+      setReport(results[1].value);
+      setMode(results[1].value.run_mode);
       setScannerError(null);
     } else {
-      const err = results[0].reason;
+      const err = results[1].reason;
       setScannerError(
         err instanceof Error ? err.message : "Failed to load signals"
       );
     }
 
-    if (results[1].status === "fulfilled" && results[1].value) {
-      setStatus(results[1].value);
-      setMode(results[1].value.run_mode);
-    }
     if (results[2].status === "fulfilled") setPositions(results[2].value);
-    if (results[3].status === "fulfilled") setTrades(results[3].value);
-    if (results[4].status === "fulfilled") setEquity(results[4].value);
-    if (results[5].status === "fulfilled") setPerformance(results[5].value);
+    if (results[3].status === "fulfilled") setEquity(results[3].value);
+    if (results[4].status === "fulfilled") setPerformance(results[4].value);
+    if (results[5].status === "fulfilled") setLiveReadiness(results[5].value);
   }, []);
-
-  const currentEquity = status?.equity ?? (equity.length > 0 ? equity[equity.length - 1].equity : 100000);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,26 +110,6 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
     exportDashboardPDF({ status, report, positions });
   };
 
-  const syncTrades = async () => {
-    if (!userEmail || trades.length === 0) return;
-    try {
-      await fetch("/api/trades/sync", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trades }),
-      });
-    } catch {
-      // Best-effort sync
-    }
-  };
-
-  useEffect(() => {
-    if (userEmail && trades.length > 0) {
-      syncTrades();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userEmail, trades.length]);
-
   return (
     <div className="min-h-screen bg-[#0a0b14]">
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
@@ -165,7 +134,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
               Trading Command Center
             </h1>
             <p className="mt-1 text-sm text-zinc-400">
-              Real-time momentum signals powered by AI
+              Private paper-trading operations with real market scanner data
             </p>
           </div>
           <div className="flex gap-2">
@@ -185,13 +154,14 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
             mode={mode}
             botRunning={status?.bot_running}
             regime={status?.regime}
+            brokerProvider={status?.broker_provider}
           />
         </div>
 
         <div className="mb-6">
           <StatsCards
             status={status}
-            signalCount={report?.summary?.signal_count ?? 0}
+            signalCount={report?.count ?? 0}
           />
         </div>
 
@@ -209,44 +179,12 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
           <PerformanceScorecard data={performance} loading={loading} />
         </div>
 
-        {/* === PEAK MOMENTUMFORGE AI: EXPONENTIAL GROWTH ENGINE === */}
-        <div className="mt-2">
-          <GrowthSimulator status={status} currentEquity={currentEquity} />
-        </div>
-
         <div className="mt-6 grid gap-6 lg:grid-cols-5">
           <div className="lg:col-span-3">
             <Portfolio positions={positions} loading={loading} />
           </div>
           <div className="lg:col-span-2">
-            {/* MomentumForge AI Intelligence Layer — the "AI doing the work" */}
-            <div className="h-full rounded-xl border border-white/10 bg-[#0a0b14] p-5">
-              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
-                <TrendingUp className="h-4 w-4 text-amber-400" /> Forge Intelligence — AI Layer
-              </div>
-              <div className="space-y-3 text-sm">
-                <div className="rounded-lg bg-white/[0.02] p-3">
-                  <div className="text-xs text-zinc-400">Market Regime</div>
-                  <div className="font-mono text-lg font-semibold text-white">{status?.regime || "unknown"}</div>
-                  <div className="mt-1 text-xs text-emerald-400">Strategy parameters auto-adjusted for edge preservation + compounding.</div>
-                </div>
-                {report && report.signals?.length > 0 && (
-                  <div className="rounded-lg bg-white/[0.02] p-3">
-                    <div className="text-xs text-zinc-400 mb-1">Top Momentum Setups (from SaaS AI)</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {report.signals.slice(0, 4).map((s, i) => (
-                        <span key={i} className="rounded bg-white/5 px-2 py-0.5 text-xs font-medium text-white/90">
-                          {s.symbol} <span className="text-amber-400">{((s.confidence || 0) * 100).toFixed(0)}%</span>
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                <div className="text-[11px] text-zinc-500 pt-1">
-                  MomentumForge AI turns scanner + regime + advisor output into intelligence and exponential projections. The core bot executes with iron risk rails (circuit breaker first, hard time exit, position sizing).
-                </div>
-              </div>
-            </div>
+            <LiveReadinessCard data={liveReadiness} loading={loading} />
           </div>
         </div>
       </main>

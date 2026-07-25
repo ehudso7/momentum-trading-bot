@@ -40,14 +40,14 @@ export function Header({ mode, backendOnline, userEmail }: HeaderProps) {
             <span className="text-lg font-bold tracking-tight text-white">
               MomentumForge
             </span>
-            <span className="ml-1.5 text-xs font-medium text-cyan-400">AI</span>
+            <span className="ml-1.5 text-xs font-medium text-cyan-400">PRIVATE</span>
           </div>
         </Link>
 
         <div className="flex items-center gap-3">
           <Badge variant={backendOnline ? "success" : "danger"}>
             <Activity className="mr-1 h-3 w-3" />
-            {backendOnline ? "Live" : "Offline"}
+            {backendOnline ? "Connected" : "Offline"}
           </Badge>
           <Badge variant={mode === "live" ? "warning" : "default"}>
             {mode.toUpperCase()}
@@ -65,18 +65,7 @@ export function Header({ mode, backendOnline, userEmail }: HeaderProps) {
                 <LogOut className="h-4 w-4" />
               </Button>
             </div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <Link href="/login">
-                <Button variant="ghost" size="sm">
-                  Sign in
-                </Button>
-              </Link>
-              <Link href="/signup">
-                <Button size="sm">Get Started</Button>
-              </Link>
-            </div>
-          )}
+          ) : null}
         </div>
       </div>
     </header>

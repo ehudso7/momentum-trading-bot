@@ -16,9 +16,6 @@ export function SiteFooter() {
           <Link href="/privacy" className="transition hover:text-zinc-300">
             Privacy
           </Link>
-          <Link href="/billing" className="transition hover:text-zinc-300">
-            Pricing
-          </Link>
         </nav>
       </div>
     </footer>

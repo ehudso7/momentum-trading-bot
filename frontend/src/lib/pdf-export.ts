@@ -1,6 +1,6 @@
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import type { BotStatus, Position, SignalReport } from "@/types";
+import type { BotStatus, Position, ScannerCandidateReport } from "@/types";
 import { formatCurrency } from "./utils";
 
 export function exportDashboardPDF({
@@ -9,7 +9,7 @@ export function exportDashboardPDF({
   positions,
 }: {
   status: BotStatus | null;
-  report: SignalReport | null;
+  report: ScannerCandidateReport | null;
   positions: Position[];
 }) {
   const doc = new jsPDF();
@@ -17,7 +17,7 @@ export function exportDashboardPDF({
 
   doc.setFontSize(20);
   doc.setTextColor(30, 30, 30);
-  doc.text("MomentumForge AI — Daily Report", 14, 22);
+  doc.text("MomentumForge — Private Paper Report", 14, 22);
 
   doc.setFontSize(10);
   doc.setTextColor(100, 100, 100);
@@ -44,21 +44,22 @@ export function exportDashboardPDF({
     });
   }
 
-  if (report?.signals?.length) {
+  if (report?.candidates?.length) {
     const y = (doc as jsPDF & { lastAutoTable: { finalY: number } }).lastAutoTable
       ?.finalY ?? 90;
 
     doc.setFontSize(14);
-    doc.text("Signal Scanner", 14, y + 14);
+    doc.text("Scanner Candidates", 14, y + 14);
 
     autoTable(doc, {
       startY: y + 18,
-      head: [["Symbol", "Direction", "Confidence", "Entry"]],
-      body: report.signals.map((s) => [
-        s.symbol,
-        s.direction,
-        `${(s.confidence * 100).toFixed(0)}%`,
-        s.entry != null ? `$${s.entry.toFixed(2)}` : "—",
+      head: [["Symbol", "Price", "Gap", "RVol", "Scanner Rank"]],
+      body: report.candidates.map((candidate) => [
+        candidate.symbol,
+        `$${candidate.price.toFixed(2)}`,
+        `${candidate.gap_pct.toFixed(1)}%`,
+        `${candidate.relative_volume.toFixed(1)}x`,
+        `${(candidate.scanner_score * 100).toFixed(0)}`,
       ]),
       theme: "striped",
       headStyles: { fillColor: [6, 182, 212] },
@@ -77,10 +78,10 @@ export function exportDashboardPDF({
       head: [["Symbol", "Side", "Qty", "Entry", "P&L"]],
       body: positions.map((p) => [
         p.symbol,
-        p.side,
-        p.qty.toString(),
+        "LONG",
+        p.shares_remaining.toString(),
         formatCurrency(p.entry_price),
-        p.unrealized_pnl != null ? formatCurrency(p.unrealized_pnl) : "—",
+        formatCurrency(p.pnl_unrealized),
       ]),
       theme: "striped",
       headStyles: { fillColor: [6, 182, 212] },

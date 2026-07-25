@@ -6,12 +6,12 @@
 export const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL ?? "https://momentumforge-enhanced.vercel.app";
 
-export const SITE_NAME = "MomentumForge AI";
+export const SITE_NAME = "MomentumForge";
 
-export const SITE_TITLE = "MomentumForge AI — Momentum Trading Dashboard";
+export const SITE_TITLE = "MomentumForge — Private Paper Trading";
 
 export const SITE_DESCRIPTION =
-  "Real-time momentum signals & AI-powered trading dashboard. Track portfolios, scan low-float gappers, and act on regime-aware entries with strict risk management.";
+  "Owner-only paper-trading operations dashboard with real market scanner observations, risk controls, and evidence-based performance tracking.";
 
 export const SITE_TAGLINE =
-  "Real-time momentum signals & AI-powered trading dashboard";
+  "Private paper-trading operations and evidence tracking";
