@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { isPrivateMode } from "@/lib/access-policy";
 
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL ||
@@ -20,6 +21,12 @@ interface ProvisionResponse {
  * has been issued via user_metadata.mf_api_key_issued.
  */
 export async function POST() {
+  if (isPrivateMode()) {
+    return NextResponse.json(
+      { error: "Browser API-key provisioning is disabled in private mode." },
+      { status: 404 }
+    );
+  }
   if (
     !process.env.NEXT_PUBLIC_SUPABASE_URL ||
     !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY

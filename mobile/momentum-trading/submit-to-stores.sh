@@ -1,5 +1,9 @@
 #!/bin/bash
 
+echo "Native store submission is disabled for the private paper launch." >&2
+echo "See PRIVATE_BETA_STATUS.md and docs/PRIVATE_PAPER_LAUNCH.md." >&2
+exit 64
+
 echo "🚀 Momentum Trading Pro - App Store Submission Script"
 echo "=================================================="
 

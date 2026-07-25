@@ -1,14 +1,17 @@
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
+import { redirect } from "next/navigation";
 import { PricingCards } from "@/components/billing/pricing-cards";
 import { CheckoutConfirmation } from "@/components/billing/checkout-confirmation";
 import { ManageSubscriptionButton } from "@/components/billing/manage-subscription-button";
+import { isPrivateMode } from "@/lib/access-policy";
 
 export default async function BillingPage({
   searchParams,
 }: {
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
+  if (isPrivateMode()) redirect("/");
   const { checkout } = await searchParams;
   const isSuccess = checkout === "success";
   const isCancel = checkout === "cancel";
@@ -36,7 +39,7 @@ export default async function BillingPage({
         {isSuccess && (
           <>
             <div className="mb-6 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-center text-sm text-emerald-400">
-              🎉 Payment successful! Thank you for supporting MomentumForge AI.
+              Payment successful. Thank you for supporting MomentumForge.
             </div>
             <CheckoutConfirmation />
           </>

@@ -38,7 +38,7 @@ export function StatsCards({ status, signalCount }: StatsCardsProps) {
       color: "from-violet-500 to-purple-600",
     },
     {
-      label: "Active Signals",
+      label: "Scanner Candidates",
       value: signalCount.toString(),
       icon: TrendingUp,
       color: "from-amber-500 to-orange-600",

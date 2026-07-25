@@ -10,6 +10,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         dumb-init \
+        gosu \
         build-essential \
         curl \
     && rm -rf /var/lib/apt/lists/*
@@ -23,19 +24,13 @@ RUN pip install --upgrade pip \
     && pip install --no-cache-dir ".[dev]" \
     && pip install --no-cache-dir --no-deps .
 
-# Create runtime data directory.
-# Railway volume mounted at /app/data may be owned by root at runtime,
-# so permissions must allow the non-root botuser to write logs/manifests.
-RUN mkdir -p /app/data \
-    && chmod -R 777 /app/data
-
-# Create non-root user and ensure app is writable where needed
-RUN useradd -m botuser \
+# Create a non-root runtime identity. The entrypoint performs the one required
+# root operation (preparing a newly mounted Railway data volume) and then drops
+# privileges through gosu before Python starts.
+RUN useradd --create-home --shell /usr/sbin/nologin botuser \
+    && mkdir -p /app/data \
     && chown -R botuser:botuser /app \
-    && chmod -R 777 /app/data
-
-# Don't switch to botuser - Railway needs root for volume permissions
-# USER botuser
+    && chmod 0750 /app/data
 
 EXPOSE 8080
 

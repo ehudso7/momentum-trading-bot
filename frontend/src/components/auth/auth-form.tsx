@@ -7,19 +7,20 @@ import { Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { createClient, isSupabaseConfigured } from "@/lib/supabase/client";
-import { provisionApiKeyIfMissing } from "@/lib/use-api-key";
 
 interface AuthFormProps {
   mode: "login" | "signup";
+  privateMode?: boolean;
+  initialError?: string | null;
 }
 
-export function AuthForm({ mode }: AuthFormProps) {
+export function AuthForm({ mode, privateMode = false, initialError = null }: AuthFormProps) {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialError);
   const [message, setMessage] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -49,9 +50,6 @@ export function AuthForm({ mode }: AuthFormProps) {
 
         // Supabase autoconfirm is enabled — session returned means instant access
         if (data.session) {
-          // Fire-and-forget: issue the user's backend API key without
-          // blocking navigation (dashboard retries if this misses).
-          provisionApiKeyIfMissing();
           router.push("/");
           router.refresh();
           return;
@@ -63,7 +61,6 @@ export function AuthForm({ mode }: AuthFormProps) {
           password,
         });
         if (!signInError) {
-          provisionApiKeyIfMissing();
           router.push("/");
           router.refresh();
           return;
@@ -81,8 +78,6 @@ export function AuthForm({ mode }: AuthFormProps) {
           // Surface a user-friendly message instead of raw fetch error
           throw new Error(error.message || "Sign in failed. Check your credentials and Supabase configuration.");
         }
-        // Fire-and-forget key provisioning — never blocks navigation
-        provisionApiKeyIfMissing();
         router.push("/");
         router.refresh();
       }
@@ -105,7 +100,9 @@ export function AuthForm({ mode }: AuthFormProps) {
           </h1>
           <p className="mt-2 text-sm text-zinc-400">
             {mode === "login"
-              ? "Sign in to access your trading dashboard"
+              ? privateMode
+                ? "Owner-only paper-trading control room"
+                : "Sign in to access your trading dashboard"
               : "Start your momentum trading journey"}
           </p>
         </div>
@@ -167,7 +164,7 @@ export function AuthForm({ mode }: AuthFormProps) {
           </Button>
         </form>
 
-        <p className="mt-6 text-center text-sm text-zinc-500">
+        {!privateMode && <p className="mt-6 text-center text-sm text-zinc-500">
           {mode === "login" ? (
             <>
               Don&apos;t have an account?{" "}
@@ -183,7 +180,7 @@ export function AuthForm({ mode }: AuthFormProps) {
               </Link>
             </>
           )}
-        </p>
+        </p>}
       </div>
     </div>
   );

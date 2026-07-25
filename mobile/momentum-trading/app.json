@@ -18,16 +18,11 @@
       "bundleIdentifier": "com.momentumtrading.pro",
       "buildNumber": "6",
       "infoPlist": {
-        "NSCameraUsageDescription": "Allow camera access to scan documents and verify identity",
-        "NSFaceIDUsageDescription": "Allow Face ID for secure authentication",
-        "NSLocationWhenInUseUsageDescription": "Allow location access for regional market data"
+        "NSFaceIDUsageDescription": "Allow Face ID for secure authentication"
       },
       "config": {
         "usesNonExemptEncryption": false
-      },
-      "associatedDomains": [
-        "applinks:momentum-trading-bot-production.up.railway.app"
-      ]
+      }
     },
     "android": {
       "package": "com.momentumtrading.pro",
@@ -37,26 +32,9 @@
         "backgroundColor": "#0A0E27"
       },
       "permissions": [
-        "CAMERA",
         "VIBRATE",
         "USE_FINGERPRINT",
         "USE_BIOMETRIC"
-      ],
-      "intentFilters": [
-        {
-          "action": "VIEW",
-          "autoVerify": true,
-          "data": [
-            {
-              "scheme": "https",
-              "host": "momentum-trading-bot-production.up.railway.app"
-            }
-          ],
-          "category": [
-            "BROWSABLE",
-            "DEFAULT"
-          ]
-        }
       ],
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
@@ -68,11 +46,10 @@
       "expo-dev-client",
       "expo-notifications",
       "expo-secure-store",
-      "expo-updates",
-      "expo-status-bar"
+      "expo-updates"
     ],
     "extra": {
-      "apiUrl": "https://momentum-trading-bot-production.up.railway.app",
+      "releaseStatus": "quarantined-private-web-only",
       "eas": {
         "projectId": "50c9a7cc-e370-47a4-9eb3-984591cc7674"
       }

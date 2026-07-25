@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tempfile
 from datetime import date as _date_type, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -315,7 +316,28 @@ def persist_report(
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / report_filename(str(rd))
     payload = json.dumps(report, sort_keys=False, default=str, indent=2)
-    path.write_text(payload + "\n", encoding="utf-8")
+    temp_path: Optional[Path] = None
+    try:
+        # Write and fsync a same-filesystem temporary file before the atomic
+        # replace. Readers therefore see either the complete previous report
+        # or the complete new one, never a partially written JSON document.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=out_dir,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     return path
 
 

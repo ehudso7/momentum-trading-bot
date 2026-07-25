@@ -40,6 +40,7 @@ from trading_bot.portfolio.manager import PortfolioManager
 from trading_bot.risk.circuit_breaker import CircuitBreaker, CircuitState
 from trading_bot.risk.correlation import CorrelationChecker
 from trading_bot.risk.position_sizer import PositionSizer
+from trading_bot.risk.live_readiness import evaluate_live_readiness
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner
 from trading_bot.strategies.advisor import TradingAdvisor
 from trading_bot.strategies.pullback_vwap import PullbackVWAPStrategy
@@ -84,6 +85,20 @@ DISCLAIMER = """
 """
 
 
+_BROKER_KEY_PLACEHOLDERS = {
+    "",
+    "your_alpaca_api_key_here",
+    "your_alpaca_api_secret_here",
+}
+
+
+def _has_valid_alpaca_credentials(config: AppConfig) -> bool:
+    """Return whether both broker secrets are configured and non-placeholder."""
+    key = config.broker.alpaca_api_key.get_secret_value().strip()
+    secret = config.broker.alpaca_api_secret.get_secret_value().strip()
+    return key not in _BROKER_KEY_PLACEHOLDERS and secret not in _BROKER_KEY_PLACEHOLDERS
+
+
 class TradingBot:
     """Main orchestrator for the trading bot."""
 
@@ -95,6 +110,8 @@ class TradingBot:
         self._current_regime: str | None = None
         self._daily_plan_generated = False
         self._premarket_watchlist: list[str] = []
+        self._latest_candidates: list[dict[str, object]] = []
+        self._broker_provider = "local_paper"
         self._dashboard_state = dashboard_state
 
         # Wire up dependencies based on run mode
@@ -104,6 +121,7 @@ class TradingBot:
                 config.backtest_end_date or "2025-01-01",
             )
             self._broker = PaperBroker(initial_equity=config.starting_capital)
+            self._broker_provider = "backtest_paper"
             polygon = None
         else:
             polygon = PolygonClient(config.data)
@@ -111,9 +129,23 @@ class TradingBot:
                 polygon, float_cache_hours=config.data.float_cache_hours
             )
             if config.run_mode == RunMode.LIVE:
+                self._assert_live_evidence_gate()
                 self._broker = AlpacaBroker(config.broker)
-            else:  # PAPER
+                self._broker_provider = "alpaca_live"
+            elif config.broker.alpaca_paper and _has_valid_alpaca_credentials(config):
+                # Alpaca paper is the production private-launch broker. Account,
+                # orders, and positions survive process/container restarts.
+                self._broker = AlpacaBroker(config.broker)
+                self._broker_provider = "alpaca_paper"
+                log.info("bot.paper_broker_selected", provider="alpaca")
+            else:  # Local PAPER fallback for keyless development/tests
                 self._broker = PaperBroker(initial_equity=config.starting_capital)
+                self._broker_provider = "local_paper"
+                log.warning(
+                    "bot.paper_broker_selected",
+                    provider="local_in_memory",
+                    persistence="none",
+                )
 
         self._news = NewsClient(polygon, config.scanner)
         alpaca_screener = (
@@ -197,6 +229,27 @@ class TradingBot:
 
         # Daily auto-reset tracking
         self._last_trading_date: str | None = None
+
+    def _assert_live_evidence_gate(self) -> None:
+        """Refuse to construct a live broker until paper evidence passes."""
+        rows: list[dict[str, str]] = []
+        journal_path = Path(self._config.journal_csv_path)
+        if journal_path.is_file():
+            try:
+                with journal_path.open(newline="") as journal_file:
+                    rows = list(csv.DictReader(journal_file))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Live trading blocked: journal could not be read ({exc})"
+                ) from exc
+
+        result = evaluate_live_readiness(
+            rows,
+            starting_equity=self._config.starting_capital,
+        )
+        if not result.ready:
+            detail = "; ".join(result.reasons) or "paper evidence is incomplete"
+            raise RuntimeError(f"Live trading blocked by evidence gate: {detail}")
 
     def run(self) -> None:
         """Main run loop. Dispatches to backtest or live/paper loop."""
@@ -528,6 +581,7 @@ class TradingBot:
 
         # 8. Scan for candidates
         candidates = self._scanner.scan()
+        self._latest_candidates = [self._candidate_to_dashboard(c) for c in candidates]
         if not candidates:
             self._health.record_scan(0)
             return
@@ -918,6 +972,22 @@ class TradingBot:
                 regime=self._current_regime,
             )
 
+    @staticmethod
+    def _candidate_to_dashboard(candidate) -> dict[str, object]:
+        """Project a scanner result into a truthful, read-only dashboard row."""
+        return {
+            "symbol": candidate.symbol,
+            "price": round(float(candidate.price), 4),
+            "gap_pct": round(float(candidate.gap_pct), 3),
+            "relative_volume": round(float(candidate.relative_volume), 3),
+            "float_shares": candidate.float_shares,
+            "volume": int(candidate.volume),
+            "prev_close": round(float(candidate.prev_close), 4),
+            "catalyst": candidate.catalyst,
+            "scanner_score": round(float(candidate.score), 4),
+            "observed_at": candidate.timestamp.isoformat(),
+        }
+
     def _compute_volatility(self, bars, price: float) -> float:
         """
         Derive a unit-less volatility figure from ATR(14) as a percentage
@@ -1092,7 +1162,10 @@ class TradingBot:
             return
 
         if not candidates:
+            self._latest_candidates = []
             return
+
+        self._latest_candidates = [self._candidate_to_dashboard(c) for c in candidates]
 
         watchlist_symbols = [c.symbol for c in candidates]
         self._premarket_watchlist = watchlist_symbols
@@ -1354,10 +1427,12 @@ class TradingBot:
             buying_power=buying_power,
             open_positions=position_dicts,
             journal_entries=journal_dicts,
+            scanner_candidates=self._latest_candidates,
             circuit_breaker=self._circuit.get_status(),
             health=self._health.get_health_status(),
             regime=self._current_regime,
             run_mode=self._config.run_mode.value,
+            broker_provider=self._broker_provider,
             market_status=market_status,
             market_status_detail=market_status_detail,
             last_error=last_error,
@@ -1521,6 +1596,14 @@ def main() -> None:
     # Load config
     config = AppConfig.from_yaml(args.config)
     config.run_mode = RunMode(args.mode)
+
+    # Re-run cross-field validation after the CLI mode override. Pydantic has
+    # already validated the YAML object, but assignment alone does not re-run
+    # model validators; without this call `--mode live` could bypass them.
+    try:
+        config.validate_safety()
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.log_level:
         config.log_level = args.log_level

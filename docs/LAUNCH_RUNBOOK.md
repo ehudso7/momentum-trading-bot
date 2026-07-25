@@ -1,9 +1,17 @@
-# Launch Runbook — remaining operator actions (2026-07-05)
+# Launch Runbook — remaining operator actions (updated 2026-07-25)
 
-Everything code-side is complete, tested (2,612 backend tests, frontend
-build/lint clean), and deployed. The items below are **operator-only
-actions** (they need production credentials or persistence approval) —
-each is a copy-paste command. Run them from the repo root.
+Scope: this runbook serves the **private paper launch**. The authoritative
+contract is `docs/PRIVATE_PAPER_LAUNCH.md`; the pre-deploy checklist is
+`docs/LAUNCH_CHECKLIST.md`. Where any of them disagree, the contract wins.
+
+Code-side gates are green as of 2026-07-25: 2,773 backend tests pass,
+`pip-audit` is clean, `npm audit --omit=dev --audit-level=high` reports zero
+vulnerabilities, and frontend lint and production build pass. The items below
+are **operator-only actions** needing production credentials or persistence
+approval — each is a copy-paste command. Run them from the repo root.
+
+Section 2 (payments) is **deferred** for this release and retained only as
+reference for the future public launch. Do not run it now.
 
 ## 1. Start the core trading bot as its own Railway service
 
@@ -47,7 +55,14 @@ launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.momentumforge.bot.plist
 The Mac must be awake during market hours (`caffeinate -s` or
 Energy Saver settings); the Railway service has no such caveat.
 
-## 2. Payments go-live config
+## 2. Payments go-live config — DEFERRED, do not run for this release
+
+> **Deferred behind the public-product gate.** The private paper launch disables
+> public signup and billing. Running this section would re-enable a monetized
+> public surface before the legal review that the contract requires (product
+> classification, disclosures, market-data redistribution rights, privacy terms,
+> subscription rules). Keep it unset. This text is reference for a future
+> public launch only.
 
 The self-serve purchase flow (signup → auto API key → checkout →
 webhook fulfillment → premium) is fully implemented and fail-closed
@@ -81,20 +96,53 @@ Then redeploy the frontend (`git commit --allow-empty -m redeploy && git push`
 or `npx vercel --prod`) so the new env vars take effect, and run one
 $0-style test checkout (see `docs/stripe-zero-dollar-test.md`).
 
-## 3. Going live (real money) — deliberate, later
+## 3. Going live (real money) — blocked by an evidence gate
 
-Paper mode is the enforced default everywhere. When paper results
-satisfy you:
+Paper mode is the enforced default everywhere. Setting `TRADING_RUN_MODE=live`
+is **not sufficient** and will not start the bot on its own.
+
+Before an `AlpacaBroker` is constructed in live mode,
+`trading_bot/main.py::_assert_live_evidence_gate` reads the trade journal and
+raises `RuntimeError` unless every criterion in
+`trading_bot/risk/live_readiness.py` passes:
+
+| Criterion | Threshold |
+|---|---|
+| Closed paper trades | ≥ 100 |
+| Distinct trading days | ≥ 20 |
+| Expectancy per trade | > 0 |
+| Profit factor | ≥ 1.25 |
+| Peak-to-trough drawdown | ≤ 5% |
+
+A `None` profit factor (for example, a small sample with no losing trades) does
+**not** pass. Check current standing on the dashboard's live-readiness card or:
+
+```bash
+curl https://<bot-domain>/api/live-readiness
+```
+
+Only once that returns `"ready": true` do the operator steps apply:
+
 1. Generate **live** Alpaca keys, set `TRADING_RUN_MODE=live` and
    `alpaca_paper=false` on the bot service only.
-2. The bot still requires its interactive confirmation gate; risk
-   limits (0.5%/trade, 1.5%/day, circuit breaker at 5% drawdown, 3:50pm
+2. Complete the interactive live-risk acknowledgement prompt.
+3. Risk limits (0.5%/trade, 1.5%/day, circuit breaker at 5% drawdown, 3:50pm
    hard exit) are non-negotiable and unchanged.
 
-## Verification checklist after 1 + 2
+Passing the gate means the software met its configured evidence threshold. It
+does not imply future profitability and does not remove trading risk.
+
+## Verification checklist after §1
+
+Private paper launch only — §2 is deferred, so it has nothing to verify.
 
 - `curl https://<bot-domain>/health` → `{"status":"alive",...}`
-- `curl https://<bot-domain>/api/status` → equity/circuit JSON
-- Signup on the site → Profile shows an auto-generated API key
-- Upgrade to Pro → Stripe checkout → back to /billing → "Premium active ✓"
-- Scanner card shows full signal details (no Preview badge) for that user
+- `curl https://<bot-domain>/api/status` → equity/circuit JSON, mode `paper`
+- `curl https://<bot-domain>/api/live-readiness` → `"ready": false` with the
+  remaining criteria listed (expected until the evidence gate is met)
+- An unauthenticated request to a private frontend route is rejected, not served
+- Signing in as the allow-listed owner reaches the dashboard
+- Scanner rows show current real market data, and no report is labeled `demo`
+
+The full pre-deploy list, including the CI gates and the rollback target, is in
+`docs/LAUNCH_CHECKLIST.md`.

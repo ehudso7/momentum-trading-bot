@@ -29,6 +29,8 @@ dependencies = [
     "alpaca-py>=0.21",
     "polygon-api-client>=1.14",
     "yfinance>=0.2.36",
+    # Security floor for yfinance -> beautifulsoup4 selector dependency.
+    "soupsieve>=2.8.4",
     "structlog>=24.1",
     "pydantic>=2.5",
     "pydantic-settings>=2.14.2",

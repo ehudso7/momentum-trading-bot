@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
+import { isPrivateMode } from "@/lib/access-policy";
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
@@ -14,6 +15,12 @@ function getSupabaseAdmin() {
 }
 
 export async function POST(request: NextRequest) {
+  if (isPrivateMode()) {
+    return NextResponse.json(
+      { error: "Billing is disabled during the private paper launch." },
+      { status: 404 }
+    );
+  }
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
     return NextResponse.json(
       { error: "Stripe not configured" },

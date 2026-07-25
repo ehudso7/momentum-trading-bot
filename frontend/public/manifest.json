@@ -1,7 +1,7 @@
 {
-  "name": "MomentumForge AI",
+  "name": "MomentumForge Private",
   "short_name": "MomentumForge",
-  "description": "Real-time momentum signals & AI-powered trading dashboard.",
+  "description": "Private paper-trading operations dashboard.",
   "id": "/",
   "start_url": "/",
   "scope": "/",

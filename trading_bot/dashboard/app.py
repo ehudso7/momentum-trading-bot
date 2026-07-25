@@ -7,6 +7,7 @@ Designed to run in a background thread alongside the trading bot.
 
 from __future__ import annotations
 
+import hmac
 import os
 import threading
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ from fastapi.templating import Jinja2Templates
 
 from trading_bot.dashboard.state import DashboardState
 from trading_bot.analytics.performance import compute_performance, rolling
-from trading_bot.api.mobile_routes import router as mobile_router
+from trading_bot.risk.live_readiness import evaluate_live_readiness
 
 log = structlog.get_logger(__name__)
 
@@ -30,6 +31,32 @@ _DEFAULT_JOURNAL_PATH = "data/journal.csv"
 _START_TIME = datetime.now(timezone.utc)
 
 _dashboard_state: DashboardState | None = None
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _private_mode_enabled() -> bool:
+    if _env_truthy("TRADING_PRIVATE_MODE"):
+        return True
+    return not _env_truthy("TRADING_PUBLIC_PRODUCT_ENABLED")
+
+
+def _dashboard_key() -> str:
+    return (os.getenv("TRADING_DASHBOARD_API_KEY") or "").strip()
+
+
+def _dashboard_auth_required() -> bool:
+    return _private_mode_enabled() or bool(_dashboard_key())
+
+
+def _valid_dashboard_bearer(request: Request) -> bool:
+    configured = _dashboard_key()
+    if not configured:
+        return False
+    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token, configured)
 
 
 def _read_journal_trades(journal_path: str) -> list[dict[str, Any]]:
@@ -68,6 +95,26 @@ def create_app(
         redoc_url=None,
     )
 
+    @app.middleware("http")
+    async def private_access_middleware(request: Request, call_next):
+        """Keep infrastructure probes public and fail closed everywhere else."""
+        if request.url.path in {"/health", "/healthz"}:
+            return await call_next(request)
+        if not _dashboard_auth_required():
+            return await call_next(request)
+        if not _dashboard_key():
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "private dashboard authentication is not configured"},
+            )
+        if not _valid_dashboard_bearer(request):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "private dashboard authentication required"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
     # --- CORS middleware ---
     allowed_origins = os.getenv(
         "DASHBOARD_CORS_ORIGINS", "http://localhost:3000,http://localhost:8080"
@@ -76,13 +123,18 @@ def create_app(
         CORSMiddleware,
         allow_origins=allowed_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
         max_age=600,
     )
 
-    # Include mobile API routes
-    app.include_router(mobile_router)
+    # The legacy mobile router contains non-production placeholder behavior and
+    # is excluded from the private launch. It can only be mounted deliberately
+    # in a non-private development process.
+    if _env_truthy("TRADING_ENABLE_LEGACY_MOBILE_API") and not _private_mode_enabled():
+        from trading_bot.api.mobile_routes import router as mobile_router
+
+        app.include_router(mobile_router)
 
     # --- Global error handler ---
     @app.exception_handler(Exception)
@@ -181,6 +233,7 @@ def create_app(
             "buying_power": snap.buying_power,
             "regime": snap.regime,
             "run_mode": snap.run_mode,
+            "broker_provider": snap.broker_provider,
             "circuit_breaker": snap.circuit_breaker,
             "health": snap.health,
             "market_status": snap.market_status,
@@ -205,6 +258,22 @@ def create_app(
         """Today's completed trades."""
         snap = state.get_snapshot()
         return snap.journal_entries
+
+    @app.get("/api/candidates")
+    async def api_candidates() -> dict[str, Any]:
+        """Latest real scanner observations from the running core bot."""
+        snap = state.get_snapshot()
+        return {
+            "observed_at": snap.last_updated,
+            "market_status": snap.market_status,
+            "run_mode": snap.run_mode,
+            "count": len(snap.scanner_candidates),
+            "candidates": snap.scanner_candidates,
+            "disclaimer": (
+                "Scanner ranks are rules-based observations, not win "
+                "probabilities or recommendations."
+            ),
+        }
 
     @app.get("/api/equity-history")
     async def api_equity_history() -> list[dict[str, Any]]:
@@ -243,6 +312,21 @@ def create_app(
             trades, window=20, starting_equity=starting_equity
         )
         return card
+
+    @app.get("/api/live-readiness")
+    async def api_live_readiness() -> dict[str, Any]:
+        """Explain why live-money mode is blocked or evidence-ready."""
+        snap = state.get_snapshot()
+        trades = _read_journal_trades(journal_path)
+        starting_equity = (
+            snap.starting_equity
+            if snap.starting_equity and snap.starting_equity > 0
+            else 100_000.0
+        )
+        return evaluate_live_readiness(
+            trades,
+            starting_equity=starting_equity,
+        ).to_dict()
 
     @app.get("/api/health")
     async def api_health() -> dict[str, Any]:

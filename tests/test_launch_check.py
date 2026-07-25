@@ -454,8 +454,8 @@ class TestRailwayTomlLockdown:
         #   * the inline console-script invocation;
         #   * a startCommand that delegates to
         #     scripts/railway_start.sh — in which case the SCRIPT
-        #     must carry the same invariants (console script +
-        #     /app/data chmod).
+        #     must carry the same invariants (console script,
+        #     least-privilege data permissions, and privilege drop).
         legacy = "uvicorn trading_bot.api.server:app --host 0.0.0.0 --port 8080"
         current = "trading-bot-api --host 0.0.0.0"
         if "railway_start.sh" in toml:
@@ -463,12 +463,12 @@ class TestRailwayTomlLockdown:
                 repo_root / "scripts" / "railway_start.sh"
             ).read_text()
             assert current in start_sh
-            # Must include the /app/data chmod step.
-            assert "chmod -R 777 /app/data" in start_sh
+            assert "chmod -R u=rwX,g=rX,o= /app/data" in start_sh
+            assert "gosu botuser" in start_sh
+            assert "chmod -R 777" not in start_sh
         else:
             assert (legacy in toml) or (current in toml)
-            # Must include the /app/data chmod step.
-            assert "chmod -R 777 /app/data" in toml
+            assert "chmod -R 777" not in toml
         # Must use the dockerfile builder.
         assert 'builder = "DOCKERFILE"' in toml
         # Health probe pointed at /health.

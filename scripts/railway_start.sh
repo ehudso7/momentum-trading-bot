@@ -6,11 +6,18 @@
 #   bot           — the core trading loop with its live dashboard bound
 #                   to $PORT (trading_bot.main)
 #
-# The chmod handles a Railway volume that may be remounted as root-owned
-# at runtime, so runtime data under /app/data stays writable.
+# A Railway volume may be remounted root-owned. The script prepares that one
+# directory and immediately drops to the unprivileged runtime account.
 set -eu
 
-chmod -R 777 /app/data 2>/dev/null || true
+run_as_bot() {
+    if [ "$(id -u)" = "0" ]; then
+        chown -R botuser:botuser /app/data
+        chmod -R u=rwX,g=rX,o= /app/data
+        exec gosu botuser "$@"
+    fi
+    exec "$@"
+}
 
 ROLE="${SERVICE_ROLE:-api}"
 
@@ -20,8 +27,8 @@ if [ "$ROLE" = "bot" ]; then
     # must fail loudly rather than fall back.
     MODE="${TRADING_RUN_MODE:-paper}"
     echo "railway_start: role=bot mode=${MODE} port=${PORT:-8080}"
-    exec trading-bot --mode "$MODE"
+    run_as_bot trading-bot --mode "$MODE"
 fi
 
 echo "railway_start: role=api port=${PORT:-8080}"
-exec trading-bot-api --host 0.0.0.0
+run_as_bot trading-bot-api --host 0.0.0.0

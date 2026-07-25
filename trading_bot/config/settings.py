@@ -198,6 +198,9 @@ class AppConfig(BaseSettings):
     """
 
     run_mode: RunMode = Field(RunMode.PAPER)
+    # Live-money activation is a separate, explicit gate. A command-line mode
+    # switch alone must never be enough to place real orders.
+    live_trading_enabled: bool = Field(False)
     starting_capital: float = Field(100_000.0, ge=100.0)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
@@ -279,6 +282,12 @@ class AppConfig(BaseSettings):
                 raise ValueError(
                     "Live mode requires a valid Alpaca API key, "
                     "not a placeholder."
+                )
+
+            if not self.live_trading_enabled:
+                raise ValueError(
+                    "Live mode is disabled. Set TRADING_LIVE_TRADING_ENABLED=true "
+                    "only after the paper-trading evidence gate passes."
                 )
 
         # Max total exposure check: per-trade risk * max positions shouldn't

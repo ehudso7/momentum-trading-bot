@@ -58,6 +58,23 @@ def selected_provider(env: Optional[dict] = None) -> str:
     raw_mode = (e.get(DATA_MODE_ENV_VAR) or "").strip().lower()
     if raw_mode == PROVIDER_DEMO:
         return PROVIDER_DEMO
+    if raw_mode == PROVIDER_POLYGON:
+        return (
+            PROVIDER_POLYGON
+            if (e.get(POLYGON_KEY_ENV_VAR) or "").strip()
+            else ""
+        )
+    if raw_mode == PROVIDER_ALPACA:
+        has_key = bool((e.get(ALPACA_KEY_ENV_VAR) or "").strip())
+        has_secret = bool((e.get(ALPACA_SECRET_ENV_VAR) or "").strip())
+        return PROVIDER_ALPACA if has_key and has_secret else ""
+    if raw_mode == PROVIDER_YFINANCE:
+        return PROVIDER_YFINANCE if _yfinance_importable() else ""
+    if raw_mode:
+        # An operator explicitly requested an unsupported provider. Do not
+        # silently choose a different source because that would make data
+        # provenance misleading.
+        return ""
     if (e.get(POLYGON_KEY_ENV_VAR) or "").strip():
         return PROVIDER_POLYGON
     if (e.get(ALPACA_KEY_ENV_VAR) or "").strip() and (
@@ -160,6 +177,7 @@ def _fetch_yfinance(symbol: str, lookback_days: int) -> tuple[list[dict], Option
 
 def _fetch_polygon(symbol: str, lookback_days: int) -> tuple[list[dict], Optional[str]]:
     try:
+        from trading_bot.config.settings import DataConfig
         from trading_bot.data.polygon_client import PolygonClient
     except Exception as exc:
         return ([], f"polygon_import_error:{type(exc).__name__}")
@@ -167,7 +185,7 @@ def _fetch_polygon(symbol: str, lookback_days: int) -> tuple[list[dict], Optiona
     if not api_key:
         return ([], "polygon_api_key_unset")
     try:
-        client = PolygonClient(api_key=api_key)
+        client = PolygonClient(DataConfig(polygon_api_key=api_key))
         # Pad lookback to absorb weekends / holidays.
         from_date = (
             datetime.now(timezone.utc) - timedelta(days=lookback_days + 30)

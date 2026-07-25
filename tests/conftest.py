@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import numpy as np
@@ -25,6 +26,10 @@ from trading_bot.models.domain import (
     SignalType,
     TradeSignal,
 )
+
+# Legacy public-product route tests opt into the public surface explicitly.
+# Runtime code is private by default when this future-launch gate is absent.
+os.environ.setdefault("TRADING_PUBLIC_PRODUCT_ENABLED", "true")
 
 
 @pytest.fixture

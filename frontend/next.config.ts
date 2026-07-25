@@ -1,9 +1,11 @@
 import type { NextConfig } from "next";
 import { withSentryConfig } from "@sentry/nextjs";
 
+const isDev = process.env.NODE_ENV === "development";
+
 const contentSecurityPolicy = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+  `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -11,14 +13,13 @@ const contentSecurityPolicy = [
     "connect-src 'self'",
     "https://*.supabase.co",
     "wss://*.supabase.co",
-    "https://momentum-trading-bot-production.up.railway.app",
-    "https://momentum-bot-core-production.up.railway.app",
     "https://*.sentry.io",
     "https://*.ingest.sentry.io",
     "https://*.ingest.us.sentry.io",
   ].join(" "),
   "frame-ancestors 'none'",
   "worker-src 'self' blob:",
+  "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",
 ].join("; ");
@@ -30,6 +31,7 @@ const securityHeaders = [
   },
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "X-Frame-Options", value: "DENY" },
+  { key: "X-Robots-Tag", value: "noindex, nofollow, noarchive" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   {
     key: "Permissions-Policy",
@@ -47,6 +49,10 @@ const nextConfig: NextConfig = {
       {
         source: "/(.*)",
         headers: securityHeaders,
+      },
+      {
+        source: "/api/:path*",
+        headers: [{ key: "Cache-Control", value: "private, no-store" }],
       },
       {
         source: "/sw.js",
