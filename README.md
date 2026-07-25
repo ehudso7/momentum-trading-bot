@@ -8,6 +8,28 @@ Automated momentum day-trading bot for US equities (NYSE/NASDAQ). Targets low-fl
 
 ---
 
+## Current release status: private paper launch
+
+This project is deployed as a **single-owner, paper-trading** application. It is
+not a public product, not an investment-advisory service, and not accepting
+users. Public signup, billing, share links, growth projections, demo signals,
+and mobile order routing are disabled.
+
+- Authoritative contract: [`docs/PRIVATE_PAPER_LAUNCH.md`](docs/PRIVATE_PAPER_LAUNCH.md)
+- Pre-deploy checklist: [`docs/LAUNCH_CHECKLIST.md`](docs/LAUNCH_CHECKLIST.md)
+- Operator runbook: [`docs/LAUNCH_RUNBOOK.md`](docs/LAUNCH_RUNBOOK.md)
+
+**Live-money trading is blocked in code**, not merely by configuration. Setting
+`TRADING_RUN_MODE=live` is not sufficient: `_assert_live_evidence_gate` in
+`trading_bot/main.py` raises before an `AlpacaBroker` is constructed unless the
+paper journal shows ≥100 closed trades across ≥20 trading days with positive
+expectancy, profit factor ≥1.25, and drawdown ≤5%.
+
+The SaaS/billing layer described below is **built but not launched**, and stays
+that way until the public-product gate in the contract passes legal review.
+
+---
+
 ## Features
 
 ### Scanning & Data
@@ -44,7 +66,12 @@ Automated momentum day-trading bot for US equities (NYSE/NASDAQ). Targets low-fl
 - **Realistic Paper Broker**: Slippage model, margin simulation, stale order cleanup
 - **Docker + Railway Ready**: Production Dockerfile with health checks, signal handling, non-root user
 
-## SaaS launch quickstart
+## SaaS quickstart — DEFERRED, not part of the current release
+
+> **Not launched.** The private paper launch disables public signup and billing.
+> Following this section would stand up a monetized public surface ahead of the
+> legal review the contract requires. It is retained as reference for a future
+> public launch only. See the release-status section above.
 
 The repo also ships a public-facing trading-signal SaaS layer
 (`trading_bot.saas` + `trading_bot.api.server`) that exposes
@@ -52,7 +79,7 @@ read-only signal recommendations behind an API-key + Stripe billing
 boundary. The SaaS layer is isolated from the live trading core —
 it never imports the scanner, the broker, or any execution module.
 
-The fastest path from "deployed" to "real users":
+Should the public gate ever pass, the path from "deployed" to "real users":
 
 ```bash
 # 1. Install
