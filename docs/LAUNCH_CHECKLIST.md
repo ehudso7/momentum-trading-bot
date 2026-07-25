@@ -44,6 +44,22 @@ Set in Vercel (production):
 - [ ] `TRADING_PRIVATE_OWNER_EMAILS` — the single owner address, lowercase
 - [ ] `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 - [ ] `NEXT_PUBLIC_DASHBOARD_URL` — the Railway bot service domain
+- [ ] `TRADING_DASHBOARD_API_KEY` — shared secret, must equal the value on the
+      `momentum-bot-core` Railway service
+- [ ] `TRADING_BACKEND_API_KEY` — must equal `TRADING_API_KEY` on the
+      `momentum-trading-bot` (analytics) Railway service
+
+The last two are easy to miss: without them the owner signs in successfully and
+the dashboard renders, but every data call returns
+`503 "Dashboard private key is not configured."` from
+`frontend/src/app/api/backend/[...path]/route.ts`. Set them on both sides or
+neither — a mismatch fails as 401 from the bot instead.
+
+> **Vercel env vars on this project are `sensitive` type — write-only.** Neither
+> `vercel env pull` nor the REST API with `decrypt=true` can read them back; both
+> return an empty string for values that are definitely set. Do not treat an
+> empty readback as proof a variable is unset. Verify behaviorally instead
+> (see §4), and note that env var changes need a redeploy to take effect.
 
 With private mode on and the allow-list empty, owner routes return 503 rather
 than opening up. That is intentional; fix the allow-list, never the check.
@@ -70,6 +86,31 @@ Run against the deployed URLs after deploying. All five must hold.
 - [ ] The core bot reports `paper` — `curl https://<bot-domain>/api/status`
 - [ ] Scanner rows are current real market data, not fixtures
 - [ ] No report is labeled `demo`
+
+### The 401-vs-503 probe
+
+Because env vars cannot be read back, this is the reliable way to prove the
+owner allow-list actually took effect:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://<app-domain>/api/backend/status
+```
+
+- **401** `{"error":"login_required"}` — correct. The request cleared the
+  allow-list check and failed only on the missing session.
+- **503** `{"error":"The private owner allow-list is not configured."}` —
+  `TRADING_PRIVATE_OWNER_EMAILS` is empty or missing. You would be locked out.
+
+The same distinction works against the bot service directly:
+
+```bash
+curl -s https://<bot-domain>/api/status                       # expect 401
+curl -s -H "Authorization: Bearer $KEY" https://<bot-domain>/api/status   # expect 200
+```
+
+A `503 "private dashboard authentication is not configured"` there means
+`TRADING_DASHBOARD_API_KEY` is unset on the bot service, **or** it was set with
+`--skip-deploys` and the container has not restarted yet.
 
 `/health` may stay public for hosting infrastructure. Trading state, reports,
 positions, trades, and operational dashboards must not.
