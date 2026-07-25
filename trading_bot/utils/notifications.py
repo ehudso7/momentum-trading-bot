@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -23,6 +24,17 @@ log = structlog.get_logger(__name__)
 
 # Timeout for webhook HTTP requests (connect, read) in seconds.
 _WEBHOOK_TIMEOUT = (5, 10)
+
+# Minimum seconds between error notifications sharing an error_type.
+#
+# notify_error is called from inside the trading tick loop, which runs as often
+# as every 10 seconds. A persistent fault (API outage, repeated reconciliation
+# failure) would otherwise emit ~360 identical webhooks per hour and bury the
+# alerts that matter. Suppressed occurrences are counted and reported on the
+# next message that gets through, so the throttle never hides that a fault is
+# ongoing. Only error notifications are throttled: trade, circuit-breaker, and
+# daily-summary events are already naturally rare and must never be dropped.
+_ERROR_NOTIFY_INTERVAL_SECONDS = 300.0
 
 
 class NotificationManager:
@@ -44,6 +56,12 @@ class NotificationManager:
         self._session.headers.update({"Content-Type": "application/json"})
         self._queue: queue.Queue = queue.Queue(maxsize=100)
         self._fallback_webhook_url: Optional[str] = getattr(config, 'fallback_webhook_url', None)
+        # Error-notification throttle state, keyed by error_type.
+        # Guarded by its own lock: notify_error may be called from the trading
+        # loop and from background threads.
+        self._error_throttle_lock = threading.Lock()
+        self._error_last_sent: dict[str, float] = {}
+        self._error_suppressed: dict[str, int] = {}
         self._worker = threading.Thread(target=self._process_queue, daemon=True)
         self._worker.start()
 
@@ -171,8 +189,18 @@ class NotificationManager:
         message: str,
         details: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Send notification for system errors (API failures, exceptions, etc.)."""
+        """Send notification for system errors (API failures, exceptions, etc.).
+
+        Throttled per ``error_type`` — see ``_ERROR_NOTIFY_INTERVAL_SECONDS``.
+        A fault that keeps firing produces one webhook per interval rather than
+        one per tick, and each delivered message reports how many occurrences
+        were suppressed since the previous one.
+        """
         if not self._config.notify_on_error:
+            return
+
+        suppressed = self._claim_error_slot(error_type)
+        if suppressed is None:
             return
 
         data: dict[str, Any] = {
@@ -181,9 +209,29 @@ class NotificationManager:
         }
         if details:
             data["details"] = details
+        if suppressed:
+            data["suppressed_since_last_notification"] = suppressed
 
         payload = self._build_payload(event_type="error", data=data)
         self._send_async(payload)
+
+    def _claim_error_slot(self, error_type: str) -> Optional[int]:
+        """Decide whether this error may notify now.
+
+        Returns the number of occurrences suppressed since the last delivered
+        notification for ``error_type`` (0 on the first one), or ``None`` when
+        this occurrence is itself throttled and must not be sent.
+        """
+        now = time.monotonic()
+        with self._error_throttle_lock:
+            last = self._error_last_sent.get(error_type)
+            if last is not None and (now - last) < _ERROR_NOTIFY_INTERVAL_SECONDS:
+                self._error_suppressed[error_type] = (
+                    self._error_suppressed.get(error_type, 0) + 1
+                )
+                return None
+            self._error_last_sent[error_type] = now
+            return self._error_suppressed.pop(error_type, 0)
 
     # --- Internal helpers ---
 
