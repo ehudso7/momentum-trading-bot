@@ -37,6 +37,69 @@ _WEBHOOK_TIMEOUT = (5, 10)
 _ERROR_NOTIFY_INTERVAL_SECONDS = 300.0
 
 
+def _money(value: Any) -> str:
+    """Format a numeric field as signed currency, tolerating missing values."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{'-' if amount < 0 else ''}${abs(amount):,.2f}"
+
+
+def _render_summary(event_type: str, data: dict[str, Any]) -> str:
+    """Render a one-line human-readable summary of a notification.
+
+    Never raises: a malformed or partial ``data`` mapping must still produce a
+    deliverable message, because the alternative is a webhook rejected for
+    having no text and an operator who hears nothing.
+    """
+    try:
+        if event_type == "trade_opened":
+            return (
+                f"OPEN {data.get('side', '').upper()} {data.get('symbol', '?')} "
+                f"{data.get('shares', '?')} @ {_money(data.get('entry_price'))} "
+                f"(stop {_money(data.get('stop_price'))}, "
+                f"risk {_money(data.get('risk_dollars'))})"
+            )
+        if event_type == "trade_closed":
+            return (
+                f"CLOSE {data.get('symbol', '?')} "
+                f"P&L {_money(data.get('pnl'))} "
+                f"({data.get('rr_ratio', '?')}R, {data.get('exit_reason', 'n/a')})"
+            )
+        if event_type == "circuit_breaker":
+            return (
+                f"CIRCUIT BREAKER {str(data.get('state', '?')).upper()} — "
+                f"{data.get('reason', 'no reason given')} "
+                f"(daily P&L {_money(data.get('daily_pnl'))}, "
+                f"{data.get('consecutive_losses', '?')} consecutive losses)"
+            )
+        if event_type == "daily_summary":
+            win_rate = data.get("win_rate")
+            rate = (
+                f"{float(win_rate) * 100:.1f}%"
+                if isinstance(win_rate, (int, float))
+                else "?"
+            )
+            return (
+                f"DAILY SUMMARY {data.get('date', '')} — "
+                f"{data.get('total_trades', '?')} trades, "
+                f"net P&L {_money(data.get('net_pnl'))}, "
+                f"win rate {rate}, "
+                f"equity {_money(data.get('ending_equity'))}"
+            ).replace("  ", " ")
+        if event_type == "error":
+            suppressed = data.get("suppressed_since_last_notification")
+            tail = f" (+{suppressed} suppressed)" if suppressed else ""
+            return (
+                f"ERROR [{data.get('error_type', 'unknown')}] "
+                f"{data.get('message', 'no message')}{tail}"
+            )
+    except Exception:  # pragma: no cover - summary must never break delivery
+        pass
+    return f"{event_type}: {data}"
+
+
 class NotificationManager:
     """
     Thread-safe, non-blocking notification manager.
@@ -238,11 +301,24 @@ class NotificationManager:
     def _build_payload(
         self, event_type: str, data: dict[str, Any]
     ) -> dict[str, Any]:
-        """Build a standardised notification payload with timestamp and event type."""
+        """Build a standardised notification payload.
+
+        Carries both a machine-readable body (``event_type`` + ``data``) and a
+        human-readable summary. The summary is not cosmetic: chat webhooks
+        reject a POST that has no renderable text field, so without it every
+        notification fails. Slack answers ``400 no_text`` and Discord ``400``
+        for an empty message; the failure then surfaces only as a swallowed log
+        line, which is how alerting can appear configured while delivering
+        nothing. ``text`` satisfies Slack, ``content`` satisfies Discord, and
+        generic JSON consumers ignore both and read ``data``.
+        """
+        summary = _render_summary(event_type, data)
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type,
             "data": data,
+            "text": summary,
+            "content": summary,
         }
 
     def _process_queue(self) -> None:
