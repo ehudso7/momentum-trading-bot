@@ -1,7 +1,7 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.2.1 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.2.0 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
 # GRAPH.md — Workflow graphs for Momentum Trading Bot
 
-Non-trivial work in this repository follows graph-based workflows defined by the governance source (`ehudso7/project-governance` v1.2.1).
+Non-trivial work in this repository follows graph-based workflows defined by the governance source (`ehudso7/project-governance` v1.2.0).
 
 ## Task classification
 
