@@ -1,6 +1,6 @@
 # Drop-in workflow for consuming repositories.
 # Copy to .github/workflows/governance-check.yml (or generate via a future
-# `ehgov init --with-ci`). Requires the governance source checked out as a
+# `malik init --with-ci`). Requires the governance source checked out as a
 # sibling or fetched at the pinned version.
 name: Governance check
 
@@ -37,8 +37,8 @@ jobs:
           repository: ehudso7/project-governance
           path: .governance-source
           # Hard-pinned governance release. Keep in sync with
-          # governance.version in GOVERNANCE.yaml when running `ehgov sync`.
-          ref: v1.2.1
+          # governance.version in GOVERNANCE.yaml when running `malik sync`.
+          ref: v2.0.0
           # The governance source is a private repository; the default
           # GITHUB_TOKEN cannot read it. Provision a fine-grained PAT with
           # read-only Contents access to project-governance in each
@@ -47,6 +47,6 @@ jobs:
       - name: Install governance tooling
         run: corepack enable && cd .governance-source && pnpm install --frozen-lockfile && pnpm build
       - name: Validate project against profile
-        run: node .governance-source/bin/ehgov.mjs validate --strict --format json
+        run: node .governance-source/bin/malik.mjs validate --strict --format json
       - name: Check generated-section drift
-        run: node .governance-source/bin/ehgov.mjs sync --check
+        run: node .governance-source/bin/malik.mjs sync --check

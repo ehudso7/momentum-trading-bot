@@ -1,7 +1,7 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.2.1 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=2.0.0 — do not edit inside this block; edits will be overwritten by `malik sync`. Project-owned content belongs in the PROJECT block. -->
 # GRAPH.md — Workflow graphs for Momentum Trading Bot
 
-Non-trivial work in this repository follows graph-based workflows defined by the governance source (`ehudso7/project-governance` v1.2.1).
+Non-trivial work in this repository follows graph-based workflows defined by the governance source (`ehudso7/project-governance` v2.0.0).
 
 ## Task classification
 
@@ -37,7 +37,7 @@ Do not force trivial tasks into graph ceremony; do not smuggle graph-required wo
 4. Stop at approval nodes until a human approves.
 5. Finish only at a terminal node; produce the evidence bundle.
 
-Render any graph as a diagram: `ehgov graph render <graph-id>`.
+Render any graph as a diagram: `malik graph render <graph-id>`.
 <!-- EH-GOV:END GENERATED -->
 
 <!-- EH-GOV:BEGIN PROJECT -->

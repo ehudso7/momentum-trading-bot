@@ -1,7 +1,7 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.2.1 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=2.0.0 — do not edit inside this block; edits will be overwritten by `malik sync`. Project-owned content belongs in the PROJECT block. -->
 # EVIDENCE.md — Momentum Trading Bot
 
-Evidence contracts for this project. Governance: `ehudso7/project-governance` v1.2.1.
+Evidence contracts for this project. Governance: `ehudso7/project-governance` v2.0.0.
 
 ## What evidence is (and is not)
 
@@ -23,7 +23,7 @@ Evidence bundles make work auditable: what was intended, what ran, what changed,
 | Observed outcome | `observed-outcome.schema.json` | Whoever measures reality afterward |
 | Verification result | `verification-result.schema.json` | UIE (never the executing agent itself) |
 
-Validate any artifact: `ehgov evidence validate <file>`.
+Validate any artifact: `malik evidence validate <file>`.
 
 ## Honesty rules
 

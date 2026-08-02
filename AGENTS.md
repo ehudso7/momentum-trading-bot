@@ -1,9 +1,9 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.2.1 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=2.0.0 — do not edit inside this block; edits will be overwritten by `malik sync`. Project-owned content belongs in the PROJECT block. -->
 # AGENTS.md — Momentum Trading Bot
 
 Cross-agent constitution for `momentum-trading-bot`. Applies to every AI coding agent operating in this repository (Claude Code, Codex, and future runtimes). Runtime-specific files (`CLAUDE.md`, etc.) defer to this one.
 
-Governance: `ehudso7/project-governance` v1.2.1 · profile `regulated-system` · criticality `critical`
+Governance: `ehudso7/project-governance` v2.0.0 · profile `regulated-system` · criticality `critical`
 
 ## Constitution
 
@@ -42,9 +42,9 @@ Governance: `ehudso7/project-governance` v1.2.1 · profile `regulated-system` ·
 
 ## Governance tooling
 
-- `ehgov inspect` — project governance status
-- `ehgov validate` — validate this repository against profile `regulated-system`
-- `ehgov sync --check` — check generated sections for drift against the pinned governance version
+- `malik inspect` — project governance status
+- `malik validate` — validate this repository against profile `regulated-system`
+- `malik sync --check` — check generated sections for drift against the pinned governance version
 <!-- EH-GOV:END GENERATED -->
 
 <!-- EH-GOV:BEGIN PROJECT -->
