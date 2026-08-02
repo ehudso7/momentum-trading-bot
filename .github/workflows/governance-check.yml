@@ -9,8 +9,14 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   governance:
+    # Fork PRs do not receive repository secrets, so the governance source
+    # checkout cannot authenticate there; skip rather than always-fail.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +36,9 @@ jobs:
         with:
           repository: ehudso7/project-governance
           path: .governance-source
-          # Pin to the version in GOVERNANCE.yaml; update via `ehgov sync`.
-          ref: v1.1.0
+          # Hard-pinned governance release. Keep in sync with
+          # governance.version in GOVERNANCE.yaml when running `ehgov sync`.
+          ref: v1.2.0
           # The governance source is a private repository; the default
           # GITHUB_TOKEN cannot read it. Provision a fine-grained PAT with
           # read-only Contents access to project-governance in each

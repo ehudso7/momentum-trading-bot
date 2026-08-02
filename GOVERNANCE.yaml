@@ -4,7 +4,7 @@
 # (`ehgov validate`), and bump `governance.version` only via `ehgov sync`.
 governance:
   source: ehudso7/project-governance
-  version: 1.1.0
+  version: 1.2.0
   schema_version: 1
   profile: regulated-system
 project:
