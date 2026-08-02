@@ -1,0 +1,45 @@
+# Drop-in workflow for consuming repositories.
+# Copy to .github/workflows/governance-check.yml (or generate via a future
+# `ehgov init --with-ci`). Requires the governance source checked out as a
+# sibling or fetched at the pinned version.
+name: Governance check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Require GOVERNANCE_READ_TOKEN
+        env:
+          GOVERNANCE_READ_TOKEN: ${{ secrets.GOVERNANCE_READ_TOKEN }}
+        run: |
+          if [ -z "$GOVERNANCE_READ_TOKEN" ]; then
+            echo "::error::GOVERNANCE_READ_TOKEN secret is not set. Create a fine-grained PAT with read-only Contents access to ehudso7/project-governance and add it as a repository secret."
+            exit 1
+          fi
+      - name: Checkout governance source (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ehudso7/project-governance
+          path: .governance-source
+          # Pin to the version in GOVERNANCE.yaml; update via `ehgov sync`.
+          ref: v1.1.0
+          # The governance source is a private repository; the default
+          # GITHUB_TOKEN cannot read it. Provision a fine-grained PAT with
+          # read-only Contents access to project-governance in each
+          # consuming repository.
+          token: ${{ secrets.GOVERNANCE_READ_TOKEN }}
+      - name: Install governance tooling
+        run: corepack enable && cd .governance-source && pnpm install --frozen-lockfile && pnpm build
+      - name: Validate project against profile
+        run: node .governance-source/bin/ehgov.mjs validate --strict --format json
+      - name: Check generated-section drift
+        run: node .governance-source/bin/ehgov.mjs sync --check

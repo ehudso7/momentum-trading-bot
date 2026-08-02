@@ -1,7 +1,7 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.1.0 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/projects-governance version=1.1.0 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
 # CLAUDE.md — Momentum Trading Bot
 
-Governance: `ehudso7/project-governance` v1.1.0 · profile `regulated-system` · criticality `critical`
+Governance: `ehudso7/projects-governance` v1.1.0 · profile `regulated-system` · criticality `critical`
 
 You are working in `momentum-trading-bot` (ai-agent-system). This project is governed: how you work here is defined by the pinned governance version above, not by ad-hoc judgment. `AGENTS.md` holds the cross-agent constitution; this file adds Claude Code specifics.
 
@@ -31,7 +31,6 @@ You are working in `momentum-trading-bot` (ai-agent-system). This project is gov
 | incident | `incident-response` |
 | audit | `repository-audit` |
 | security | `security-review` |
-| diligence | `acquisition-diligence` |
 | dependency | `dependency-upgrade` |
 
 Graph definitions live in the governance source (`graphs/`); render one with `ehgov graph render <id>`.

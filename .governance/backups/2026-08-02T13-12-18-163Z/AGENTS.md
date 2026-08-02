@@ -1,9 +1,9 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=1.1.0 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/projects-governance version=1.1.0 — do not edit inside this block; edits will be overwritten by `ehgov sync`. Project-owned content belongs in the PROJECT block. -->
 # AGENTS.md — Momentum Trading Bot
 
 Cross-agent constitution for `momentum-trading-bot`. Applies to every AI coding agent operating in this repository (Claude Code, Codex, and future runtimes). Runtime-specific files (`CLAUDE.md`, etc.) defer to this one.
 
-Governance: `ehudso7/project-governance` v1.1.0 · profile `regulated-system` · criticality `critical`
+Governance: `ehudso7/projects-governance` v1.1.0 · profile `regulated-system` · criticality `critical`
 
 ## Constitution
 
@@ -37,7 +37,6 @@ Governance: `ehudso7/project-governance` v1.1.0 · profile `regulated-system` ·
 | incident | `incident-response` |
 | audit | `repository-audit` |
 | security | `security-review` |
-| diligence | `acquisition-diligence` |
 | dependency | `dependency-upgrade` |
 
 ## Governance tooling
