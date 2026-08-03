@@ -1,7 +1,7 @@
-<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=2.3.0 — do not edit inside this block; edits will be overwritten by `malik sync`. Project-owned content belongs in the PROJECT block. -->
+<!-- EH-GOV:BEGIN GENERATED source=ehudso7/project-governance version=2.4.0 — do not edit inside this block; edits will be overwritten by `malik sync`. Project-owned content belongs in the PROJECT block. -->
 # EVIDENCE.md — Momentum Trading Bot
 
-Evidence contracts for this project. Governance: `ehudso7/project-governance` v2.3.0.
+Evidence contracts for this project. Governance: `ehudso7/project-governance` v2.4.0.
 
 ## What evidence is (and is not)
 
