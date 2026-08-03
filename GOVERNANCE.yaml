@@ -6,7 +6,7 @@
 # `governance.version` and then run `malik sync` to refresh managed sections.
 governance:
   source: ehudso7/project-governance
-  version: 2.3.0
+  version: 2.4.0
   schema_version: 1
   profile: regulated-system
 project:

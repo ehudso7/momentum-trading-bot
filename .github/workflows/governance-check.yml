@@ -38,7 +38,7 @@ jobs:
           path: .governance-source
           # Hard-pinned governance release. Keep in sync with
           # governance.version in GOVERNANCE.yaml when running `malik sync`.
-          ref: v2.3.0
+          ref: v2.4.0
           # The governance source is a private repository; the default
           # GITHUB_TOKEN cannot read it. Provision a fine-grained PAT with
           # read-only Contents access to project-governance in each
