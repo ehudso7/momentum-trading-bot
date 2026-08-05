@@ -21,6 +21,7 @@ patched with a sentinel so no real SDK client is created.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -28,15 +29,46 @@ import pytest
 from trading_bot.config.settings import AppConfig, BrokerConfig, RunMode
 from trading_bot.execution.paper_broker import PaperBroker
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SHIPPED_CONFIG_YAML = REPO_ROOT / "trading_bot" / "config" / "config.yaml"
+
+# Bare (unprefixed) credential names that AppConfig.from_yaml overlays onto the
+# loaded YAML, mirrored by the CI guard in .github/workflows/ci.yml.
+BARE_CREDENTIAL_ENV_VARS = (
+    "ALPACA_API_KEY",
+    "ALPACA_API_SECRET",
+    "POLYGON_API_KEY",
+    "FINNHUB_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_config_env(monkeypatch, tmp_path):
+    """
+    Isolate every AppConfig built in this module from ambient configuration.
+
+    AppConfig is a pydantic-settings model with ``env_file=".env"``, so a
+    developer's local .env — or any exported TRADING_* / brokerage variable —
+    would otherwise flow into `AppConfig()` and `AppConfig.from_yaml()` here.
+    That makes the suite non-hermetic and, worse, could let a live-mode
+    misconfiguration pass unnoticed. Point the settings model at a path that
+    cannot exist and drop ambient credential/config vars. monkeypatch restores
+    both the model_config entry and the environment after each test.
+    """
+    monkeypatch.setitem(
+        AppConfig.model_config, "env_file", str(tmp_path / "no-such.env")
+    )
+    for name in list(os.environ):
+        if name.startswith("TRADING_") or name in BARE_CREDENTIAL_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+
 
 # ---------------------------------------------------------------------------
 # Invariant 1: paper mode is the default everywhere.
 # ---------------------------------------------------------------------------
 class TestPaperModeIsDefault:
-    def test_appconfig_defaults_to_paper(self, monkeypatch):
-        """A bare AppConfig (no env overrides) is paper mode."""
-        # Ensure no ambient TRADING_RUN_MODE leaks in from the environment.
-        monkeypatch.delenv("TRADING_RUN_MODE", raising=False)
+    def test_appconfig_defaults_to_paper(self):
+        """A bare AppConfig (no env overrides, no .env) is paper mode."""
         cfg = AppConfig()
         assert cfg.run_mode == RunMode.PAPER
 
@@ -46,9 +78,8 @@ class TestPaperModeIsDefault:
 
     def test_shipped_config_yaml_is_paper(self):
         """The committed config.yaml ships in paper mode."""
-        cfg_path = Path("trading_bot/config/config.yaml")
-        assert cfg_path.exists(), "config.yaml must exist"
-        cfg = AppConfig.from_yaml(str(cfg_path))
+        assert SHIPPED_CONFIG_YAML.exists(), "config.yaml must exist"
+        cfg = AppConfig.from_yaml(str(SHIPPED_CONFIG_YAML))
         assert cfg.run_mode == RunMode.PAPER
 
 
@@ -67,13 +98,13 @@ class TestEnvCannotSilentlyGoLive:
         with pytest.raises(ValueError, match="alpaca_paper"):
             AppConfig()
 
-    def test_live_kill_switch_defaults_off(self, monkeypatch):
+    def test_live_kill_switch_defaults_off(self):
         """
         Even a fully explicit live config (LIVE + alpaca_paper=False + real
         keys) is rejected unless TRADING_LIVE_TRADING_ENABLED=true is ALSO
-        set. The kill-switch defaults to off.
+        set. The kill-switch defaults to off (the hermetic fixture guarantees
+        it is not set in the environment).
         """
-        monkeypatch.delenv("TRADING_LIVE_TRADING_ENABLED", raising=False)
         with pytest.raises(ValueError, match="TRADING_LIVE_TRADING_ENABLED"):
             AppConfig(
                 run_mode=RunMode.LIVE,

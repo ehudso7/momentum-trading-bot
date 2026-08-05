@@ -1,0 +1,174 @@
+{
+  "record_id": "rec-mtb-ci-paper-mode-guard-20260805",
+  "project_id": "momentum-trading-bot",
+  "task_id": "ci-paper-mode-guard-port-pr63",
+  "graph_id": "feature-development",
+  "graph_version": "1.0.0",
+  "governance_version": "2.4.0",
+  "started_at": "2026-08-05T00:50:00Z",
+  "completed_at": "2026-08-05T01:40:00Z",
+  "actor": "ehudso7",
+  "agent": "claude-code",
+  "model": "claude-fable-5",
+  "status": "completed",
+  "terminal_node": "done",
+  "node_executions": [
+    {
+      "node_id": "intake",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Task: port the unique paper-trading safety coverage from PR #63 (branch ci/python-tests) into the repository's current CI as a new PR, without adding a second parallel Python workflow and without merging or closing #63."
+    },
+    {
+      "node_id": "classify",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Classified graph-required: touches the sensitive path .github/workflows/** and encodes a live-money safety control. No production deployment, migration, secret, billing, auth, or authorization change, so no human approval node is triggered by GOVERNANCE.yaml."
+    },
+    {
+      "node_id": "inspect",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Read main's .github/workflows/ci.yml, PR #63's python-ci.yml and tests/test_trading_mode_safety.py, trading_bot/config/settings.py (AppConfig/BrokerConfig/DataConfig, validate_safety, from_yaml), trading_bot/main.py (TradingBot broker selection, _assert_live_evidence_gate, _has_valid_alpaca_credentials), tests/test_config_validation.py, tests/test_broker_selection.py, tests/conftest.py."
+    },
+    {
+      "node_id": "requirements",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Port only #63's unique value: (a) paper-mode env pinning plus a fail-closed credential/live-config guard, folded into the existing backend job; (b) the safety tests minus everything already covered by test_config_validation.py and test_broker_selection.py. Existing green checks (backend, governance, web) must stay green."
+    },
+    {
+      "node_id": "architecture",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Decision: extend the existing 'Launch validation' backend job rather than add python-ci.yml as a second workflow — a parallel workflow would duplicate the whole suite for no added signal. Guard runs as the first step after checkout, before dependency install, so a credentialed runner aborts before any code executes."
+    },
+    {
+      "node_id": "plan",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Branch off main -> edit ci.yml backend job -> add deduplicated tests -> run targeted and full suites locally -> commit, push, open non-draft PR -> observe required checks."
+    },
+    {
+      "node_id": "implement",
+      "status": "retried-then-completed",
+      "attempts": 2,
+      "notes": "Attempt 1 (commit 79061d6): job-level TRADING_RUN_MODE=paper / TRADING_BROKER__ALPACA_PAPER=true plus the fail-closed guard step. Attempt 2: automated review found the credential list missed the pydantic-prefixed data-provider names; audited every credential field in settings.py and widened the guard to both naming forms (bare ALPACA_API_KEY / ALPACA_API_SECRET / POLYGON_API_KEY / FINNHUB_API_KEY and prefixed TRADING_BROKER__ALPACA_API_KEY / TRADING_BROKER__ALPACA_API_SECRET / TRADING_DATA__POLYGON_API_KEY / TRADING_DATA__FINNHUB_API_KEY), and added checks for the TRADING_LIVE_TRADING_ENABLED kill-switch and a non-paper TRADING_BROKER__ALPACA_BASE_URL override. Variable names only are echoed; values never are."
+    },
+    {
+      "node_id": "generate-tests",
+      "status": "retried-then-completed",
+      "attempts": 2,
+      "notes": "Attempt 1: tests/test_trading_mode_safety.py with paper-by-default, env-cannot-silently-go-live, and run-mode-gated order-path invariants; #63's live-opt-in and risk-bound classes dropped as duplicates of test_config_validation.py. Two of #63's tests failed against current main (it now has a TRADING_LIVE_TRADING_ENABLED kill-switch and a paper-evidence gate that #63 predates), so they were rewritten to assert both gates and a new kill-switch-defaults-off test was added. Attempt 2: automated review found AppConfig loads env_file='.env', so an ambient developer .env leaked into every construction; added an autouse hermetic fixture that repoints AppConfig.model_config['env_file'] at a nonexistent tmp_path file and drops ambient TRADING_*/bare credential vars, and made the shipped-config.yaml assertion resolve its path from __file__ instead of the process cwd."
+    },
+    {
+      "node_id": "run-tests",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-ci-paper-mode-guard-20260805.json"
+      ],
+      "notes": "Targeted run (10 new tests plus the two suites they were deduplicated against): 27 passed, exit 0. Full backend suite under the pinned CI env: 2795 passed, exit 0. Four deliberate negative controls were also run and each failed exactly the intended assertion, then the mutation was reverted (git diff over trading_bot/ empty afterwards)."
+    },
+    {
+      "node_id": "static-analysis",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "ci.yml parsed with yaml.safe_load to confirm structural validity, and the guard step's shell body was extracted and executed against nine environment cases (clean plus eight hostile) to confirm exit codes and messages. This repository configures no Python linter or type checker (pyproject.toml has no ruff/flake8/black/mypy section; the backend job runs pip-audit and pytest only), so none was run."
+    },
+    {
+      "node_id": "security-review",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Sensitive path .github/workflows/** touched, as the task requires. The change only tightens controls: it adds env pinning and a fail-closed guard, and weakens no existing gate. No secret is added, read, or logged — the guard tests variable presence by name and never echoes a value. Credential name list audited directly against BrokerConfig/DataConfig fields and every bare name read by AppConfig.from_yaml, trading_bot/saas/market_data.py, and trading_bot/admin/billing_verification.py. pip-audit continues to run unchanged in the same job."
+    },
+    {
+      "node_id": "change-review",
+      "status": "retried-then-completed",
+      "attempts": 2,
+      "notes": "PR #68 opened non-draft. Automated review raised three findings, all legitimate and all addressed in attempt 2 of implement/generate-tests: (1) copilot — guard missed TRADING_DATA__POLYGON_API_KEY; (2) qodo — tests read the ambient .env; (3) qodo — governance profile requires an evidence artifact for a non-trivial change. Re-review and the human merge decision were still pending when this record was written; the agent does not merge."
+    },
+    {
+      "node_id": "collect-evidence",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "This record and its evidence bundle written to .governance/evidence/ (the directory GOVERNANCE.yaml designates), each carrying a canonical SHA-256 content_hash."
+    },
+    {
+      "node_id": "verify",
+      "status": "completed",
+      "attempts": 1,
+      "confidence": 0.9,
+      "notes": "Agent-side verification only, so the state ceiling is 'tested' per EVIDENCE_STANDARD.md section 7.2 and AI_AGENT_STANDARD.md section 8 — promotion to 'verified' requires an independent UIE verification result, which does not exist for this run. Recorded: targeted suite 27 passed, full suite 2795 passed, guard exercised over nine env cases, four negative controls confirming the assertions are not vacuous, and required checks backend/governance/web observed green on commit 79061d6."
+    },
+    {
+      "node_id": "done",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Implementation complete and pushed to branch ci/paper-mode-guard; PR #68 left open for human merge."
+    }
+  ],
+  "files_changed": [
+    ".github/workflows/ci.yml",
+    "tests/test_trading_mode_safety.py",
+    ".governance/evidence/rec-mtb-ci-paper-mode-guard-20260805.json",
+    ".governance/evidence/bundle-mtb-ci-paper-mode-guard-20260805.json"
+  ],
+  "commands_executed": [
+    {
+      "command": "python -m pytest tests/test_trading_mode_safety.py tests/test_config_validation.py tests/test_broker_selection.py -q",
+      "exit_code": 0,
+      "node_id": "run-tests",
+      "summary": "27 passed — the 10 new safety tests plus the two suites they were deduplicated against"
+    },
+    {
+      "command": "TRADING_RUN_MODE=paper TRADING_BROKER__ALPACA_PAPER=true python -m pytest tests/ -q",
+      "exit_code": 0,
+      "node_id": "run-tests",
+      "summary": "2795 passed under the same env the CI backend job now pins"
+    },
+    {
+      "command": "python -m pytest tests/test_trading_mode_safety.py -q",
+      "exit_code": 0,
+      "node_id": "run-tests",
+      "summary": "10 passed with a hostile ambient .env (TRADING_RUN_MODE=live, leaked ALPACA/POLYGON keys, TRADING_LIVE_TRADING_ENABLED=true) exported and on disk, and again from an unrelated cwd — proves hermeticity"
+    },
+    {
+      "command": "python -c \"import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))\"",
+      "exit_code": 0,
+      "node_id": "static-analysis",
+      "summary": "workflow parses as valid YAML"
+    },
+    {
+      "command": "bash /tmp/guard.sh  # guard step body extracted from ci.yml, run over 9 env cases",
+      "exit_code": 0,
+      "node_id": "static-analysis",
+      "summary": "clean paper env exits 0; each of the 8 hostile cases (run_mode=live, alpaca_paper=false, kill-switch on, non-paper base URL, and each credential naming variant) exits 1 with a name-only error"
+    },
+    {
+      "command": "python -m pytest tests/test_prefix_check.py -q  # negative control: pre-fix test file under an ambient .env with TRADING_RUN_MODE=live",
+      "exit_code": 1,
+      "node_id": "run-tests",
+      "summary": "INTENTIONAL FAILURE — 1 failed (test_appconfig_defaults_to_paper), 9 passed; confirms the non-hermeticity the review reported was real and that the fixture fixes it"
+    },
+    {
+      "command": "python -m pytest tests/test_trading_mode_safety.py -q  # negative control: config.yaml temporarily set to run_mode live",
+      "exit_code": 1,
+      "node_id": "run-tests",
+      "summary": "INTENTIONAL FAILURE — test_shipped_config_yaml_is_paper failed as designed; mutation reverted"
+    },
+    {
+      "command": "python -m pytest tests/test_trading_mode_safety.py -q  # negative control: live_trading_enabled default temporarily flipped to True",
+      "exit_code": 1,
+      "node_id": "run-tests",
+      "summary": "INTENTIONAL FAILURE — test_live_kill_switch_defaults_off failed as designed; mutation reverted"
+    },
+    {
+      "command": "python -m pytest tests/test_trading_mode_safety.py -q  # negative control: paper branch in main.py temporarily forced onto AlpacaBroker",
+      "exit_code": 1,
+      "node_id": "run-tests",
+      "summary": "INTENTIONAL FAILURE — test_paper_mode_without_credentials_uses_local_paper_broker failed as designed; mutation reverted, git diff over trading_bot/ empty afterwards"
+    }
+  ],
+  "content_hash": "ae54172de73a1cb4a678f3eb620030005edace6b7ca54c3e8b49effb26b3b1c8"
+}

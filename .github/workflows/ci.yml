@@ -37,15 +37,34 @@ jobs:
             echo "::error::TRADING_BROKER__ALPACA_PAPER must be true in CI"
             exit 1
           fi
-          # Presence of any real brokerage credential is a hard failure.
-          # (Names only; never echo values.)
-          for var in ALPACA_API_KEY ALPACA_API_SECRET POLYGON_API_KEY \
-                     TRADING_BROKER__ALPACA_API_KEY TRADING_BROKER__ALPACA_API_SECRET; do
+          # AppConfig.validate_safety requires this kill-switch for any live
+          # config; it must stay off in CI.
+          if [ -n "${TRADING_LIVE_TRADING_ENABLED:-}" ] \
+             && [ "${TRADING_LIVE_TRADING_ENABLED}" != "false" ]; then
+            echo "::error::TRADING_LIVE_TRADING_ENABLED must be unset or false in CI"
+            exit 1
+          fi
+          # Any brokerage/market-data credential is a hard failure. Both naming
+          # forms are covered: the bare names AppConfig.from_yaml and the SaaS
+          # market-data resolver read directly, and the pydantic-settings names
+          # (env_prefix "TRADING_", nested delimiter "__") that populate
+          # BrokerConfig (broker.*) and DataConfig (data.*).
+          # (Names only; values are never echoed.)
+          for var in ALPACA_API_KEY ALPACA_API_SECRET POLYGON_API_KEY FINNHUB_API_KEY \
+                     TRADING_BROKER__ALPACA_API_KEY TRADING_BROKER__ALPACA_API_SECRET \
+                     TRADING_DATA__POLYGON_API_KEY TRADING_DATA__FINNHUB_API_KEY; do
             if [ -n "${!var:-}" ]; then
               echo "::error::$var is set in CI; brokerage credentials are forbidden here"
               exit 1
             fi
           done
+          # A non-paper Alpaca endpoint override is live configuration even
+          # without credentials present.
+          if [ -n "${TRADING_BROKER__ALPACA_BASE_URL:-}" ] \
+             && [ "${TRADING_BROKER__ALPACA_BASE_URL}" != "https://paper-api.alpaca.markets" ]; then
+            echo "::error::TRADING_BROKER__ALPACA_BASE_URL must be unset or the Alpaca paper endpoint in CI"
+            exit 1
+          fi
           echo "Paper-mode guard passed: no live config, no brokerage credentials."
       - uses: actions/setup-python@v5
         with:
