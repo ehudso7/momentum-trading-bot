@@ -16,8 +16,56 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # Pin CI to paper/simulation mode via the repo's real settings env vars
+      # (env_prefix "TRADING_", nested delimiter "__"). CI must never run in
+      # live mode and must never carry brokerage credentials.
+      TRADING_RUN_MODE: paper
+      TRADING_BROKER__ALPACA_PAPER: "true"
     steps:
       - uses: actions/checkout@v4
+      - name: Fail closed if live trading is configured in CI
+        # Defense in depth: any live-mode config or brokerage credential in the
+        # CI environment aborts the job before dependencies install or tests run.
+        run: |
+          set -euo pipefail
+          if [ "${TRADING_RUN_MODE:-paper}" = "live" ]; then
+            echo "::error::TRADING_RUN_MODE=live is forbidden in CI"
+            exit 1
+          fi
+          if [ "${TRADING_BROKER__ALPACA_PAPER:-true}" != "true" ]; then
+            echo "::error::TRADING_BROKER__ALPACA_PAPER must be true in CI"
+            exit 1
+          fi
+          # AppConfig.validate_safety requires this kill-switch for any live
+          # config; it must stay off in CI.
+          if [ -n "${TRADING_LIVE_TRADING_ENABLED:-}" ] \
+             && [ "${TRADING_LIVE_TRADING_ENABLED}" != "false" ]; then
+            echo "::error::TRADING_LIVE_TRADING_ENABLED must be unset or false in CI"
+            exit 1
+          fi
+          # Any brokerage/market-data credential is a hard failure. Both naming
+          # forms are covered: the bare names AppConfig.from_yaml and the SaaS
+          # market-data resolver read directly, and the pydantic-settings names
+          # (env_prefix "TRADING_", nested delimiter "__") that populate
+          # BrokerConfig (broker.*) and DataConfig (data.*).
+          # (Names only; values are never echoed.)
+          for var in ALPACA_API_KEY ALPACA_API_SECRET POLYGON_API_KEY FINNHUB_API_KEY \
+                     TRADING_BROKER__ALPACA_API_KEY TRADING_BROKER__ALPACA_API_SECRET \
+                     TRADING_DATA__POLYGON_API_KEY TRADING_DATA__FINNHUB_API_KEY; do
+            if [ -n "${!var:-}" ]; then
+              echo "::error::$var is set in CI; brokerage credentials are forbidden here"
+              exit 1
+            fi
+          done
+          # A non-paper Alpaca endpoint override is live configuration even
+          # without credentials present.
+          if [ -n "${TRADING_BROKER__ALPACA_BASE_URL:-}" ] \
+             && [ "${TRADING_BROKER__ALPACA_BASE_URL}" != "https://paper-api.alpaca.markets" ]; then
+            echo "::error::TRADING_BROKER__ALPACA_BASE_URL must be unset or the Alpaca paper endpoint in CI"
+            exit 1
+          fi
+          echo "Paper-mode guard passed: no live config, no brokerage credentials."
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
