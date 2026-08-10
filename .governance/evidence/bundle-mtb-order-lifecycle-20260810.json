@@ -6,7 +6,7 @@
   "graph_version": "1.0.0",
   "governance_version": "2.4.0",
   "started_at": "2026-08-10T19:30:00Z",
-  "completed_at": "2026-08-10T20:07:01Z",
+  "completed_at": "2026-08-10T20:18:21Z",
   "actor": "ehudso7",
   "agent": "codex",
   "execution_record_ref": ".governance/evidence/rec-mtb-order-lifecycle-20260810.json",
@@ -37,7 +37,7 @@
     "done"
   ],
   "nodes_skipped": [],
-  "retries": 1,
+  "retries": 2,
   "failures": [
     {
       "node_id": "implement-fix",
@@ -46,7 +46,12 @@
     },
     {
       "node_id": "affected-area-tests",
-      "reason": "The complete repository pytest suite could not run in the incident workspace because the repository's runtime/dev dependencies were unavailable. Focused stdlib-compatible tests and compileall ran successfully; full GitHub CI is required before merge.",
+      "reason": "The complete suite could not run locally because project dependencies were unavailable. The first GitHub backend run passed 2,821 tests and found one stale assertion for the intentionally changed health semantics. After aligning that assertion, the rerun passed all 2,822 tests and the Python production-dependency audit.",
+      "recovered": true
+    },
+    {
+      "node_id": "affected-area-tests",
+      "reason": "The web production-dependency audit fails on nanoid 3.3.16 (high) and dompurify 3.4.12 (moderate). The frontend/package-lock.json blob is identical on main and this branch, so the incident repair did not introduce this repository-level blocker.",
       "recovered": false
     }
   ],
@@ -65,6 +70,7 @@
     "tests/test_circuit_breaker_recovery.py",
     "tests/test_daily_summary_percent.py",
     "tests/test_execution.py",
+    "tests/test_health.py",
     "tests/test_health_circuit_state.py",
     "tests/test_notification_throttle.py",
     "tests/test_portfolio_order_lifecycle.py",
@@ -131,6 +137,26 @@
       "command": "git diff --no-index --check baseline repair (modified production files)",
       "exit_code": 0,
       "summary": "no whitespace errors in reconstructed production diffs"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 31427927056 / backend",
+      "exit_code": 1,
+      "summary": "2,821 passed; one stale health-semantics assertion failed and was corrected"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 31428238722 / backend",
+      "exit_code": 0,
+      "summary": "Python production-dependency audit passed; 2,822 tests passed with 323 non-failing deprecation warnings"
+    },
+    {
+      "command": "GitHub Actions Governance check run 31428238735",
+      "exit_code": 0,
+      "summary": "governance profile validation and generated-section drift check passed"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 31428238722 / web",
+      "exit_code": 1,
+      "summary": "unchanged frontend lockfile failed production audit for nanoid 3.3.16 (high) and dompurify 3.4.12 (moderate)"
     }
   ],
   "tests": {
@@ -140,9 +166,10 @@
       "PYTHONPATH=. python tests/test_portfolio_order_lifecycle.py",
       "PYTHONPATH=. python tests/test_circuit_breaker_persistence.py",
       "PYTHONPATH=. python tests/test_health_circuit_state.py",
-      "PYTHONPATH=. python tests/test_daily_summary_percent.py"
+      "PYTHONPATH=. python tests/test_daily_summary_percent.py",
+      "GitHub Actions Launch validation run 31428238722 / backend"
     ],
-    "passed": 22,
+    "passed": 2822,
     "failed": 0,
     "skipped": 0,
     "result": "pass"
@@ -161,7 +188,7 @@
     {
       "policy_id": "delivery",
       "outcome": "warn",
-      "detail": "Focused regressions and compilation pass, but the complete repository suite and GitHub required checks remain pending and must pass before human merge. No deployment is authorized."
+      "detail": "Focused regressions, compilation, governance validation, Python dependency audit, and the complete 2,822-test backend suite pass. The required web audit remains red on an unchanged lockfile and must be resolved separately before merge. No deployment is authorized."
     },
     {
       "policy_id": "ai-agents",
@@ -187,8 +214,8 @@
     },
     {
       "check": "dependency-audit",
-      "outcome": "not-run",
-      "detail": "No dependency files changed. Repository CI dependency/security checks are pending on the draft PR."
+      "outcome": "warn",
+      "detail": "Python production dependencies passed pip-audit. The web production audit fails on nanoid 3.3.16 (high) and dompurify 3.4.12 (moderate); frontend/package-lock.json has the same blob SHA on main and this repair branch."
     }
   ],
   "artifacts": [
@@ -196,7 +223,7 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-order-lifecycle-20260810.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "2deceb4fd78294d1c3349cff85f1561599ded888ae0948fcecfc2bdc9bc85e9d"
+      "sha256": "018ef78b26133ec38488a44553f8d28309ba80a6c58207604dcd30c8e1f73156"
     },
     {
       "id": "alpaca-lifecycle-repair",
@@ -227,12 +254,18 @@
       "path": "tests/test_portfolio_order_lifecycle.py",
       "produced_by_node": "regression-tests",
       "sha256": "6632a6b703523e080d19651be8f7120f3499a94f9101b775ef517ef1f91a304a"
+    },
+    {
+      "id": "health-semantics-regression",
+      "path": "tests/test_health.py",
+      "produced_by_node": "affected-area-tests",
+      "sha256": "71f128f435f6598f59d50e535237db3dd30e7a8d50aede9fd4bd97fc2fd6d670"
     }
   ],
   "completion_status": "tested",
-  "confidence": 0.86,
+  "confidence": 0.9,
   "unresolved_risks": [
-    "The complete repository test suite and required GitHub checks have not yet run against this repair; the pull request must remain draft until they pass.",
+    "The required web dependency audit remains red on an unchanged frontend lockfile (nanoid 3.3.16 and dompurify 3.4.12); the pull request must remain draft until that repository-level blocker is resolved.",
     "The focused Alpaca tests use SDK-shaped fakes. A paper-account sandbox canary has not exercised real Alpaca timing, eventual consistency, or order-replacement behavior.",
     "No independent UIE verification result exists, so this work cannot be promoted from 'tested' to 'verified'.",
     "The branch will be unmerged and undeployed. Human review and explicit production-deployment approval are required before any restart.",
@@ -243,5 +276,5 @@
     "procedure": "Before deployment, close the draft PR or delete its branch. After an authorized merge, revert the repair commit. No schema or data migration is involved. Keep the bot stopped while rolling back.",
     "tested": false
   },
-  "content_hash": "c3b56a232f0c2c21a1be69a3361bdbf7db733262398189430d74c0d7c6241045"
+  "content_hash": "cde721b712a21e52e978a1a06585bb2346984b84abfc441005768b53e3f5d340"
 }
