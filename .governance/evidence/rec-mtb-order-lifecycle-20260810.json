@@ -6,7 +6,7 @@
   "graph_version": "1.0.0",
   "governance_version": "2.4.0",
   "started_at": "2026-08-10T19:30:00Z",
-  "completed_at": "2026-08-10T20:07:01Z",
+  "completed_at": "2026-08-10T20:18:21Z",
   "actor": "ehudso7",
   "agent": "codex",
   "status": "completed",
@@ -62,12 +62,12 @@
     },
     {
       "node_id": "affected-area-tests",
-      "status": "completed",
-      "attempts": 1,
+      "status": "retried-then-completed",
+      "attempts": 2,
       "evidence_refs": [
         ".governance/evidence/bundle-mtb-order-lifecycle-20260810.json"
       ],
-      "notes": "Compiled all modified production and test modules and ran whitespace/error checks over the reconstructed diffs. The complete repository pytest suite was not runnable in the incident workspace because project dependencies including pytest, alpaca-py, structlog, and pydantic-settings were unavailable; the draft PR must obtain repository CI before merge."
+      "notes": "Compiled all modified production and test modules and ran whitespace/error checks over the reconstructed diffs. GitHub's first complete backend run passed 2,821 tests and exposed one stale pre-existing assertion that still classified a financial halt as an operational outage; the assertion was aligned with the new documented semantics. The rerun passed all 2,822 tests and the Python production-dependency audit. Governance validation also passed. The web dependency audit remains red on an unchanged frontend lockfile and is tracked as an unresolved repository-level blocker."
     },
     {
       "node_id": "collect-evidence",
@@ -79,8 +79,8 @@
       "node_id": "verify",
       "status": "completed",
       "attempts": 1,
-      "confidence": 0.86,
-      "notes": "Agent-side state is 'tested', not 'verified'. Baseline negative controls fail and repaired focused suites pass; compileall and diff checks pass. Independent UIE verification, a real Alpaca sandbox integration run, and full GitHub CI remain outstanding."
+      "confidence": 0.9,
+      "notes": "Agent-side state is 'tested', not 'verified'. Baseline negative controls fail; repaired focused suites, compileall, diff checks, governance validation, Python dependency audit, and the complete 2,822-test backend suite pass. The unchanged frontend lockfile fails its security audit, and independent UIE verification plus a real Alpaca sandbox integration run remain outstanding."
     },
     {
       "node_id": "done",
@@ -104,6 +104,7 @@
     "tests/test_circuit_breaker_recovery.py",
     "tests/test_daily_summary_percent.py",
     "tests/test_execution.py",
+    "tests/test_health.py",
     "tests/test_health_circuit_state.py",
     "tests/test_notification_throttle.py",
     "tests/test_portfolio_order_lifecycle.py",
@@ -182,7 +183,31 @@
       "exit_code": 0,
       "node_id": "affected-area-tests",
       "summary": "no whitespace errors in reconstructed production diffs"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 31427927056 / backend",
+      "exit_code": 1,
+      "node_id": "affected-area-tests",
+      "summary": "2,821 passed; one stale health-semantics assertion failed and was corrected"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 31428238722 / backend",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "Python production-dependency audit passed; 2,822 tests passed with 323 non-failing deprecation warnings"
+    },
+    {
+      "command": "GitHub Actions Governance check run 31428238735",
+      "exit_code": 0,
+      "node_id": "collect-evidence",
+      "summary": "governance profile validation and generated-section drift check passed"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 31428238722 / web",
+      "exit_code": 1,
+      "node_id": "affected-area-tests",
+      "summary": "unchanged frontend lockfile failed production audit for nanoid 3.3.16 (high) and dompurify 3.4.12 (moderate); this repair changes no frontend dependency file"
     }
   ],
-  "content_hash": "0b75dfe2f0549504beb2637cd6422d32cae5d40f5067c97bafb4e52a6b82887e"
+  "content_hash": "83037a6615c4cfd507057f62062310a1215cc755995fe55b2f88b1ff43b79e87"
 }
