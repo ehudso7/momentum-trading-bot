@@ -186,6 +186,7 @@ class TradingBot:
 
         # Notifications
         self._notify = NotificationManager(config.notifications)
+        self._last_circuit_alert_state: CircuitState | None = None
 
         # Correlation checking
         self._correlation = CorrelationChecker(self._market_data)
@@ -353,23 +354,7 @@ class TradingBot:
                     self._update_dashboard(
                         last_error="Circuit breaker HALTED: API errors exceeded threshold"
                     )
-                    self._notify.notify_circuit_breaker(
-                        state="halted",
-                        reason="API errors exceeded threshold",
-                        daily_pnl=self._portfolio.get_daily_pnl(),
-                        consecutive_losses=0,
-                    )
-                    # Ask advisor for circuit breaker recommendation
-                    cb_status = self._circuit.get_status()
-                    cb_rec = self._advisor.recommend_circuit_breaker_action(
-                        status=cb_status,
-                        daily_trades=self._portfolio.get_daily_journal_entries(),
-                    )
-                    log.info(
-                        "bot.advisor_circuit_breaker",
-                        action=cb_rec.action,
-                        reasons=cb_rec.reasons,
-                    )
+                    self._notify_circuit_state_change(self._circuit.state)
                     break
                 # Signal-aware backoff: wake immediately on shutdown
                 if self._shutdown_event.wait(timeout=30):
@@ -423,6 +408,29 @@ class TradingBot:
             daily_pnl=format_currency(self._portfolio.get_daily_pnl()),
         )
 
+    def _notify_circuit_state_change(self, state: CircuitState) -> None:
+        """Notify and consult the advisor once per circuit state transition."""
+        if state == self._last_circuit_alert_state:
+            return
+
+        cb_status = self._circuit.get_status()
+        self._notify.notify_circuit_breaker(
+            state=state.value,
+            reason=cb_status.get("halt_reason") or "risk state changed",
+            daily_pnl=cb_status.get("daily_pnl", 0.0),
+            consecutive_losses=cb_status.get("consecutive_losses", 0),
+        )
+        cb_rec = self._advisor.recommend_circuit_breaker_action(
+            status=cb_status,
+            daily_trades=self._portfolio.get_daily_journal_entries(),
+        )
+        log.info(
+            "bot.advisor_circuit_breaker",
+            action=cb_rec.action,
+            reasons=cb_rec.reasons,
+        )
+        self._last_circuit_alert_state = state
+
     def _tick(self) -> None:
         """Single iteration of the main trading loop."""
         # 0a. Check if a new trading day started (auto-reset daily state)
@@ -461,24 +469,11 @@ class TradingBot:
                         exit_reason=entry.exit_reason,
                     )
 
-            # Notify and get advisor recommendation on circuit breaker trigger
-            cb_status = self._circuit.get_status()
-            self._notify.notify_circuit_breaker(
-                state=state.value,
-                reason=f"drawdown {cb_status.get('drawdown_pct', 0):.1f}%",
-                daily_pnl=self._portfolio.get_daily_pnl(),
-                consecutive_losses=cb_status.get("consecutive_losses", 0),
-            )
-            cb_rec = self._advisor.recommend_circuit_breaker_action(
-                status=cb_status,
-                daily_trades=self._portfolio.get_daily_journal_entries(),
-            )
-            log.info(
-                "bot.advisor_circuit_breaker",
-                action=cb_rec.action,
-                reasons=cb_rec.reasons,
-            )
+            self._notify_circuit_state_change(state)
             return
+
+        # A recovery or reset makes the next halt a new transition.
+        self._last_circuit_alert_state = None
 
         # 2. Check hard time exit SECOND
         if is_near_close(minutes_before=10):

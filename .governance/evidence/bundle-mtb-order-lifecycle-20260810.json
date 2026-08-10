@@ -1,0 +1,247 @@
+{
+  "bundle_id": "bundle-mtb-order-lifecycle-20260810",
+  "project_id": "momentum-trading-bot",
+  "task_id": "incident-alpaca-order-lifecycle-20260810",
+  "graph_id": "bug-resolution",
+  "graph_version": "1.0.0",
+  "governance_version": "2.4.0",
+  "started_at": "2026-08-10T19:30:00Z",
+  "completed_at": "2026-08-10T20:07:01Z",
+  "actor": "ehudso7",
+  "agent": "codex",
+  "execution_record_ref": ".governance/evidence/rec-mtb-order-lifecycle-20260810.json",
+  "nodes_attempted": [
+    "intake",
+    "reproduce",
+    "verify-environment",
+    "root-cause",
+    "plan-fix",
+    "implement-fix",
+    "regression-tests",
+    "affected-area-tests",
+    "collect-evidence",
+    "verify",
+    "done"
+  ],
+  "nodes_completed": [
+    "intake",
+    "reproduce",
+    "verify-environment",
+    "root-cause",
+    "plan-fix",
+    "implement-fix",
+    "regression-tests",
+    "affected-area-tests",
+    "collect-evidence",
+    "verify",
+    "done"
+  ],
+  "nodes_skipped": [],
+  "retries": 1,
+  "failures": [
+    {
+      "node_id": "implement-fix",
+      "reason": "The first implementation pass still allowed a scale-out sell beside full-size bracket exits and could restore a stop after an unconfirmed manual-exit cancellation. Final change review found both cases; the implementation and regressions were tightened before publication.",
+      "recovered": true
+    },
+    {
+      "node_id": "affected-area-tests",
+      "reason": "The complete repository pytest suite could not run in the incident workspace because the repository's runtime/dev dependencies were unavailable. Focused stdlib-compatible tests and compileall ran successfully; full GitHub CI is required before merge.",
+      "recovered": false
+    }
+  ],
+  "files_changed": [
+    "trading_bot/execution/alpaca_broker.py",
+    "trading_bot/execution/paper_broker.py",
+    "trading_bot/main.py",
+    "trading_bot/models/domain.py",
+    "trading_bot/portfolio/manager.py",
+    "trading_bot/risk/circuit_breaker.py",
+    "trading_bot/utils/health.py",
+    "trading_bot/utils/notifications.py",
+    "tests/test_alpaca_order_lifecycle.py",
+    "tests/test_circuit_alert_transition.py",
+    "tests/test_circuit_breaker_persistence.py",
+    "tests/test_circuit_breaker_recovery.py",
+    "tests/test_daily_summary_percent.py",
+    "tests/test_execution.py",
+    "tests/test_health_circuit_state.py",
+    "tests/test_notification_throttle.py",
+    "tests/test_portfolio_order_lifecycle.py",
+    ".governance/evidence/rec-mtb-order-lifecycle-20260810.json",
+    ".governance/evidence/bundle-mtb-order-lifecycle-20260810.json"
+  ],
+  "commands_executed": [
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_alpaca_order_lifecycle.py",
+      "exit_code": 1,
+      "summary": "INTENTIONAL PRE-FIX FAILURE: deployed execution lifecycle safeguards are absent"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_alpaca_order_lifecycle.py",
+      "exit_code": 0,
+      "summary": "7 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_portfolio_order_lifecycle.py",
+      "exit_code": 1,
+      "summary": "INTENTIONAL PRE-FIX FAILURE: broker-confirmed portfolio state and competing-exit safeguards are absent"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_portfolio_order_lifecycle.py",
+      "exit_code": 0,
+      "summary": "10 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_circuit_breaker_persistence.py",
+      "exit_code": 1,
+      "summary": "INTENTIONAL PRE-FIX FAILURE: persistent loss trigger can time-transition and cooldown allows entries"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_circuit_breaker_persistence.py",
+      "exit_code": 0,
+      "summary": "3 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_health_circuit_state.py",
+      "exit_code": 1,
+      "summary": "INTENTIONAL PRE-FIX FAILURE: financial halt duplicates as health failure"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_health_circuit_state.py",
+      "exit_code": 0,
+      "summary": "1 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_daily_summary_percent.py",
+      "exit_code": 1,
+      "summary": "INTENTIONAL PRE-FIX FAILURE: 100.0 is rendered as 10000.0%"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_daily_summary_percent.py",
+      "exit_code": 0,
+      "summary": "1 passed"
+    },
+    {
+      "command": "python -m compileall -q trading_bot tests",
+      "exit_code": 0,
+      "summary": "all reconstructed production and test modules compiled"
+    },
+    {
+      "command": "git diff --no-index --check baseline repair (modified production files)",
+      "exit_code": 0,
+      "summary": "no whitespace errors in reconstructed production diffs"
+    }
+  ],
+  "tests": {
+    "run": true,
+    "commands": [
+      "PYTHONPATH=. python tests/test_alpaca_order_lifecycle.py",
+      "PYTHONPATH=. python tests/test_portfolio_order_lifecycle.py",
+      "PYTHONPATH=. python tests/test_circuit_breaker_persistence.py",
+      "PYTHONPATH=. python tests/test_health_circuit_state.py",
+      "PYTHONPATH=. python tests/test_daily_summary_percent.py"
+    ],
+    "passed": 22,
+    "failed": 0,
+    "skipped": 0,
+    "result": "pass"
+  },
+  "policy_results": [
+    {
+      "policy_id": "base",
+      "outcome": "pass",
+      "detail": "The graph-required bug-resolution workflow was followed node by node and records pre-fix failures, implementation retry, local validation, and unresolved verification work."
+    },
+    {
+      "policy_id": "security",
+      "outcome": "pass",
+      "detail": "No secret, credential, account mutation, broker command, deployment action, or sensitive-path change is included. Order mutations now carry stable client IDs and explicit open/close position intent."
+    },
+    {
+      "policy_id": "delivery",
+      "outcome": "warn",
+      "detail": "Focused regressions and compilation pass, but the complete repository suite and GitHub required checks remain pending and must pass before human merge. No deployment is authorized."
+    },
+    {
+      "policy_id": "ai-agents",
+      "outcome": "pass",
+      "detail": "completion_status is 'tested', not 'verified'; independent UIE verification does not exist for this run. Every recorded command was actually executed, including intentional pre-fix negative controls."
+    }
+  ],
+  "security_results": [
+    {
+      "check": "no-secrets-in-diff",
+      "outcome": "pass",
+      "detail": "No credential values or new secret-handling paths are present in the reconstructed diff."
+    },
+    {
+      "check": "no-external-mutation",
+      "outcome": "pass",
+      "detail": "This run did not submit or cancel broker orders, mutate Alpaca/Railway state, merge code, deploy, or restart the bot."
+    },
+    {
+      "check": "fail-closed-order-lifecycle",
+      "outcome": "pass",
+      "detail": "Focused tests cover stable client IDs, timeout-after-accept recovery, enum normalization, nested bracket retrieval, SELL_TO_CLOSE exits, cancellation confirmation, broker-flat protection, scale-out bracket cancellation, and cancellation races."
+    },
+    {
+      "check": "dependency-audit",
+      "outcome": "not-run",
+      "detail": "No dependency files changed. Repository CI dependency/security checks are pending on the draft PR."
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "execution-record",
+      "path": ".governance/evidence/rec-mtb-order-lifecycle-20260810.json",
+      "produced_by_node": "collect-evidence",
+      "sha256": "2deceb4fd78294d1c3349cff85f1561599ded888ae0948fcecfc2bdc9bc85e9d"
+    },
+    {
+      "id": "alpaca-lifecycle-repair",
+      "path": "trading_bot/execution/alpaca_broker.py",
+      "produced_by_node": "implement-fix",
+      "sha256": "108021b660ecc8e40df717385de36353820066033a3c882237328edf43a49b78"
+    },
+    {
+      "id": "portfolio-lifecycle-repair",
+      "path": "trading_bot/portfolio/manager.py",
+      "produced_by_node": "implement-fix",
+      "sha256": "0aaa732013be371a391903f04dfc05f1e7d6e889c0173b36f76400107600bfb9"
+    },
+    {
+      "id": "circuit-persistence-repair",
+      "path": "trading_bot/risk/circuit_breaker.py",
+      "produced_by_node": "implement-fix",
+      "sha256": "25e45a28d2e56ecfb861f889a167bf23af08171e39faaca8813a3a2463c7215d"
+    },
+    {
+      "id": "alpaca-lifecycle-regressions",
+      "path": "tests/test_alpaca_order_lifecycle.py",
+      "produced_by_node": "regression-tests",
+      "sha256": "039af73147a4258ef90c5d2cc5599cecf272774e45c72f39814fe6391dcfc8e3"
+    },
+    {
+      "id": "portfolio-lifecycle-regressions",
+      "path": "tests/test_portfolio_order_lifecycle.py",
+      "produced_by_node": "regression-tests",
+      "sha256": "6632a6b703523e080d19651be8f7120f3499a94f9101b775ef517ef1f91a304a"
+    }
+  ],
+  "completion_status": "tested",
+  "confidence": 0.86,
+  "unresolved_risks": [
+    "The complete repository test suite and required GitHub checks have not yet run against this repair; the pull request must remain draft until they pass.",
+    "The focused Alpaca tests use SDK-shaped fakes. A paper-account sandbox canary has not exercised real Alpaca timing, eventual consistency, or order-replacement behavior.",
+    "No independent UIE verification result exists, so this work cannot be promoted from 'tested' to 'verified'.",
+    "The branch will be unmerged and undeployed. Human review and explicit production-deployment approval are required before any restart.",
+    "Existing datetime.utcnow deprecation warnings remain in unrelated timestamp helpers; they do not fail these tests."
+  ],
+  "rollback": {
+    "available": true,
+    "procedure": "Before deployment, close the draft PR or delete its branch. After an authorized merge, revert the repair commit. No schema or data migration is involved. Keep the bot stopped while rolling back.",
+    "tested": false
+  },
+  "content_hash": "c3b56a232f0c2c21a1be69a3361bdbf7db733262398189430d74c0d7c6241045"
+}

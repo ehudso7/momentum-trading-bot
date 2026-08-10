@@ -7,6 +7,9 @@ Paper trading uses Alpaca's paper trading environment.
 
 from __future__ import annotations
 
+import time
+import uuid
+
 import structlog
 
 from trading_bot.config.settings import BrokerConfig
@@ -18,6 +21,30 @@ log = structlog.get_logger(__name__)
 
 # Alpaca paper trading base URL
 _PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+
+_ORDER_CONFIRM_TIMEOUT_SECONDS = 10.0
+_ORDER_CONFIRM_POLL_SECONDS = 0.25
+_TERMINAL_ORDER_STATUSES = {
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+    "replaced",
+    "done_for_day",
+}
+
+
+def _enum_value(value: object) -> str:
+    """Return the wire value for alpaca-py string enums.
+
+    ``str(OrderStatus.FILLED)`` is ``"OrderStatus.FILLED"`` on supported
+    alpaca-py versions, not ``"filled"``.  Order lifecycle decisions must use
+    the enum's value or the portfolio manager will miss fills and terminal
+    states.
+    """
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().lower()
 
 
 class AlpacaBroker(BrokerBase):
@@ -40,6 +67,93 @@ class AlpacaBroker(BrokerBase):
         )
         self._paper = config.alpaca_paper
         log.info("alpaca.connected", paper=self._paper)
+
+    @staticmethod
+    def _client_order_id(purpose: str, symbol: str) -> str:
+        """Create a stable, Alpaca-compatible ID for one logical submission."""
+        safe_symbol = "".join(ch for ch in symbol.lower() if ch.isalnum())[:8]
+        safe_purpose = "".join(ch for ch in purpose.lower() if ch.isalnum())[:8]
+        return f"mtb-{safe_purpose}-{safe_symbol}-{uuid.uuid4().hex[:20]}"[:48]
+
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
+    def _submit_order_idempotent(self, request: object, client_order_id: str):
+        """Submit once logically even when a timeout occurs after acceptance.
+
+        The public method creates the client ID and request before entering the
+        retry wrapper.  Every retry therefore reuses the same ID.  A lookup is
+        attempted after any exception so a timeout-after-accept returns the
+        already-created order instead of placing a duplicate.
+        """
+        try:
+            return self._client.submit_order(request)
+        except Exception:
+            try:
+                existing = self._client.get_order_by_client_id(client_order_id)
+            except Exception:
+                existing = None
+            if existing is not None:
+                log.warning(
+                    "alpaca.order_recovered_by_client_id",
+                    client_order_id=client_order_id,
+                    order_id=str(existing.id),
+                )
+                return existing
+            raise
+
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
+    def _replace_order_idempotent(
+        self, order_id: str, request: object, client_order_id: str
+    ):
+        """Replace a stop without a cancel-and-resubmit duplicate window."""
+        try:
+            return self._client.replace_order_by_id(order_id, request)
+        except Exception:
+            try:
+                existing = self._client.get_order_by_client_id(client_order_id)
+            except Exception:
+                existing = None
+            if existing is not None:
+                return existing
+            raise
+
+    @staticmethod
+    def _position_intent(side: OrderSide):
+        from alpaca.trading.enums import PositionIntent
+
+        if side == OrderSide.SELL:
+            return PositionIntent.SELL_TO_CLOSE
+        return PositionIntent.BUY_TO_OPEN
+
+    @staticmethod
+    def _leg_payload(leg: object) -> dict:
+        return {
+            "id": str(getattr(leg, "id", "")),
+            "status": _enum_value(getattr(leg, "status", "")),
+            "type": _enum_value(getattr(leg, "type", "")),
+            "filled_qty": int(getattr(leg, "filled_qty", 0) or 0),
+            "filled_avg_price": float(
+                getattr(leg, "filled_avg_price", 0.0) or 0.0
+            ),
+            "stop_price": float(getattr(leg, "stop_price", 0.0) or 0.0),
+            "limit_price": float(getattr(leg, "limit_price", 0.0) or 0.0),
+        }
+
+    @classmethod
+    def _bracket_leg_ids(cls, order: object) -> tuple[str, str]:
+        stop_id = ""
+        tp_id = ""
+        for leg in getattr(order, "legs", None) or []:
+            payload = cls._leg_payload(leg)
+            order_type = payload["type"]
+            if payload["stop_price"] > 0 or order_type in {
+                "stop",
+                "stop_limit",
+                "trailing_stop",
+            }:
+                stop_id = payload["id"]
+            elif payload["limit_price"] > 0 or order_type == "limit":
+                tp_id = payload["id"]
+        return stop_id, tp_id
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_account_equity(self) -> float:
@@ -66,23 +180,25 @@ class AlpacaBroker(BrokerBase):
             for p in positions
         ]
 
-    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_market_order(self, symbol: str, qty: int, side: OrderSide) -> str:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
+        client_order_id = self._client_order_id("market", symbol)
         request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
             side=AlpacaSide.BUY if side == OrderSide.BUY else AlpacaSide.SELL,
             time_in_force=TimeInForce.DAY,
+            position_intent=self._position_intent(side),
+            client_order_id=client_order_id,
         )
-        order = self._client.submit_order(request)
+        order = self._submit_order_idempotent(request, client_order_id)
 
         # Check for immediate rejection before returning
-        status_str = str(order.status).lower() if order.status else ""
-        if status_str in ("rejected", "canceled", "expired"):
+        status_str = _enum_value(order.status)
+        if status_str in ("rejected", "canceled", "cancelled", "expired"):
             log.error(
                 "alpaca.order_rejected",
                 order_id=str(order.id),
@@ -101,10 +217,10 @@ class AlpacaBroker(BrokerBase):
             symbol=symbol,
             side=side.value,
             qty=qty,
+            client_order_id=client_order_id,
         )
         return str(order.id)
 
-    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_limit_order(
         self, symbol: str, qty: int, side: OrderSide, limit_price: float
     ) -> str:
@@ -112,14 +228,17 @@ class AlpacaBroker(BrokerBase):
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import LimitOrderRequest
 
+        client_order_id = self._client_order_id("limit", symbol)
         request = LimitOrderRequest(
             symbol=symbol,
             qty=qty,
             side=AlpacaSide.BUY if side == OrderSide.BUY else AlpacaSide.SELL,
             time_in_force=TimeInForce.DAY,
             limit_price=limit_price,
+            position_intent=self._position_intent(side),
+            client_order_id=client_order_id,
         )
-        order = self._client.submit_order(request)
+        order = self._submit_order_idempotent(request, client_order_id)
         log.info(
             "alpaca.limit_order",
             order_id=str(order.id),
@@ -130,7 +249,6 @@ class AlpacaBroker(BrokerBase):
         )
         return str(order.id)
 
-    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_bracket_order(
         self,
         symbol: str,
@@ -148,6 +266,7 @@ class AlpacaBroker(BrokerBase):
             TakeProfitRequest,
         )
 
+        client_order_id = self._client_order_id("bracket", symbol)
         request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
@@ -156,18 +275,15 @@ class AlpacaBroker(BrokerBase):
             order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
             stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+            position_intent=self._position_intent(side),
+            client_order_id=client_order_id,
         )
-        order = self._client.submit_order(request)
+        order = self._submit_order_idempotent(request, client_order_id)
 
-        # Extract leg order IDs
-        stop_id = ""
-        tp_id = ""
-        if order.legs:
-            for leg in order.legs:
-                if hasattr(leg, "stop_price") and leg.stop_price:
-                    stop_id = str(leg.id)
-                elif hasattr(leg, "limit_price") and leg.limit_price:
-                    tp_id = str(leg.id)
+        # Alpaca activates bracket legs only after the parent fills.  They may
+        # legitimately be absent from the immediate submission response; the
+        # portfolio manager retrieves the parent again with nested=True.
+        stop_id, tp_id = self._bracket_leg_ids(order)
 
         log.info(
             "alpaca.bracket_order",
@@ -186,20 +302,22 @@ class AlpacaBroker(BrokerBase):
             "tp_order_id": tp_id,
         }
 
-    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def submit_stop_order(self, symbol: str, qty: int, stop_price: float) -> str:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import StopOrderRequest
 
+        client_order_id = self._client_order_id("stop", symbol)
         request = StopOrderRequest(
             symbol=symbol,
             qty=qty,
             side=AlpacaSide.SELL,
             time_in_force=TimeInForce.DAY,
             stop_price=stop_price,
+            position_intent=self._position_intent(OrderSide.SELL),
+            client_order_id=client_order_id,
         )
-        order = self._client.submit_order(request)
+        order = self._submit_order_idempotent(request, client_order_id)
         log.info(
             "alpaca.stop_order",
             order_id=str(order.id),
@@ -209,18 +327,21 @@ class AlpacaBroker(BrokerBase):
         )
         return str(order.id)
 
-    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def replace_stop_order(
         self, order_id: str, qty: int, new_stop_price: float
     ) -> str:
         from alpaca.trading.requests import ReplaceOrderRequest
 
+        client_order_id = self._client_order_id("replace", "stop")
         request = ReplaceOrderRequest(
             qty=qty,
             stop_price=round(new_stop_price, 2),
+            client_order_id=client_order_id,
         )
         try:
-            new_order = self._client.replace_order_by_id(order_id, request)
+            new_order = self._replace_order_idempotent(
+                order_id, request, client_order_id
+            )
             log.info(
                 "alpaca.stop_replaced",
                 old_id=order_id,
@@ -235,41 +356,114 @@ class AlpacaBroker(BrokerBase):
                 order_id=order_id,
                 error=str(e),
             )
-            # Fallback: cancel old and submit new
-            # Look up the symbol from the original order
-            symbol = ""
-            try:
-                old_order = self._client.get_order_by_id(order_id)
-                symbol = old_order.symbol or ""
-            except Exception:
-                pass
-            self.cancel_order(order_id)
-            if not symbol:
-                log.error("alpaca.replace_stop_no_symbol", order_id=order_id)
-                return ""
-            return self.submit_stop_order(
-                symbol=symbol,
-                qty=qty,
-                stop_price=new_stop_price,
-            )
+            # Never cancel-and-resubmit after an ambiguous replace failure.
+            # The replacement may already exist; a blind fallback can leave two
+            # sell orders live.  Preserve the known stop and let the next tick
+            # reconcile it.
+            current = self.get_order_status(order_id)
+            if current.get("status") not in _TERMINAL_ORDER_STATUSES:
+                log.warning(
+                    "alpaca.replace_stop_preserving_original",
+                    order_id=order_id,
+                    status=current.get("status"),
+                )
+                return order_id
+            raise
 
     def cancel_order(self, order_id: str) -> bool:
         try:
+            current = self.get_order_status(order_id)
+            if current.get("status") in _TERMINAL_ORDER_STATUSES:
+                return current.get("status") in {
+                    "canceled",
+                    "cancelled",
+                    "expired",
+                    "replaced",
+                }
             self._client.cancel_order_by_id(order_id)
-            log.info("alpaca.order_cancelled", order_id=order_id)
-            return True
+            deadline = time.monotonic() + _ORDER_CONFIRM_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                current = self.get_order_status(order_id)
+                status = current.get("status")
+                if status in {"canceled", "cancelled", "expired", "replaced"}:
+                    log.info("alpaca.order_cancelled", order_id=order_id)
+                    return True
+                if status in {"filled", "rejected"}:
+                    log.warning(
+                        "alpaca.cancel_lost_race",
+                        order_id=order_id,
+                        status=status,
+                    )
+                    return False
+                time.sleep(_ORDER_CONFIRM_POLL_SECONDS)
+            log.error("alpaca.cancel_unconfirmed", order_id=order_id)
+            return False
         except Exception as e:
             log.error("alpaca.cancel_error", order_id=order_id, error=str(e))
             return False
 
+    def cancel_open_orders_for_symbol(self, symbol: str) -> bool:
+        """Cancel and confirm every open order for a symbol."""
+        try:
+            from alpaca.trading.enums import QueryOrderStatus
+            from alpaca.trading.requests import GetOrdersRequest
+
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[symbol],
+                nested=True,
+            )
+            orders = self._client.get_orders(filter=request)
+        except Exception as e:
+            log.error(
+                "alpaca.open_orders_lookup_error", symbol=symbol, error=str(e)
+            )
+            return False
+
+        results = [self.cancel_order(str(order.id)) for order in orders]
+        return all(results) if results else True
+
     def close_position(self, symbol: str) -> bool:
         try:
-            self._client.close_position(symbol)
-            log.info("alpaca.position_closed", symbol=symbol)
-            return True
+            if not self.cancel_open_orders_for_symbol(symbol):
+                log.error(
+                    "alpaca.close_blocked_by_open_orders",
+                    symbol=symbol,
+                )
+                return False
+            if self._position_qty(symbol) == 0:
+                return True
+            order = self._client.close_position(symbol)
+            order_id = str(getattr(order, "id", ""))
+            if order_id:
+                deadline = time.monotonic() + _ORDER_CONFIRM_TIMEOUT_SECONDS
+                while time.monotonic() < deadline:
+                    status = self.get_order_status(order_id).get("status")
+                    if status == "filled":
+                        break
+                    if status in {
+                        "canceled",
+                        "cancelled",
+                        "expired",
+                        "rejected",
+                    }:
+                        return False
+                    time.sleep(_ORDER_CONFIRM_POLL_SECONDS)
+            closed = self._position_qty(symbol) == 0
+            if closed:
+                log.info("alpaca.position_closed", symbol=symbol)
+            else:
+                log.error("alpaca.position_close_unconfirmed", symbol=symbol)
+            return closed
         except Exception as e:
             log.error("alpaca.close_error", symbol=symbol, error=str(e))
             return False
+
+    def _position_qty(self, symbol: str) -> int:
+        for position in self.get_positions():
+            if position.get("symbol") == symbol:
+                return int(position.get("qty", 0))
+        return 0
 
     def close_all_positions(self) -> bool:
         try:
@@ -283,16 +477,28 @@ class AlpacaBroker(BrokerBase):
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_order_status(self, order_id: str) -> dict:
         try:
-            order = self._client.get_order_by_id(order_id)
+            from alpaca.trading.requests import GetOrderByIdRequest
+
+            order = self._client.get_order_by_id(
+                order_id,
+                filter=GetOrderByIdRequest(nested=True),
+            )
             return {
                 "id": str(order.id),
-                "status": str(order.status),
+                "status": _enum_value(order.status),
                 "filled_qty": int(order.filled_qty) if order.filled_qty else 0,
                 "filled_avg_price": (
                     float(order.filled_avg_price)
                     if order.filled_avg_price
                     else 0.0
                 ),
+                "client_order_id": str(
+                    getattr(order, "client_order_id", "") or ""
+                ),
+                "legs": [
+                    self._leg_payload(leg)
+                    for leg in (getattr(order, "legs", None) or [])
+                ],
             }
         except Exception as e:
             log.error("alpaca.order_status_error", order_id=order_id, error=str(e))

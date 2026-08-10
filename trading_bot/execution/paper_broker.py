@@ -338,6 +338,12 @@ class PaperBroker(BrokerBase):
         return False
 
     def close_position(self, symbol: str) -> bool:
+        # Cancel every protective/exit order before flattening.  Otherwise a
+        # stale bracket leg can fire after the position is gone and mask the
+        # exact orphan-exit failure that the paper broker is meant to catch.
+        for order_id, order in list(self._pending_orders.items()):
+            if order.get("symbol") == symbol:
+                self.cancel_order(order_id)
         if symbol in self._positions and self._positions[symbol]["qty"] > 0:
             qty = self._positions[symbol]["qty"]
             self.submit_market_order(symbol, qty, OrderSide.SELL)

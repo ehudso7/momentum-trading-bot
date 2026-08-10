@@ -77,7 +77,7 @@ def _render_summary(event_type: str, data: dict[str, Any]) -> str:
         if event_type == "daily_summary":
             win_rate = data.get("win_rate")
             rate = (
-                f"{float(win_rate) * 100:.1f}%"
+                f"{float(win_rate):.1f}%"
                 if isinstance(win_rate, (int, float))
                 else "?"
             )

@@ -1,0 +1,188 @@
+{
+  "record_id": "rec-mtb-order-lifecycle-20260810",
+  "project_id": "momentum-trading-bot",
+  "task_id": "incident-alpaca-order-lifecycle-20260810",
+  "graph_id": "bug-resolution",
+  "graph_version": "1.0.0",
+  "governance_version": "2.4.0",
+  "started_at": "2026-08-10T19:30:00Z",
+  "completed_at": "2026-08-10T20:07:01Z",
+  "actor": "ehudso7",
+  "agent": "codex",
+  "status": "completed",
+  "terminal_node": "done",
+  "node_executions": [
+    {
+      "node_id": "intake",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "User supplied Alpaca paper-account and Slack screenshots showing fragmented fills, repeated JWEL entries/exits, a $134.34 daily loss, a three-loss circuit halt, repeated halt notifications, and a health-check error. The user stopped the bot and removed the Railway deployment before repair work began."
+    },
+    {
+      "node_id": "reproduce",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-order-lifecycle-20260810.json"
+      ],
+      "notes": "Executable negative controls against deployed commit b7f8b0845162cc3a620de51fd1fc674c98f56235 reproduced enum-status mismatch, absent immediate bracket legs, non-idempotent retry behavior, broker-flat oversells, unconfirmed cancellation, persistent circuit-trigger recovery, halted-as-unhealthy duplication, and 10000% win-rate rendering."
+    },
+    {
+      "node_id": "verify-environment",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Scoped the repair to Alpaca paper trading. Broker screenshots showed zero remaining positions and zero open orders after the stop. No broker, Railway, secret, deployment, or production-state mutation was performed by this run."
+    },
+    {
+      "node_id": "root-cause",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Primary cause: str(alpaca enum) produced values such as OrderStatus.FILLED while the portfolio manager compared only lowercase wire values, so fills and terminal states were missed. Contributing causes: the immediate bracket response was assumed to contain legs; submissions were retried without a stable client_order_id; parent/exit fills were accepted without bounded terminal confirmation; bracket cancellations were not proven before replacement exits; the internal quantity was trusted over broker quantity; a persistent loss trigger could time-transition into an entry-eligible state; circuit and health paths emitted the same condition; daily-summary rendering multiplied an already-percent value by 100."
+    },
+    {
+      "node_id": "plan-fix",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Normalize SDK enums at the broker boundary; make submissions and replacements idempotent; fetch nested bracket state; require broker-confirmed fills, quantities, legs, cancellations, and flatness; eliminate competing exit orders; keep active risk triggers halted; emit circuit alerts only on transitions; separate operational health from financial halt state; correct percentage rendering; add pre-fix/post-fix regressions."
+    },
+    {
+      "node_id": "implement-fix",
+      "status": "retried-then-completed",
+      "attempts": 2,
+      "notes": "Attempt 1 implemented the core lifecycle, circuit, and notification safeguards. Final change review found that scale-outs still placed a sell while full-size bracket exits were live and that an unconfirmed manual-exit cancellation could restore a competing stop. Attempt 2 now confirms both bracket legs inactive before scale-out, restores one stop for the confirmed remainder, blocks on ambiguous cancellation, and handles cancellation losing the race to a complete fill."
+    },
+    {
+      "node_id": "regression-tests",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-order-lifecycle-20260810.json"
+      ],
+      "notes": "Added focused stdlib-compatible lifecycle, circuit persistence, health-state, alert-transition, and summary-percent tests; extended paper-broker, circuit-recovery, and notification tests. The five locally executable focused suites pass 22 tests after the repair."
+    },
+    {
+      "node_id": "affected-area-tests",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-order-lifecycle-20260810.json"
+      ],
+      "notes": "Compiled all modified production and test modules and ran whitespace/error checks over the reconstructed diffs. The complete repository pytest suite was not runnable in the incident workspace because project dependencies including pytest, alpaca-py, structlog, and pydantic-settings were unavailable; the draft PR must obtain repository CI before merge."
+    },
+    {
+      "node_id": "collect-evidence",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Wrote this execution record and its evidence bundle to the repository-designated .governance/evidence directory with canonical SHA-256 content hashes."
+    },
+    {
+      "node_id": "verify",
+      "status": "completed",
+      "attempts": 1,
+      "confidence": 0.86,
+      "notes": "Agent-side state is 'tested', not 'verified'. Baseline negative controls fail and repaired focused suites pass; compileall and diff checks pass. Independent UIE verification, a real Alpaca sandbox integration run, and full GitHub CI remain outstanding."
+    },
+    {
+      "node_id": "done",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Repair is ready for a draft pull request and human review. The bot remains stopped; no merge, deployment, restart, or live-money action is part of this run."
+    }
+  ],
+  "files_changed": [
+    "trading_bot/execution/alpaca_broker.py",
+    "trading_bot/execution/paper_broker.py",
+    "trading_bot/main.py",
+    "trading_bot/models/domain.py",
+    "trading_bot/portfolio/manager.py",
+    "trading_bot/risk/circuit_breaker.py",
+    "trading_bot/utils/health.py",
+    "trading_bot/utils/notifications.py",
+    "tests/test_alpaca_order_lifecycle.py",
+    "tests/test_circuit_alert_transition.py",
+    "tests/test_circuit_breaker_persistence.py",
+    "tests/test_circuit_breaker_recovery.py",
+    "tests/test_daily_summary_percent.py",
+    "tests/test_execution.py",
+    "tests/test_health_circuit_state.py",
+    "tests/test_notification_throttle.py",
+    "tests/test_portfolio_order_lifecycle.py",
+    ".governance/evidence/rec-mtb-order-lifecycle-20260810.json",
+    ".governance/evidence/bundle-mtb-order-lifecycle-20260810.json"
+  ],
+  "commands_executed": [
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_alpaca_order_lifecycle.py",
+      "exit_code": 1,
+      "node_id": "reproduce",
+      "summary": "INTENTIONAL PRE-FIX FAILURE: deployed code misses nested status normalization, SELL_TO_CLOSE intent, idempotent retry recovery, cancellation confirmation, and safe replace behavior"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_alpaca_order_lifecycle.py",
+      "exit_code": 0,
+      "node_id": "regression-tests",
+      "summary": "7 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_portfolio_order_lifecycle.py",
+      "exit_code": 1,
+      "node_id": "reproduce",
+      "summary": "INTENTIONAL PRE-FIX FAILURE: deployed code uses signal rather than fill price, can sell an already-flat symbol, does not confirm bracket cancellation, and submits scale-outs beside active exits"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_portfolio_order_lifecycle.py",
+      "exit_code": 0,
+      "node_id": "regression-tests",
+      "summary": "10 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_circuit_breaker_persistence.py",
+      "exit_code": 1,
+      "node_id": "reproduce",
+      "summary": "INTENTIONAL PRE-FIX FAILURE: persistent loss streak enters cooldown and cooldown permits new entries"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_circuit_breaker_persistence.py",
+      "exit_code": 0,
+      "node_id": "regression-tests",
+      "summary": "3 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_health_circuit_state.py",
+      "exit_code": 1,
+      "node_id": "reproduce",
+      "summary": "INTENTIONAL PRE-FIX FAILURE: a financial halt is also treated as an operational health failure"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_health_circuit_state.py",
+      "exit_code": 0,
+      "node_id": "regression-tests",
+      "summary": "1 passed"
+    },
+    {
+      "command": "PYTHONPATH=../baseline python tests/test_daily_summary_percent.py",
+      "exit_code": 1,
+      "node_id": "reproduce",
+      "summary": "INTENTIONAL PRE-FIX FAILURE: 100.0 is rendered as 10000.0%"
+    },
+    {
+      "command": "PYTHONPATH=. python tests/test_daily_summary_percent.py",
+      "exit_code": 0,
+      "node_id": "regression-tests",
+      "summary": "1 passed"
+    },
+    {
+      "command": "python -m compileall -q trading_bot tests",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "all reconstructed production and test modules compiled"
+    },
+    {
+      "command": "git diff --no-index --check baseline repair (modified production files)",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "no whitespace errors in reconstructed production diffs"
+    }
+  ],
+  "content_hash": "0b75dfe2f0549504beb2637cd6422d32cae5d40f5067c97bafb4e52a6b82887e"
+}

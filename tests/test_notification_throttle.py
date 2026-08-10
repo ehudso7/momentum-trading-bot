@@ -226,6 +226,23 @@ class TestPayloadIsDeliverable:
             assert summary, f"{event_type} rendered empty"
             assert isinstance(summary, str)
 
+    def test_daily_summary_does_not_multiply_percentage_twice(self, sent):
+        _manager().notify_daily_summary(
+            date="2026-08-10",
+            total_trades=1,
+            winning_trades=1,
+            losing_trades=0,
+            gross_pnl=13.62,
+            net_pnl=13.62,
+            win_rate=100.0,
+            largest_win=13.62,
+            largest_loss=0.0,
+            ending_equity=71_653.41,
+        )
+
+        assert "win rate 100.0%" in sent[0]["text"]
+        assert "10000.0%" not in sent[0]["text"]
+
 
 class TestRareEventsAreNeverThrottled:
     """Circuit-breaker and daily-summary alerts are the ones that matter most."""

@@ -201,10 +201,11 @@ class HealthMonitor:
 
         Returns False if:
         - No tick has been recorded in the last 5 minutes.
-        - The circuit breaker is in HALTED state.
 
         Returns True otherwise (including when no tick has ever been
-        recorded, as the system may still be starting up).
+        recorded, as the system may still be starting up). A financial-risk
+        halt is reported in ``circuit_breaker_state`` but is not an operational
+        health failure; treating it as both caused duplicate error alerts.
         """
         # Check tick freshness
         if self._last_tick_at is not None:
@@ -215,19 +216,6 @@ class HealthMonitor:
                     seconds_since_tick=round(elapsed.total_seconds(), 1),
                 )
                 return False
-
-        # Check circuit breaker
-        if self._circuit_breaker is not None:
-            state_attr = getattr(self._circuit_breaker, "state", None)
-            if state_attr is not None:
-                state_value = (
-                    state_attr.value
-                    if hasattr(state_attr, "value")
-                    else str(state_attr)
-                )
-                if state_value == "halted":
-                    log.warning("health.circuit_halted")
-                    return False
 
         return True
 

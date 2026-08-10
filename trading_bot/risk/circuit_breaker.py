@@ -40,7 +40,8 @@ class CircuitBreaker:
     - API error count exceeds threshold within 5-minute window
 
     Recovery flow:
-    - After cooldown_minutes in HALTED, auto-transitions to COOLDOWN.
+    - After the active trigger clears and cooldown_minutes elapse in HALTED,
+      transitions to COOLDOWN.
     - After 5 minutes in COOLDOWN with no new triggers, transitions to WARNING.
     - WARNING allows reduced trading; full NORMAL requires daily reset
       or force_reset.
@@ -58,6 +59,7 @@ class CircuitBreaker:
         self._api_error_window = timedelta(minutes=5)
         self._halted_at: Optional[datetime] = None
         self._cooldown_entered_at: Optional[datetime] = None
+        self._halt_reason: Optional[str] = None
         self._api_error_counts: dict[str, int] = defaultdict(int)
 
     @property
@@ -96,43 +98,75 @@ class CircuitBreaker:
 
     @property
     def is_trading_allowed(self) -> bool:
-        """
-        Trading is allowed in NORMAL, WARNING, and COOLDOWN states,
-        BUT only if drawdown hasn't exceeded the hard daily limit.
+        """Allow new entries only in NORMAL or WARNING.
 
-        COOLDOWN after a halt should not allow NEW trades if the daily
-        drawdown is still above threshold — only position management.
+        COOLDOWN is reserved for monitoring and position management.  Treating
+        it as entry-eligible created a one-tick window in which the bot could
+        trade again before a persistent loss-streak trigger re-halted it.
         """
-        if self._state == CircuitState.HALTED:
-            return False
-        if self._state == CircuitState.COOLDOWN:
-            # COOLDOWN allows position management but blocks new entries
-            # if drawdown still exceeds threshold
-            if self._starting_equity > 0:
-                total_pnl = self._daily_pnl + self._unrealized_pnl
-                drawdown_pct = abs(min(0, total_pnl)) / self._starting_equity * 100
-                if drawdown_pct >= self._config.drawdown_circuit_breaker_pct:
-                    return False
-        return self._state in (
-            CircuitState.NORMAL,
-            CircuitState.WARNING,
-            CircuitState.COOLDOWN,
-        )
+        return self._state in (CircuitState.NORMAL, CircuitState.WARNING)
 
     @property
     def daily_pnl(self) -> float:
         return self._daily_pnl
 
+    def _active_halt_reason(self) -> Optional[str]:
+        """Return the highest-priority trigger that is still active."""
+        if self._starting_equity > 0:
+            total_pnl = self._daily_pnl + self._unrealized_pnl
+            drawdown_pct = (
+                abs(min(0, total_pnl)) / self._starting_equity * 100
+            )
+            if drawdown_pct >= self._config.drawdown_circuit_breaker_pct:
+                return (
+                    f"daily_drawdown: {drawdown_pct:.2f}% >= "
+                    f"{self._config.drawdown_circuit_breaker_pct}% "
+                    f"(realized={self._daily_pnl:.2f}, "
+                    f"unrealized={self._unrealized_pnl:.2f})"
+                )
+
+            realized_loss_pct = (
+                abs(min(0, self._daily_pnl))
+                / self._starting_equity
+                * 100
+            )
+            if (
+                realized_loss_pct
+                >= self._config.hard_daily_loss_limit_pct
+            ):
+                return (
+                    f"hard_daily_loss: realized {realized_loss_pct:.2f}% >= "
+                    f"{self._config.hard_daily_loss_limit_pct}% "
+                    f"(realized={self._daily_pnl:.2f})"
+                )
+
+        if (
+            self._consecutive_losses
+            >= self._config.max_consecutive_losses
+        ):
+            return (
+                f"consecutive_losses: {self._consecutive_losses} >= "
+                f"{self._config.max_consecutive_losses}"
+            )
+
+        self._prune_old_errors()
+        error_count = len(self._api_errors)
+        if error_count >= self._config.api_error_halt_threshold:
+            return (
+                f"api_errors: {error_count} in 5 minutes >= "
+                f"{self._config.api_error_halt_threshold}"
+            )
+        return None
+
     def check(self) -> CircuitState:
-        """
-        Evaluate all circuit breaker conditions.
-
-        Returns current circuit state after evaluation.
-        Includes auto-recovery logic: HALTED -> COOLDOWN -> WARNING.
-        """
+        """Evaluate triggers before considering any recovery transition."""
         now = now_et()
+        active_reason = self._active_halt_reason()
+        if active_reason is not None:
+            self._halt(active_reason)
+            return self._state
 
-        # --- Auto-recovery: HALTED -> COOLDOWN ---
+        # Recovery is possible only after the trigger itself has cleared.
         if self._state == CircuitState.HALTED and self._halted_at is not None:
             elapsed = now - self._halted_at
             if elapsed >= timedelta(minutes=self._cooldown_minutes):
@@ -140,72 +174,45 @@ class CircuitBreaker:
                 self._cooldown_entered_at = now
                 log.info(
                     "circuit.cooldown_entered",
-                    halted_for_minutes=round(elapsed.total_seconds() / 60, 1),
+                    halted_for_minutes=round(
+                        elapsed.total_seconds() / 60, 1
+                    ),
                 )
                 return self._state
 
-        # --- Auto-recovery: COOLDOWN -> WARNING ---
-        if self._state == CircuitState.COOLDOWN and self._cooldown_entered_at is not None:
+        if (
+            self._state == CircuitState.COOLDOWN
+            and self._cooldown_entered_at is not None
+        ):
             elapsed = now - self._cooldown_entered_at
             if elapsed >= timedelta(minutes=5):
                 self._state = CircuitState.WARNING
                 self._cooldown_entered_at = None
+                self._halt_reason = None
                 log.info(
                     "circuit.recovered_to_warning",
-                    cooldown_minutes=round(elapsed.total_seconds() / 60, 1),
+                    cooldown_minutes=round(
+                        elapsed.total_seconds() / 60, 1
+                    ),
                 )
                 return self._state
 
-        if self._starting_equity <= 0:
-            return self._state
-
-        # 1. Daily drawdown check (includes both realized and unrealized P&L)
         if self._starting_equity > 0:
             total_pnl = self._daily_pnl + self._unrealized_pnl
-            drawdown_pct = abs(min(0, total_pnl)) / self._starting_equity * 100
-            if drawdown_pct >= self._config.drawdown_circuit_breaker_pct:
-                self._halt(
-                    f"daily_drawdown: {drawdown_pct:.2f}% >= "
-                    f"{self._config.drawdown_circuit_breaker_pct}% "
-                    f"(realized={self._daily_pnl:.2f}, unrealized={self._unrealized_pnl:.2f})"
-                )
-                return self._state
-
-            # 1b. Hard daily loss limit (realized P&L only — absolute floor)
-            realized_loss_pct = abs(min(0, self._daily_pnl)) / self._starting_equity * 100
-            if realized_loss_pct >= self._config.hard_daily_loss_limit_pct:
-                self._halt(
-                    f"hard_daily_loss: realized {realized_loss_pct:.2f}% >= "
-                    f"{self._config.hard_daily_loss_limit_pct}% "
-                    f"(realized={self._daily_pnl:.2f})"
-                )
-                return self._state
-
-            # Warning at 75% of threshold
-            if drawdown_pct >= self._config.drawdown_circuit_breaker_pct * 0.75:
+            drawdown_pct = (
+                abs(min(0, total_pnl)) / self._starting_equity * 100
+            )
+            if (
+                drawdown_pct
+                >= self._config.drawdown_circuit_breaker_pct * 0.75
+            ):
                 self._warn(
                     f"drawdown_approaching: {drawdown_pct:.2f}% "
-                    f"(halt at {self._config.drawdown_circuit_breaker_pct}%)"
+                    f"(halt at "
+                    f"{self._config.drawdown_circuit_breaker_pct}%)"
                 )
 
-        # 2. Consecutive losses check
-        if self._consecutive_losses >= self._config.max_consecutive_losses:
-            self._halt(
-                f"consecutive_losses: {self._consecutive_losses} >= "
-                f"{self._config.max_consecutive_losses}"
-            )
-            return self._state
-
-        # 3. API error check (within 5-minute window)
-        self._prune_old_errors()
         error_count = len(self._api_errors)
-        if error_count >= self._config.api_error_halt_threshold:
-            self._halt(
-                f"api_errors: {error_count} in 5 minutes >= "
-                f"{self._config.api_error_halt_threshold}"
-            )
-            return self._state
-
         if error_count >= self._config.api_error_halt_threshold * 0.6:
             self._warn(f"api_errors_rising: {error_count} in 5 minutes")
 
@@ -280,6 +287,7 @@ class CircuitBreaker:
         self._state = CircuitState.NORMAL
         self._halted_at = None
         self._cooldown_entered_at = None
+        self._halt_reason = None
         log.info("circuit.daily_reset", equity=round(equity, 2))
 
     def force_reset(self) -> None:
@@ -290,10 +298,12 @@ class CircuitBreaker:
         self._api_error_counts.clear()
         self._halted_at = None
         self._cooldown_entered_at = None
+        self._halt_reason = None
         log.warning("circuit.force_reset")
 
     def _halt(self, reason: str) -> None:
         """Transition to HALTED state."""
+        self._halt_reason = reason
         if self._state != CircuitState.HALTED:
             self._state = CircuitState.HALTED
             self._halted_at = now_et()
@@ -316,6 +326,7 @@ class CircuitBreaker:
         """Get current circuit breaker status for monitoring."""
         return {
             "state": self._state.value,
+            "halt_reason": self._halt_reason,
             "daily_pnl": round(self._daily_pnl, 2),
             "starting_equity": round(self._starting_equity, 2),
             "consecutive_losses": self._consecutive_losses,
@@ -323,7 +334,12 @@ class CircuitBreaker:
             "api_error_summary": self.get_error_summary(),
             "unrealized_pnl": round(self._unrealized_pnl, 2),
             "drawdown_pct": (
-                round(abs(min(0, self._daily_pnl + self._unrealized_pnl)) / self._starting_equity * 100, 2)
+                round(
+                    abs(min(0, self._daily_pnl + self._unrealized_pnl))
+                    / self._starting_equity
+                    * 100,
+                    2,
+                )
                 if self._starting_equity > 0
                 else 0.0
             ),

@@ -82,6 +82,25 @@ class TestPaperBroker:
         assert result is True
         assert len(broker.get_positions()) == 0
 
+    def test_close_position_cancels_all_symbol_exit_orders(self):
+        broker = PaperBroker(initial_equity=25_000.0, slippage_bps=0.0)
+        broker.update_price("TEST", 10.0)
+        bracket = broker.submit_bracket_order(
+            "TEST",
+            100,
+            OrderSide.BUY,
+            stop_price=9.0,
+            take_profit_price=12.0,
+        )
+
+        assert broker.close_position("TEST") is True
+        assert broker.get_order_status(bracket["stop_order_id"])["status"] == "cancelled"
+        assert broker.get_order_status(bracket["tp_order_id"])["status"] == "cancelled"
+
+        # A later price move must not fire a stale exit after the account is flat.
+        assert broker.update_price("TEST", 8.0) == []
+        assert broker.get_positions() == []
+
     def test_close_all_positions(self):
         broker = PaperBroker(initial_equity=50_000.0)
         broker.update_price("AAA", 10.0)

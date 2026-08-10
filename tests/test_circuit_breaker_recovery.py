@@ -63,14 +63,16 @@ class TestHaltedToCooldown:
         assert state == CircuitState.HALTED
 
     def test_transitions_to_cooldown_after_cooldown_minutes(self, halted_cb: CircuitBreaker):
-        """Exactly at cooldown_minutes the state should become COOLDOWN."""
+        """A cleared trigger may enter COOLDOWN at the configured time."""
+        halted_cb._consecutive_losses = 0
         future = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = halted_cb.check()
         assert state == CircuitState.COOLDOWN
 
     def test_transitions_to_cooldown_well_past_cooldown(self, halted_cb: CircuitBreaker):
-        """Even long after cooldown_minutes, next check() moves to COOLDOWN."""
+        """A cleared trigger can recover even well after the minimum wait."""
+        halted_cb._consecutive_losses = 0
         future = halted_cb._halted_at + timedelta(minutes=60)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             state = halted_cb.check()
@@ -78,17 +80,30 @@ class TestHaltedToCooldown:
 
     def test_cooldown_entered_at_is_set(self, halted_cb: CircuitBreaker):
         """_cooldown_entered_at is populated when entering COOLDOWN."""
+        halted_cb._consecutive_losses = 0
         future = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             halted_cb.check()
         assert halted_cb._cooldown_entered_at is not None
 
-    def test_trading_allowed_in_cooldown(self, halted_cb: CircuitBreaker):
-        """COOLDOWN allows trading (is_trading_allowed is True)."""
+    def test_trading_blocked_in_cooldown(self, halted_cb: CircuitBreaker):
+        """COOLDOWN permits monitoring but never new entries."""
+        halted_cb._consecutive_losses = 0
         future = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             halted_cb.check()
-        assert halted_cb.is_trading_allowed is True
+        assert halted_cb.is_trading_allowed is False
+
+    def test_persistent_loss_trigger_stays_halted_after_wait(
+        self, halted_cb: CircuitBreaker
+    ):
+        """Elapsed time alone cannot clear a still-active loss streak."""
+        future = halted_cb._halted_at + timedelta(minutes=60)
+        with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
+            state = halted_cb.check()
+        assert state == CircuitState.HALTED
+        assert halted_cb._cooldown_entered_at is None
+        assert "consecutive_losses" in halted_cb.get_status()["halt_reason"]
 
     def test_halted_at_not_none_required(self, risk_config: RiskConfig):
         """If _halted_at is None while HALTED, no recovery happens."""
@@ -115,14 +130,11 @@ class TestCooldownToWarning:
     def test_stays_cooldown_before_5_minutes(self, halted_cb: CircuitBreaker):
         """If less than 5 minutes have passed in COOLDOWN, state stays COOLDOWN."""
         # First: transition to COOLDOWN
+        halted_cb._consecutive_losses = 0
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
         assert halted_cb.state == CircuitState.COOLDOWN
-
-        # Clear the consecutive losses so the halt condition doesn't re-trigger
-        # during the next check() while in COOLDOWN.
-        halted_cb._consecutive_losses = 0
 
         # Now check 4 minutes into COOLDOWN -- should still be COOLDOWN
         four_min_later = cooldown_entry + timedelta(minutes=4)
@@ -133,13 +145,11 @@ class TestCooldownToWarning:
     def test_transitions_to_warning_after_5_minutes(self, halted_cb: CircuitBreaker):
         """After 5 minutes in COOLDOWN, check() transitions to WARNING."""
         # Transition to COOLDOWN
+        halted_cb._consecutive_losses = 0
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
         assert halted_cb.state == CircuitState.COOLDOWN
-
-        # Clear the original halt trigger so it doesn't re-halt
-        halted_cb._consecutive_losses = 0
 
         # Now 5 minutes later
         five_min_later = cooldown_entry + timedelta(minutes=5)
@@ -150,12 +160,10 @@ class TestCooldownToWarning:
     def test_warning_clears_cooldown_entered_at(self, halted_cb: CircuitBreaker):
         """Transitioning to WARNING clears _cooldown_entered_at."""
         # Transition HALTED -> COOLDOWN -> WARNING
+        halted_cb._consecutive_losses = 0
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
-
-        # Clear original halt trigger
-        halted_cb._consecutive_losses = 0
 
         warning_time = cooldown_entry + timedelta(minutes=5)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=warning_time):
@@ -167,12 +175,10 @@ class TestCooldownToWarning:
     def test_trading_allowed_in_warning(self, halted_cb: CircuitBreaker):
         """WARNING allows trading."""
         # Full recovery: HALTED -> COOLDOWN -> WARNING
+        halted_cb._consecutive_losses = 0
         cooldown_entry = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=cooldown_entry):
             halted_cb.check()
-
-        # Clear original halt trigger
-        halted_cb._consecutive_losses = 0
 
         warning_time = cooldown_entry + timedelta(minutes=5)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=warning_time):
@@ -219,14 +225,14 @@ class TestFullRecoveryCycle:
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t1):
             assert cb.check() == CircuitState.HALTED
 
-        # 30 minutes later: COOLDOWN
+        # Clear the original trigger before recovery is considered.
+        cb._consecutive_losses = 0
+
+        # 30 minutes later: COOLDOWN (new entries remain blocked)
         t2 = halted_at + timedelta(minutes=30)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t2):
             assert cb.check() == CircuitState.COOLDOWN
-        assert cb.is_trading_allowed is True
-
-        # Clear the original halt trigger so subsequent checks don't re-halt
-        cb._consecutive_losses = 0
+        assert cb.is_trading_allowed is False
 
         # 4 minutes into COOLDOWN: still COOLDOWN
         t3 = t2 + timedelta(minutes=4)
@@ -360,6 +366,7 @@ class TestRehaltFromCooldown:
     def _enter_cooldown(self, cb: CircuitBreaker) -> CircuitBreaker:
         """Helper: drive cb from HALTED into COOLDOWN state."""
         halted_at = cb._halted_at
+        cb._consecutive_losses = 0
         future = halted_at + timedelta(minutes=cb._cooldown_minutes)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             cb.check()
@@ -483,6 +490,9 @@ class TestEdgeCases:
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t1):
             assert cb.check() == CircuitState.HALTED
 
+        # Clear the trigger; elapsed time alone is insufficient.
+        cb._consecutive_losses = 0
+
         # 60 minutes: COOLDOWN
         t2 = cb._halted_at + timedelta(minutes=60)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t2):
@@ -497,6 +507,7 @@ class TestEdgeCases:
         for _ in range(risk_config.max_consecutive_losses):
             cb.record_trade_result(-1.0)
 
+        cb._consecutive_losses = 0
         t1 = cb._halted_at + timedelta(minutes=1)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=t1):
             cb.check()
@@ -519,6 +530,7 @@ class TestEdgeCases:
 
     def test_get_status_during_cooldown(self, halted_cb: CircuitBreaker):
         """get_status() reports COOLDOWN state and non-null cooldown_entered_at."""
+        halted_cb._consecutive_losses = 0
         future = halted_cb._halted_at + timedelta(minutes=10)
         with patch("trading_bot.risk.circuit_breaker.now_et", return_value=future):
             halted_cb.check()
