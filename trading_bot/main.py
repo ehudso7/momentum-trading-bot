@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import math
 import os
 import signal
 import sys
@@ -36,7 +37,7 @@ from trading_bot.data.polygon_client import PolygonClient
 from trading_bot.data.yahoo_screener import YahooScreener
 from trading_bot.execution.alpaca_broker import AlpacaBroker
 from trading_bot.execution.paper_broker import PaperBroker
-from trading_bot.portfolio.manager import PortfolioManager
+from trading_bot.portfolio.manager import PortfolioManager, PortfolioSafetyError
 from trading_bot.risk.circuit_breaker import CircuitBreaker, CircuitState
 from trading_bot.risk.correlation import CorrelationChecker
 from trading_bot.risk.position_sizer import PositionSizer
@@ -282,136 +283,352 @@ class TradingBot:
 
     def _run_live_loop(self) -> None:
         """Synchronous polling loop for paper/live trading."""
-        # Initialize daily state
-        try:
-            equity = self._broker.get_account_equity()
-        except Exception:
-            equity = self._config.starting_capital
-            log.warning("bot.equity_fallback", equity=equity)
-
-        self._starting_equity = equity
-        self._circuit.reset_daily(equity)
-        self._sizer.reset_daily()
-        self._portfolio.reset_daily()
-
-        log.info("bot.account_loaded", equity=format_currency(equity))
-
-        # Reconcile positions with broker on startup
-        try:
-            self._portfolio.reconcile_positions()
-            log.info("bot.positions_reconciled")
-        except Exception as e:
-            log.error("bot.reconcile_error", error=str(e))
-            self._health.record_error("reconciliation")
-            self._notify.notify_error(
-                error_type="reconciliation",
-                message=f"Position reconciliation failed: {e}",
-            )
-
-        self._running = True
-        self._shutdown_event.clear()
+        # The shutdown event is monotonic for the lifetime of this bot.  It is
+        # deliberately never cleared here: a SIGTERM received during startup
+        # must not be erased after a slow reconciliation call returns.
+        self._running = not self._shutdown_event.is_set()
         self._daily_plan_generated = False
         self._premarket_watchlist = []
         tick_count = 0
+        shutdown_entries = []
 
-        # Push initial state to dashboard before first tick
-        self._update_dashboard()
-
-        while self._running:
-            try:
-                self._tick()
-                tick_count += 1
-
-                # Record tick for health monitoring
-                self._health.record_tick()
-
-                # Push state to dashboard
-                self._update_dashboard()
-
-                if tick_count % 10 == 0:
-                    self._log_status()
-
-                # Signal-aware sleep with adaptive interval
-                interval = self._get_adaptive_scan_interval()
-                if self._shutdown_event.wait(timeout=interval):
-                    log.info("bot.shutdown_event_received")
-                    break
-
-            except KeyboardInterrupt:
-                log.info("bot.keyboard_interrupt")
-                break
-            except Exception as e:
-                log.error("bot.tick_error", error=str(e), exc_info=True)
-                self._circuit.record_api_error()
-                self._health.record_error("tick")
-                self._update_dashboard(last_error=str(e))
-                self._notify.notify_error(
-                    error_type="tick_error",
-                    message=f"Error during tick: {e}",
-                )
-                if not self._circuit.is_trading_allowed:
-                    log.critical("bot.circuit_breaker_halted")
-                    self._update_dashboard(
-                        last_error="Circuit breaker HALTED: API errors exceeded threshold"
-                    )
-                    self._notify_circuit_state_change(self._circuit.state)
-                    break
-                # Signal-aware backoff: wake immediately on shutdown
-                if self._shutdown_event.wait(timeout=30):
-                    break
-
-        # Push final state to dashboard before shutdown
-        self._update_dashboard()
-
-        # Shutdown: close all positions
-        entries = self._portfolio.close_all("shutdown")
-
-        # Verify all positions actually closed at the broker
         try:
-            remaining = self._broker.get_positions()
-            if remaining:
-                log.critical(
-                    "bot.shutdown_positions_remaining",
-                    count=len(remaining),
-                    symbols=[p["symbol"] for p in remaining],
-                    detail="Attempting broker-side close_all as last resort",
-                )
-                self._broker.close_all_positions()
-        except Exception as e:
-            log.error("bot.shutdown_verify_error", error=str(e))
+            if not self._running:
+                return
 
-        # Notify on trade closures during shutdown
-        for entry in entries:
-            self._notify.notify_trade_closed(
-                symbol=entry.symbol,
-                side=entry.side,
-                shares=entry.shares,
-                entry_price=entry.entry_price,
-                exit_price=entry.exit_price,
-                pnl=entry.pnl,
-                rr_ratio=entry.rr_ratio,
-                hold_time_minutes=entry.hold_time_minutes,
-                exit_reason=entry.exit_reason,
+            # First establish a clean broker boundary. A fresh process has no
+            # trustworthy lifecycle IDs for inherited orders or positions, so
+            # no daily baseline or trading tick is initialized until
+            # reconciliation proves the account is clean.
+            try:
+                self._portfolio.reconcile_positions()
+                log.info("bot.positions_reconciled")
+            except Exception as e:
+                log.critical("bot.reconcile_error", error=str(e))
+                self._health.record_error("reconciliation")
+                try:
+                    self._notify.notify_error(
+                        error_type="reconciliation",
+                        message=f"Position reconciliation failed: {e}",
+                    )
+                except Exception as notify_error:
+                    log.error(
+                        "bot.reconcile_notification_error",
+                        error=str(notify_error),
+                    )
+                if isinstance(e, PortfolioSafetyError):
+                    raise
+                raise PortfolioSafetyError(
+                    f"Position reconciliation failed: {e}"
+                ) from e
+
+            if self._shutdown_requested():
+                log.info("bot.shutdown_requested_during_startup")
+                return
+
+            # Initialize daily state only from a fresh, finite, positive
+            # post-reconciliation equity.  A guessed baseline can disable or
+            # distort the drawdown circuit, so there is no startup fallback.
+            equity = self._strict_account_equity("startup")
+            self._starting_equity = equity
+            self._circuit.reset_daily(equity)
+            self._sizer.reset_daily()
+            self._portfolio.reset_daily()
+
+            log.info("bot.account_loaded", equity=format_currency(equity))
+
+            if self._shutdown_requested():
+                log.info("bot.shutdown_requested_before_first_tick")
+                return
+
+            # Push initial state to dashboard before first tick
+            self._update_dashboard()
+
+            while self._running and not self._shutdown_event.is_set():
+                try:
+                    self._tick()
+                    tick_count += 1
+
+                    # Record tick for health monitoring
+                    self._health.record_tick()
+
+                    # Push state to dashboard
+                    self._update_dashboard()
+
+                    if tick_count % 10 == 0:
+                        self._log_status()
+
+                    # Signal-aware sleep with adaptive interval
+                    interval = self._get_adaptive_scan_interval()
+                    if self._shutdown_event.wait(timeout=interval):
+                        log.info("bot.shutdown_event_received")
+                        break
+
+                except PortfolioSafetyError as e:
+                    log.critical(
+                        "bot.portfolio_safety_halt",
+                        error=str(e),
+                        detail="Stopping immediately; no further tick will run",
+                    )
+                    self.stop()
+                    self._health.record_error("portfolio_safety")
+                    try:
+                        self._update_dashboard(
+                            last_error=f"Portfolio safety halt: {e}"
+                        )
+                    except Exception as dashboard_error:
+                        log.error(
+                            "bot.safety_dashboard_error",
+                            error=str(dashboard_error),
+                        )
+                    try:
+                        self._notify.notify_error(
+                            error_type="portfolio_safety",
+                            message=f"Portfolio safety halt: {e}",
+                        )
+                    except Exception as notify_error:
+                        log.error(
+                            "bot.safety_notification_error",
+                            error=str(notify_error),
+                        )
+                    break
+                except KeyboardInterrupt:
+                    log.info("bot.keyboard_interrupt")
+                    self.stop()
+                    break
+                except Exception as e:
+                    log.error("bot.tick_error", error=str(e), exc_info=True)
+                    self._circuit.record_api_error()
+                    self._health.record_error("tick")
+                    try:
+                        self._update_dashboard(last_error=str(e))
+                        self._notify.notify_error(
+                            error_type="tick_error",
+                            message=f"Error during tick: {e}",
+                        )
+                    except Exception as reporting_error:
+                        log.error(
+                            "bot.tick_error_reporting_failed",
+                            error=str(reporting_error),
+                        )
+                    if not self._circuit.is_trading_allowed:
+                        log.critical("bot.circuit_breaker_halted")
+                        self.stop()
+                        try:
+                            self._notify_circuit_state_change(self._circuit.state)
+                        except Exception as notify_error:
+                            log.error(
+                                "bot.circuit_notification_error",
+                                error=str(notify_error),
+                            )
+                        break
+                    # Signal-aware backoff: wake immediately on shutdown
+                    if self._shutdown_event.wait(timeout=30):
+                        break
+        finally:
+            # Cleanup must run even when startup, dashboard, notification, or
+            # reporting code raises.  Mark stopped before any cleanup call so
+            # no caller can observe or restart an active loop concurrently.
+            self._running = False
+            self._shutdown_event.set()
+            cleanup_error: PortfolioSafetyError | None = None
+            try:
+                shutdown_entries = self._flatten_all_and_verify("shutdown")
+            except Exception as exc:
+                cleanup_error = (
+                    exc
+                    if isinstance(exc, PortfolioSafetyError)
+                    else PortfolioSafetyError(f"shutdown flatten failed: {exc}")
+                )
+                log.critical(
+                    "bot.shutdown_flatten_unverified",
+                    error=str(cleanup_error),
+                )
+
+            # Everything below is best-effort reporting.  None of it may
+            # prevent the broker flatten attempt above from running.
+            try:
+                self._update_dashboard(
+                    last_error=(str(cleanup_error) if cleanup_error else None)
+                )
+            except Exception as exc:
+                log.error("bot.shutdown_dashboard_error", error=str(exc))
+            for entry in shutdown_entries:
+                try:
+                    self._notify.notify_trade_closed(
+                        symbol=entry.symbol,
+                        side=entry.side,
+                        shares=entry.shares,
+                        entry_price=entry.entry_price,
+                        exit_price=entry.exit_price,
+                        pnl=entry.pnl,
+                        rr_ratio=entry.rr_ratio,
+                        hold_time_minutes=entry.hold_time_minutes,
+                        exit_reason=entry.exit_reason,
+                    )
+                except Exception as exc:
+                    log.error("bot.shutdown_notification_error", error=str(exc))
+            try:
+                self._generate_daily_summary()
+            except Exception as exc:
+                log.error("bot.shutdown_summary_error", error=str(exc))
+            try:
+                self._generate_daily_alpha_report()
+            except Exception as exc:
+                log.error("bot.shutdown_alpha_report_error", error=str(exc))
+
+            log.info(
+                "bot.shutdown",
+                trades_closed=len(shutdown_entries),
+                daily_pnl=format_currency(self._portfolio.get_daily_pnl()),
+            )
+            if cleanup_error is not None:
+                raise cleanup_error
+
+    def _shutdown_requested(self) -> bool:
+        """Return whether a monotonic shutdown request has been received."""
+        return self._shutdown_event.is_set() or not self._running
+
+    def _strict_account_equity(self, context: str) -> float:
+        """Return fresh usable equity, or hard-stop before any new tick."""
+        try:
+            raw_equity = self._broker.get_account_equity()
+            if isinstance(raw_equity, bool):
+                raise ValueError("boolean equity is not valid")
+            equity = float(raw_equity)
+        except Exception as exc:
+            raise PortfolioSafetyError(
+                f"{context}: account equity could not be verified: {exc}"
+            ) from exc
+        if not math.isfinite(equity) or equity <= 0:
+            raise PortfolioSafetyError(
+                f"{context}: broker returned invalid account equity {equity!r}"
+            )
+        return equity
+
+    def _flatten_all_and_verify(self, context: str) -> list:
+        """Broker-wide flatten first, then reconcile local bookkeeping safely."""
+
+        def broker_flatten_and_verify(phase: str) -> None:
+            try:
+                close_confirmed = self._broker.close_all_positions()
+            except Exception as exc:
+                raise PortfolioSafetyError(
+                    f"{context}:{phase}: broker close_all_positions failed: {exc}"
+                ) from exc
+            if close_confirmed is not True:
+                raise PortfolioSafetyError(
+                    f"{context}:{phase}: broker did not confirm close_all_positions"
+                )
+            try:
+                remaining = self._broker.get_positions()
+            except Exception as exc:
+                raise PortfolioSafetyError(
+                    f"{context}:{phase}: broker-flat verification failed: {exc}"
+                ) from exc
+            if remaining:
+                raise PortfolioSafetyError(
+                    f"{context}:{phase}: broker positions remain after close-all: "
+                    f"{[(p.get('symbol'), p.get('qty')) for p in remaining]}"
+                )
+
+        # This must be the first potentially blocking cleanup action.  A local
+        # position close can poll each order for many seconds, which is too late
+        # for a container SIGTERM grace period.  The broker-wide endpoint also
+        # cancels orphan orders that local state cannot see.
+        broker_flatten_and_verify("initial")
+
+        entries = []
+        bookkeeping_error: Exception | None = None
+        try:
+            entries = self._portfolio.finalize_verified_broker_flat(context)
+        except Exception as exc:
+            bookkeeping_error = exc
+            log.error(
+                "bot.local_flat_bookkeeping_error",
+                context=context,
+                error=str(exc),
             )
 
-        # Generate and log daily summary report
-        self._generate_daily_summary()
+        # Local bookkeeping observes the already-flat broker and submits
+        # nothing. Repeat the account-wide proof anyway so an unexpected local
+        # side effect cannot leave a new position or order armed.
+        broker_flatten_and_verify("post_bookkeeping")
+        try:
+            post_bookkeeping_fills = self._broker.get_last_close_fills()
+        except Exception as exc:
+            raise PortfolioSafetyError(
+                f"{context}:post_bookkeeping: close-fill verification failed: {exc}"
+            ) from exc
+        if not isinstance(post_bookkeeping_fills, list):
+            raise PortfolioSafetyError(
+                f"{context}:post_bookkeeping: broker returned an invalid "
+                "close-fill set"
+            )
+        if post_bookkeeping_fills:
+            raise PortfolioSafetyError(
+                f"{context}:post_bookkeeping: broker liquidated an unexpected "
+                f"raced position ({len(post_bookkeeping_fills)} fills)"
+            )
+        # Both account proofs are flat and every close fill was booked. Remove
+        # the pre-flatten mark-to-market component so status/drawdown does not
+        # count the same remaining loss once as realized and again as unrealized.
+        self._circuit.update_unrealized_pnl(0.0)
+        if bookkeeping_error is not None:
+            if isinstance(bookkeeping_error, PortfolioSafetyError):
+                raise bookkeeping_error
+            raise PortfolioSafetyError(
+                f"{context}: verified-flat bookkeeping failed: "
+                f"{bookkeeping_error}"
+            ) from bookkeeping_error
+        return entries
 
-        # Phase 3.2 — post-run alpha validation report. Best-effort
-        # only: any failure here is logged and swallowed so shutdown
-        # can never be delayed or blocked by post-run analytics.
-        self._generate_daily_alpha_report()
+    def _handle_circuit_block(
+        self,
+        state: CircuitState,
+        open_positions: list,
+        unrealized_pnl: float,
+    ) -> bool:
+        """Apply one circuit transition immediately and report whether blocked."""
+        if self._circuit.is_trading_allowed:
+            return False
 
-        log.info(
-            "bot.shutdown",
-            trades_closed=len(entries),
-            daily_pnl=format_currency(self._portfolio.get_daily_pnl()),
-        )
+        log.warning("bot.circuit_active", state=state.value)
+        if state == CircuitState.HALTED:
+            log.critical(
+                "bot.emergency_close",
+                positions=len(open_positions),
+                unrealized_pnl=round(unrealized_pnl, 2),
+            )
+            entries = self._flatten_all_and_verify("circuit_breaker_halt")
+            # A broker-wide emergency flatten is terminal for this process;
+            # timed circuit recovery is for monitoring, never auto-reentry.
+            self.stop()
+            for entry in entries:
+                self._notify.notify_trade_closed(
+                    symbol=entry.symbol,
+                    side=entry.side,
+                    shares=entry.shares,
+                    entry_price=entry.entry_price,
+                    exit_price=entry.exit_price,
+                    pnl=entry.pnl,
+                    rr_ratio=entry.rr_ratio,
+                    hold_time_minutes=entry.hold_time_minutes,
+                    exit_reason=entry.exit_reason,
+                )
+
+        self._notify_circuit_state_change(state)
+        return True
 
     def _notify_circuit_state_change(self, state: CircuitState) -> None:
         """Notify and consult the advisor once per circuit state transition."""
         if state == self._last_circuit_alert_state:
             return
+
+        # Commit the transition before any external side effect.  If Slack
+        # succeeds and the advisor then fails, retrying this method must not send
+        # the same circuit alert again on the next tick.
+        self._last_circuit_alert_state = state
 
         cb_status = self._circuit.get_status()
         self._notify.notify_circuit_breaker(
@@ -429,12 +646,13 @@ class TradingBot:
             action=cb_rec.action,
             reasons=cb_rec.reasons,
         )
-        self._last_circuit_alert_state = state
 
     def _tick(self) -> None:
         """Single iteration of the main trading loop."""
         # 0a. Check if a new trading day started (auto-reset daily state)
         self._check_daily_reset()
+        if self._shutdown_requested():
+            return
 
         # 0b. Feed unrealized P&L to circuit breaker so it can halt
         #    BEFORE a catastrophic open position is closed at a loss.
@@ -444,32 +662,7 @@ class TradingBot:
 
         # 1. Check circuit breaker FIRST (NON-NEGOTIABLE)
         state = self._circuit.check()
-        if not self._circuit.is_trading_allowed:
-            log.warning("bot.circuit_active", state=state.value)
-
-            # EMERGENCY: close all open positions when circuit breaker halts
-            # to prevent unrealized losses from growing further.
-            if state == CircuitState.HALTED and open_positions:
-                log.critical(
-                    "bot.emergency_close",
-                    positions=len(open_positions),
-                    unrealized_pnl=round(unrealized, 2),
-                )
-                entries = self._portfolio.close_all("circuit_breaker_halt")
-                for entry in entries:
-                    self._notify.notify_trade_closed(
-                        symbol=entry.symbol,
-                        side=entry.side,
-                        shares=entry.shares,
-                        entry_price=entry.entry_price,
-                        exit_price=entry.exit_price,
-                        pnl=entry.pnl,
-                        rr_ratio=entry.rr_ratio,
-                        hold_time_minutes=entry.hold_time_minutes,
-                        exit_reason=entry.exit_reason,
-                    )
-
-            self._notify_circuit_state_change(state)
+        if self._handle_circuit_block(state, open_positions, unrealized):
             return
 
         # A recovery or reset makes the next halt a new transition.
@@ -477,8 +670,11 @@ class TradingBot:
 
         # 2. Check hard time exit SECOND
         if is_near_close(minutes_before=10):
-            if self._portfolio.get_open_positions():
-                entries = self._portfolio.close_all("hard_time_exit")
+            # Always use the broker-wide boundary, even when local tracking is
+            # empty.  This is the last safety net for inherited positions or
+            # orphan orders that the process does not know about.
+            entries = self._flatten_all_and_verify("hard_time_exit")
+            if entries:
                 log.info("bot.time_exit", trades_closed=len(entries))
 
                 # Notify on time exit closures
@@ -566,12 +762,20 @@ class TradingBot:
                     exit_reason=e.exit_reason,
                 )
 
-        # 7. Only look for new entries during active hours
-        if not is_market_open():
+        # Position exits can realize a loss and transition the breaker during
+        # this same tick. Refresh the remaining unrealized component, evaluate
+        # again, and apply the identical terminal HALTED cleanup before either
+        # a market-hours scan or a closed-market return. A tick that crosses the
+        # closing bell must not defer an emergency flatten to the next interval.
+        open_positions = self._portfolio.get_open_positions()
+        unrealized = sum(position.pnl_unrealized for position in open_positions)
+        self._circuit.update_unrealized_pnl(unrealized)
+        state = self._circuit.check()
+        if self._handle_circuit_block(state, open_positions, unrealized):
             return
 
-        # Re-check circuit breaker after position updates
-        if not self._circuit.is_trading_allowed:
+        # 7. Only look for new entries during active hours
+        if not is_market_open():
             return
 
         # 8. Scan for candidates
@@ -915,8 +1119,16 @@ class TradingBot:
                 )
                 continue
 
-            # Execute trade
-            position = self._portfolio.open_position(signal, risk_result)
+            # Execute only while the monotonic shutdown gate is still open.
+            # This check is intentionally adjacent to broker submission: a
+            # SIGTERM during scanning/advice must not create a late position.
+            position = self._open_position_if_running(signal, risk_result)
+            if position is None:
+                log.info(
+                    "bot.entry_aborted_shutdown",
+                    symbol=candidate.symbol,
+                )
+                return
 
             # Check if entry was rejected by broker
             if position.shares == 0:
@@ -966,6 +1178,12 @@ class TradingBot:
                 risk=format_currency(risk_result.risk_dollars),
                 regime=self._current_regime,
             )
+
+    def _open_position_if_running(self, signal, risk_result):
+        """Submit one entry only if shutdown has not been requested."""
+        if self._shutdown_requested():
+            return None
+        return self._portfolio.open_position(signal, risk_result)
 
     @staticmethod
     def _candidate_to_dashboard(candidate) -> dict[str, object]:
@@ -1107,20 +1325,21 @@ class TradingBot:
                 new_date=today,
             )
 
-            # Generate end-of-day report for previous day
-            self._generate_daily_summary()
+            # Treat the rollover as a transaction: first prove broker state,
+            # then prove the post-reconciliation equity, and only then commit
+            # any new-day state.  Failure leaves the previous date/counters
+            # intact and propagates to the loop's hard safety halt.
+            self._portfolio.reconcile_positions()
+            if self._shutdown_requested():
+                return
+            equity = self._strict_account_equity("daily_reset")
 
-            # Phase 3.2: alpha validation report for the day that just
-            # ended. Uses the PREVIOUS date explicitly so the dated CSVs
-            # picked up by the rotation scheme are the correct ones.
+            # Reports observe the completed previous day before its counters
+            # are cleared.  They are still non-authoritative for safety.
+            self._generate_daily_summary()
             self._generate_daily_alpha_report(date=self._last_trading_date)
 
-            # Reset all daily counters
-            try:
-                equity = self._broker.get_account_equity()
-            except Exception:
-                equity = self._starting_equity + self._portfolio.get_daily_pnl()
-
+            # Commit all daily state only after both safety proofs succeeded.
             self._starting_equity = equity
             self._circuit.reset_daily(equity)
             self._sizer.reset_daily()
@@ -1129,12 +1348,6 @@ class TradingBot:
             self._premarket_watchlist = []
             self._rejected_signals.clear()
             self._last_trading_date = today
-
-            # Reconcile positions on new day
-            try:
-                self._portfolio.reconcile_positions()
-            except Exception as e:
-                log.error("bot.daily_reconcile_error", error=str(e))
 
             log.info(
                 "bot.new_day_started",

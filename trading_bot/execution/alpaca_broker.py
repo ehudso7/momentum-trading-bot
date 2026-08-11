@@ -7,8 +7,10 @@ Paper trading uses Alpaca's paper trading environment.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 
 import structlog
 
@@ -34,6 +36,15 @@ _TERMINAL_ORDER_STATUSES = {
     "done_for_day",
 }
 
+# After a filled long bracket parent, Alpaca normally reports the take-profit
+# limit as ``new`` while its contingent stop remains ``held`` until the stop
+# price triggers.  That ``held`` stop is the broker-managed protective half of
+# the OCO pair, not an unsubmitted client-side stop.  Status acceptance is
+# therefore leg-type specific; unknown and transitional statuses still fail
+# closed.
+_ACTIVE_TAKE_PROFIT_STATUS = "new"
+_PROTECTIVE_STOP_STATUSES = {"new", "held"}
+
 
 def _enum_value(value: object) -> str:
     """Return the wire value for alpaca-py string enums.
@@ -45,6 +56,47 @@ def _enum_value(value: object) -> str:
     """
     raw = getattr(value, "value", value)
     return str(raw or "").strip().lower()
+
+
+def _strict_integral_qty(
+    value: object,
+    *,
+    allow_zero: bool = True,
+    allow_negative: bool = False,
+) -> int | None:
+    """Normalize an exact broker quantity without ever truncating it.
+
+    Alpaca serializes quantities as strings, often with a ``.0`` suffix.  A
+    plain ``int(float(value))`` silently turns a fractional broker quantity
+    such as 647.5 into 647 and can make an oversized exit look exact.  Invalid,
+    non-finite, fractional, boolean, and disallowed signed values therefore
+    return ``None`` so lifecycle validation fails closed.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if (
+        not decimal_value.is_finite()
+        or decimal_value != decimal_value.to_integral_value()
+    ):
+        return None
+    qty = int(decimal_value)
+    if allow_negative:
+        if not allow_zero and qty == 0:
+            return None
+    elif qty < 0 or (not allow_zero and qty == 0):
+        return None
+    return qty
+
+
+def _require_positive_integral_qty(value: object) -> int:
+    qty = _strict_integral_qty(value, allow_zero=False)
+    if qty is None:
+        raise ValueError(f"Quantity must be a positive whole number: {value!r}")
+    return qty
 
 
 class AlpacaBroker(BrokerBase):
@@ -66,6 +118,7 @@ class AlpacaBroker(BrokerBase):
             paper=config.alpaca_paper,
         )
         self._paper = config.alpaca_paper
+        self._last_close_fills: list[dict] = []
         log.info("alpaca.connected", paper=self._paper)
 
     @staticmethod
@@ -128,9 +181,16 @@ class AlpacaBroker(BrokerBase):
     def _leg_payload(leg: object) -> dict:
         return {
             "id": str(getattr(leg, "id", "")),
+            "symbol": str(getattr(leg, "symbol", "") or ""),
+            "side": _enum_value(getattr(leg, "side", "")),
+            "qty": _strict_integral_qty(
+                getattr(leg, "qty", None), allow_zero=False
+            ),
             "status": _enum_value(getattr(leg, "status", "")),
             "type": _enum_value(getattr(leg, "type", "")),
-            "filled_qty": int(getattr(leg, "filled_qty", 0) or 0),
+            "filled_qty": _strict_integral_qty(
+                getattr(leg, "filled_qty", 0), allow_zero=True
+            ),
             "filled_avg_price": float(
                 getattr(leg, "filled_avg_price", 0.0) or 0.0
             ),
@@ -139,21 +199,51 @@ class AlpacaBroker(BrokerBase):
         }
 
     @classmethod
-    def _bracket_leg_ids(cls, order: object) -> tuple[str, str]:
-        stop_id = ""
-        tp_id = ""
+    def _bracket_leg_ids(
+        cls, order: object, expected_qty: int | None = None
+    ) -> tuple[str, str]:
+        """Return one verified, working SELL stop/target pair.
+
+        Alpaca can expose child IDs before the legs are usable.  Submission
+        hints therefore obey the same side/quantity/status requirements as a
+        later nested parent read; callers must never treat an arbitrary pair
+        of child IDs as protection for the position.
+        """
+        # Child IDs can be present while the entry is still pending.  They are
+        # evidence of live protection only on a freshly observed filled parent.
+        if _enum_value(getattr(order, "status", "")) != "filled":
+            return "", ""
+
+        stop_ids: list[str] = []
+        tp_ids: list[str] = []
         for leg in getattr(order, "legs", None) or []:
             payload = cls._leg_payload(leg)
+            if (
+                not payload["id"]
+                or payload["side"] != "sell"
+                or payload["qty"] is None
+                or (
+                    expected_qty is not None
+                    and payload["qty"] != expected_qty
+                )
+            ):
+                continue
             order_type = payload["type"]
             if payload["stop_price"] > 0 or order_type in {
                 "stop",
                 "stop_limit",
                 "trailing_stop",
             }:
-                stop_id = payload["id"]
+                if payload["status"] in _PROTECTIVE_STOP_STATUSES:
+                    stop_ids.append(payload["id"])
             elif payload["limit_price"] > 0 or order_type == "limit":
-                tp_id = payload["id"]
-        return stop_id, tp_id
+                if payload["status"] == _ACTIVE_TAKE_PROFIT_STATUS:
+                    tp_ids.append(payload["id"])
+        # Bracket protection is atomic: one working leg without its OCO
+        # partner (or an ambiguous duplicate pair) is not a ready bracket.
+        if len(stop_ids) != 1 or len(tp_ids) != 1:
+            return "", ""
+        return stop_ids[0], tp_ids[0]
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_account_equity(self) -> float:
@@ -168,23 +258,36 @@ class AlpacaBroker(BrokerBase):
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_positions(self) -> list[dict]:
         positions = self._client.get_all_positions()
-        return [
-            {
-                "symbol": p.symbol,
-                "qty": int(p.qty),
-                "avg_entry_price": float(p.avg_entry_price),
-                "current_price": float(p.current_price),
-                "unrealized_pl": float(p.unrealized_pl),
-                "market_value": float(p.market_value),
-            }
-            for p in positions
-        ]
+        normalized = []
+        for position in positions:
+            qty = _strict_integral_qty(
+                getattr(position, "qty", None),
+                allow_zero=False,
+                allow_negative=True,
+            )
+            if qty is None:
+                raise RuntimeError(
+                    "Alpaca returned a non-integral or invalid position "
+                    f"quantity for {getattr(position, 'symbol', '')!s}"
+                )
+            normalized.append(
+                {
+                    "symbol": position.symbol,
+                    "qty": qty,
+                    "avg_entry_price": float(position.avg_entry_price),
+                    "current_price": float(position.current_price),
+                    "unrealized_pl": float(position.unrealized_pl),
+                    "market_value": float(position.market_value),
+                }
+            )
+        return normalized
 
     def submit_market_order(self, symbol: str, qty: int, side: OrderSide) -> str:
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
+        qty = _require_positive_integral_qty(qty)
         client_order_id = self._client_order_id("market", symbol)
         request = MarketOrderRequest(
             symbol=symbol,
@@ -228,6 +331,7 @@ class AlpacaBroker(BrokerBase):
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import LimitOrderRequest
 
+        qty = _require_positive_integral_qty(qty)
         client_order_id = self._client_order_id("limit", symbol)
         request = LimitOrderRequest(
             symbol=symbol,
@@ -266,6 +370,7 @@ class AlpacaBroker(BrokerBase):
             TakeProfitRequest,
         )
 
+        qty = _require_positive_integral_qty(qty)
         client_order_id = self._client_order_id("bracket", symbol)
         request = MarketOrderRequest(
             symbol=symbol,
@@ -283,7 +388,7 @@ class AlpacaBroker(BrokerBase):
         # Alpaca activates bracket legs only after the parent fills.  They may
         # legitimately be absent from the immediate submission response; the
         # portfolio manager retrieves the parent again with nested=True.
-        stop_id, tp_id = self._bracket_leg_ids(order)
+        stop_id, tp_id = self._bracket_leg_ids(order, expected_qty=qty)
 
         log.info(
             "alpaca.bracket_order",
@@ -307,6 +412,7 @@ class AlpacaBroker(BrokerBase):
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import StopOrderRequest
 
+        qty = _require_positive_integral_qty(qty)
         client_order_id = self._client_order_id("stop", symbol)
         request = StopOrderRequest(
             symbol=symbol,
@@ -332,6 +438,7 @@ class AlpacaBroker(BrokerBase):
     ) -> str:
         from alpaca.trading.requests import ReplaceOrderRequest
 
+        qty = _require_positive_integral_qty(qty)
         client_order_id = self._client_order_id("replace", "stop")
         request = ReplaceOrderRequest(
             qty=qty,
@@ -373,6 +480,13 @@ class AlpacaBroker(BrokerBase):
     def cancel_order(self, order_id: str) -> bool:
         try:
             current = self.get_order_status(order_id)
+            if str(current.get("id", "") or "") != str(order_id):
+                log.error(
+                    "alpaca.cancel_identity_mismatch",
+                    order_id=order_id,
+                    observed_order_id=current.get("id"),
+                )
+                return False
             if current.get("status") in _TERMINAL_ORDER_STATUSES:
                 return current.get("status") in {
                     "canceled",
@@ -384,6 +498,13 @@ class AlpacaBroker(BrokerBase):
             deadline = time.monotonic() + _ORDER_CONFIRM_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 current = self.get_order_status(order_id)
+                if str(current.get("id", "") or "") != str(order_id):
+                    log.error(
+                        "alpaca.cancel_identity_mismatch",
+                        order_id=order_id,
+                        observed_order_id=current.get("id"),
+                    )
+                    return False
                 status = current.get("status")
                 if status in {"canceled", "cancelled", "expired", "replaced"}:
                     log.info("alpaca.order_cancelled", order_id=order_id)
@@ -402,18 +523,29 @@ class AlpacaBroker(BrokerBase):
             log.error("alpaca.cancel_error", order_id=order_id, error=str(e))
             return False
 
+    def _get_open_orders(self, symbols: list[str] | None = None) -> list[object]:
+        """Return every currently open order, including nested bracket legs."""
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        request_kwargs: dict[str, object] = {
+            "status": QueryOrderStatus.OPEN,
+            "nested": True,
+        }
+        if symbols:
+            request_kwargs["symbols"] = symbols
+        request = GetOrdersRequest(**request_kwargs)
+        orders = self._client.get_orders(filter=request)
+        if not isinstance(orders, list):
+            raise RuntimeError(
+                "Alpaca open-order query returned an unrecognized payload"
+            )
+        return orders
+
     def cancel_open_orders_for_symbol(self, symbol: str) -> bool:
         """Cancel and confirm every open order for a symbol."""
         try:
-            from alpaca.trading.enums import QueryOrderStatus
-            from alpaca.trading.requests import GetOrdersRequest
-
-            request = GetOrdersRequest(
-                status=QueryOrderStatus.OPEN,
-                symbols=[symbol],
-                nested=True,
-            )
-            orders = self._client.get_orders(filter=request)
+            orders = self._get_open_orders([symbol])
         except Exception as e:
             log.error(
                 "alpaca.open_orders_lookup_error", symbol=symbol, error=str(e)
@@ -462,17 +594,226 @@ class AlpacaBroker(BrokerBase):
     def _position_qty(self, symbol: str) -> int:
         for position in self.get_positions():
             if position.get("symbol") == symbol:
-                return int(position.get("qty", 0))
+                qty = position.get("qty")
+                if not isinstance(qty, int) or isinstance(qty, bool):
+                    raise RuntimeError(
+                        f"Unnormalized broker quantity for {symbol}: {qty!r}"
+                    )
+                return qty
         return 0
 
     def close_all_positions(self) -> bool:
+        """Cancel/flatten globally and retain exact close-fill snapshots."""
+        self._last_close_fills = []
         try:
-            self._client.close_all_positions(cancel_orders=True)
-            log.info("alpaca.all_positions_closed")
+            snapshot_error: Exception | None = None
+            try:
+                positions_before = self.get_positions()
+            except Exception as exc:
+                # An invalid accounting snapshot (for example a fractional
+                # holding created outside this bot) must not prevent the one
+                # operation that makes the account safe.  Flatten first, prove
+                # the live account empty, then return False because exact P&L
+                # bookkeeping cannot be reconstructed from this snapshot.
+                positions_before = []
+                snapshot_error = exc
+                log.critical(
+                    "alpaca.close_all_preclose_snapshot_invalid",
+                    error=str(exc),
+                )
+            responses = self._client.close_all_positions(cancel_orders=True)
+            deadline = time.monotonic() + _ORDER_CONFIRM_TIMEOUT_SECONDS
+            while True:
+                positions_error: Exception | None = None
+                orders_error: Exception | None = None
+                try:
+                    positions = self.get_positions()
+                except Exception as exc:
+                    positions = []
+                    positions_error = exc
+                try:
+                    open_orders = self._get_open_orders()
+                except Exception as exc:
+                    open_orders = []
+                    orders_error = exc
+                if (
+                    positions_error is None
+                    and orders_error is None
+                    and not positions
+                    and not open_orders
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    log.critical(
+                        "alpaca.close_all_unconfirmed",
+                        positions=[p.get("symbol") for p in positions],
+                        open_order_ids=[
+                            str(getattr(order, "id", ""))
+                            for order in open_orders
+                        ],
+                        positions_error=(
+                            str(positions_error) if positions_error else None
+                        ),
+                        orders_error=(str(orders_error) if orders_error else None),
+                    )
+                    return False
+                time.sleep(_ORDER_CONFIRM_POLL_SECONDS)
+
+            if snapshot_error is not None:
+                log.critical(
+                    "alpaca.close_all_accounting_snapshot_unavailable",
+                    error=str(snapshot_error),
+                )
+                return False
+
+            if not positions_before:
+                # A close response despite an empty pre-close snapshot means
+                # broker state changed between reads (or the snapshot was
+                # stale).  There is no trusted signed quantity to match the
+                # fill against, so succeeding with an empty accounting set
+                # would hide an untracked liquidation.  Halt fail-closed.
+                if not isinstance(responses, list) or responses:
+                    log.critical(
+                        "alpaca.close_all_unexpected_flat_snapshot_responses",
+                        response_type=type(responses).__name__,
+                        response_count=(
+                            len(responses)
+                            if isinstance(responses, list)
+                            else None
+                        ),
+                    )
+                    return False
+                log.info("alpaca.all_positions_closed")
+                return True
+            if not isinstance(responses, list):
+                log.critical(
+                    "alpaca.close_all_fill_responses_missing",
+                    response_type=type(responses).__name__,
+                )
+                return False
+
+            close_order_ids = []
+            for response in responses:
+                if isinstance(response, dict):
+                    order_id = response.get("order_id")
+                else:
+                    order_id = getattr(response, "order_id", None)
+                normalized_order_id = str(order_id or "").strip()
+                if not normalized_order_id:
+                    log.critical(
+                        "alpaca.close_all_response_missing_order_id",
+                        response=repr(response),
+                    )
+                    return False
+                close_order_ids.append(normalized_order_id)
+            if (
+                len(close_order_ids) != len(responses)
+                or len(close_order_ids) != len(positions_before)
+                or len(close_order_ids) != len(set(close_order_ids))
+            ):
+                log.critical(
+                    "alpaca.close_all_response_count_or_identity_mismatch",
+                    responses=len(responses),
+                    order_ids=len(close_order_ids),
+                    positions=len(positions_before),
+                )
+                return False
+
+            fills = [
+                self.get_order_status(order_id)
+                for order_id in close_order_ids
+            ]
+            for requested_order_id, fill in zip(close_order_ids, fills):
+                if str(fill.get("id", "") or "") != requested_order_id:
+                    log.critical(
+                        "alpaca.close_all_fill_id_mismatch",
+                        requested_order_id=requested_order_id,
+                        observed_order_id=fill.get("id"),
+                    )
+                    return False
+            expected_by_symbol: dict[str, int] = {}
+            for position in positions_before:
+                symbol = str(position.get("symbol", "") or "").upper()
+                signed_qty = _strict_integral_qty(
+                    position.get("qty"),
+                    allow_zero=False,
+                    allow_negative=True,
+                )
+                if not symbol or signed_qty is None:
+                    log.critical(
+                        "alpaca.close_all_invalid_position_snapshot",
+                        position=position,
+                    )
+                    return False
+                if symbol in expected_by_symbol:
+                    log.critical(
+                        "alpaca.close_all_duplicate_position_symbol",
+                        symbol=symbol,
+                    )
+                    return False
+                expected_by_symbol[symbol] = signed_qty
+            fills_by_symbol: dict[str, list[dict]] = {}
+            for fill in fills:
+                symbol = str(fill.get("symbol", "") or "").upper()
+                fills_by_symbol.setdefault(symbol, []).append(fill)
+
+            validated_fills = []
+            for symbol, signed_qty in expected_by_symbol.items():
+                matching = fills_by_symbol.get(symbol, [])
+                expected_side = "sell" if signed_qty > 0 else "buy"
+                if len(matching) != 1:
+                    log.critical(
+                        "alpaca.close_all_fill_count_mismatch",
+                        symbol=symbol,
+                        count=len(matching),
+                    )
+                    return False
+                fill = matching[0]
+                fill_price = float(
+                    fill.get("filled_avg_price", 0.0) or 0.0
+                )
+                order_qty = _strict_integral_qty(
+                    fill.get("qty"), allow_zero=False
+                )
+                filled_qty = _strict_integral_qty(
+                    fill.get("filled_qty"), allow_zero=False
+                )
+                if (
+                    _enum_value(fill.get("status", "")) != "filled"
+                    or _enum_value(fill.get("side", "")) != expected_side
+                    or order_qty != abs(signed_qty)
+                    or filled_qty != abs(signed_qty)
+                    or not math.isfinite(fill_price)
+                    or fill_price <= 0
+                ):
+                    log.critical(
+                        "alpaca.close_all_fill_unconfirmed",
+                        symbol=symbol,
+                        fill=fill,
+                    )
+                    return False
+                validated_fills.append(dict(fill))
+
+            if len(validated_fills) != len(fills):
+                log.critical(
+                    "alpaca.close_all_unmatched_fill",
+                    expected=len(validated_fills),
+                    observed=len(fills),
+                )
+                return False
+            self._last_close_fills = validated_fills
+            log.info(
+                "alpaca.all_positions_closed",
+                fills=len(validated_fills),
+            )
             return True
         except Exception as e:
             log.error("alpaca.close_all_error", error=str(e))
             return False
+
+    def get_last_close_fills(self) -> list[dict]:
+        """Return immutable snapshots of the last global-flatten fills."""
+        return [dict(fill) for fill in getattr(self, "_last_close_fills", [])]
 
     @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_order_status(self, order_id: str) -> dict:
@@ -485,8 +826,22 @@ class AlpacaBroker(BrokerBase):
             )
             return {
                 "id": str(order.id),
+                "symbol": str(getattr(order, "symbol", "") or ""),
+                "side": _enum_value(getattr(order, "side", "")),
+                "qty": _strict_integral_qty(
+                    getattr(order, "qty", None), allow_zero=False
+                ),
+                "type": _enum_value(getattr(order, "type", "")),
+                "stop_price": float(
+                    getattr(order, "stop_price", 0.0) or 0.0
+                ),
+                "limit_price": float(
+                    getattr(order, "limit_price", 0.0) or 0.0
+                ),
                 "status": _enum_value(order.status),
-                "filled_qty": int(order.filled_qty) if order.filled_qty else 0,
+                "filled_qty": _strict_integral_qty(
+                    getattr(order, "filled_qty", 0), allow_zero=True
+                ),
                 "filled_avg_price": (
                     float(order.filled_avg_price)
                     if order.filled_avg_price
