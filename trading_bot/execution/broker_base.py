@@ -108,7 +108,23 @@ class BrokerBase(ABC):
 
     @abstractmethod
     def close_all_positions(self) -> bool:
-        """Close all open positions. Returns True if successful."""
+        """Cancel open orders and flatten signed positions.
+
+        Return True only after both open orders and positions are confirmed
+        empty and exact close fills are retained for every position that was
+        present. Callers use this as a fail-closed safety boundary.
+        """
+        ...
+
+    @abstractmethod
+    def get_last_close_fills(self) -> list[dict]:
+        """Return exact fills produced by the last account-wide flatten.
+
+        Each normalized snapshot contains at least id, symbol, side, qty,
+        status, filled_qty, and filled_avg_price.  The list is empty when the
+        last flatten had no positions.  Callers must not synthesize realized
+        P&L when an expected fill is absent or ambiguous.
+        """
         ...
 
     @abstractmethod
@@ -116,7 +132,9 @@ class BrokerBase(ABC):
         """
         Get order status.
 
-        Returns dict with keys: id, status, filled_qty, filled_avg_price.
+        Returns a normalized snapshot with id, symbol, side, qty, type,
+        status, stop_price, limit_price, filled_qty, filled_avg_price, and
+        nested ``legs`` when the broker supports bracket orders.
         """
         ...
 

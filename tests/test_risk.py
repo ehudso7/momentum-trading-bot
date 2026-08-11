@@ -283,6 +283,49 @@ class TestCircuitBreaker:
         assert "consecutive_losses" in status
         assert status["daily_pnl"] == -100.0
 
+    def test_partial_realized_pnl_is_visible_without_double_counting_trade(
+        self, risk_config: RiskConfig
+    ):
+        cb = CircuitBreaker(risk_config)
+        cb.reset_daily(100_000.0)
+
+        cb.record_partial_realized_pnl(-100.0)
+        cb.update_unrealized_pnl(-25.0)
+
+        status = cb.get_status()
+        assert status["daily_pnl"] == -100.0
+        assert status["unrealized_pnl"] == -25.0
+        assert status["daily_pnl"] + status["unrealized_pnl"] == -125.0
+        assert status["consecutive_losses"] == 0
+
+        # The complete trade lost $50 after a profitable final tranche. Only
+        # the unrecorded +$50 delta is added to daily P&L; loss-streak semantics
+        # use the complete trade result exactly once.
+        cb.record_trade_result(-50.0, realized_already_recorded=-100.0)
+        status = cb.get_status()
+        assert status["daily_pnl"] == -50.0
+        assert status["consecutive_losses"] == 1
+
+    def test_nonfinite_unrealized_pnl_latches_terminal_halt(
+        self, risk_config: RiskConfig
+    ):
+        for invalid in (float("nan"), float("inf"), float("-inf")):
+            cb = CircuitBreaker(risk_config)
+            cb.reset_daily(25_000.0)
+
+            cb.update_unrealized_pnl(invalid)
+
+            status = cb.get_status()
+            assert cb.state == CircuitState.HALTED
+            assert cb.is_trading_allowed is False
+            assert status["unrealized_pnl"] == 0.0
+            assert "unrealized_pnl_unverified" in status["halt_reason"]
+
+            # A later valid sample cannot erase a data-integrity halt. Only a
+            # verified daily/admin reset may clear it.
+            cb.update_unrealized_pnl(0.0)
+            assert cb.check() == CircuitState.HALTED
+
 
 def _make_position(
     symbol: str,

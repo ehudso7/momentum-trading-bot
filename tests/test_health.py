@@ -180,16 +180,15 @@ class TestHealthMonitorIsHealthy:
 
         assert monitor.is_healthy() is True
 
-    def test_is_healthy_false_when_circuit_breaker_halted(self):
-        """Circuit breaker in halted state makes system unhealthy."""
+    def test_is_healthy_true_when_circuit_breaker_halted(self):
+        """A financial halt is reported separately from operational health."""
         monitor = HealthMonitor()
 
-        # Create a mock circuit breaker with halted state
         mock_cb = MagicMock()
         mock_cb.state.value = "halted"
         monitor.set_circuit_breaker(mock_cb)
 
-        assert monitor.is_healthy() is False
+        assert monitor.is_healthy() is True
 
     def test_is_healthy_true_when_circuit_breaker_active(self):
         """Circuit breaker in active state does not affect health."""

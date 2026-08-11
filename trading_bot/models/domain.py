@@ -108,6 +108,8 @@ class PositionInfo:
     broker_order_ids: list[str] = field(default_factory=list)
     broker_stop_order_id: Optional[str] = None
     broker_tp_order_id: Optional[str] = None
+    broker_filled_qty: dict[str, int] = field(default_factory=dict)
+    broker_filled_notional: dict[str, float] = field(default_factory=dict)
 
     @property
     def total_pnl(self) -> float:

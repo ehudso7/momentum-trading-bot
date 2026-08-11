@@ -139,7 +139,7 @@ class TestSlippageModelVolumeImpact:
 
 
 class TestPaperBrokerSubmitStopOrder:
-    """submit_stop_order() creates pending order."""
+    """submit_stop_order() creates a working order."""
 
     def test_stop_order_returns_order_id(self):
         broker = PaperBroker()
@@ -148,12 +148,12 @@ class TestPaperBrokerSubmitStopOrder:
         assert isinstance(order_id, str)
         assert len(order_id) > 0
 
-    def test_stop_order_status_is_pending(self):
+    def test_stop_order_status_is_new(self):
         broker = PaperBroker()
         order_id = broker.submit_stop_order("TEST", 100, 9.0)
         status = broker.get_order_status(order_id)
 
-        assert status["status"] == "pending"
+        assert status["status"] == "new"
         assert status["symbol"] == "TEST"
         assert status["type"] == "stop"
         assert status["qty"] == 100
@@ -201,7 +201,7 @@ class TestPaperBrokerCleanupStaleOrders:
 
         assert stale_ids == []
         assert order_id in broker._pending_orders
-        assert broker.get_order_status(order_id)["status"] == "pending"
+        assert broker.get_order_status(order_id)["status"] == "new"
 
     def test_cleanup_mixed_stale_and_fresh(self):
         broker = PaperBroker()
@@ -217,7 +217,7 @@ class TestPaperBrokerCleanupStaleOrders:
         assert stale_id in stale_ids
         assert fresh_id not in stale_ids
         assert fresh_id in broker._pending_orders
-        assert broker.get_order_status(fresh_id)["status"] == "pending"
+        assert broker.get_order_status(fresh_id)["status"] == "new"
 
     def test_cleanup_returns_empty_when_no_orders(self):
         broker = PaperBroker()
@@ -238,12 +238,12 @@ class TestPaperBrokerGetOrderStatus:
         assert status["filled_qty"] == 100
         assert status["filled_avg_price"] > 0
 
-    def test_pending_stop_order_status(self):
+    def test_new_stop_order_status(self):
         broker = PaperBroker()
         order_id = broker.submit_stop_order("TEST", 100, 9.0)
 
         status = broker.get_order_status(order_id)
-        assert status["status"] == "pending"
+        assert status["status"] == "new"
         assert status["id"] == order_id
 
     def test_cancelled_order_status(self):
