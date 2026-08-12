@@ -12,9 +12,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-import yaml
 from pydantic import BaseModel, Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    YamlConfigSettingsSource,
+)
 
 
 def _strip_whitespace(value: object) -> object:
@@ -234,36 +237,84 @@ class AppConfig(BaseSettings):
 
     @classmethod
     def from_yaml(cls, path: str = "trading_bot/config/config.yaml") -> "AppConfig":
-        """Load config from YAML file, then overlay .env and env vars."""
+        """Load YAML defaults, then apply dotenv and environment overrides.
+
+        ``BaseSettings`` normally gives explicit initializer values priority
+        over environment variables. Passing the entire YAML mapping directly
+        into ``cls(**yaml_data)`` therefore makes YAML defeat Railway/runtime
+        overrides for every field present in the file.
+
+        This loader gives the sources the intended project precedence:
+
+        1. Canonical ``TRADING_*`` process environment variables.
+        2. Compatibility aliases such as ``ALPACA_API_KEY``.
+        3. Canonical ``TRADING_*`` values from ``.env``.
+        4. YAML defaults.
+        5. File-secret settings.
+
+        Direct ``AppConfig(...)`` construction keeps Pydantic's normal
+        initializer-first behavior for tests and deliberate programmatic
+        overrides.
+        """
         config_path = Path(path)
-        yaml_data: dict = {}
-        if config_path.exists():
-            with open(config_path) as f:
-                yaml_data = yaml.safe_load(f) or {}
 
-        # Inject env vars for secrets if present (override YAML)
-        env_overrides = {}
-        if os.getenv("POLYGON_API_KEY"):
-            env_overrides.setdefault("data", {})["polygon_api_key"] = os.getenv(
-                "POLYGON_API_KEY"
-            )
-        if os.getenv("ALPACA_API_KEY"):
-            env_overrides.setdefault("broker", {})["alpaca_api_key"] = os.getenv(
-                "ALPACA_API_KEY"
-            )
-        if os.getenv("ALPACA_API_SECRET"):
-            env_overrides.setdefault("broker", {})["alpaca_api_secret"] = os.getenv(
-                "ALPACA_API_SECRET"
-            )
+        compatibility_overrides: dict[str, dict[str, str]] = {}
 
-        # Deep merge env_overrides into yaml_data
-        for key, val in env_overrides.items():
-            if isinstance(val, dict) and key in yaml_data:
-                yaml_data[key].update(val)
-            else:
-                yaml_data[key] = val
+        polygon_api_key = os.getenv("POLYGON_API_KEY")
+        if polygon_api_key:
+            compatibility_overrides.setdefault(
+                "data",
+                {},
+            )["polygon_api_key"] = polygon_api_key
 
-        return cls(**yaml_data)
+        alpaca_api_key = os.getenv("ALPACA_API_KEY")
+        if alpaca_api_key:
+            compatibility_overrides.setdefault(
+                "broker",
+                {},
+            )["alpaca_api_key"] = alpaca_api_key
+
+        alpaca_api_secret = os.getenv("ALPACA_API_SECRET")
+        if alpaca_api_secret:
+            compatibility_overrides.setdefault(
+                "broker",
+                {},
+            )["alpaca_api_secret"] = alpaca_api_secret
+
+        class _YamlBackedConfig(cls):
+            @classmethod
+            def settings_customise_sources(
+                _settings_subclass,
+                settings_cls: type[BaseSettings],
+                init_settings: PydanticBaseSettingsSource,
+                env_settings: PydanticBaseSettingsSource,
+                dotenv_settings: PydanticBaseSettingsSource,
+                file_secret_settings: PydanticBaseSettingsSource,
+            ) -> tuple[PydanticBaseSettingsSource, ...]:
+                yaml_settings = YamlConfigSettingsSource(
+                    settings_cls,
+                    yaml_file=config_path,
+                    deep_merge=True,
+                )
+
+                # First source has the highest priority.
+                return (
+                    env_settings,
+                    init_settings,
+                    dotenv_settings,
+                    yaml_settings,
+                    file_secret_settings,
+                )
+
+        loaded = _YamlBackedConfig(
+            **compatibility_overrides
+        )
+
+        # Return the public class rather than leaking the temporary loader
+        # subclass into application code.
+        return cls.model_validate(
+            loaded.model_dump()
+        )
 
     @model_validator(mode="after")
     def validate_safety(self) -> "AppConfig":
