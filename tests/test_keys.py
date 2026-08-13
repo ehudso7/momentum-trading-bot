@@ -1559,3 +1559,98 @@ class TestPhase62Cli:
                 assert marker not in result.stdout, (
                     f"CLI {json_flag} leaked: {marker!r}"
                 )
+
+
+
+class TestRevokeDashPrefixedApiKey:
+    """Dash-prefixed generated keys must remain valid CLI values."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "-" + ("A" * 42),
+            "--" + ("B" * 41),
+        ],
+    )
+    def test_revoke_accepts_option_like_raw_key(
+        self,
+        raw: str,
+        tmp_path: Path,
+    ):
+        revoked_path = tmp_path / "revoked.jsonl"
+
+        rc = keys_main(
+            [
+                "revoke",
+                "--api-key",
+                raw,
+                "--revoked-path",
+                str(revoked_path),
+                "--reason",
+                "dash-prefix-regression",
+            ]
+        )
+
+        assert rc == 0
+        assert revoked_path.exists()
+
+        body = revoked_path.read_text(
+            encoding="utf-8",
+        )
+
+        # The raw key must never be persisted.
+        assert raw not in body
+
+        rows = [
+            json.loads(line)
+            for line in body.splitlines()
+            if line.strip()
+        ]
+
+        assert len(rows) == 1
+        assert rows[0]["key_hash"] == _hash_api_key(raw)
+        assert rows[0]["reason"] == "dash-prefix-regression"
+
+    def test_missing_api_key_value_still_errors(
+        self,
+        tmp_path: Path,
+    ):
+        revoked_path = tmp_path / "must-not-exist.jsonl"
+
+        with pytest.raises(SystemExit) as exc_info:
+            keys_main(
+                [
+                    "revoke",
+                    "--api-key",
+                    "--revoked-path",
+                    str(revoked_path),
+                ]
+            )
+
+        assert exc_info.value.code == 2
+        assert not revoked_path.exists()
+
+    def test_equals_form_remains_supported(
+        self,
+        tmp_path: Path,
+    ):
+        raw = "--" + ("C" * 41)
+        revoked_path = tmp_path / "equals-form.jsonl"
+
+        rc = keys_main(
+            [
+                "revoke",
+                f"--api-key={raw}",
+                "--revoked-path",
+                str(revoked_path),
+            ]
+        )
+
+        assert rc == 0
+
+        body = revoked_path.read_text(
+            encoding="utf-8",
+        )
+
+        assert raw not in body
+        assert _hash_api_key(raw) in body
