@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -254,3 +256,209 @@ def _make_gainer(
         "day_low": price * 0.95,
         "vwap": price * 0.99,
     }
+
+
+
+class TestScannerLatencyGuardrails:
+    """Regression coverage for the August 14 premarket stall."""
+
+    def _make_scanner(
+        self,
+        gainers: list[dict],
+        *,
+        max_candidates: int = 20,
+    ) -> MomentumGapperScanner:
+        market_data = MagicMock()
+        market_data.get_float_shares.return_value = 5_000_000
+        market_data.get_avg_volume.return_value = 100_000
+
+        news_client = MagicMock()
+        news_client.find_catalyst.return_value = None
+
+        polygon_client = MagicMock()
+        polygon_client.get_gainers.return_value = gainers
+
+        return MomentumGapperScanner(
+            market_data=market_data,
+            news_client=news_client,
+            polygon_client=polygon_client,
+            config=ScannerConfig(
+                max_candidates=max_candidates,
+            ),
+        )
+
+    def test_unsupported_punctuation_symbols_are_dropped_before_float_lookup(
+        self,
+    ):
+        scanner = self._make_scanner(
+            [
+                _make_gainer(
+                    "AHT.PRG",
+                    change_pct=90,
+                    volume=9_000_000,
+                ),
+                _make_gainer(
+                    "NE.WSA",
+                    change_pct=80,
+                    volume=8_000_000,
+                ),
+                _make_gainer(
+                    "GOOD",
+                    change_pct=30,
+                    volume=5_000_000,
+                ),
+            ]
+        )
+
+        results = scanner.scan()
+
+        assert [item.symbol for item in results] == ["GOOD"]
+
+        called_symbols = [
+            call.args[0]
+            for call
+            in scanner._data.get_float_shares.call_args_list
+        ]
+
+        assert "AHT.PRG" not in called_symbols
+        assert "NE.WSA" not in called_symbols
+        assert "GOOD" in called_symbols
+
+    def test_expensive_enrichment_pool_is_bounded(
+        self,
+    ):
+        gainers = [
+            _make_gainer(
+                f"SYM{i}",
+                change_pct=100 - i,
+                volume=10_000_000 - i,
+            )
+            for i in range(80)
+        ]
+
+        scanner = self._make_scanner(
+            gainers,
+            max_candidates=20,
+        )
+
+        scanner.scan()
+
+        assert (
+            scanner._data.get_float_shares.call_count
+            <= 20
+        )
+
+    def test_float_filter_stops_after_deadline(
+        self,
+        monkeypatch,
+    ):
+        gainers = [
+            _make_gainer(
+                f"SYM{i}",
+                change_pct=30,
+                volume=5_000_000,
+            )
+            for i in range(10)
+        ]
+
+        scanner = self._make_scanner(gainers)
+
+        values = iter(
+            [
+                0.0,
+                0.0,
+                95.0,
+                95.0,
+                95.0,
+            ]
+        )
+
+        monkeypatch.setattr(
+            "trading_bot.scanners.momentum_gappers.time.monotonic",
+            lambda: next(values, 95.0),
+        )
+
+        results = scanner.scan()
+
+        assert len(results) <= 1
+        assert (
+            scanner._data.get_float_shares.call_count
+            <= 1
+        )
+
+    @pytest.mark.parametrize(
+        "symbol,expected",
+        [
+            ("AAPL", True),
+            ("TSLA1", True),
+            ("AHT.PRG", False),
+            ("NE.WSA", False),
+            ("BBBY.WS", False),
+            ("BRK-B", False),
+            ("", False),
+        ],
+    )
+    def test_supported_symbol_filter(
+        self,
+        symbol: str,
+        expected: bool,
+    ):
+        assert (
+            MomentumGapperScanner._is_supported_symbol(
+                symbol
+            )
+            is expected
+        )
+
+    def test_pathological_slow_enrichment_returns_within_budget(
+        self,
+        monkeypatch,
+    ):
+        """Many slow lookups must not recreate the multi-minute stall."""
+        gainers = [
+            _make_gainer(
+                f"SLOW{i}",
+                change_pct=100.0 - (i * 0.5),
+                volume=10_000_000 - i,
+            )
+            for i in range(80)
+        ]
+
+        scanner = self._make_scanner(
+            gainers,
+            max_candidates=20,
+        )
+
+        # Compress the production 90-second budget to one second so the
+        # regression test completes quickly while exercising the same
+        # deadline logic.
+        monkeypatch.setattr(
+            "trading_bot.scanners.momentum_gappers."
+            "_SCAN_TIME_BUDGET_SECONDS",
+            1.0,
+        )
+
+        def slow_float(_symbol):
+            time.sleep(0.20)
+            return 5_000_000
+
+        scanner._data.get_float_shares.side_effect = slow_float
+
+        started = time.monotonic()
+
+        results = scanner.scan()
+
+        elapsed = time.monotonic() - started
+
+        # One in-flight lookup can finish after the deadline, so allow a
+        # modest scheduling margin. The critical proof is that the scanner
+        # does not process the entire 20-symbol enrichment pool.
+        assert elapsed < 2.0
+        assert scanner._data.get_float_shares.call_count <= 6
+
+        # Once the deadline is exhausted, downstream expensive stages should
+        # not continue chewing through candidates.
+        assert scanner._data.get_avg_volume.call_count <= 1
+        assert scanner._news.find_catalyst.call_count <= 1
+
+        assert isinstance(results, list)
