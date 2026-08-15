@@ -17,6 +17,7 @@ Filter pipeline:
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import structlog
@@ -34,6 +35,14 @@ _MARKET_MINUTES = (
     MARKET_CLOSE.hour * 60 + MARKET_CLOSE.minute
     - MARKET_OPEN.hour * 60 - MARKET_OPEN.minute
 )  # 390
+
+# Scanner latency guardrails.
+#
+# The scanner runs inside the bot's synchronous polling loop. Expensive
+# enrichment across a large candidate universe can otherwise prevent the
+# loop from recording a health tick for several minutes.
+_SCAN_TIME_BUDGET_SECONDS = 90.0
+_MAX_EXPENSIVE_ENRICHMENT_CANDIDATES = 20
 
 
 class MomentumGapperScanner:
@@ -68,6 +77,12 @@ class MomentumGapperScanner:
         Each step is a filter that reduces the candidate pool.
         Logged at each stage for debugging.
         """
+        scan_started_at = time.monotonic()
+        scan_deadline = (
+            scan_started_at
+            + _SCAN_TIME_BUDGET_SECONDS
+        )
+
         # Step 1: Fetch gainers (Polygon primary, Alpaca fallback)
         raw_gainers = self._fetch_gainers()
         log.info("scanner.raw_gainers", count=len(raw_gainers))
@@ -99,9 +114,99 @@ class MomentumGapperScanner:
             dropped_symbols=sorted(dropped_gap)[:10] if dropped_gap else [],
         )
 
+        # Step 3b: Reject unsupported symbol formats before expensive
+        # enrichment. The low-float equity strategy does not support
+        # preferred/warrant/unit-style symbols such as AHT.PRG or BBBY.WS.
+        before_symbol = set(
+            s["symbol"]
+            for s in candidates
+        )
+
+        candidates = [
+            s
+            for s in candidates
+            if self._is_supported_symbol(
+                str(
+                    s.get(
+                        "symbol",
+                        "",
+                    )
+                )
+            )
+        ]
+
+        after_symbol = set(
+            s["symbol"]
+            for s in candidates
+        )
+
+        dropped_symbol = (
+            before_symbol
+            - after_symbol
+        )
+
+        log.info(
+            "scanner.after_symbol_filter",
+            count=len(candidates),
+            dropped=len(dropped_symbol),
+            dropped_symbols=(
+                sorted(dropped_symbol)[:10]
+                if dropped_symbol
+                else []
+            ),
+        )
+
+        # Rank using only cheap screener fields before expensive float/news
+        # enrichment. This caps the amount of blocking third-party work per
+        # synchronous bot tick.
+        candidates.sort(
+            key=lambda item: (
+                float(
+                    item.get(
+                        "change_pct",
+                        0,
+                    )
+                    or 0
+                ),
+                int(
+                    item.get(
+                        "volume",
+                        0,
+                    )
+                    or 0
+                ),
+            ),
+            reverse=True,
+        )
+
+        enrichment_limit = min(
+            len(candidates),
+            max(
+                self._config.max_candidates,
+                min(
+                    _MAX_EXPENSIVE_ENRICHMENT_CANDIDATES,
+                    self._config.max_candidates + 5,
+                ),
+            ),
+        )
+
+        if len(candidates) > enrichment_limit:
+            log.info(
+                "scanner.enrichment_pool_limited",
+                before=len(candidates),
+                after=enrichment_limit,
+            )
+
+        candidates = candidates[
+            :enrichment_limit
+        ]
+
         # Step 4: Float filter
         before_float = set(s["symbol"] for s in candidates)
-        candidates = self._filter_float(candidates)
+        candidates = self._filter_float(
+            candidates,
+            deadline=scan_deadline,
+        )
         after_float = set(s["symbol"] for s in candidates)
         dropped_float = before_float - after_float
         log.info(
@@ -113,7 +218,10 @@ class MomentumGapperScanner:
 
         # Step 5: Relative volume filter
         before_vol = set(s["symbol"] for s in candidates)
-        candidates = self._filter_volume(candidates)
+        candidates = self._filter_volume(
+            candidates,
+            deadline=scan_deadline,
+        )
         after_vol = set(s["symbol"] for s in candidates)
         dropped_vol = before_vol - after_vol
         log.info(
@@ -142,6 +250,21 @@ class MomentumGapperScanner:
         # Step 7: Build ScanResults with catalyst check, scoring, and persistence boost
         results = []
         for c in candidates:
+            if time.monotonic() >= scan_deadline:
+                log.warning(
+                    "scanner.deadline_reached",
+                    stage="catalyst",
+                    completed=len(results),
+                    remaining=(
+                        len(candidates)
+                        - len(results)
+                    ),
+                    budget_seconds=(
+                        _SCAN_TIME_BUDGET_SECONDS
+                    ),
+                )
+                break
+
             catalyst = self._news.find_catalyst(c["symbol"])
             base_score = self._compute_score(
                 gap_pct=c["change_pct"],
@@ -188,6 +311,24 @@ class MomentumGapperScanner:
         )
 
         return results
+
+    @staticmethod
+    def _is_supported_symbol(
+        symbol: str,
+    ) -> bool:
+        """Return whether a symbol belongs in the common-equity scanner.
+
+        Punctuation-bearing symbols commonly represent preferred shares,
+        warrants, units, indices, or vendor-specific synthetic tickers. Those
+        instruments are not supported by this strategy and trigger expensive
+        downstream lookup failures.
+        """
+        normalized = symbol.strip().upper()
+
+        if not normalized:
+            return False
+
+        return normalized.isalnum()
 
     def _fetch_gainers(self) -> list[dict]:
         """
@@ -276,7 +417,12 @@ class MomentumGapperScanner:
             <= self._config.max_gap_pct
         ]
 
-    def _filter_float(self, snapshots: list[dict]) -> list[dict]:
+    def _filter_float(
+        self,
+        snapshots: list[dict],
+        *,
+        deadline: float | None = None,
+    ) -> list[dict]:
         """
         Filter by float < max_float_shares.
 
@@ -285,7 +431,24 @@ class MomentumGapperScanner:
         but scored lower.
         """
         results = []
-        for s in snapshots:
+        for index, s in enumerate(snapshots):
+            if (
+                deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                log.warning(
+                    "scanner.deadline_reached",
+                    stage="float",
+                    completed=index,
+                    remaining=(
+                        len(snapshots) - index
+                    ),
+                    budget_seconds=(
+                        _SCAN_TIME_BUDGET_SECONDS
+                    ),
+                )
+                break
+
             float_shares = self._data.get_float_shares(s["symbol"])
             s["float_shares"] = float_shares
 
@@ -308,11 +471,33 @@ class MomentumGapperScanner:
 
         return results
 
-    def _filter_volume(self, snapshots: list[dict]) -> list[dict]:
+    def _filter_volume(
+        self,
+        snapshots: list[dict],
+        *,
+        deadline: float | None = None,
+    ) -> list[dict]:
         """Filter by relative volume >= min_relative_volume."""
         tod_factor = self._time_of_day_factor()
         results = []
-        for s in snapshots:
+        for index, s in enumerate(snapshots):
+            if (
+                deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                log.warning(
+                    "scanner.deadline_reached",
+                    stage="volume",
+                    completed=index,
+                    remaining=(
+                        len(snapshots) - index
+                    ),
+                    budget_seconds=(
+                        _SCAN_TIME_BUDGET_SECONDS
+                    ),
+                )
+                break
+
             avg_vol = self._data.get_avg_volume(s["symbol"])
             current_vol = s.get("volume", 0)
 

@@ -24,6 +24,7 @@ class APIErrorType(str, Enum):
     TIMEOUT = "timeout"
     RATE_LIMIT = "rate_limit"
     AUTH_ERROR = "auth_error"
+    NOT_FOUND = "not_found"
     SERVER_ERROR = "server_error"
     CONNECTION_ERROR = "connection_error"
     UNKNOWN = "unknown"
@@ -40,6 +41,15 @@ def classify_error(error: Exception) -> APIErrorType:
         return APIErrorType.RATE_LIMIT
     if any(x in error_str for x in ["401", "403", "unauthorized", "forbidden", "auth"]):
         return APIErrorType.AUTH_ERROR
+    if any(
+        x in error_str
+        for x in [
+            "404",
+            "not found",
+            "not_found",
+        ]
+    ):
+        return APIErrorType.NOT_FOUND
     if any(x in error_str for x in ["500", "502", "503", "504", "server error", "internal"]):
         return APIErrorType.SERVER_ERROR
     if any(x in error_type for x in ["connection", "network", "dns"]):
@@ -83,11 +93,16 @@ def retry_with_backoff(
                     last_error = e
                     error_type = classify_error(e)
 
-                    # Don't retry auth errors
-                    if error_type == APIErrorType.AUTH_ERROR:
+                    # Permanent caller/data errors must fail immediately.
+                    # Retrying them only blocks the synchronous trading loop.
+                    if error_type in {
+                        APIErrorType.AUTH_ERROR,
+                        APIErrorType.NOT_FOUND,
+                    }:
                         log.error(
-                            "api.auth_error_no_retry",
+                            "api.permanent_error_no_retry",
                             func=func.__name__,
+                            error_type=error_type.value,
                             error=str(e),
                         )
                         raise
