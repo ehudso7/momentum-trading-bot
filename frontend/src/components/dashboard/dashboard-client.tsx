@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { FileDown, RefreshCw } from "lucide-react";
-import { motion } from "framer-motion";
 import { Header } from "@/components/dashboard/header";
 import { StatsCards } from "@/components/dashboard/stats-cards";
 import { Scanner } from "@/components/dashboard/scanner";
@@ -73,7 +72,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
     } else {
       const err = results[1].reason;
       setScannerError(
-        err instanceof Error ? err.message : "Failed to load signals"
+        err instanceof Error ? err.message : "Failed to load scanner data"
       );
     }
 
@@ -111,12 +110,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
   };
 
   return (
-    <div className="min-h-screen bg-[#0a0b14]">
-      <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -left-1/4 top-0 h-[500px] w-[500px] rounded-full bg-cyan-500/10 blur-[120px]" />
-        <div className="absolute -right-1/4 bottom-0 h-[500px] w-[500px] rounded-full bg-blue-600/10 blur-[120px]" />
-      </div>
-
+    <div className="min-h-screen bg-[#0f1211]">
       <Header
         mode={mode}
         backendOnline={backendOnline}
@@ -124,17 +118,16 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
       />
 
       <main className="relative mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8">
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between"
-        >
+        <div className="mb-6 flex flex-col gap-4 border-b border-white/10 pb-5 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-white sm:text-3xl">
-              Trading Command Center
+            <p className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-[#84968e]">
+              Private operations
+            </p>
+            <h1 className="text-2xl font-semibold tracking-tight text-[#f2f0e8] sm:text-3xl">
+              Trading command center
             </h1>
             <p className="mt-1 text-sm text-zinc-400">
-              Private paper-trading operations with real market scanner data
+              Paper-trading status, market observations, risk controls, and evidence
             </p>
           </div>
           <div className="flex gap-2">
@@ -147,7 +140,7 @@ export function DashboardClient({ userEmail }: DashboardClientProps) {
               Export PDF
             </Button>
           </div>
-        </motion.div>
+        </div>
 
         <div className="mb-6">
           <ModeToggle
