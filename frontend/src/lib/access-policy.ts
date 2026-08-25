@@ -1,16 +1,30 @@
 /** Pure private-access policy helpers shared by Proxy and server routes. */
 
+const TRUE_VALUES = new Set(["true", "1", "on", "yes"]);
+const FALSE_VALUES = new Set(["false", "0", "off", "no"]);
+
+function normalizedEnv(name: string): string {
+  return process.env[name]?.trim().toLowerCase() ?? "";
+}
+
 export function isPrivateMode(): boolean {
-  const configured = process.env.TRADING_PRIVATE_MODE?.trim().toLowerCase();
-  if (configured === "false" || configured === "0" || configured === "off") {
-    return false;
-  }
-  if (configured === "true" || configured === "1" || configured === "on") {
+  const privateMode = normalizedEnv("TRADING_PRIVATE_MODE");
+  const publicProductEnabled = normalizedEnv(
+    "TRADING_PUBLIC_PRODUCT_ENABLED"
+  );
+
+  if (TRUE_VALUES.has(privateMode)) {
     return true;
   }
-  // A production deployment must fail private by default. Public launch is an
-  // explicit future decision, never an accidental missing environment value.
-  return process.env.NODE_ENV === "production";
+
+  // Public mode is a two-key decision. A deployment only leaves private mode
+  // when private mode is explicitly disabled AND the separate public-product
+  // gate is explicitly enabled. Missing, malformed, or partially changed
+  // configuration remains owner-only by default.
+  const privateExplicitlyDisabled = FALSE_VALUES.has(privateMode);
+  const publicExplicitlyEnabled = TRUE_VALUES.has(publicProductEnabled);
+
+  return !(privateExplicitlyDisabled && publicExplicitlyEnabled);
 }
 
 export function ownerEmails(): Set<string> {
