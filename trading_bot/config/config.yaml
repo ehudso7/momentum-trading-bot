@@ -101,3 +101,25 @@ data:
   use_polygon_news: true
   float_cache_hours: 24
   # API keys should be in .env file, not here
+
+# Agent gate: Scout / Veto / Brief layer between the advisor and order
+# placement. Blocking-only — it can veto or shrink an approved entry, never
+# approve a rejected one, never touch the broker, never bypass the circuit
+# breaker, PDT, correlation, or position sizer. Not autonomous trading.
+agents:
+  enabled: true
+  require_scout: false         # true = a failed/disabled scout blocks entries
+                               # AND high-confidence toxic catalysts block
+  block_toxic_catalysts: true  # high-confidence pump/dilution/offering blocks
+                               # (also enforced whenever require_scout is true)
+  llm:
+    enabled: false             # default OFF; scout returns "llm_disabled"
+    provider: "openai"         # openai | anthropic
+    model: "gpt-4.1-mini"      # must match provider (claude-* for anthropic)
+    max_tokens: 200
+    timeout_seconds: 8
+    daily_call_budget: 40      # hard cap on model calls per UTC day
+    # API keys come from env only: OPENAI_API_KEY / ANTHROPIC_API_KEY
+  veto:
+    min_advisor_confidence: 0.55
+    toxic_catalyst_confidence: 0.70

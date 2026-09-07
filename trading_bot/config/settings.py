@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import (
@@ -191,6 +191,69 @@ class DataConfig(BaseModel):
     polygon_rate_limit_per_minute: int = Field(5, ge=1, le=100)
 
 
+class AgentLLMConfig(BaseModel):
+    """
+    Optional LLM catalyst classifier used by the agent gate's scout.
+
+    OFF by default. The scout never trades, never touches the broker, and
+    never sees credentials: provider API keys are read from the process
+    environment (``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY``) at call time,
+    not from this model, so they are never dumped, logged, or serialized.
+    """
+
+    enabled: bool = Field(False)
+    provider: Literal["openai", "anthropic"] = Field("openai")
+    model: str = Field("gpt-4.1-mini", min_length=1)
+    max_tokens: int = Field(200, ge=32, le=2000)
+    timeout_seconds: float = Field(8.0, ge=1.0, le=60.0)
+    daily_call_budget: int = Field(40, ge=0, le=10_000)
+
+    @model_validator(mode="after")
+    def validate_model_matches_provider(self) -> "AgentLLMConfig":
+        """Catch the obvious provider/model mismatch before the first call."""
+        name = self.model.lower()
+        if self.provider == "anthropic" and not name.startswith("claude"):
+            raise ValueError(
+                f"agents.llm.model '{self.model}' is not an Anthropic model; "
+                "set a 'claude-*' model or switch provider to 'openai'"
+            )
+        if self.provider == "openai" and name.startswith("claude"):
+            raise ValueError(
+                f"agents.llm.model '{self.model}' is an Anthropic model; "
+                "set provider to 'anthropic' or choose an OpenAI model"
+            )
+        return self
+
+
+class AgentVetoConfig(BaseModel):
+    """Deterministic rule-veto thresholds for the agent gate."""
+
+    min_advisor_confidence: float = Field(0.55, ge=0.0, le=1.0)
+    # A scout classification at or above this confidence counts as
+    # "high confidence" when deciding whether a toxic catalyst blocks.
+    toxic_catalyst_confidence: float = Field(0.70, ge=0.0, le=1.0)
+
+
+class AgentsConfig(BaseModel):
+    """
+    Scout / Veto / Brief layer between the rule-based advisor and order
+    placement. Blocking-only for safety: the gate can veto or shrink an
+    entry the risk engine already approved, never approve a rejected one
+    or increase size.
+    """
+
+    enabled: bool = Field(True)
+    # When true, a failed or disabled scout blocks the entry, and a
+    # high-confidence toxic classification blocks regardless of
+    # block_toxic_catalysts (a mandatory scout's verdict is honoured).
+    require_scout: bool = Field(False)
+    # When true, a high-confidence pump/dilution/offering classification
+    # blocks the entry even if require_scout is false.
+    block_toxic_catalysts: bool = Field(True)
+    llm: AgentLLMConfig = Field(default_factory=AgentLLMConfig)
+    veto: AgentVetoConfig = Field(default_factory=AgentVetoConfig)
+
+
 class AppConfig(BaseSettings):
     """
     Root application configuration.
@@ -212,6 +275,7 @@ class AppConfig(BaseSettings):
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
     log_level: str = Field("INFO")
     log_json: bool = Field(False)
     journal_csv_path: str = Field("data/journal.csv")

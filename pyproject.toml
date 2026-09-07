@@ -53,6 +53,12 @@ Issues = "https://github.com/ehudso7/momentum-trading-bot/issues"
 backtest = [
     "vectorbt>=0.26",
 ]
+# Optional LLM catalyst scout for the agent gate (agents.llm.enabled).
+# Not required at runtime: the gate defaults to LLM off.
+llm = [
+    "openai>=1.0",
+    "anthropic>=0.40",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
