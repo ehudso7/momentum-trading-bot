@@ -44,6 +44,23 @@ describe('HomeScreen', () => {
     expect(screen.queryByTestId('line-chart')).toBeNull();
   });
 
+  it('renders an em dash rather than NaN or Infinity', async () => {
+    getPortfolio.mockResolvedValue({
+      totalValue: Number.NaN,
+      dayChange: Number.POSITIVE_INFINITY,
+      dayChangePercent: Number.NaN,
+      positions: [],
+    });
+    getLatestSignals.mockResolvedValue([]);
+
+    const screen = renderScreen(<HomeScreen />);
+
+    await waitFor(() => expect(screen.getAllByText('—').length).toBeGreaterThan(0));
+    const text = renderedText(screen.toJSON());
+    expect(text).not.toContain('NaN');
+    expect(text).not.toContain('Infinity');
+  });
+
   it('renders the portfolio value the API returns', async () => {
     getPortfolio.mockResolvedValue({
       totalValue: 4321.99,

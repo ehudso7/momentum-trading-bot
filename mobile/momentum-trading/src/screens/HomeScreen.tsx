@@ -15,6 +15,7 @@ import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
+import { fmtMoney, fmtPct } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
@@ -45,10 +46,6 @@ export default function HomeScreen() {
   // fabricated one (see components/DataUnavailable.tsx).
   const chartData: { labels: string[]; datasets: { data: number[] }[] } | null = null;
 
-  const fmtMoney = (n: number | undefined) =>
-    typeof n === 'number' ? `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—';
-  const fmtPct = (n: number | undefined) =>
-    typeof n === 'number' ? `${n >= 0 ? '+' : ''}${n.toFixed(2)}%` : '—';
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>

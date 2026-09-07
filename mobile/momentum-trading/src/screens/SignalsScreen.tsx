@@ -13,6 +13,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { api, Signal } from '../services/api';
+import { fmtMoney, fmtConfidence, fmtTime } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 type TabKey = 'latest' | 'history';
@@ -81,22 +82,6 @@ export default function SignalsScreen() {
     if (confidence >= 0.8) return '#f59e0b';
     return '#ef4444';
   };
-
-  const formatTime = (timestamp: string) => {
-    const parsed = new Date(timestamp);
-    if (Number.isNaN(parsed.getTime())) return '—';
-    return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
-
-  const fmtPrice = (value: number | undefined) =>
-    typeof value === 'number' && Number.isFinite(value)
-      ? `$${value.toFixed(2)}`
-      : '—';
-
-  const fmtConfidence = (value: number | undefined) =>
-    typeof value === 'number' && Number.isFinite(value)
-      ? `${(value * 100).toFixed(0)}%`
-      : '—';
 
   const handleSubscribeToSignal = (signalId: string) => {
     subscribeToSignalMutation.mutate(signalId);
@@ -179,7 +164,7 @@ export default function SignalsScreen() {
                       <Text style={styles.actionText}>{signal.action}</Text>
                     </View>
                     <Text style={[styles.signalTime, { color: theme.textSecondary }]}>
-                      {formatTime(signal.timestamp)}
+                      {fmtTime(signal.timestamp)}
                     </Text>
                   </View>
                 </View>
@@ -190,7 +175,7 @@ export default function SignalsScreen() {
                       Reference Price
                     </Text>
                     <Text style={[styles.priceValue, { color: theme.text }]}>
-                      {fmtPrice(signal.price)}
+                      {fmtMoney(signal.price)}
                     </Text>
                   </View>
                 </View>

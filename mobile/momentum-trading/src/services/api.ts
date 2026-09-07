@@ -21,20 +21,50 @@ export interface AuthResponse {
   expires_at: string;
 }
 
-export interface Position {
+// The two position endpoints return DIFFERENT shapes, so they get different
+// types. `/portfolio` embeds valuation fields; `/positions` returns the open
+// lot. An earlier revision of this file declared a single `Position` with
+// `shares`/`value`/`change` — those keys exist in neither payload; they were
+// carried over from the screens' old mock data. Typing the client against
+// the fixtures instead of the server is what let PortfolioScreen call
+// `position.value.toLocaleString()` on a field the API never sends.
+//
+// Caveat: the backend declares `PortfolioResponse.positions` as
+// `List[Dict]`, so these fields are read off the handler's literal, not off
+// an enforced schema. Every field is optional here for that reason, and the
+// screens format through src/utils/format.ts so a missing one renders as an
+// em dash rather than crashing.
+
+/** An entry in `/portfolio` -> `positions`. */
+export interface PortfolioPosition {
   symbol: string;
   name?: string;
-  shares: number;
-  value: number;
-  change: number;
-  changePercent: number;
+  quantity?: number;
+  avgPrice?: number;
+  currentPrice?: number;
+  marketValue?: number;
+  dayChange?: number;
+  dayChangePercent?: number;
+  unrealizedGain?: number;
+  unrealizedGainPercent?: number;
+}
+
+/** An entry returned by `/positions`. */
+export interface AccountPosition {
+  symbol: string;
+  quantity?: number;
+  side?: string;
+  entryPrice?: number;
+  currentPrice?: number;
+  unrealizedPnL?: number;
+  entryDate?: string;
 }
 
 export interface PortfolioResponse {
   totalValue: number;
   dayChange: number;
   dayChangePercent: number;
-  positions: Position[];
+  positions: PortfolioPosition[];
 }
 
 export interface Quote {
@@ -141,7 +171,7 @@ class ApiService {
     return this.get('/portfolio');
   }
 
-  async getPositions(): Promise<Position[]> {
+  async getPositions(): Promise<AccountPosition[]> {
     return this.get('/positions');
   }
 

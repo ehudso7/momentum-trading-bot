@@ -43,7 +43,12 @@ describe('PortfolioScreen', () => {
     expect(screen.queryByTestId('line-chart')).toBeNull();
   });
 
-  it('renders positions returned by the API', async () => {
+  // The payload below is the shape trading_bot/api/mobile_routes.py actually
+  // returns from GET /positions. An earlier version of this test invented
+  // `shares`/`value`/`change` keys, matching the old TypeScript type rather
+  // than the server, so it passed while the screen called
+  // `position.value.toLocaleString()` on a field the API never sends.
+  it('renders positions in the shape the backend actually returns', async () => {
     getPortfolio.mockResolvedValue({
       totalValue: 1234.56,
       dayChange: -12.34,
@@ -53,11 +58,12 @@ describe('PortfolioScreen', () => {
     getPositions.mockResolvedValue([
       {
         symbol: 'WXYZ',
-        name: 'Test Holding',
-        shares: 10,
-        value: 500,
-        change: 5,
-        changePercent: 1.01,
+        quantity: 50,
+        side: 'long',
+        entryPrice: 148.25,
+        currentPrice: 150.25,
+        unrealizedPnL: 100,
+        entryDate: '2026-09-07T10:30:00Z',
       },
     ]);
     getPerformance.mockResolvedValue(null);
@@ -65,5 +71,30 @@ describe('PortfolioScreen', () => {
     const screen = renderScreen(<PortfolioScreen />);
 
     await waitFor(() => expect(screen.getByText('WXYZ')).toBeOnTheScreen());
+    expect(screen.getByText('50 shares')).toBeOnTheScreen();
+    expect(screen.getByText('$150.25')).toBeOnTheScreen();
+    expect(screen.getByText('+$100.00')).toBeOnTheScreen();
+    expect(screen.getByText('$1,234.56')).toBeOnTheScreen();
+    expect(screen.getByText('-0.99%')).toBeOnTheScreen();
+  });
+
+  it('renders an em dash rather than NaN when a position omits its numbers', async () => {
+    getPortfolio.mockResolvedValue({
+      totalValue: Number.NaN,
+      dayChange: Number.POSITIVE_INFINITY,
+      dayChangePercent: Number.NaN,
+      positions: [],
+    });
+    getPositions.mockResolvedValue([{ symbol: 'NOPE' }]);
+    getPerformance.mockResolvedValue(null);
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() => expect(screen.getByText('NOPE')).toBeOnTheScreen());
+
+    const text = renderedText(screen.toJSON());
+    expect(text).not.toContain('NaN');
+    expect(text).not.toContain('Infinity');
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
   });
 });

@@ -14,6 +14,13 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { PieChart, LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { api } from '../services/api';
+import {
+  fmtMoney,
+  fmtSignedMoney,
+  fmtPct,
+  fmtQuantity,
+  changeColor,
+} from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
@@ -53,11 +60,6 @@ export default function PortfolioScreen() {
   // shape by the backend, so the chart renders an unavailable state rather
   // than a fabricated curve.
   const performanceSeries: { labels: string[]; datasets: { data: number[] }[] } | null = null;
-
-  const fmtMoney = (n: number | undefined) =>
-    typeof n === 'number' ? `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—';
-  const fmtPct = (n: number | undefined) =>
-    typeof n === 'number' ? `${n >= 0 ? '+' : ''}${n.toFixed(2)}%` : '—';
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -179,16 +181,16 @@ export default function PortfolioScreen() {
                   {position.symbol}
                 </Text>
                 <Text style={[styles.positionName, { color: theme.textSecondary }]}>
-                  {position.shares} shares
+                  {`${fmtQuantity(position.quantity)} shares`}
                 </Text>
               </View>
 
               <View style={styles.positionCenter}>
                 <Text style={[styles.positionValue, { color: theme.text }]}>
-                  ${position.value.toLocaleString()}
+                  {fmtMoney(position.currentPrice)}
                 </Text>
                 <Text style={[styles.positionCompany, { color: theme.textSecondary }]}>
-                  {position.name}
+                  {position.side ?? ''}
                 </Text>
               </View>
 
@@ -196,18 +198,20 @@ export default function PortfolioScreen() {
                 <Text
                   style={[
                     styles.positionChange,
-                    { color: position.change >= 0 ? '#10b981' : '#ef4444' },
+                    { color: changeColor(position.unrealizedPnL, theme.textSecondary) },
                   ]}
                 >
-                  {position.change >= 0 ? '+' : ''}${position.change}
+                  {fmtSignedMoney(position.unrealizedPnL)}
                 </Text>
                 <Text
                   style={[
                     styles.positionPercent,
-                    { color: position.changePercent >= 0 ? '#10b981' : '#ef4444' },
+                    { color: theme.textSecondary },
                   ]}
                 >
-                  {position.changePercent >= 0 ? '+' : ''}{position.changePercent}%
+                  {position.entryPrice !== undefined
+                    ? `entry ${fmtMoney(position.entryPrice)}`
+                    : ''}
                 </Text>
               </View>
             </TouchableOpacity>

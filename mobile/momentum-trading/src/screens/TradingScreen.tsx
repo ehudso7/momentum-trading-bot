@@ -39,6 +39,7 @@ import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { api, Quote } from '../services/api';
+import { fmtMoney, fmtSignedMoney, fmtPct, fmtVolume } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
@@ -113,29 +114,6 @@ export default function TradingScreen() {
   // real ticker reads as that ticker's actual price action.
   const chartData: { labels: string[]; datasets: { data: number[] }[] } | null =
     null;
-
-  const fmtMoney = (value: number | undefined) =>
-    typeof value === 'number' && Number.isFinite(value)
-      ? `$${value.toFixed(2)}`
-      : '\u2014';
-
-  const fmtSignedMoney = (value: number | undefined) =>
-    typeof value === 'number' && Number.isFinite(value)
-      ? `${value >= 0 ? '+' : '-'}$${Math.abs(value).toFixed(2)}`
-      : '\u2014';
-
-  const fmtPct = (value: number | undefined) =>
-    typeof value === 'number' && Number.isFinite(value)
-      ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
-      : '\u2014';
-
-  const fmtVolume = (value: number | undefined) => {
-    if (typeof value !== 'number' || !Number.isFinite(value)) return '\u2014';
-    if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`;
-    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-    if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
-    return String(value);
-  };
 
   // Handle broker deep-link. Try to open the broker's app or website; if the
   // system rejects the URL for any reason we surface a friendly explanation
