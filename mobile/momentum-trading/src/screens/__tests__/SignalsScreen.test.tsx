@@ -2,6 +2,7 @@ import React from 'react';
 import { waitFor } from '@testing-library/react-native';
 import SignalsScreen from '../SignalsScreen';
 import { renderScreen, renderedText, FABRICATED_LITERALS } from './renderScreen';
+import { fmtMoney } from '../../utils/format';
 
 jest.mock('../../contexts/WebSocketContext', () => ({
   useWebSocket: () => ({ subscribe: jest.fn(), lastMessage: null, send: jest.fn() }),
@@ -61,7 +62,7 @@ describe('SignalsScreen', () => {
 
     await waitFor(() => expect(screen.getByText('ZZZZ')).toBeOnTheScreen());
     expect(screen.getByText('VWAP pullback')).toBeOnTheScreen();
-    expect(screen.getByText('$4.32')).toBeOnTheScreen();
+    expect(screen.getByText(fmtMoney(4.32))).toBeOnTheScreen();
     expect(screen.getByText('71%')).toBeOnTheScreen();
     expect(screen.getByText('Held VWAP on the third test.')).toBeOnTheScreen();
   });

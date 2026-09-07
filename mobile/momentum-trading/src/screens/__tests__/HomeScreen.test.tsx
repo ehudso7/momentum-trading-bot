@@ -2,6 +2,7 @@ import React from 'react';
 import { waitFor } from '@testing-library/react-native';
 import HomeScreen from '../HomeScreen';
 import { renderScreen, renderedText, FABRICATED_LITERALS } from './renderScreen';
+import { fmtMoney, fmtSignedMoney } from '../../utils/format';
 
 jest.mock('../../contexts/AuthContext', () => ({
   useAuth: () => ({
@@ -73,7 +74,9 @@ describe('HomeScreen', () => {
     const screen = renderScreen(<HomeScreen />);
 
     await waitFor(() =>
-      expect(renderedText(screen.toJSON())).toContain('4,321.99'),
+      expect(renderedText(screen.toJSON())).toContain(fmtMoney(4321.99)),
     );
+    // The day's P&L carries an explicit sign rather than reading "$1.23".
+    expect(screen.getByText(fmtSignedMoney(1.23))).toBeOnTheScreen();
   });
 });

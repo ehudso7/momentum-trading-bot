@@ -87,8 +87,8 @@ export default function PortfolioScreen() {
 
           <View style={styles.summaryStats}>
             <View style={styles.stat}>
-              <Text style={styles.statValue}>{fmtMoney(portfolio?.dayChange)}</Text>
-              <Text style={styles.statLabel}>Today's Gain</Text>
+              <Text style={styles.statValue}>{fmtSignedMoney(portfolio?.dayChange)}</Text>
+              <Text style={styles.statLabel}>Today's P&L</Text>
             </View>
             <View style={styles.stat}>
               <Text style={styles.statValue}>{fmtPct(portfolio?.dayChangePercent)}</Text>

@@ -15,7 +15,7 @@ import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
-import { fmtMoney, fmtPct } from '../utils/format';
+import { fmtMoney, fmtSignedMoney, fmtPct } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
@@ -79,7 +79,7 @@ export default function HomeScreen() {
           <View style={styles.portfolioStats}>
             <View style={styles.stat}>
               <Text style={styles.statLabel}>Today's P&L</Text>
-              <Text style={styles.statValue}>{fmtMoney(portfolio?.dayChange)}</Text>
+              <Text style={styles.statValue}>{fmtSignedMoney(portfolio?.dayChange)}</Text>
             </View>
             <View style={styles.stat}>
               <Text style={styles.statLabel}>Return</Text>

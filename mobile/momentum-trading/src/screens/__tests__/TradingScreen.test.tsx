@@ -2,6 +2,7 @@ import React from 'react';
 import { waitFor } from '@testing-library/react-native';
 import TradingScreen from '../TradingScreen';
 import { renderScreen, renderedText, FABRICATED_LITERALS } from './renderScreen';
+import { fmtMoney, fmtSignedMoney, fmtPct } from '../../utils/format';
 
 jest.mock('../../contexts/WebSocketContext', () => ({
   useWebSocket: () => ({ subscribe: jest.fn(), lastMessage: null, send: jest.fn() }),
@@ -49,9 +50,11 @@ describe('TradingScreen', () => {
 
     const screen = renderScreen(<TradingScreen />);
 
-    await waitFor(() => expect(screen.getByText('$12.34')).toBeOnTheScreen());
-    expect(screen.getByText('-$0.56 (-4.34%)')).toBeOnTheScreen();
-    expect(screen.getByText('$12.90')).toBeOnTheScreen();
+    await waitFor(() => expect(screen.getByText(fmtMoney(12.34))).toBeOnTheScreen());
+    expect(
+      screen.getByText(`${fmtSignedMoney(-0.56)} (${fmtPct(-4.34)})`),
+    ).toBeOnTheScreen();
+    expect(screen.getByText(fmtMoney(12.9))).toBeOnTheScreen();
     expect(screen.getByText('3.4M')).toBeOnTheScreen();
   });
 

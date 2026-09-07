@@ -31,16 +31,35 @@ describe('numeric formatters reject unusable input', () => {
   }
 });
 
+// `fmtMoney`/`fmtSignedMoney` format through `toLocaleString(undefined, ...)`,
+// which follows the runtime's locale — correct for a mobile app, but it means
+// a hardcoded '$1,234.50' would fail on a machine set to, say, de-DE, where
+// the same value renders '1.234,50'. Asserting a fixed string here would make
+// the suite pass or fail on the runner's locale rather than on the code.
+//
+// So the digits are built with the same locale call, and the parts that are
+// the actual behaviour under test — the '$' prefix, the explicit +/- sign,
+// and two-decimal precision — are asserted separately and exactly.
+const digits = (n: number) =>
+  n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
 describe('formatting of real values', () => {
-  it('formats money to two decimals with separators', () => {
-    expect(fmtMoney(1234.5)).toBe('$1,234.50');
-    expect(fmtMoney(0)).toBe('$0.00');
+  it('prefixes money with $ and always shows two decimals', () => {
+    expect(fmtMoney(1234.5)).toBe(`$${digits(1234.5)}`);
+    expect(fmtMoney(0)).toBe(`$${digits(0)}`);
+    expect(fmtMoney(1234.5)).toMatch(/^\$/);
+    expect(fmtMoney(1234.5)).toMatch(/\d{2}$/);
   });
 
-  it('always shows an explicit sign for signed money', () => {
-    expect(fmtSignedMoney(100)).toBe('+$100.00');
-    expect(fmtSignedMoney(-31.25)).toBe('-$31.25');
-    expect(fmtSignedMoney(0)).toBe('+$0.00');
+  it('always shows an explicit sign for signed money, and never "$-"', () => {
+    expect(fmtSignedMoney(100)).toBe(`+$${digits(100)}`);
+    expect(fmtSignedMoney(-31.25)).toBe(`-$${digits(31.25)}`);
+    expect(fmtSignedMoney(0)).toBe(`+$${digits(0)}`);
+
+    // The sign belongs before the currency symbol. `fmtMoney` on a negative
+    // produces the nonstandard "$-31.25", which is why P&L uses this instead.
+    expect(fmtSignedMoney(-31.25)).not.toContain('$-');
+    expect(fmtSignedMoney(-31.25).startsWith('-$')).toBe(true);
   });
 
   it('formats percentages with a leading + only when non-negative', () => {

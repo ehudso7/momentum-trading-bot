@@ -2,6 +2,10 @@ import React from 'react';
 import { waitFor } from '@testing-library/react-native';
 import PortfolioScreen from '../PortfolioScreen';
 import { renderScreen, renderedText, FABRICATED_LITERALS } from './renderScreen';
+// Compared against the real formatters, not hardcoded strings: fmtMoney uses
+// the runtime locale, so '$1,234.56' would fail on a de-DE runner. Formatter
+// behaviour itself is pinned in src/utils/__tests__/format.test.ts.
+import { fmtMoney, fmtSignedMoney } from '../../utils/format';
 
 jest.mock('../../services/api', () => ({
   api: {
@@ -72,10 +76,30 @@ describe('PortfolioScreen', () => {
 
     await waitFor(() => expect(screen.getByText('WXYZ')).toBeOnTheScreen());
     expect(screen.getByText('50 shares')).toBeOnTheScreen();
-    expect(screen.getByText('$150.25')).toBeOnTheScreen();
-    expect(screen.getByText('+$100.00')).toBeOnTheScreen();
-    expect(screen.getByText('$1,234.56')).toBeOnTheScreen();
+    expect(screen.getByText(fmtMoney(150.25))).toBeOnTheScreen();
+    expect(screen.getByText(fmtSignedMoney(100))).toBeOnTheScreen();
+    expect(screen.getByText(fmtMoney(1234.56))).toBeOnTheScreen();
     expect(screen.getByText('-0.99%')).toBeOnTheScreen();
+  });
+
+  // A losing day previously rendered "$-12.34" because the summary used
+  // fmtMoney. The sign belongs before the currency symbol.
+  it('renders a losing day as -$… and never $-…', async () => {
+    getPortfolio.mockResolvedValue({
+      totalValue: 1000,
+      dayChange: -12.34,
+      dayChangePercent: -1.22,
+      positions: [],
+    });
+    getPositions.mockResolvedValue([]);
+    getPerformance.mockResolvedValue(null);
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText(fmtSignedMoney(-12.34))).toBeOnTheScreen(),
+    );
+    expect(renderedText(screen.toJSON())).not.toContain('$-');
   });
 
   it('renders an em dash rather than NaN when a position omits its numbers', async () => {
