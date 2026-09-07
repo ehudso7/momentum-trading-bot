@@ -78,7 +78,7 @@ describe('TradingScreen', () => {
   });
 
   it('keeps the non-advice disclaimer and does not offer in-app order placement', async () => {
-    getMarketData.mockResolvedValue(undefined);
+    getMarketData.mockResolvedValue(null);
 
     const screen = renderScreen(<TradingScreen />);
 

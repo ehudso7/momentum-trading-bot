@@ -24,10 +24,10 @@ describe('PortfolioScreen', () => {
     getPerformance.mockReset();
   });
 
-  it('shows no invented holdings or equity when the API returns nothing', async () => {
-    getPortfolio.mockResolvedValue(undefined);
+  it('shows no invented holdings or equity when the API returns an empty portfolio', async () => {
+    getPortfolio.mockResolvedValue(null);
     getPositions.mockResolvedValue([]);
-    getPerformance.mockResolvedValue(undefined);
+    getPerformance.mockResolvedValue(null);
 
     const screen = renderScreen(<PortfolioScreen />);
 
@@ -60,7 +60,7 @@ describe('PortfolioScreen', () => {
         changePercent: 1.01,
       },
     ]);
-    getPerformance.mockResolvedValue(undefined);
+    getPerformance.mockResolvedValue(null);
 
     const screen = renderScreen(<PortfolioScreen />);
 

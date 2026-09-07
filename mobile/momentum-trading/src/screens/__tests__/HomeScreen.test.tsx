@@ -30,7 +30,7 @@ describe('HomeScreen', () => {
   });
 
   it('never falls back to a sample balance or equity curve', async () => {
-    getPortfolio.mockResolvedValue(undefined);
+    getPortfolio.mockResolvedValue(null);
     getLatestSignals.mockResolvedValue([]);
 
     const screen = renderScreen(<HomeScreen />);

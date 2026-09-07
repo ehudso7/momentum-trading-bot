@@ -22,8 +22,8 @@ import { api } from '../../services/api';
 
 describe('ProfileScreen', () => {
   beforeEach(() => {
-    (api.getSubscription as jest.Mock).mockResolvedValue(undefined);
-    (api.getSettings as jest.Mock).mockResolvedValue(undefined);
+    (api.getSubscription as jest.Mock).mockResolvedValue(null);
+    (api.getSettings as jest.Mock).mockResolvedValue(null);
   });
 
   it('does not present an invented personal trading record', async () => {
