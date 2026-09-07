@@ -62,6 +62,44 @@ describe('HomeScreen', () => {
     expect(text).not.toContain('Infinity');
   });
 
+  // Before this, an unresolved or failed signals query fell through to
+  // "No active signals" — a claim about the account made while the app had no
+  // idea. Loading and failure must be distinguishable from a real empty list.
+  it('does not claim there are no signals while the query is still loading', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getLatestSignals.mockReturnValue(new Promise(() => {})); // never settles
+
+    const screen = renderScreen(<HomeScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Loading signals…')).toBeOnTheScreen(),
+    );
+    expect(screen.queryByText('No active signals')).toBeNull();
+  });
+
+  it('does not claim there are no signals when the query fails', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getLatestSignals.mockRejectedValue(new Error('unreachable'));
+
+    const screen = renderScreen(<HomeScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Signals unavailable')).toBeOnTheScreen(),
+    );
+    expect(screen.queryByText('No active signals')).toBeNull();
+  });
+
+  it('says there are no signals only when the API really returns none', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getLatestSignals.mockResolvedValue([]);
+
+    const screen = renderScreen(<HomeScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText('No active signals')).toBeOnTheScreen(),
+    );
+  });
+
   it('renders the portfolio value the API returns', async () => {
     getPortfolio.mockResolvedValue({
       totalValue: 4321.99,

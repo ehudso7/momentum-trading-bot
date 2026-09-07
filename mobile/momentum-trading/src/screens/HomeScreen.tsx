@@ -37,7 +37,11 @@ export default function HomeScreen() {
     queryFn: api.getPortfolio,
   });
 
-  const { data: signals } = useQuery({
+  const {
+    data: signals,
+    isLoading: signalsLoading,
+    isError: signalsError,
+  } = useQuery({
     queryKey: ['signals', 'latest'],
     queryFn: api.getLatestSignals,
   });
@@ -168,9 +172,25 @@ export default function HomeScreen() {
               </View>
             </TouchableOpacity>
           )) : (
-            <Text style={[styles.noSignals, { color: theme.textSecondary }]}>
-              No active signals
-            </Text>
+            // "No active signals" is a claim about the user's account. While
+            // the query is loading, or after it fails, the app does not know
+            // whether there are signals, and saying there are none would be
+            // asserting something unverified — the same defect as showing a
+            // fabricated number.
+            <DataUnavailable
+              title={
+                signalsLoading
+                  ? 'Loading signals…'
+                  : signalsError
+                    ? 'Signals unavailable'
+                    : 'No active signals'
+              }
+              detail={
+                signalsError
+                  ? 'The signals service could not be reached.'
+                  : undefined
+              }
+            />
           )}
         </View>
 

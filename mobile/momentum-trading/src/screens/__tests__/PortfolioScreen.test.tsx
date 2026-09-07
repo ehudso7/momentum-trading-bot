@@ -112,6 +112,46 @@ describe('PortfolioScreen', () => {
     expect(screen.getByText(`entry ${fmtMoney(undefined)}`)).toBeOnTheScreen();
   });
 
+  it('does not claim there are no holdings while the query is still loading', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getPositions.mockReturnValue(new Promise(() => {})); // never settles
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Loading holdings…')).toBeOnTheScreen(),
+    );
+    expect(screen.queryByText('No holdings to display')).toBeNull();
+  });
+
+  it('does not claim there are no holdings when the query fails', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getPositions.mockRejectedValue(new Error('unreachable'));
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Holdings unavailable')).toBeOnTheScreen(),
+    );
+    expect(screen.queryByText('No holdings to display')).toBeNull();
+  });
+
+  // The centre column is styled as a position "value" but shows a per-share
+  // price, so it must say which it is.
+  it('labels the per-share price rather than implying position value', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getPositions.mockResolvedValue([
+      { symbol: 'LBL', quantity: 3, side: 'long', currentPrice: 10 },
+    ]);
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() => expect(screen.getByText('LBL')).toBeOnTheScreen());
+    expect(screen.getByText('price · long')).toBeOnTheScreen();
+    // 3 x 10 = 30 would be the market value; it is deliberately not shown.
+    expect(renderedText(screen.toJSON())).not.toContain('$30.00');
+  });
+
   it('renders a losing day as -$… and never $-…', async () => {
     getPortfolio.mockResolvedValue({
       totalValue: 1000,

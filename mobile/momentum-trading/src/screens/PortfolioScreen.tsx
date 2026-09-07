@@ -35,7 +35,11 @@ export default function PortfolioScreen() {
     queryFn: api.getPortfolio,
   });
 
-  const { data: positions } = useQuery({
+  const {
+    data: positions,
+    isLoading: positionsLoading,
+    isError: positionsError,
+  } = useQuery({
     queryKey: ['positions'],
     queryFn: api.getPositions,
   });
@@ -149,7 +153,23 @@ export default function PortfolioScreen() {
           </View>
 
           {holdings.length === 0 ? (
-            <DataUnavailable title="No holdings to display" />
+            // Same reasoning as HomeScreen: until the query resolves, the app
+            // does not know whether the account holds anything, so it must not
+            // say it holds nothing.
+            <DataUnavailable
+              title={
+                positionsLoading
+                  ? 'Loading holdings…'
+                  : positionsError
+                    ? 'Holdings unavailable'
+                    : 'No holdings to display'
+              }
+              detail={
+                positionsError
+                  ? 'The positions service could not be reached.'
+                  : undefined
+              }
+            />
           ) : holdings.map((position) => (
             <TouchableOpacity
               key={position.symbol}
@@ -168,8 +188,14 @@ export default function PortfolioScreen() {
                 <Text style={[styles.positionValue, { color: theme.text }]}>
                   {fmtMoney(position.currentPrice)}
                 </Text>
+                {/* Labelled explicitly: this is the per-share price the
+                    endpoint returns, not the position's market value. The
+                    style name reads as "value", which invited exactly that
+                    misreading. Market value is not derived here because
+                    quantity x price means different things for a long and a
+                    short, and /positions does not send a marketValue field. */}
                 <Text style={[styles.positionCompany, { color: theme.textSecondary }]}>
-                  {fmtText(position.side)}
+                  {`price · ${fmtText(position.side)}`}
                 </Text>
               </View>
 
