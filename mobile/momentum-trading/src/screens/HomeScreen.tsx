@@ -134,9 +134,9 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
 
-          {signals?.length ? signals.map((signal, index) => (
+          {signals?.length ? signals.map((signal) => (
             <TouchableOpacity
-              key={index}
+              key={signal.id}
               style={[styles.signalItem, { borderColor: theme.border }]}
             >
               <View style={styles.signalLeft}>

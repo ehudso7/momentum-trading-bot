@@ -29,7 +29,6 @@ const { width } = Dimensions.get('window');
 export default function PortfolioScreen() {
   const { theme } = useTheme();
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedPeriod, setSelectedPeriod] = useState('1D');
 
   const { data: portfolio } = useQuery({
     queryKey: ['portfolio'],
@@ -41,17 +40,10 @@ export default function PortfolioScreen() {
     queryFn: api.getPositions,
   });
 
-  const { data: performance } = useQuery({
-    queryKey: ['performance', selectedPeriod],
-    queryFn: () => api.getPerformance(selectedPeriod.toLowerCase()),
-  });
-
   const onRefresh = React.useCallback(async () => {
     setRefreshing(true);
     setTimeout(() => setRefreshing(false), 2000);
   }, []);
-
-  const periods = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
 
   // Holdings come from the API only. There is deliberately no sample
   // fallback here: see components/DataUnavailable.tsx.
@@ -100,29 +92,15 @@ export default function PortfolioScreen() {
 
         {/* Performance Chart */}
         <View style={[styles.chartCard, { backgroundColor: theme.card }]}>
+          {/* The 1D/1W/1M/... selector lived here. It only ever drove the
+              /performance query, whose result was never rendered, so the
+              buttons changed the highlight and issued a request while the
+              chart below stayed unavailable regardless. Controls that appear
+              to change what you are looking at but do not are the same
+              dishonesty as fabricated numbers, so both the selector and the
+              query are gone until a charted series exists to drive them. */}
           <View style={styles.chartHeader}>
             <Text style={[styles.sectionTitle, { color: theme.text }]}>Performance</Text>
-            <View style={styles.periodSelector}>
-              {periods.map((period) => (
-                <TouchableOpacity
-                  key={period}
-                  onPress={() => setSelectedPeriod(period)}
-                  style={[
-                    styles.periodButton,
-                    selectedPeriod === period && styles.periodButtonActive,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.periodText,
-                      { color: selectedPeriod === period ? '#fff' : theme.textSecondary },
-                    ]}
-                  >
-                    {period}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
           </View>
 
           {performanceSeries ? (
@@ -210,9 +188,7 @@ export default function PortfolioScreen() {
                     { color: theme.textSecondary },
                   ]}
                 >
-                  {position.entryPrice !== undefined
-                    ? `entry ${fmtMoney(position.entryPrice)}`
-                    : ''}
+                  {`entry ${fmtMoney(position.entryPrice)}`}
                 </Text>
               </View>
             </TouchableOpacity>

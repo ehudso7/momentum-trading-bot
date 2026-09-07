@@ -31,7 +31,6 @@ describe('PortfolioScreen', () => {
   it('shows no invented holdings or equity when the API returns an empty portfolio', async () => {
     getPortfolio.mockResolvedValue(null);
     getPositions.mockResolvedValue([]);
-    getPerformance.mockResolvedValue(null);
 
     const screen = renderScreen(<PortfolioScreen />);
 
@@ -70,7 +69,6 @@ describe('PortfolioScreen', () => {
         entryDate: '2026-09-07T10:30:00Z',
       },
     ]);
-    getPerformance.mockResolvedValue(null);
 
     const screen = renderScreen(<PortfolioScreen />);
 
@@ -84,6 +82,36 @@ describe('PortfolioScreen', () => {
 
   // A losing day previously rendered "$-12.34" because the summary used
   // fmtMoney. The sign belongs before the currency symbol.
+  // The /performance query used to run here (and re-run on every period
+  // change) while its result was never rendered — the chart is hardcoded
+  // unavailable. The request, and the period selector that triggered it, are
+  // gone until a charted series exists.
+  it('does not call the performance endpoint while no series is rendered', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getPositions.mockResolvedValue([]);
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Performance history unavailable')).toBeOnTheScreen(),
+    );
+    expect(getPerformance).not.toHaveBeenCalled();
+    expect(screen.queryByText('1D')).toBeNull();
+    expect(screen.queryByText('ALL')).toBeNull();
+  });
+
+  // An absent entry price used to render an empty string, leaving a blank
+  // line in the row rather than saying the value is unavailable.
+  it('renders an explicit entry price even when the field is absent', async () => {
+    getPortfolio.mockResolvedValue(null);
+    getPositions.mockResolvedValue([{ symbol: 'NOENTRY', quantity: 1 }]);
+
+    const screen = renderScreen(<PortfolioScreen />);
+
+    await waitFor(() => expect(screen.getByText('NOENTRY')).toBeOnTheScreen());
+    expect(screen.getByText(`entry ${fmtMoney(undefined)}`)).toBeOnTheScreen();
+  });
+
   it('renders a losing day as -$… and never $-…', async () => {
     getPortfolio.mockResolvedValue({
       totalValue: 1000,
@@ -92,7 +120,6 @@ describe('PortfolioScreen', () => {
       positions: [],
     });
     getPositions.mockResolvedValue([]);
-    getPerformance.mockResolvedValue(null);
 
     const screen = renderScreen(<PortfolioScreen />);
 
@@ -110,7 +137,6 @@ describe('PortfolioScreen', () => {
       positions: [],
     });
     getPositions.mockResolvedValue([{ symbol: 'NOPE' }]);
-    getPerformance.mockResolvedValue(null);
 
     const screen = renderScreen(<PortfolioScreen />);
 
