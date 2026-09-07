@@ -43,6 +43,7 @@ from trading_bot.risk.correlation import CorrelationChecker
 from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.risk.live_readiness import evaluate_live_readiness
 from trading_bot.scanners.momentum_gappers import MomentumGapperScanner
+from trading_bot.agents.gate import AgentGate
 from trading_bot.strategies.advisor import TradingAdvisor
 from trading_bot.strategies.pullback_vwap import PullbackVWAPStrategy
 from trading_bot.strategies.regime import MarketRegime, RegimeDetector
@@ -194,6 +195,20 @@ class TradingBot:
 
         # AI trading advisor
         self._advisor = TradingAdvisor()
+
+        # Agent gate (Scout / Veto / Brief): blocking-only review between the
+        # advisor and order placement. It can veto or shrink an approved
+        # entry, never approve a rejected one, and never touches the broker.
+        # With agents.enabled=false it is a no-op allow (pre-gate behaviour).
+        self._agent_gate = AgentGate.from_config(config)
+        if self._agent_gate.enabled:
+            log.info(
+                "bot.agent_gate_active",
+                llm_enabled=config.agents.llm.enabled,
+                require_scout=config.agents.require_scout,
+                block_toxic_catalysts=config.agents.block_toxic_catalysts,
+                min_advisor_confidence=config.agents.veto.min_advisor_confidence,
+            )
 
         # Rejected signal shadow journal (capped to prevent unbounded growth)
         self._rejected_signals: collections.deque[RejectedSignal] = collections.deque(maxlen=5000)
@@ -1075,6 +1090,21 @@ class TradingBot:
                 confidence=round(advisor_rec.confidence, 2),
                 reasons=advisor_rec.reasons,
             )
+            # Agent gate (Scout / Veto / Brief). Evaluated for EVERY advisor
+            # outcome so a structured AgentDecision is always persisted, but
+            # it can only block or shrink — the advisor skip below and every
+            # earlier risk rail keep their existing authority.
+            agent_decision = self._agent_gate.evaluate(
+                signal=signal,
+                scan_result=candidate,
+                advisor_rec=advisor_rec,
+                regime=self._current_regime or "range_bound",
+                positions=self._portfolio.get_open_positions(),
+                equity=equity,
+                circuit_status=self._circuit.get_status(),
+                broker=self._broker,
+            )
+
             if advisor_rec.action == "skip":
                 advisor_reason = "; ".join(advisor_rec.reasons)
                 self._record_rejection(RejectedSignal(
@@ -1095,6 +1125,44 @@ class TradingBot:
                     confidence=advisor_rec.confidence,
                 )
                 continue
+
+            if agent_decision.decision == "block":
+                veto_reason = "[agent_veto] " + "; ".join(agent_decision.reasons)
+                self._record_rejection(RejectedSignal(
+                    timestamp=now_et(),
+                    symbol=candidate.symbol,
+                    stage="agent_veto",
+                    reason=veto_reason,
+                    entry_price=signal.entry_price,
+                    stop_price=signal.stop_price,
+                    signal_type=signal.signal_type.value,
+                    gap_pct=candidate.gap_pct,
+                    score=candidate.score,
+                ))
+                self._log_decision(
+                    snapshot,
+                    action="skip",
+                    reason=f"agent_veto:{'; '.join(agent_decision.reasons)}",
+                    confidence=advisor_rec.confidence,
+                )
+                continue
+
+            if agent_decision.decision == "reduce" and risk_result.shares > 0:
+                # Same in-place hook every other size adjustment above uses.
+                # The multiplier is < 1.0 by construction, so this can only
+                # shrink the risk engine's approved share count.
+                agent_shares = max(
+                    1, int(risk_result.shares * agent_decision.size_multiplier)
+                )
+                log.info(
+                    "bot.agent_size_reduction",
+                    symbol=candidate.symbol,
+                    multiplier=round(agent_decision.size_multiplier, 3),
+                    original=risk_result.shares,
+                    adjusted=agent_shares,
+                    reasons=agent_decision.reasons,
+                )
+                risk_result.shares = agent_shares
 
             # Phase 3: paper-only alpha filter gate. Runs AFTER every
             # risk / correlation / advisor check so it can ONLY block
@@ -1417,7 +1485,7 @@ class TradingBot:
             with open(report_file, "w") as f:
                 f.write(summary_text)
                 f.write(f"\n\nRejected signals today: {len(self._rejected_signals)}\n")
-                for stage in ["strategy", "risk", "correlation", "advisor"]:
+                for stage in ["strategy", "risk", "correlation", "advisor", "agent_veto"]:
                     count = sum(1 for r in self._rejected_signals if r.stage == stage)
                     if count:
                         f.write(f"  {stage}: {count}\n")
@@ -1647,6 +1715,7 @@ class TradingBot:
             rejected_signals_count=len(self._rejected_signals),
             rejected_by_stage=rejected_by_stage,
             rejected_signals=recent_rejections,
+            agent_decisions=self._agent_gate.recent_decisions(),
         )
 
     def stop(self) -> None:

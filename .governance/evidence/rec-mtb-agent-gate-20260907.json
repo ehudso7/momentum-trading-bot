@@ -1,0 +1,234 @@
+{
+  "record_id": "rec-mtb-agent-gate-20260907",
+  "project_id": "momentum-trading-bot",
+  "task_id": "feature-agent-gate-layer-20260907",
+  "graph_id": "feature-development",
+  "graph_version": "1.0.0",
+  "governance_version": "2.4.0",
+  "started_at": "2026-09-07T02:20:00Z",
+  "completed_at": "2026-09-07T03:05:00Z",
+  "actor": "ehudso7",
+  "agent": "claude-code",
+  "status": "completed",
+  "terminal_node": "done",
+  "classification": "multi-step",
+  "node_executions": [
+    {
+      "node_id": "intake",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Add a Scout / Veto / Brief agent layer between TradingAdvisor.recommend_entry and PortfolioManager.open_position. Explicit constraints: agents never call the broker, hold keys, change live gates, or bypass circuit breaker / PDT / correlation / sizer; no crypto, memecoin, Robinhood, DEX, quantum_predictor, or crypto_trading usage; LLM off by default."
+    },
+    {
+      "node_id": "inspect",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Read AGENTS.md, CLAUDE.md, GRAPH.md, EVIDENCE.md, prior evidence bundles, main.py (_tick, _open_position_if_running, _log_decision, _record_rejection, _update_dashboard), advisor.py, models/domain.py, decision_log.py, settings.py, config.yaml, dashboard/state.py + app.py, broker_base.py, circuit_breaker status, position_sizer PDT logic, helpers is_market_open/is_near_close, regime enum, alpha filter pattern, existing test construction of TradingBot."
+    },
+    {
+      "node_id": "design",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "VetoContext is a frozen dataclass projection so RuleVeto stays pure. AgentGate builds context from tick objects, short-circuits scout on veto block, applies require_scout/block_toxic_catalysts policy, multiplies veto * (0.5 if advisor reduce), briefs. Fail-closed on unexpected exception. agents.enabled=false is a no-op allow that records nothing. Scout reads provider keys from env at call time; SDKs are lazy optional extras; a Protocol client is injected for tests. Brief persists to data/agent_decisions.csv (decision_log.csv keeps its one-row-per-candidate invariant via the existing _log_decision path)."
+    },
+    {
+      "node_id": "implement",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "New package trading_bot/agents (models, veto, scout, brief, gate). Typed AgentsConfig/AgentLLMConfig/AgentVetoConfig in settings.py with bounds and a provider/model mismatch validator; agents: block in config.yaml. main.py: AgentGate.from_config constructed beside TradingAdvisor; gate evaluated in _tick immediately after recommend_entry for every advisor outcome; block -> RejectedSignal(stage=agent_veto, reason prefixed [agent_veto]) + decision_log skip row; reduce -> in-place risk_result.shares shrink via the same hook regime/tier/volatility use; allow -> unchanged path; agent_decisions pushed to DashboardState; agent_veto added to daily-summary stage list. Dashboard: agent_decisions snapshot field, agent_decisions_count in /api/status, new /api/agent-decisions. Optional extra [llm] in pyproject. README, .env.example, CLAUDE.md module table updated. _assert_live_evidence_gate, circuit order, Alpaca key handling, live confirmation copy, crypto and quantum modules untouched."
+    },
+    {
+      "node_id": "test",
+      "status": "retried-then-completed",
+      "attempts": 2,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
+      ],
+      "notes": "79 new tests in tests/agents: veto (31), scout (20), gate (28 incl. 7 TradingBot._tick wiring tests on the keyless PaperBroker). First run had 7 test-side failures (recursive now_et patch, fixture lacked _running=True, wrong symbol/tier arithmetic); fixed in the tests, no production change required."
+    },
+    {
+      "node_id": "affected-area-tests",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
+      ],
+      "notes": "Targeted suites (273) and the complete pre-existing backend suite (2959) pass with the gate wired in. CI web job then failed on a production npm audit of the untouched frontend lockfile (browserslist, fast-uri); the existing Dependabot fix (#82, #83) was ported with npm --package-lock-only and the audit passes locally."
+    },
+    {
+      "node_id": "collect-evidence",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Wrote this execution record and its evidence bundle with SHA-256 file digests and canonical content hashes (sha256 of sort_keys compact JSON excluding content_hash)."
+    },
+    {
+      "node_id": "verify",
+      "status": "completed",
+      "attempts": 1,
+      "confidence": 0.85,
+      "notes": "Agent-side state is 'tested', not 'verified'. No independent UIE verification exists. The LLM provider clients (OpenAI chat completions, Anthropic messages) are exercised only through the injected fake client; no real model call was made in this run and no provider SDK was installed."
+    },
+    {
+      "node_id": "review-fixes",
+      "status": "retried-then-completed",
+      "attempts": 4,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
+      ],
+      "notes": "Copilot PR review (PR #84, 'changes recommended', 3 comments) verified and fixed: (1) AgentGate.from_config created data/agent_decisions.csv even with agents.enabled=false, contradicting the no-side-effect guarantee -> a disabled gate now gets a path-less AgentBrief; (2) AgentDecision docstring claimed reduce multipliers lie in [0.25, 0.75] while the enforced invariant is 0 < x < 1 -> docstring corrected; (3) CatalystScout.parse_response used a greedy {.*} regex that over-captured when the reply contained extra braces, turning a valid reply into a fail-closed scout failure -> replaced with json.JSONDecoder.raw_decode from each '{' so the first complete object wins. All three are inside the new agent modules; no risk rail or main.py behaviour changed. Second Copilot pass raised two suppressed findings: (4) daily_call_budget was reserved before the client was built, so a missing key/SDK consumed budget without any model call -> client is now built first and the budget is reserved only when a request is about to be sent; (5) toxic-catalyst blocking also applies when require_scout=true even if block_toxic_catalysts=false. That is the specified behaviour (block when require_scout OR block_toxic_catalysts), so the code was kept and config.yaml, settings.py, README, and an inline comment now state it explicitly. Third Copilot pass: (6) build_context probed broker.get_day_trade_count() for every candidate, an Alpaca get_account() round trip even when equity was far above the PDT threshold -> the probe now runs only when equity is known and below pdt_equity_threshold (or is skipped when risk config is absent). Fourth Copilot pass: (7) the PDT probe still ran on small accounts when the advisor had already said skip, although the veto blocks on that alone -> the probe now also requires advisor_action != skip; (8) the README architecture diagram placed the agent gate before correlation and sizing, contradicting TradingBot._tick -> diagram reordered to strategy -> sizer -> correlation -> advisor -> gate -> execution."
+    },
+    {
+      "node_id": "done",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Ready for a draft pull request and human review. No merge, deployment, restart, broker mutation, or live-money action is part of this run."
+    }
+  ],
+  "files_changed": [
+    "trading_bot/agents/__init__.py",
+    "trading_bot/agents/models.py",
+    "trading_bot/agents/veto.py",
+    "trading_bot/agents/scout.py",
+    "trading_bot/agents/brief.py",
+    "trading_bot/agents/gate.py",
+    "trading_bot/main.py",
+    "trading_bot/config/settings.py",
+    "trading_bot/config/config.yaml",
+    "trading_bot/config/.env.example",
+    "trading_bot/dashboard/state.py",
+    "trading_bot/dashboard/app.py",
+    "pyproject.toml",
+    "frontend/package-lock.json",
+    "README.md",
+    "CLAUDE.md",
+    "tests/agents/__init__.py",
+    "tests/agents/test_veto.py",
+    "tests/agents/test_scout.py",
+    "tests/agents/test_gate.py",
+    ".governance/evidence/rec-mtb-agent-gate-20260907.json",
+    ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
+  ],
+  "commands_executed": [
+    {
+      "command": "pip install -e \".[dev]\" -q",
+      "exit_code": 0,
+      "node_id": "setup",
+      "summary": "installed project with dev extras in the session container"
+    },
+    {
+      "command": "python -m compileall -q trading_bot/agents trading_bot/main.py trading_bot/dashboard trading_bot/config",
+      "exit_code": 0,
+      "node_id": "implement",
+      "summary": "all new and modified production modules compiled"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 1,
+      "node_id": "test",
+      "summary": "INITIAL RUN: 72 passed, 7 failed \u2014 test-side defects only (recursive now_et patch, fixture missing _running=True, wrong symbol/tier arithmetic in two assertions); no production defect"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "test",
+      "summary": "79 passed after fixing the test fixtures"
+    },
+    {
+      "command": "python -m pytest tests/test_risk.py tests/test_advisor.py tests/test_dashboard.py tests/test_dashboard_api.py tests/test_config_validation.py tests/test_trading_mode_safety.py tests/test_circuit_alert_transition.py tests/test_alpha_filter.py tests/test_decision_log.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "273 passed, 2 warnings \u2014 risk, advisor, dashboard, config, trading-mode safety, circuit transition, alpha filter, decision log"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider -x --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "2959 passed, 3 warnings in 46.78s \u2014 complete pre-existing backend suite with the gate wired in"
+    },
+    {
+      "command": "python -m pytest tests/agents tests/test_reports.py tests/test_daily_summary_percent.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "test",
+      "summary": "146 passed after adding agent_veto to the daily-summary stage list"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "node_id": "implement",
+      "summary": "no whitespace errors"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 34077713182 / web (job 101606985600)",
+      "exit_code": 1,
+      "node_id": "affected-area-tests",
+      "summary": "npm audit --omit=dev --audit-level=high failed on browserslist <=4.28.6 (GHSA-c83g-rgw3-j3cx, GHSA-73wf-gq98-2v4g) and fast-uri 3.0.0-3.1.5 (GHSA-5jgf-p345-68v8 et al.) in frontend/package-lock.json, a file this feature does not touch; Dependabot PRs #82 and #83 carry the fix"
+    },
+    {
+      "command": "cd frontend && npm update browserslist fast-uri --package-lock-only --no-audit --no-fund",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "ported the Dependabot fix with the repo's own tooling: browserslist 4.28.2->4.28.9, fast-uri 3.1.5->3.1.7 plus browserslist's data subdependencies; identical versions to PRs #82/#83, 26 insertions / 26 deletions"
+    },
+    {
+      "command": "cd frontend && npm audit --omit=dev --audit-level=high",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "found 0 vulnerabilities after the port"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "85 passed after addressing the three Copilot review findings (6 new regression tests: 4 brace-robust parse cases, 2 from_config side-effect cases)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "2959 passed, 3 warnings in 44.08s"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "no whitespace errors"
+    },
+    {
+      "command": "python -m pytest tests/agents tests/test_config_validation.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "107 passed after the second Copilot pass (3 new tests: budget not consumed on client-construction failure, budget consumed only when a request is sent, require_scout honours a toxic verdict with block_toxic_catalysts=false)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "90 passed after the third Copilot pass (PDT probe gated on equity < threshold; 2 new tests assert zero broker calls above the threshold and without risk config)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "91 passed after the fourth Copilot pass (PDT probe also skipped when the advisor already said skip; README architecture diagram reordered to the real tick order)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "2959 passed"
+    }
+  ],
+  "content_hash": "c91b374c525cd01f269cbb2743efe02c84b22525037a39a2ebef3e042a4940d6"
+}
