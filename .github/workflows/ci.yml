@@ -133,8 +133,15 @@ jobs:
       - name: Tests
         run: npm run test:ci
       - name: Expo doctor
-        # Non-blocking: expo-doctor validates against Expo's remote schema and
-        # the React Native directory API, so an outage upstream would redden a
-        # PR that changed nothing. Typecheck above is the blocking gate.
+        # Runs the expo-doctor pinned in package-lock.json via `npm run
+        # doctor`, not `npx --yes expo-doctor`, which would resolve and execute
+        # whatever version npm serves at run time — an unpinned dependency
+        # fetched outside the lockfile, and a job that can fail on npm
+        # availability rather than on project state.
+        #
+        # Still non-blocking: the checks it performs validate against Expo's
+        # remote schema and the React Native directory API, so an upstream
+        # outage would redden a PR that changed nothing. Typecheck and tests
+        # above are the blocking gates.
         continue-on-error: true
-        run: npx --yes expo-doctor
+        run: npm run doctor
