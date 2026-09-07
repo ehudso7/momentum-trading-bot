@@ -78,12 +78,40 @@ export function isUsableConfidence(value: number | null | undefined): boolean {
   return isRenderableNumber(value) && value >= 0 && value <= 1;
 }
 
+/**
+ * An optional text field, or an em dash when absent or blank.
+ *
+ * Rendering `{signal.action}` directly gives an empty element when the field
+ * is missing, which reads as a broken UI rather than as missing data. Blank
+ * strings count as absent for the same reason.
+ */
+export function fmtText(value: string | null | undefined): string {
+  if (typeof value !== 'string') return DASH;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : DASH;
+}
+
 /** Local `HH:MM` from an ISO timestamp, or an em dash if unparseable. */
 export function fmtTime(timestamp: string | null | undefined): string {
   if (!timestamp) return DASH;
   const parsed = new Date(timestamp);
   if (Number.isNaN(parsed.getTime())) return DASH;
   return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * Colour for a trade action. Only an explicit BUY or SELL gets a colour; an
+ * absent or unrecognised action is unknown, and colouring it red would imply
+ * a SELL the payload never contained.
+ */
+export function actionColor(
+  action: string | null | undefined,
+  muted: string,
+): string {
+  const normalised = typeof action === 'string' ? action.trim().toUpperCase() : '';
+  if (normalised === 'BUY') return '#10b981';
+  if (normalised === 'SELL') return '#ef4444';
+  return muted;
 }
 
 /** Colour helper: green when non-negative, red when negative, muted otherwise. */

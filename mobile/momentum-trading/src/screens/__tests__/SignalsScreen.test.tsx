@@ -134,6 +134,29 @@ describe('SignalsScreen', () => {
     expect(screen.getAllByText('—').length).toBeGreaterThan(0);
   });
 
+  // A signal with no action must not render a red badge implying a SELL, nor
+  // an empty badge that reads as a broken UI.
+  it('renders a missing action as an em dash, not an implied SELL', async () => {
+    getLatestSignals.mockResolvedValue([
+      {
+        id: 'sig-4',
+        symbol: 'NOACT',
+        confidence: 0.6,
+        price: 10,
+        timestamp: '2026-09-07T14:31:00Z',
+      },
+    ]);
+    getSignalHistory.mockResolvedValue([]);
+
+    const screen = renderScreen(<SignalsScreen />);
+
+    await waitFor(() => expect(screen.getByText('NOACT')).toBeOnTheScreen());
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+
+    const text = renderedText(screen.toJSON());
+    expect(text).not.toContain('undefined');
+  });
+
   it('does not claim a performance record', async () => {
     getLatestSignals.mockResolvedValue([]);
     getSignalHistory.mockResolvedValue([]);

@@ -9,6 +9,8 @@ import {
   fmtTime,
   changeColor,
   isUsableConfidence,
+  fmtText,
+  actionColor,
 } from '../format';
 
 // Every formatter must reject non-finite input. NaN and Infinity are `typeof
@@ -106,6 +108,39 @@ describe('formatting of real values', () => {
 
   it('parses a valid ISO timestamp', () => {
     expect(fmtTime('2026-09-07T14:31:00Z')).not.toBe(DASH);
+  });
+});
+
+describe('fmtText', () => {
+  it('returns an em dash for absent or blank text', () => {
+    expect(fmtText(undefined)).toBe(DASH);
+    expect(fmtText(null)).toBe(DASH);
+    expect(fmtText('')).toBe(DASH);
+    expect(fmtText('   ')).toBe(DASH);
+  });
+
+  it('trims and returns real text', () => {
+    expect(fmtText('BUY')).toBe('BUY');
+    expect(fmtText('  Momentum Breakout  ')).toBe('Momentum Breakout');
+  });
+});
+
+describe('actionColor', () => {
+  // An absent action previously fell through to the SELL colour, so a signal
+  // with no action rendered a red badge implying a sell the payload never
+  // contained.
+  it('is muted for an absent or unrecognised action, never red', () => {
+    expect(actionColor(undefined, '#888')).toBe('#888');
+    expect(actionColor(null, '#888')).toBe('#888');
+    expect(actionColor('', '#888')).toBe('#888');
+    expect(actionColor('HOLD', '#888')).toBe('#888');
+  });
+
+  it('colours only explicit BUY and SELL', () => {
+    expect(actionColor('BUY', '#888')).toBe('#10b981');
+    expect(actionColor('buy', '#888')).toBe('#10b981');
+    expect(actionColor('SELL', '#888')).toBe('#ef4444');
+    expect(actionColor(' sell ', '#888')).toBe('#ef4444');
   });
 });
 

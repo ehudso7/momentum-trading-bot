@@ -19,6 +19,8 @@ import {
   fmtPct,
   fmtConfidence,
   fmtTime,
+  fmtText,
+  actionColor,
   isUsableConfidence,
 } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
@@ -82,7 +84,7 @@ export default function SignalsScreen() {
   const errored = activeTab === 'latest' ? signalsError : historyError;
 
   const getSignalColor = (action: string | undefined) =>
-    action?.toUpperCase() === 'BUY' ? '#10b981' : '#ef4444';
+    actionColor(action, theme.textSecondary);
 
   // An unusable confidence gets the muted colour, not a red "low confidence"
   // band — the value is unknown, not bad.
@@ -167,7 +169,7 @@ export default function SignalsScreen() {
                       {signal.symbol}
                     </Text>
                     <Text style={[styles.signalType, { color: theme.textSecondary }]}>
-                      {signal.type}
+                      {fmtText(signal.type)}
                     </Text>
                   </View>
 
@@ -178,7 +180,7 @@ export default function SignalsScreen() {
                         { backgroundColor: getSignalColor(signal.action) },
                       ]}
                     >
-                      <Text style={styles.actionText}>{signal.action}</Text>
+                      <Text style={styles.actionText}>{fmtText(signal.action)}</Text>
                     </View>
                     <Text style={[styles.signalTime, { color: theme.textSecondary }]}>
                       {fmtTime(signal.timestamp)}

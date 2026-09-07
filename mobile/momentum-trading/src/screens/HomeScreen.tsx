@@ -20,6 +20,7 @@ import {
   fmtSignedMoney,
   fmtPct,
   fmtConfidence,
+  fmtText,
   isUsableConfidence,
 } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
@@ -143,7 +144,7 @@ export default function HomeScreen() {
                   {signal.symbol}
                 </Text>
                 <Text style={[styles.signalType, { color: theme.textSecondary }]}>
-                  {signal.type}
+                  {fmtText(signal.type)}
                 </Text>
               </View>
               <View style={styles.signalRight}>

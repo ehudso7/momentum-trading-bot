@@ -19,6 +19,7 @@ import {
   fmtSignedMoney,
   fmtPct,
   fmtQuantity,
+  fmtText,
   changeColor,
 } from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
@@ -190,7 +191,7 @@ export default function PortfolioScreen() {
                   {fmtMoney(position.currentPrice)}
                 </Text>
                 <Text style={[styles.positionCompany, { color: theme.textSecondary }]}>
-                  {position.side ?? ''}
+                  {fmtText(position.side)}
                 </Text>
               </View>
 
