@@ -864,12 +864,17 @@ class AlpacaBroker(BrokerBase):
                 "filled_avg_price": 0.0,
             }
 
+    @retry_with_backoff(max_retries=2, base_delay=1.0, max_delay=10.0)
     def get_day_trade_count(self) -> int:
-        try:
-            account = self._client.get_account()
-            return int(account.daytrade_count) if account.daytrade_count else 0
-        except Exception:
-            return 0
+        """Rolling 5-day day-trade count from the account.
+
+        Raises after retries on a broker failure. A failure must never be
+        reported as ``0``: callers that enforce PDT treat an exception as
+        "count unknown" and fail closed, and a silent zero would let a
+        small account trade past the limit during an outage.
+        """
+        account = self._client.get_account()
+        return int(account.daytrade_count) if account.daytrade_count else 0
 
     def reset_paper_account(self) -> bool:
         """

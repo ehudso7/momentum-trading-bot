@@ -26,6 +26,7 @@ nothing, so behaviour is identical to the pre-gate bot.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -63,6 +64,11 @@ _ENTRY_OK_CIRCUIT_STATES = frozenset({"normal", "warning"})
 
 _MIN_REDUCE_MULTIPLIER = 0.25
 
+# The day-trade count is account-global, so one probe per tick is enough.
+# Ticks run every 10–60 s; a 30 s TTL bounds a small-account scan with many
+# candidates to one get_account() round trip instead of one per candidate.
+DEFAULT_PDT_PROBE_TTL_SECONDS = 30.0
+
 
 class AgentGate:
     """Blocking-only gate between the advisor and order placement."""
@@ -78,6 +84,8 @@ class AgentGate:
         scanner_config: Optional[ScannerConfig] = None,
         market_open_fn: Callable[[], bool] = is_market_open,
         near_close_fn: Callable[[int], bool] = is_near_close,
+        pdt_probe_ttl_seconds: float = DEFAULT_PDT_PROBE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._veto = veto
@@ -87,6 +95,10 @@ class AgentGate:
         self._scanner = scanner_config
         self._market_open_fn = market_open_fn
         self._near_close_fn = near_close_fn
+        self._pdt_probe_ttl = max(0.0, float(pdt_probe_ttl_seconds))
+        self._clock = clock
+        # (probe time, count or None, unavailable) — one entry, account-global.
+        self._pdt_cache: Optional[tuple[float, Optional[int], bool]] = None
 
     @classmethod
     def from_config(cls, config: AppConfig, data_dir: Optional[Path] = None) -> "AgentGate":
@@ -329,7 +341,9 @@ class AgentGate:
         """Project tick objects onto the pure ``VetoContext``.
 
         The only I/O is the read-only PDT probe, and only when equity is
-        below the PDT threshold so the check can bind.
+        below the PDT threshold and the advisor did not already skip, so
+        the check can bind. The probe is cached per short TTL (account-global
+        value, one call per tick rather than per candidate).
         """
         circuit_state = None
         circuit_ok: Optional[bool] = None
@@ -356,9 +370,10 @@ class AgentGate:
             and pdt_threshold is not None
             and equity_value < pdt_threshold
         )
-        day_trade_count = (
-            self._day_trade_count(broker, symbol) if pdt_may_apply else None
-        )
+        day_trade_count: Optional[int] = None
+        pdt_count_unavailable = False
+        if pdt_may_apply:
+            day_trade_count, pdt_count_unavailable = self._day_trade_count(broker, symbol)
 
         return VetoContext(
             symbol=symbol or None,
@@ -391,19 +406,52 @@ class AgentGate:
             equity=equity_value,
             pdt_equity_threshold=pdt_threshold,
             day_trade_count=day_trade_count,
+            pdt_count_unavailable=pdt_count_unavailable,
         )
 
-    @staticmethod
-    def _day_trade_count(broker: Any, symbol: str) -> Optional[int]:
-        """Read-only PDT probe. Any failure → None (check skipped, logged)."""
+    def _day_trade_count(self, broker: Any, symbol: str) -> tuple[Optional[int], bool]:
+        """
+        Read-only PDT probe, cached for ``pdt_probe_ttl_seconds``.
+
+        Returns ``(count, unavailable)``. ``unavailable`` is True when the
+        probe was attempted and failed (broker missing, method missing,
+        exception, or a non-integer result); the veto then fails closed.
+        Failures are cached for the same TTL so an outage costs one call
+        per window, not one per candidate.
+        """
+        now = self._clock()
+        cached = self._pdt_cache
+        if cached is not None and now - cached[0] < self._pdt_probe_ttl:
+            return cached[1], cached[2]
+
+        count: Optional[int] = None
+        unavailable = False
         getter = getattr(broker, "get_day_trade_count", None)
         if broker is None or not callable(getter):
-            return None
-        try:
-            return _int_or_none(getter())
-        except Exception as exc:
-            log.warning("agent.day_trade_count_unavailable", symbol=symbol, error=str(exc))
-            return None
+            unavailable = True
+            log.warning(
+                "agent.day_trade_count_unavailable",
+                symbol=symbol,
+                error="broker does not expose get_day_trade_count",
+            )
+        else:
+            try:
+                count = _int_or_none(getter())
+                if count is None:
+                    unavailable = True
+                    log.warning(
+                        "agent.day_trade_count_unavailable",
+                        symbol=symbol,
+                        error="broker returned a non-integer day-trade count",
+                    )
+            except Exception as exc:
+                unavailable = True
+                log.warning(
+                    "agent.day_trade_count_unavailable", symbol=symbol, error=str(exc)
+                )
+
+        self._pdt_cache = (now, count, unavailable)
+        return count, unavailable
 
     @staticmethod
     def _safe_bool(fn: Callable[[], bool]) -> Optional[bool]:
@@ -426,6 +474,7 @@ class AgentGate:
             "circuit_state": ctx.circuit_state,
             "open_positions": ctx.open_positions,
             "day_trade_count": ctx.day_trade_count,
+            "pdt_count_unavailable": ctx.pdt_count_unavailable,
         }
 
 

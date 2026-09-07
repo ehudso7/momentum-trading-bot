@@ -126,6 +126,13 @@ class TestHardRules:
         assert decision.decision == "block"
         assert "pdt_limit:3/3" in decision.reasons
 
+    def test_pdt_count_unavailable_fails_closed(self, veto):
+        decision = veto.evaluate(
+            _healthy(equity=10_000.0, day_trade_count=None, pdt_count_unavailable=True)
+        )
+        assert decision.decision == "block"
+        assert "pdt_count_unavailable" in decision.reasons
+
     def test_pdt_not_enforced_above_threshold(self, veto):
         decision = veto.evaluate(
             _healthy(equity=100_000.0, pdt_equity_threshold=25_000.0, day_trade_count=9)

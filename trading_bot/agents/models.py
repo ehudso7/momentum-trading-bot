@@ -139,10 +139,15 @@ class VetoContext:
     spread_pct: Optional[float] = None
     max_spread_pct: Optional[float] = None
 
-    # PDT
+    # PDT. ``day_trade_count`` is None when the probe was not needed (equity
+    # above the threshold, advisor skip) — an optional check that is simply
+    # skipped. ``pdt_count_unavailable`` is True only when the probe was
+    # attempted and failed; PDT can then bind but cannot be evaluated, so
+    # the veto fails closed.
     equity: Optional[float] = None
     pdt_equity_threshold: Optional[float] = None
     day_trade_count: Optional[int] = None
+    pdt_count_unavailable: bool = False
     pdt_max_day_trades: int = 3
 
 

@@ -55,6 +55,8 @@
     "trading_bot/agents/scout.py",
     "trading_bot/agents/brief.py",
     "trading_bot/agents/gate.py",
+    "trading_bot/execution/alpaca_broker.py",
+    "trading_bot/execution/broker_base.py",
     "trading_bot/main.py",
     "trading_bot/config/settings.py",
     "trading_bot/config/config.yaml",
@@ -192,6 +194,16 @@
       "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
       "exit_code": 0,
       "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "99 passed after the seventh Copilot pass (broker PDT failures surfaced; veto fails closed on unavailable count; probe cached per 30 s TTL)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed, including execution tests after the AlpacaBroker.get_day_trade_count change"
     }
   ],
   "tests": {
@@ -258,6 +270,11 @@
       "check": "csv-formula-injection",
       "outcome": "pass",
       "detail": "AgentBrief neutralises leading =, +, -, @, tab, CR and LF in every text field of the decision record before it reaches agent_decisions.csv or the dashboard; test_text_fields_are_neutralised_against_formula_injection covers model-controlled scout_notes and reasons."
+    },
+    {
+      "check": "pdt-fail-closed",
+      "outcome": "pass",
+      "detail": "A day-trade-count probe that fails blocks small-account entries instead of being read as zero; AlpacaBroker raises rather than masking, and tests cover the raise, the block, and the TTL cache."
     }
   ],
   "artifacts": [
@@ -265,19 +282,19 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "3275de2ed9bd7cd698a2594a60cee44d5ef62f17efa85c9fd32b94ba42b11ff9"
+      "sha256": "bb5db57c2c8a898f96dd9c099e1628154c6e560620ebf19c7eb8087509b8faf0"
     },
     {
       "id": "agent-models",
       "path": "trading_bot/agents/models.py",
       "produced_by_node": "implement",
-      "sha256": "c0494242ee93dd302ae5adcec8a4628e0b6d14ae463f4dc1e6050cf6750d3429"
+      "sha256": "59d591e9a852d55cee331c0a1e802a168d957fc21bbb73d920890a975e73943f"
     },
     {
       "id": "rule-veto",
       "path": "trading_bot/agents/veto.py",
       "produced_by_node": "implement",
-      "sha256": "b2be07918fdca1ddcec04996f1d71e0208226ffdf5f3376c3f4c28d486e9f917"
+      "sha256": "b01ea4f4c3c3c97f1c0f760f62eacc91c08ad52b2d3f003ac1255736ab912010"
     },
     {
       "id": "catalyst-scout",
@@ -295,7 +312,7 @@
       "id": "agent-gate",
       "path": "trading_bot/agents/gate.py",
       "produced_by_node": "implement",
-      "sha256": "5325d4b8e1ef816723703c3cdf136ba1f4cb98573e9a368bf58275bcbc83be64"
+      "sha256": "81425d6bf9f971b340c433b8f457e0e207471f7b07f39ddcbe0a9a4bcef90e71"
     },
     {
       "id": "main-wiring",
@@ -313,7 +330,7 @@
       "id": "veto-tests",
       "path": "tests/agents/test_veto.py",
       "produced_by_node": "test",
-      "sha256": "ed1e1019bbd50cc57fcf9298c64956afdff800a225761fa288015a28a8a845f7"
+      "sha256": "b18307721212c4b4d9d6aa3f59e44f929b5cf8669b32bab9e3d1e6f87c500662"
     },
     {
       "id": "scout-tests",
@@ -325,7 +342,7 @@
       "id": "gate-tests",
       "path": "tests/agents/test_gate.py",
       "produced_by_node": "test",
-      "sha256": "34abd03f7cc8d43d42fd650e688eb68e4d6b032c13d32173f1c8d1e9677d1461"
+      "sha256": "925504cdecac20cdbf5912babcf81e48e8344c37f082609e1097a0e652974066"
     }
   ],
   "completion_status": "tested",
@@ -342,5 +359,5 @@
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "c043b834ca06a1b17239b8a9372141a308976b124a7d07cf150bd22f50da1ba2"
+  "content_hash": "d383328e6537a53ef28534d95b03212cc7dfecbf4b18334df9f82ae122cb13eb"
 }

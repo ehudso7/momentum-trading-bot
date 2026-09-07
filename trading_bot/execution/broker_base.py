@@ -140,5 +140,10 @@ class BrokerBase(ABC):
 
     @abstractmethod
     def get_day_trade_count(self) -> int:
-        """Get number of day trades in the current rolling 5-day window."""
+        """Get number of day trades in the current rolling 5-day window.
+
+        Must raise when the count cannot be obtained. Returning ``0`` on a
+        failure is forbidden: PDT enforcement treats an exception as
+        "unknown" and fails closed, but would treat ``0`` as safe.
+        """
         ...

@@ -191,7 +191,11 @@ class RuleVeto:
             )
 
         # PDT: accounts under the threshold get at most N day trades in the
-        # rolling window. Only enforced when the broker reported a count.
+        # rolling window. A probe that was attempted but failed means the
+        # rule may bind yet cannot be evaluated: fail closed rather than
+        # trade blind into a possible PDT flag.
+        if ctx.pdt_count_unavailable:
+            reasons.append("pdt_count_unavailable")
         if (
             ctx.day_trade_count is not None
             and ctx.equity is not None

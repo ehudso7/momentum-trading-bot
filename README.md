@@ -72,7 +72,9 @@ and records nothing, so the CSV is not created.
 - **RuleVeto** — deterministic, no network. Blocks on circuit state, session
   validity, advisor skip / low advisor confidence, max positions, duplicate
   symbol, gap beyond the scanner ceiling, scanner price / rvol / float bounds,
-  and PDT. Missing required context fails closed.
+  and PDT (small accounts are blocked if the broker cannot report the
+  day-trade count; the count is probed at most once per 30 s, not per
+  candidate). Missing required context fails closed.
 - **CatalystScout** — optional LLM catalyst classifier (`earnings`, `fda`,
   `merger`, `dilution`, `offering`, `pump`, `rumor`, `unknown`). **OFF by
   default.** When enabled it makes one short, non-streaming call per

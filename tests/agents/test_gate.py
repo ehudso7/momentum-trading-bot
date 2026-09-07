@@ -301,11 +301,54 @@ class TestContextBuilding:
         assert "pdt_limit:3/3" in decision.reasons
         broker.get_day_trade_count.assert_called_once()
 
-    def test_broken_pdt_probe_skips_check(self, tmp_path):
+    def test_broken_pdt_probe_fails_closed_for_small_account(self, tmp_path):
+        """A probe that fails means PDT may bind but cannot be checked: block."""
         broker = Mock()
         broker.get_day_trade_count.side_effect = RuntimeError("api down")
         decision = _evaluate(_gate(tmp_path), broker=broker, equity=10_000.0)
-        assert decision.decision == "allow"
+        assert decision.decision == "block"
+        assert "pdt_count_unavailable" in decision.reasons
+        assert decision.raw["pdt_count_unavailable"] is True
+
+    def test_missing_broker_fails_closed_for_small_account(self, tmp_path):
+        decision = _evaluate(_gate(tmp_path), broker=None, equity=10_000.0)
+        assert decision.decision == "block"
+        assert "pdt_count_unavailable" in decision.reasons
+
+    def test_pdt_probe_is_cached_per_ttl(self, tmp_path):
+        """Account-global value: one broker call per TTL window, not per candidate."""
+        now = {"t": 1000.0}
+        gate = _gate(tmp_path)
+        gate._clock = lambda: now["t"]
+        gate._pdt_probe_ttl = 30.0
+        broker = Mock()
+        broker.get_day_trade_count.return_value = 1
+        for symbol in ("AAAA", "BBBB", "CCCC"):
+            decision = _evaluate(
+                gate, signal=_signal(symbol), scan_result=_scan(symbol), broker=broker, equity=10_000.0
+            )
+            assert decision.decision == "allow"
+            assert decision.raw["day_trade_count"] == 1
+        assert broker.get_day_trade_count.call_count == 1
+
+        now["t"] += 31.0  # TTL elapsed → one fresh probe
+        broker.get_day_trade_count.return_value = 3
+        decision = _evaluate(gate, broker=broker, equity=10_000.0)
+        assert decision.decision == "block"
+        assert "pdt_limit:3/3" in decision.reasons
+        assert broker.get_day_trade_count.call_count == 2
+
+    def test_pdt_probe_failure_is_cached_too(self, tmp_path):
+        now = {"t": 5.0}
+        gate = _gate(tmp_path)
+        gate._clock = lambda: now["t"]
+        broker = Mock()
+        broker.get_day_trade_count.side_effect = RuntimeError("api down")
+        for _ in range(3):
+            decision = _evaluate(gate, broker=broker, equity=10_000.0)
+            assert decision.decision == "block"
+            assert "pdt_count_unavailable" in decision.reasons
+        assert broker.get_day_trade_count.call_count == 1
 
     def test_gate_never_calls_order_methods_on_broker(self, tmp_path):
         """Below the PDT threshold the only broker touch is the read-only probe."""
@@ -385,6 +428,35 @@ class TestBrief:
             assert _neutralize_formula(trigger + "x") == "'" + trigger + "x"
         assert _neutralize_formula("safe") == "safe"
         assert _neutralize_formula("") == ""
+
+
+class TestBrokerPdtContract:
+    """The gate's fail-closed PDT rule depends on brokers raising, never 0."""
+
+    def test_alpaca_day_trade_count_raises_instead_of_masking_as_zero(self):
+        from trading_bot.execution.alpaca_broker import AlpacaBroker
+
+        class _FailingClient:
+            def get_account(self):
+                raise ConnectionError("account endpoint unavailable")
+
+        broker = AlpacaBroker.__new__(AlpacaBroker)
+        broker._client = _FailingClient()
+        with patch("trading_bot.utils.resilience.time.sleep"):
+            with pytest.raises(ConnectionError):
+                broker.get_day_trade_count()
+
+    def test_alpaca_day_trade_count_reads_account_field(self):
+        from trading_bot.execution.alpaca_broker import AlpacaBroker
+        from types import SimpleNamespace
+
+        class _Client:
+            def get_account(self):
+                return SimpleNamespace(daytrade_count=2)
+
+        broker = AlpacaBroker.__new__(AlpacaBroker)
+        broker._client = _Client()
+        assert broker.get_day_trade_count() == 2
 
 
 # ---------------------------------------------------------------------------
