@@ -1,0 +1,253 @@
+{
+  "bundle_id": "bundle-mtb-agent-gate-20260907",
+  "project_id": "momentum-trading-bot",
+  "task_id": "feature-agent-gate-layer-20260907",
+  "graph_id": "feature-development",
+  "graph_version": "1.0.0",
+  "governance_version": "2.4.0",
+  "started_at": "2026-09-07T02:20:00Z",
+  "completed_at": "2026-09-07T03:05:00Z",
+  "actor": "ehudso7",
+  "agent": "claude-code",
+  "execution_record_ref": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
+  "nodes_attempted": [
+    "intake",
+    "inspect",
+    "design",
+    "implement",
+    "test",
+    "affected-area-tests",
+    "collect-evidence",
+    "verify",
+    "done"
+  ],
+  "nodes_completed": [
+    "intake",
+    "inspect",
+    "design",
+    "implement",
+    "test",
+    "affected-area-tests",
+    "collect-evidence",
+    "verify",
+    "done"
+  ],
+  "nodes_skipped": [],
+  "retries": 1,
+  "failures": [
+    {
+      "node_id": "test",
+      "reason": "First run of tests/agents had 7 failures caused by the tests themselves (a now_et monkeypatch that recursed, a fixture that did not set _running=True so _tick returned before scanning, and two assertions with the wrong symbol / sizing-tier arithmetic). All were corrected in the tests; no production code changed as a result.",
+      "recovered": true
+    }
+  ],
+  "files_changed": [
+    "trading_bot/agents/__init__.py",
+    "trading_bot/agents/models.py",
+    "trading_bot/agents/veto.py",
+    "trading_bot/agents/scout.py",
+    "trading_bot/agents/brief.py",
+    "trading_bot/agents/gate.py",
+    "trading_bot/main.py",
+    "trading_bot/config/settings.py",
+    "trading_bot/config/config.yaml",
+    "trading_bot/config/.env.example",
+    "trading_bot/dashboard/state.py",
+    "trading_bot/dashboard/app.py",
+    "pyproject.toml",
+    "README.md",
+    "CLAUDE.md",
+    "tests/agents/__init__.py",
+    "tests/agents/test_veto.py",
+    "tests/agents/test_scout.py",
+    "tests/agents/test_gate.py",
+    ".governance/evidence/rec-mtb-agent-gate-20260907.json",
+    ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
+  ],
+  "commands_executed": [
+    {
+      "command": "pip install -e \".[dev]\" -q",
+      "exit_code": 0,
+      "summary": "installed project with dev extras in the session container"
+    },
+    {
+      "command": "python -m compileall -q trading_bot/agents trading_bot/main.py trading_bot/dashboard trading_bot/config",
+      "exit_code": 0,
+      "summary": "all new and modified production modules compiled"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 1,
+      "summary": "INITIAL RUN: 72 passed, 7 failed \u2014 test-side defects only (recursive now_et patch, fixture missing _running=True, wrong symbol/tier arithmetic in two assertions); no production defect"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "79 passed after fixing the test fixtures"
+    },
+    {
+      "command": "python -m pytest tests/test_risk.py tests/test_advisor.py tests/test_dashboard.py tests/test_dashboard_api.py tests/test_config_validation.py tests/test_trading_mode_safety.py tests/test_circuit_alert_transition.py tests/test_alpha_filter.py tests/test_decision_log.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "273 passed, 2 warnings \u2014 risk, advisor, dashboard, config, trading-mode safety, circuit transition, alpha filter, decision log"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider -x --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed, 3 warnings in 46.78s \u2014 complete pre-existing backend suite with the gate wired in"
+    },
+    {
+      "command": "python -m pytest tests/agents tests/test_reports.py tests/test_daily_summary_percent.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "146 passed after adding agent_veto to the daily-summary stage list"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "summary": "no whitespace errors"
+    }
+  ],
+  "tests": {
+    "run": true,
+    "commands": [
+      "python -m pytest tests/agents -q -p no:cacheprovider",
+      "python -m pytest tests/test_risk.py tests/test_advisor.py tests/test_dashboard.py tests/test_dashboard_api.py tests/test_config_validation.py tests/test_trading_mode_safety.py tests/test_circuit_alert_transition.py tests/test_alpha_filter.py tests/test_decision_log.py -q -p no:cacheprovider",
+      "python -m pytest tests/ -q -p no:cacheprovider -x --ignore=tests/agents"
+    ],
+    "passed": 3038,
+    "failed": 0,
+    "skipped": 0,
+    "result": "pass"
+  },
+  "policy_results": [
+    {
+      "policy_id": "base",
+      "outcome": "pass",
+      "detail": "Classified multi-step; feature-development graph followed node by node with inspect-before-change and recorded retries."
+    },
+    {
+      "policy_id": "security",
+      "outcome": "pass",
+      "detail": "No secrets in diff. Provider keys are read from env at call time, never stored in config, prompts, logs, or records. No sensitive-path file touched (no *auth*, *secret*, *billing*, *permission*, migrations, workflows, infra). Agent layer has no broker write path; the only broker access is the read-only get_day_trade_count probe, asserted by test."
+    },
+    {
+      "policy_id": "delivery",
+      "outcome": "pass",
+      "detail": "New (79) and existing (2959) suites pass locally. Default config keeps run_mode=paper, live_trading_enabled=false, agents.enabled=true, agents.llm.enabled=false (asserted by test). No deployment is authorized by this run."
+    },
+    {
+      "policy_id": "ai-agents",
+      "outcome": "pass",
+      "detail": "completion_status is 'tested'. Every command listed was executed in this session with the recorded exit code, including the failing first test run."
+    }
+  ],
+  "security_results": [
+    {
+      "check": "no-secrets-in-diff",
+      "outcome": "pass",
+      "detail": "Only placeholder names in .env.example comments; no credential values."
+    },
+    {
+      "check": "no-broker-mutation-from-agents",
+      "outcome": "pass",
+      "detail": "tests/agents/test_gate.py::TestContextBuilding::test_gate_never_calls_order_methods_on_broker proves the gate touches only get_day_trade_count."
+    },
+    {
+      "check": "blocking-only",
+      "outcome": "pass",
+      "detail": "AgentDecision enforces allow=1.0, block=0.0, 0<reduce<1; main.py applies the multiplier only to an already-approved RiskCheckResult and only when < 1.0."
+    },
+    {
+      "check": "live-gate-untouched",
+      "outcome": "pass",
+      "detail": "_assert_live_evidence_gate, validate_safety, DISCLAIMER, and Alpaca credential handling are byte-identical."
+    },
+    {
+      "check": "excluded-modules",
+      "outcome": "pass",
+      "detail": "No import of trading_bot/crypto or trading_bot/ai/quantum_predictor; no Robinhood, memecoin, Solana, DEX, or wallet references."
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "execution-record",
+      "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
+      "produced_by_node": "collect-evidence",
+      "sha256": "31303310370040381a81f7c99d35162985fa2b9a7a6196506c961f968db318bd"
+    },
+    {
+      "id": "agent-models",
+      "path": "trading_bot/agents/models.py",
+      "produced_by_node": "implement",
+      "sha256": "505c903dffbb8cb4bcbe8721cf97eb635938ca8545db011ceab4acd90b572897"
+    },
+    {
+      "id": "rule-veto",
+      "path": "trading_bot/agents/veto.py",
+      "produced_by_node": "implement",
+      "sha256": "b2be07918fdca1ddcec04996f1d71e0208226ffdf5f3376c3f4c28d486e9f917"
+    },
+    {
+      "id": "catalyst-scout",
+      "path": "trading_bot/agents/scout.py",
+      "produced_by_node": "implement",
+      "sha256": "ad6c2e8701acb076b464bc0cf05730fc843af75eb54b9fc1fb4589619aa41e05"
+    },
+    {
+      "id": "agent-brief",
+      "path": "trading_bot/agents/brief.py",
+      "produced_by_node": "implement",
+      "sha256": "fefc665a229ee380000c3af38c3a04def4df5ad54c8149e7801d2c8cbf126922"
+    },
+    {
+      "id": "agent-gate",
+      "path": "trading_bot/agents/gate.py",
+      "produced_by_node": "implement",
+      "sha256": "72d77e1fd84b2a06fa8f1e5c71bdac503066544919e2402267e143c1ae24c2df"
+    },
+    {
+      "id": "main-wiring",
+      "path": "trading_bot/main.py",
+      "produced_by_node": "implement",
+      "sha256": "430244cccfe691a21d22d91f7e20c1c792dc1e7881bce005b2b48930cec47178"
+    },
+    {
+      "id": "settings",
+      "path": "trading_bot/config/settings.py",
+      "produced_by_node": "implement",
+      "sha256": "578e1f0693723f8ac5a52a01135b149f5a3541d7909929e0fe7aa22853be0fab"
+    },
+    {
+      "id": "veto-tests",
+      "path": "tests/agents/test_veto.py",
+      "produced_by_node": "test",
+      "sha256": "ed1e1019bbd50cc57fcf9298c64956afdff800a225761fa288015a28a8a845f7"
+    },
+    {
+      "id": "scout-tests",
+      "path": "tests/agents/test_scout.py",
+      "produced_by_node": "test",
+      "sha256": "38b73989fcb9ddeed5035c7d3a60a1b701c97ed98dd7a6478b86151680607a15"
+    },
+    {
+      "id": "gate-tests",
+      "path": "tests/agents/test_gate.py",
+      "produced_by_node": "test",
+      "sha256": "86dcb55c7bfdd731bb3b9bf6bcee0a72bf9da30eb6842f7e1d81f29dab140ee5"
+    }
+  ],
+  "completion_status": "tested",
+  "confidence": 0.85,
+  "unresolved_risks": [
+    "No independent UIE verification result exists, so this work cannot be promoted from 'tested' to 'verified'.",
+    "The OpenAI and Anthropic client wrappers are covered only by an injected fake; a real one-shot call against each provider in a paper session is still outstanding before agents.llm.enabled=true is used.",
+    "The veto's min_advisor_confidence (0.55) is applied to the advisor's ADJUSTED confidence, which is lower than the raw signal confidence (e.g. x0.85 with no catalyst). With the gate on this tightens paper entries relative to the pre-gate bot; the operator should review data/agent_decisions.csv after the first paper sessions and tune the threshold deliberately.",
+    "Fail-closed gate_error blocks mean a defect inside the agent layer stops all new entries (never lets one through). This is intended, but it is a new way for the bot to go quiet; the agent.gate_error log event should be alerted on.",
+    "The frontend lockfile audit blocker recorded in bundle-mtb-order-lifecycle-20260810 is unrelated to and unchanged by this run."
+  ],
+  "rollback": {
+    "available": true,
+    "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
+    "tested": true
+  },
+  "content_hash": "c64d3e89c80d13a2e08b1756febc281cab346ddd9a33039e1117f5e31030d6e2"
+}

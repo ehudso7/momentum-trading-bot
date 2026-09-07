@@ -56,6 +56,38 @@ that way until the public-product gate in the contract passes legal review.
 - **Hard Time Exit**: Flat all positions by 3:50 PM ET
 - **PDT Protection**: Warns when approaching pattern day trader limits
 
+### Agent gate (optional)
+
+A Scout / Veto / Brief layer that sits **between** the rule-based advisor and
+order placement (`trading_bot/agents/`). It is a blocking-only review, not
+autonomous trading: it can veto or shrink an entry that the circuit breaker,
+risk engine, correlation check, and advisor have already approved, and it can
+never approve a rejected entry, increase size, pick symbols, or touch the
+broker. Every decision (allow, reduce, or block) is written to
+`data/agent_decisions.csv`, logged via structlog, and exposed at
+`/api/agent-decisions`.
+
+- **RuleVeto** — deterministic, no network. Blocks on circuit state, session
+  validity, advisor skip / low advisor confidence, max positions, duplicate
+  symbol, gap beyond the scanner ceiling, scanner price / rvol / float bounds,
+  and PDT. Missing required context fails closed.
+- **CatalystScout** — optional LLM catalyst classifier (`earnings`, `fda`,
+  `merger`, `dilution`, `offering`, `pump`, `rumor`, `unknown`). **OFF by
+  default.** When enabled it makes one short, non-streaming call per
+  candidate under a hard timeout and a daily call budget, and fails closed on
+  any error. A failed scout only blocks when `agents.require_scout: true`; a
+  high-confidence `pump` / `dilution` / `offering` blocks when
+  `agents.block_toxic_catalysts: true` (the default).
+- **AgentBrief** — one human-readable log line plus one structured record.
+
+Defaults ship with the gate on and the LLM off (`agents:` in `config.yaml`).
+The live-mode evidence gate, circuit breaker order, and Alpaca key handling
+are untouched. Run the gate in paper mode first and read
+`data/agent_decisions.csv` before considering the LLM scout; enabling it
+requires `pip install ".[llm]"` and `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
+in the environment (never in config). Set `TRADING_AGENTS__ENABLED=false`
+to disable the layer entirely.
+
 ### Infrastructure
 - **Three Run Modes**: Backtest, Paper (default), Live
 - **Live Web Dashboard**: Real-time FastAPI dashboard with equity curve, positions, trades, health metrics
@@ -253,6 +285,8 @@ Data Sources (merged):
                            ↓
                     AI Advisor (entry recommendation)
                            ↓
+                    Agent Gate (rule veto → optional scout → brief)
+                           ↓
                     Correlation Check → Risk Check (position sizer)
                            ↓
                     Execution (Alpaca broker)
@@ -328,6 +362,7 @@ http://localhost:8080/api/trades         # JSON: today's completed trades
 http://localhost:8080/api/equity-history # JSON: equity curve data
 http://localhost:8080/api/health         # JSON: system health metrics
 http://localhost:8080/api/circuit-breaker # JSON: circuit breaker state
+http://localhost:8080/api/agent-decisions # JSON: recent agent-gate decisions
 http://localhost:8080/api/docs          # Swagger API docs
 ```
 

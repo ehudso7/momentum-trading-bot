@@ -59,6 +59,9 @@ class DashboardSnapshot:
     rejected_by_stage: dict[str, int] = field(default_factory=dict)
     rejected_signals: list[dict[str, Any]] = field(default_factory=list)
 
+    # Agent gate decisions (most recent first; empty when the gate is off)
+    agent_decisions: list[dict[str, Any]] = field(default_factory=list)
+
     # Metadata
     run_mode: str = "paper"
     broker_provider: str = "unknown"
@@ -95,6 +98,7 @@ class DashboardState:
         rejected_signals_count: int = 0,
         rejected_by_stage: dict[str, int] | None = None,
         rejected_signals: list[dict[str, Any]] | None = None,
+        agent_decisions: list[dict[str, Any]] | None = None,
     ) -> None:
         """Called by the bot on each tick to push latest state."""
         now_eastern = datetime.now(ET)
@@ -128,6 +132,7 @@ class DashboardState:
                 rejected_signals_count=rejected_signals_count,
                 rejected_by_stage=rejected_by_stage or {},
                 rejected_signals=rejected_signals or [],
+                agent_decisions=agent_decisions or [],
                 run_mode=run_mode,
                 broker_provider=broker_provider,
                 last_updated=now_str,

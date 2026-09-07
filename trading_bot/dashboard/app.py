@@ -245,6 +245,21 @@ def create_app(
             "last_error": snap.last_error,
             "rejected_signals_count": snap.rejected_signals_count,
             "rejected_by_stage": snap.rejected_by_stage,
+            "agent_decisions_count": len(snap.agent_decisions),
+        }
+
+    @app.get("/api/agent-decisions")
+    async def api_agent_decisions() -> dict[str, Any]:
+        """Recent agent-gate decisions (veto / scout / brief), newest first."""
+        snap = state.get_snapshot()
+        return {
+            "observed_at": snap.last_updated,
+            "count": len(snap.agent_decisions),
+            "decisions": snap.agent_decisions,
+            "disclaimer": (
+                "Agent gate decisions are blocking-only reviews of entries the "
+                "risk engine already approved. They are not trade recommendations."
+            ),
         }
 
     @app.get("/api/positions")

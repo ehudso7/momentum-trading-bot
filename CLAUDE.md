@@ -106,6 +106,7 @@ Scanner (4 data sources merged) → Filter Pipeline (price, gap, float, rvol)
 | Strategy | `trading_bot/strategies/pullback_vwap.py` | 5 entry setups, regime-adaptive proximity, multi-bar lookback |
 | Regime | `trading_bot/strategies/regime.py` | SPY-based regime detection + parameter adjustment tables |
 | Advisor | `trading_bot/strategies/advisor.py` | Rule-based entry/exit/sizing recommendations |
+| Agent Gate | `trading_bot/agents/` | Blocking-only veto / optional LLM scout / brief between advisor and order placement |
 | Risk | `trading_bot/risk/position_sizer.py` | `shares = risk$ / stop_distance`, max positions, leverage, PDT |
 | Circuit Breaker | `trading_bot/risk/circuit_breaker.py` | Halt on >5% drawdown, consecutive losses, API errors |
 | Correlation | `trading_bot/risk/correlation.py` | Sector/price correlation checker |
