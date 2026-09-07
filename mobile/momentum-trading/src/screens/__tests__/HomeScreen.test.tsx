@@ -12,7 +12,8 @@ jest.mock('../../contexts/AuthContext', () => ({
 }));
 
 jest.mock('../../contexts/WebSocketContext', () => ({
-  useWebSocket: () => ({ subscribe: jest.fn(), lastMessage: null, send: jest.fn() }),
+  // Typed against the real contract — see ./mockWebSocket.
+  useWebSocket: () => require('./mockWebSocket').makeWebSocketMock(),
 }));
 
 jest.mock('../../services/api', () => ({

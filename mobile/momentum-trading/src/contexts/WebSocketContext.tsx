@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import Constants from 'expo-constants';
 
-interface WebSocketContextType {
+export interface WebSocketContextType {
   isConnected: boolean;
   subscribe: (channel: string) => void;
   unsubscribe: (channel: string) => void;
