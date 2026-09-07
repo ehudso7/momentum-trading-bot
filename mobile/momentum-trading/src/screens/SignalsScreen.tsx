@@ -8,30 +8,51 @@ import {
   RefreshControl,
   Alert,
 } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { api } from '../services/api';
+import { api, Signal, isHistoricalSignal } from '../services/api';
+import {
+  fmtMoney,
+  fmtSignedMoney,
+  fmtPct,
+  fmtConfidence,
+  fmtTime,
+  fmtText,
+  actionColor,
+  isUsableConfidence,
+} from '../utils/format';
+import DataUnavailable from '../components/DataUnavailable';
+
+type TabKey = 'latest' | 'history';
+
+const TABS: { key: TabKey; label: string }[] = [
+  { key: 'latest', label: 'Latest' },
+  { key: 'history', label: 'History' },
+];
 
 export default function SignalsScreen() {
   const { theme } = useTheme();
-  const { subscribe, lastMessage } = useWebSocket();
+  const { subscribe } = useWebSocket();
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
-  const [activeTab, setActiveTab] = useState('all');
+  const [activeTab, setActiveTab] = useState<TabKey>('latest');
 
   React.useEffect(() => {
     subscribe('signals:*');
   }, [subscribe]);
 
-  const { data: signals } = useQuery({
+  const { data: signals, isLoading: signalsLoading, isError: signalsError } = useQuery({
     queryKey: ['signals', 'latest'],
     queryFn: api.getLatestSignals,
   });
 
-  const { data: signalHistory } = useQuery({
+  const {
+    data: signalHistory,
+    isLoading: historyLoading,
+    isError: historyError,
+  } = useQuery({
     queryKey: ['signals', 'history'],
     queryFn: api.getSignalHistory,
   });
@@ -53,64 +74,33 @@ export default function SignalsScreen() {
     setTimeout(() => setRefreshing(false), 2000);
   }, [queryClient]);
 
-  const mockSignals = [
-    {
-      id: '1',
-      symbol: 'AAPL',
-      type: 'Momentum Breakout',
-      action: 'BUY',
-      confidence: 0.95,
-      price: 150.25,
-      stopLoss: 147.50,
-      takeProfit: [155.00, 158.50, 162.00],
-      timestamp: new Date(),
-      status: 'active',
-      aiReasoning: 'Strong momentum with volume confirmation above 20-day moving average',
-      riskReward: 2.8,
-    },
-    {
-      id: '2',
-      symbol: 'TSLA',
-      type: 'Reversal Pattern',
-      action: 'SELL',
-      confidence: 0.87,
-      price: 250.75,
-      stopLoss: 255.00,
-      takeProfit: [245.00, 240.00, 235.00],
-      timestamp: new Date(Date.now() - 30 * 60 * 1000),
-      status: 'active',
-      aiReasoning: 'Double top pattern with RSI divergence indicating potential reversal',
-      riskReward: 3.2,
-    },
-    {
-      id: '3',
-      symbol: 'NVDA',
-      type: 'AI Volatility',
-      action: 'BUY',
-      confidence: 0.92,
-      price: 520.50,
-      stopLoss: 510.00,
-      takeProfit: [535.00, 550.00, 565.00],
-      timestamp: new Date(Date.now() - 60 * 60 * 1000),
-      status: 'triggered',
-      aiReasoning: 'Quantum predictor detected 95% probability of upward movement',
-      riskReward: 2.1,
-    },
-  ];
+  // The two tabs map one-to-one onto the two endpoints the SDK exposes. There
+  // is deliberately no client-side "active/triggered" split: the backend does
+  // not send a lifecycle status, and inventing one would put a made-up state
+  // next to a real symbol.
+  const visibleSignals: Signal[] =
+    (activeTab === 'latest' ? signals : signalHistory) ?? [];
+  const loading = activeTab === 'latest' ? signalsLoading : historyLoading;
+  const errored = activeTab === 'latest' ? signalsError : historyError;
 
-  const getSignalColor = (action: string) => {
-    return action === 'BUY' ? '#10b981' : '#ef4444';
-  };
+  const getSignalColor = (action: string | undefined) =>
+    actionColor(action, theme.textSecondary);
 
-  const getConfidenceColor = (confidence: number) => {
-    if (confidence >= 0.9) return '#10b981';
-    if (confidence >= 0.8) return '#f59e0b';
+  // An unusable confidence gets the muted colour, not a red "low confidence"
+  // band — the value is unknown, not bad.
+  const getConfidenceColor = (confidence: number | undefined) => {
+    if (!isUsableConfidence(confidence)) return theme.textSecondary;
+    if ((confidence as number) >= 0.9) return '#10b981';
+    if ((confidence as number) >= 0.8) return '#f59e0b';
     return '#ef4444';
   };
 
-  const formatTime = (date: Date) => {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
+  const confidenceBarWidth = (
+    confidence: number | undefined,
+  ): `${number}%` =>
+    isUsableConfidence(confidence)
+      ? (`${(confidence as number) * 100}%` as `${number}%`)
+      : '0%';
 
   const handleSubscribeToSignal = (signalId: string) => {
     subscribeToSignalMutation.mutate(signalId);
@@ -126,7 +116,7 @@ export default function SignalsScreen() {
       >
         {/* Header */}
         <View style={styles.header}>
-          <Text style={[styles.title, { color: theme.text }]}>AI Trading Signals</Text>
+          <Text style={[styles.title, { color: theme.text }]}>Trading Signals</Text>
           <View style={styles.headerRight}>
             <TouchableOpacity style={styles.filterButton}>
               <Text style={[styles.filterIcon, { color: theme.textSecondary }]}>⚙️</Text>
@@ -134,49 +124,32 @@ export default function SignalsScreen() {
           </View>
         </View>
 
-        {/* Performance Summary */}
-        <LinearGradient
-          colors={['#667eea', '#764ba2']}
-          style={styles.performanceCard}
-        >
-          <Text style={styles.performanceTitle}>AI Signal Performance</Text>
-
-          <View style={styles.performanceStats}>
-            <View style={styles.performanceStat}>
-              <Text style={styles.performanceValue}>95.2%</Text>
-              <Text style={styles.performanceLabel}>Accuracy</Text>
-            </View>
-            <View style={styles.performanceStat}>
-              <Text style={styles.performanceValue}>+24.8%</Text>
-              <Text style={styles.performanceLabel}>Avg Return</Text>
-            </View>
-            <View style={styles.performanceStat}>
-              <Text style={styles.performanceValue}>2.8:1</Text>
-              <Text style={styles.performanceLabel}>Risk/Reward</Text>
-            </View>
-          </View>
-        </LinearGradient>
+        <Text style={[styles.disclosure, { color: theme.textSecondary }]}>
+          Signals are research output, not investment advice, and this app does not
+          place orders. Past signal results are not shown because no verified
+          performance record has been published for them.
+        </Text>
 
         {/* Tabs */}
         <View style={styles.tabs}>
-          {['all', 'active', 'history'].map((tab) => (
+          {TABS.map((tab) => (
             <TouchableOpacity
-              key={tab}
-              onPress={() => setActiveTab(tab)}
+              key={tab.key}
+              onPress={() => setActiveTab(tab.key)}
               style={[
                 styles.tab,
                 {
-                  backgroundColor: activeTab === tab ? theme.primary : 'transparent',
+                  backgroundColor: activeTab === tab.key ? theme.primary : 'transparent',
                 },
               ]}
             >
               <Text
                 style={[
                   styles.tabText,
-                  { color: activeTab === tab ? '#fff' : theme.textSecondary },
+                  { color: activeTab === tab.key ? '#fff' : theme.textSecondary },
                 ]}
               >
-                {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                {tab.label}
               </Text>
             </TouchableOpacity>
           ))}
@@ -184,13 +157,8 @@ export default function SignalsScreen() {
 
         {/* Signals List */}
         <View style={styles.signalsList}>
-          {mockSignals
-            .filter((signal) =>
-              activeTab === 'all' ||
-              (activeTab === 'active' && signal.status === 'active') ||
-              (activeTab === 'history' && signal.status === 'triggered')
-            )
-            .map((signal) => (
+          {visibleSignals.length ? (
+            visibleSignals.map((signal) => (
               <TouchableOpacity
                 key={signal.id}
                 style={[styles.signalCard, { backgroundColor: theme.card }]}
@@ -201,7 +169,7 @@ export default function SignalsScreen() {
                       {signal.symbol}
                     </Text>
                     <Text style={[styles.signalType, { color: theme.textSecondary }]}>
-                      {signal.type}
+                      {fmtText(signal.type)}
                     </Text>
                   </View>
 
@@ -212,56 +180,65 @@ export default function SignalsScreen() {
                         { backgroundColor: getSignalColor(signal.action) },
                       ]}
                     >
-                      <Text style={styles.actionText}>{signal.action}</Text>
+                      <Text style={styles.actionText}>{fmtText(signal.action)}</Text>
                     </View>
                     <Text style={[styles.signalTime, { color: theme.textSecondary }]}>
-                      {formatTime(signal.timestamp)}
+                      {fmtTime(signal.timestamp)}
                     </Text>
                   </View>
                 </View>
 
                 <View style={styles.signalBody}>
-                  <View style={styles.priceInfo}>
-                    <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
-                      Entry Price
-                    </Text>
-                    <Text style={[styles.priceValue, { color: theme.text }]}>
-                      ${signal.price.toFixed(2)}
-                    </Text>
-                  </View>
-
-                  <View style={styles.targetsContainer}>
-                    <View style={styles.targetItem}>
-                      <Text style={[styles.targetLabel, { color: theme.textSecondary }]}>
-                        Stop Loss
+                  {isHistoricalSignal(signal) ? (
+                    <>
+                      <View style={styles.priceInfo}>
+                        <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                          Entry
+                        </Text>
+                        <Text style={[styles.priceValue, { color: theme.text }]}>
+                          {fmtMoney(signal.entryPrice)}
+                        </Text>
+                      </View>
+                      <View style={styles.priceInfo}>
+                        <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                          Exit
+                        </Text>
+                        <Text style={[styles.priceValue, { color: theme.text }]}>
+                          {fmtMoney(signal.exitPrice)}
+                        </Text>
+                      </View>
+                      <View style={styles.priceInfo}>
+                        <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                          Result
+                        </Text>
+                        <Text style={[styles.priceValue, { color: theme.text }]}>
+                          {`${fmtSignedMoney(signal.profit)} (${fmtPct(signal.profitPercent)})`}
+                        </Text>
+                      </View>
+                    </>
+                  ) : (
+                    <View style={styles.priceInfo}>
+                      <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                        Reference Price
                       </Text>
-                      <Text style={[styles.targetValue, { color: '#ef4444' }]}>
-                        ${signal.stopLoss.toFixed(2)}
+                      <Text style={[styles.priceValue, { color: theme.text }]}>
+                        {fmtMoney(signal.price)}
                       </Text>
                     </View>
-
-                    <View style={styles.targetItem}>
-                      <Text style={[styles.targetLabel, { color: theme.textSecondary }]}>
-                        Target 1
-                      </Text>
-                      <Text style={[styles.targetValue, { color: '#10b981' }]}>
-                        ${signal.takeProfit[0].toFixed(2)}
-                      </Text>
-                    </View>
-                  </View>
+                  )}
                 </View>
 
                 <View style={styles.signalFooter}>
                   <View style={styles.confidenceContainer}>
                     <Text style={[styles.confidenceLabel, { color: theme.textSecondary }]}>
-                      AI Confidence
+                      Signal Confidence
                     </Text>
                     <View style={styles.confidenceBar}>
                       <View
                         style={[
                           styles.confidenceFill,
                           {
-                            width: `${signal.confidence * 100}%`,
+                            width: confidenceBarWidth(signal.confidence),
                             backgroundColor: getConfidenceColor(signal.confidence),
                           },
                         ]}
@@ -273,73 +250,54 @@ export default function SignalsScreen() {
                         { color: getConfidenceColor(signal.confidence) },
                       ]}
                     >
-                      {(signal.confidence * 100).toFixed(0)}%
+                      {fmtConfidence(signal.confidence)}
                     </Text>
                   </View>
 
-                  <View style={styles.reasoningContainer}>
-                    <Text style={[styles.reasoningLabel, { color: theme.textSecondary }]}>
-                      AI Reasoning:
-                    </Text>
-                    <Text style={[styles.reasoningText, { color: theme.text }]}>
-                      {signal.aiReasoning}
-                    </Text>
-                  </View>
+                  {!isHistoricalSignal(signal) && signal.reasoning ? (
+                    <View style={styles.reasoningContainer}>
+                      <Text style={[styles.reasoningLabel, { color: theme.textSecondary }]}>
+                        Reasoning:
+                      </Text>
+                      <Text style={[styles.reasoningText, { color: theme.text }]}>
+                        {signal.reasoning}
+                      </Text>
+                    </View>
+                  ) : null}
 
                   <View style={styles.signalActions}>
                     <TouchableOpacity
-                      style={[styles.actionButton, { backgroundColor: theme.primary }]}
+                      style={[
+                        styles.actionButton,
+                        {
+                          backgroundColor: 'transparent',
+                          borderWidth: 1,
+                          borderColor: theme.border,
+                        },
+                      ]}
                       onPress={() => handleSubscribeToSignal(signal.id)}
-                    >
-                      <Text style={styles.actionButtonText}>Trade Now</Text>
-                    </TouchableOpacity>
-
-                    <TouchableOpacity
-                      style={[styles.actionButton, { backgroundColor: 'transparent', borderWidth: 1, borderColor: theme.border }]}
-                      onPress={() => handleSubscribeToSignal(signal.id)}
+                      disabled={subscribeToSignalMutation.isPending}
                     >
                       <Text style={[styles.actionButtonText, { color: theme.primary }]}>
-                        Subscribe
+                        Subscribe to alerts
                       </Text>
                     </TouchableOpacity>
                   </View>
                 </View>
               </TouchableOpacity>
-            ))}
-        </View>
-
-        {/* AI Insights */}
-        <View style={[styles.insightsCard, { backgroundColor: theme.card }]}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>
-            🧠 AI Market Insights
-          </Text>
-
-          <View style={styles.insight}>
-            <Text style={[styles.insightTitle, { color: theme.text }]}>
-              Market Regime Detection
-            </Text>
-            <Text style={[styles.insightText, { color: theme.textSecondary }]}>
-              Current market is in <Text style={{ color: '#10b981' }}>BULLISH</Text> regime with high momentum signals
-            </Text>
-          </View>
-
-          <View style={styles.insight}>
-            <Text style={[styles.insightTitle, { color: theme.text }]}>
-              Volatility Forecast
-            </Text>
-            <Text style={[styles.insightText, { color: theme.textSecondary }]}>
-              Expected volatility to <Text style={{ color: '#f59e0b' }}>increase 15%</Text> in next 2 hours due to FOMC announcement
-            </Text>
-          </View>
-
-          <View style={styles.insight}>
-            <Text style={[styles.insightTitle, { color: theme.text }]}>
-              Sector Rotation
-            </Text>
-            <Text style={[styles.insightText, { color: theme.textSecondary }]}>
-              AI models detect rotation from <Text style={{ color: '#ef4444' }}>Tech</Text> to <Text style={{ color: '#10b981' }}>Healthcare</Text>
-            </Text>
-          </View>
+            ))
+          ) : (
+            <DataUnavailable
+              title={loading ? 'Loading signals…' : 'No signals available'}
+              detail={
+                loading
+                  ? undefined
+                  : errored
+                    ? 'The signals service could not be reached.'
+                    : 'No signals have been published for this view.'
+              }
+            />
+          )}
         </View>
 
         <View style={{ height: 100 }} />
@@ -373,40 +331,11 @@ const styles = StyleSheet.create({
   filterIcon: {
     fontSize: 20,
   },
-  performanceCard: {
-    margin: 20,
-    marginTop: 10,
-    padding: 25,
-    borderRadius: 20,
-    elevation: 5,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-  },
-  performanceTitle: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 20,
-    textAlign: 'center',
-  },
-  performanceStats: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  performanceStat: {
-    alignItems: 'center',
-  },
-  performanceValue: {
-    color: '#fff',
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  performanceLabel: {
-    color: 'rgba(255, 255, 255, 0.8)',
+  disclosure: {
+    marginHorizontal: 20,
+    marginBottom: 16,
     fontSize: 12,
+    lineHeight: 17,
   },
   tabs: {
     flexDirection: 'row',
@@ -479,28 +408,12 @@ const styles = StyleSheet.create({
   priceInfo: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 12,
   },
   priceLabel: {
     fontSize: 14,
   },
   priceValue: {
     fontSize: 16,
-    fontWeight: '600',
-  },
-  targetsContainer: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  targetItem: {
-    alignItems: 'center',
-  },
-  targetLabel: {
-    fontSize: 12,
-    marginBottom: 4,
-  },
-  targetValue: {
-    fontSize: 14,
     fontWeight: '600',
   },
   signalFooter: {
@@ -555,33 +468,5 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
-  },
-  insightsCard: {
-    margin: 20,
-    marginTop: 0,
-    padding: 20,
-    borderRadius: 20,
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.22,
-    shadowRadius: 2.22,
-  },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 16,
-  },
-  insight: {
-    marginBottom: 16,
-  },
-  insightTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 4,
-  },
-  insightText: {
-    fontSize: 13,
-    lineHeight: 18,
   },
 });

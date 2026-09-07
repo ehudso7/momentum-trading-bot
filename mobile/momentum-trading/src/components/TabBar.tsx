@@ -4,14 +4,11 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
-  Dimensions,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { BottomTabBarProps } from '@react-navigation/bottom-tabs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
-
-const { width } = Dimensions.get('window');
 
 interface TabItem {
   name: string;
@@ -79,7 +76,7 @@ export default function TabBar({ state, descriptors, navigation }: BottomTabBarP
               accessibilityRole="button"
               accessibilityState={isFocused ? { selected: true } : {}}
               accessibilityLabel={options.tabBarAccessibilityLabel}
-              testID={options.tabBarTestID}
+              testID={options.tabBarButtonTestID}
               onPress={onPress}
               onLongPress={onLongPress}
               style={[styles.tab, { flex: 1 }]}

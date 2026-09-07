@@ -101,3 +101,47 @@ jobs:
         env:
           TRADING_PRIVATE_MODE: "true"
           TRADING_PRIVATE_OWNER_EMAILS: owner@example.invalid
+
+  mobile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: mobile/momentum-trading
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/momentum-trading/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Audit production dependencies
+        # Gated at "critical" rather than "high" because every current high
+        # advisory (postcss, image-size) reaches this project only through
+        # Expo's own build toolchain (@expo/cli, @expo/prebuild-config) and
+        # npm reports the sole fix as expo@57 — an SDK 54 -> 57 major upgrade,
+        # which is its own change, not a drive-by here. The step below reports
+        # those findings so they stay visible instead of silently accepted.
+        run: npm audit --omit=dev --audit-level=critical
+      - name: Report high-severity advisories (informational)
+        if: always()
+        run: npm audit --omit=dev --audit-level=high || true
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests
+        run: npm run test:ci
+      - name: Expo doctor
+        # Runs the expo-doctor pinned in package-lock.json via `npm run
+        # doctor`, not `npx --yes expo-doctor`, which would resolve and execute
+        # whatever version npm serves at run time — an unpinned dependency
+        # fetched outside the lockfile, and a job that can fail on npm
+        # availability rather than on project state.
+        #
+        # Still non-blocking: the checks it performs validate against Expo's
+        # remote schema and the React Native directory API, so an upstream
+        # outage would redden a PR that changed nothing. Typecheck and tests
+        # above are the blocking gates.
+        continue-on-error: true
+        run: npm run doctor

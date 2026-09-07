@@ -9,11 +9,27 @@ import {
   Switch,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useQuery } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
+import DataUnavailable from '../components/DataUnavailable';
+
+// Declared explicitly so the heterogeneous entries below (some carry a
+// subtitle, some a trailing control, some neither) infer as one item type
+// rather than a union TypeScript cannot narrow at the render site.
+interface MenuItem {
+  icon: string;
+  title: string;
+  onPress: () => void;
+  subtitle?: string;
+  rightComponent?: React.ReactNode;
+}
+
+interface MenuSection {
+  section: string;
+  items: MenuItem[];
+}
 
 export default function ProfileScreen() {
   const { theme, isDark, toggleTheme } = useTheme();
@@ -21,15 +37,10 @@ export default function ProfileScreen() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [biometricEnabled, setBiometricEnabled] = useState(true);
 
-  const { data: subscription } = useQuery({
-    queryKey: ['subscription'],
-    queryFn: api.getSubscription,
-  });
-
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-  });
+  // The /subscription and /settings queries used to run here and their
+  // results were never rendered — the same dead-request defect as the
+  // /performance query on PortfolioScreen. Re-add them alongside the UI that
+  // actually displays them.
 
   const handleLogout = () => {
     Alert.alert(
@@ -50,7 +61,7 @@ export default function ProfileScreen() {
 
   const handleUpgrade = async () => {
     try {
-      const checkoutSession = await api.createCheckoutSession('price_1TQC0vBVIDu5AoABCJOLlQID');
+      await api.createCheckoutSession('price_1TQC0vBVIDu5AoABCJOLlQID');
       // In real app, open checkout URL
       Alert.alert('Upgrade', 'Redirecting to payment...');
     } catch (error) {
@@ -58,7 +69,7 @@ export default function ProfileScreen() {
     }
   };
 
-  const menuItems = [
+  const menuItems: MenuSection[] = [
     {
       section: 'Account',
       items: [
@@ -154,28 +165,17 @@ export default function ProfileScreen() {
           </View>
         </LinearGradient>
 
-        {/* Stats Cards */}
+        {/* Lifetime performance stats.
+
+            Previously hardcoded to "$12,450 / 156 / 87%" for every account,
+            which read as the signed-in user's own trading record. No endpoint
+            publishes per-user performance, so there is nothing to show. Wire
+            this to a real stats endpoint before restoring the three cards. */}
         <View style={styles.statsContainer}>
-          <View style={[styles.statCard, { backgroundColor: theme.card }]}>
-            <Text style={[styles.statValue, { color: theme.text }]}>$12,450</Text>
-            <Text style={[styles.statLabel, { color: theme.textSecondary }]}>
-              Total Gains
-            </Text>
-          </View>
-
-          <View style={[styles.statCard, { backgroundColor: theme.card }]}>
-            <Text style={[styles.statValue, { color: theme.text }]}>156</Text>
-            <Text style={[styles.statLabel, { color: theme.textSecondary }]}>
-              Trades Won
-            </Text>
-          </View>
-
-          <View style={[styles.statCard, { backgroundColor: theme.card }]}>
-            <Text style={[styles.statValue, { color: theme.text }]}>87%</Text>
-            <Text style={[styles.statLabel, { color: theme.textSecondary }]}>
-              Win Rate
-            </Text>
-          </View>
+          <DataUnavailable
+            title="Performance stats unavailable"
+            detail="Your trading statistics are not published yet."
+          />
         </View>
 
         {/* Upgrade Card */}
@@ -329,26 +329,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     marginTop: -20,
     gap: 10,
-  },
-  statCard: {
-    flex: 1,
-    padding: 16,
-    borderRadius: 12,
-    alignItems: 'center',
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.22,
-    shadowRadius: 2.22,
-  },
-  statValue: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  statLabel: {
-    fontSize: 12,
-    textAlign: 'center',
   },
   upgradeCardContainer: {
     margin: 20,

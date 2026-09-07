@@ -38,7 +38,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { api } from '../services/api';
+import { api, Quote } from '../services/api';
+import { fmtMoney, fmtSignedMoney, fmtPct, fmtVolume } from '../utils/format';
+import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
 
@@ -96,17 +98,22 @@ export default function TradingScreen() {
     subscribe(`market:${selectedSymbol}`);
   }, [selectedSymbol, subscribe]);
 
-  useQuery({
+  const {
+    data: quote,
+    isLoading: quoteLoading,
+    isError: quoteError,
+  } = useQuery<Quote>({
     queryKey: ['market', selectedSymbol],
     queryFn: () => api.getMarketData(selectedSymbol),
   });
 
   const watchlist = ['AAPL', 'TSLA', 'NVDA', 'MSFT', 'GOOGL', 'AMZN'];
 
-  const chartData = {
-    labels: ['9:30', '10:00', '10:30', '11:00', '11:30', '12:00'],
-    datasets: [{ data: [150, 152, 148, 155, 153, 157] }],
-  };
+  // No intraday series endpoint exists yet, so there is nothing to plot. This
+  // stays null rather than holding a sample series: a hardcoded curve under a
+  // real ticker reads as that ticker's actual price action.
+  const chartData: { labels: string[]; datasets: { data: number[] }[] } | null =
+    null;
 
   // Handle broker deep-link. Try to open the broker's app or website; if the
   // system rejects the URL for any reason we surface a friendly explanation
@@ -184,27 +191,6 @@ export default function TradingScreen() {
               >
                 {symbol}
               </Text>
-              <Text
-                style={[
-                  styles.watchlistPrice,
-                  {
-                    color:
-                      selectedSymbol === symbol
-                        ? 'rgba(255,255,255,0.8)'
-                        : theme.textSecondary,
-                  },
-                ]}
-              >
-                $150.25
-              </Text>
-              <Text
-                style={[
-                  styles.watchlistChange,
-                  { color: selectedSymbol === symbol ? '#fff' : '#10b981' },
-                ]}
-              >
-                +2.5%
-              </Text>
             </TouchableOpacity>
           ))}
         </ScrollView>
@@ -214,30 +200,38 @@ export default function TradingScreen() {
           <View style={styles.stockHeader}>
             <View>
               <Text style={styles.stockSymbol}>{selectedSymbol}</Text>
-              <Text style={styles.stockCompany}>Apple Inc.</Text>
+              <Text style={styles.stockCompany}>
+                {quoteLoading
+                  ? 'Loading quote\u2026'
+                  : quoteError
+                    ? 'Quote unavailable'
+                    : 'Delayed quote'}
+              </Text>
             </View>
             <View style={styles.stockPriceContainer}>
-              <Text style={styles.stockPrice}>$150.25</Text>
-              <Text style={styles.stockChange}>+$2.50 (+1.69%)</Text>
+              <Text style={styles.stockPrice}>{fmtMoney(quote?.price)}</Text>
+              <Text style={styles.stockChange}>
+                {`${fmtSignedMoney(quote?.change)} (${fmtPct(quote?.changePercent)})`}
+              </Text>
             </View>
           </View>
 
           <View style={styles.stockStats}>
             <View style={styles.stockStat}>
               <Text style={styles.stockStatLabel}>Open</Text>
-              <Text style={styles.stockStatValue}>$148.25</Text>
+              <Text style={styles.stockStatValue}>{fmtMoney(quote?.open)}</Text>
             </View>
             <View style={styles.stockStat}>
               <Text style={styles.stockStatLabel}>High</Text>
-              <Text style={styles.stockStatValue}>$152.10</Text>
+              <Text style={styles.stockStatValue}>{fmtMoney(quote?.high)}</Text>
             </View>
             <View style={styles.stockStat}>
               <Text style={styles.stockStatLabel}>Low</Text>
-              <Text style={styles.stockStatValue}>$147.80</Text>
+              <Text style={styles.stockStatValue}>{fmtMoney(quote?.low)}</Text>
             </View>
             <View style={styles.stockStat}>
               <Text style={styles.stockStatLabel}>Volume</Text>
-              <Text style={styles.stockStatValue}>2.5M</Text>
+              <Text style={styles.stockStatValue}>{fmtVolume(quote?.volume)}</Text>
             </View>
           </View>
         </LinearGradient>
@@ -248,27 +242,34 @@ export default function TradingScreen() {
             Price Chart — {selectedSymbol}
           </Text>
 
-          <LineChart
-            data={chartData}
-            width={width - 40}
-            height={200}
-            chartConfig={{
-              backgroundColor: theme.card,
-              backgroundGradientFrom: theme.card,
-              backgroundGradientTo: theme.card,
-              decimalPlaces: 2,
-              color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
-              labelColor: () => theme.textSecondary,
-              style: { borderRadius: 16 },
-              propsForDots: {
-                r: '4',
-                strokeWidth: '2',
-                stroke: '#667eea',
-              },
-            }}
-            bezier
-            style={styles.chart}
-          />
+          {chartData ? (
+            <LineChart
+              data={chartData}
+              width={width - 40}
+              height={200}
+              chartConfig={{
+                backgroundColor: theme.card,
+                backgroundGradientFrom: theme.card,
+                backgroundGradientTo: theme.card,
+                decimalPlaces: 2,
+                color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
+                labelColor: () => theme.textSecondary,
+                style: { borderRadius: 16 },
+                propsForDots: {
+                  r: '4',
+                  strokeWidth: '2',
+                  stroke: '#667eea',
+                },
+              }}
+              bezier
+              style={styles.chart}
+            />
+          ) : (
+            <DataUnavailable
+              title="Price history unavailable"
+              detail="No intraday series is published for this symbol yet."
+            />
+          )}
         </View>
 
         {/* Trade on your broker — hand-off panel replaces the previous
@@ -381,15 +382,6 @@ const styles = StyleSheet.create({
   watchlistSymbol: {
     fontSize: 14,
     fontWeight: '700',
-  },
-  watchlistPrice: {
-    fontSize: 12,
-    marginTop: 4,
-  },
-  watchlistChange: {
-    fontSize: 12,
-    marginTop: 2,
-    fontWeight: '600',
   },
   stockCard: {
     margin: 20,

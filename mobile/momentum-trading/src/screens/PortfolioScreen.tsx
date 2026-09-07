@@ -11,30 +11,37 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import { useQuery } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { PieChart, LineChart } from 'react-native-chart-kit';
+import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { api } from '../services/api';
+import {
+  fmtMoney,
+  fmtSignedMoney,
+  fmtPct,
+  fmtQuantity,
+  fmtText,
+  changeColor,
+} from '../utils/format';
+import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
 
 export default function PortfolioScreen() {
   const { theme } = useTheme();
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedPeriod, setSelectedPeriod] = useState('1D');
 
   const { data: portfolio } = useQuery({
     queryKey: ['portfolio'],
     queryFn: api.getPortfolio,
   });
 
-  const { data: positions } = useQuery({
+  const {
+    data: positions,
+    isLoading: positionsLoading,
+    isError: positionsError,
+  } = useQuery({
     queryKey: ['positions'],
     queryFn: api.getPositions,
-  });
-
-  const { data: performance } = useQuery({
-    queryKey: ['performance', selectedPeriod],
-    queryFn: () => api.getPerformance(selectedPeriod.toLowerCase()),
   });
 
   const onRefresh = React.useCallback(async () => {
@@ -42,28 +49,14 @@ export default function PortfolioScreen() {
     setTimeout(() => setRefreshing(false), 2000);
   }, []);
 
-  const periods = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
+  // Holdings come from the API only. There is deliberately no sample
+  // fallback here: see components/DataUnavailable.tsx.
+  const holdings = positions ?? [];
 
-  const pieData = [
-    { name: 'Stocks', population: 65, color: '#667eea', legendFontColor: theme.text },
-    { name: 'Crypto', population: 20, color: '#10b981', legendFontColor: theme.text },
-    { name: 'Cash', population: 10, color: '#f59e0b', legendFontColor: theme.text },
-    { name: 'Bonds', population: 5, color: '#ef4444', legendFontColor: theme.text },
-  ];
-
-  const chartData = {
-    labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'],
-    datasets: [{
-      data: [100000, 102000, 98500, 105000, 108000, 112000],
-    }],
-  };
-
-  const mockPositions = [
-    { symbol: 'AAPL', name: 'Apple Inc.', shares: 50, value: 8500, change: 2.5, changePercent: 3.2 },
-    { symbol: 'TSLA', name: 'Tesla Inc.', shares: 25, value: 6250, change: -125, changePercent: -2.0 },
-    { symbol: 'NVDA', name: 'NVIDIA Corp.', shares: 15, value: 7800, change: 150, changePercent: 1.96 },
-    { symbol: 'MSFT', name: 'Microsoft Corp.', shares: 30, value: 9600, change: 75, changePercent: 0.79 },
-  ];
+  // The performance series the chart needs is not yet returned in a charted
+  // shape by the backend, so the chart renders an unavailable state rather
+  // than a fabricated curve.
+  const performanceSeries: { labels: string[]; datasets: { data: number[] }[] } | null = null;
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -87,89 +80,66 @@ export default function PortfolioScreen() {
           style={styles.summaryCard}
         >
           <Text style={styles.summaryLabel}>Total Portfolio Value</Text>
-          <Text style={styles.summaryValue}>$112,450.73</Text>
+          <Text style={styles.summaryValue}>{fmtMoney(portfolio?.totalValue)}</Text>
 
           <View style={styles.summaryStats}>
             <View style={styles.stat}>
-              <Text style={styles.statValue}>+$2,450</Text>
-              <Text style={styles.statLabel}>Today's Gain</Text>
+              <Text style={styles.statValue}>{fmtSignedMoney(portfolio?.dayChange)}</Text>
+              <Text style={styles.statLabel}>Today's P&L</Text>
             </View>
             <View style={styles.stat}>
-              <Text style={styles.statValue}>+12.45%</Text>
-              <Text style={styles.statLabel}>Total Return</Text>
+              <Text style={styles.statValue}>{fmtPct(portfolio?.dayChangePercent)}</Text>
+              <Text style={styles.statLabel}>Today's Change</Text>
             </View>
           </View>
         </LinearGradient>
 
         {/* Performance Chart */}
         <View style={[styles.chartCard, { backgroundColor: theme.card }]}>
+          {/* The 1D/1W/1M/... selector lived here. It only ever drove the
+              /performance query, whose result was never rendered, so the
+              buttons changed the highlight and issued a request while the
+              chart below stayed unavailable regardless. Controls that appear
+              to change what you are looking at but do not are the same
+              dishonesty as fabricated numbers, so both the selector and the
+              query are gone until a charted series exists to drive them. */}
           <View style={styles.chartHeader}>
             <Text style={[styles.sectionTitle, { color: theme.text }]}>Performance</Text>
-            <View style={styles.periodSelector}>
-              {periods.map((period) => (
-                <TouchableOpacity
-                  key={period}
-                  onPress={() => setSelectedPeriod(period)}
-                  style={[
-                    styles.periodButton,
-                    selectedPeriod === period && styles.periodButtonActive,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.periodText,
-                      { color: selectedPeriod === period ? '#fff' : theme.textSecondary },
-                    ]}
-                  >
-                    {period}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
           </View>
 
-          <LineChart
-            data={chartData}
-            width={width - 40}
-            height={200}
-            chartConfig={{
-              backgroundColor: theme.card,
-              backgroundGradientFrom: theme.card,
-              backgroundGradientTo: theme.card,
-              decimalPlaces: 0,
-              color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
-              labelColor: (opacity = 1) => theme.textSecondary,
-              style: { borderRadius: 16 },
-              propsForDots: {
-                r: '4',
-                strokeWidth: '2',
-                stroke: '#667eea',
-              },
-            }}
-            bezier
-            style={styles.chart}
-          />
+          {performanceSeries ? (
+            <LineChart
+              data={performanceSeries}
+              width={width - 40}
+              height={200}
+              chartConfig={{
+                backgroundColor: theme.card,
+                backgroundGradientFrom: theme.card,
+                backgroundGradientTo: theme.card,
+                decimalPlaces: 0,
+                color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
+                labelColor: () => theme.textSecondary,
+                style: { borderRadius: 16 },
+                propsForDots: { r: '4', strokeWidth: '2', stroke: '#667eea' },
+              }}
+              bezier
+              style={styles.chart}
+            />
+          ) : (
+            <DataUnavailable
+              title="Performance history unavailable"
+              detail="Connect an account to chart real performance."
+            />
+          )}
         </View>
 
         {/* Asset Allocation */}
         <View style={[styles.allocationCard, { backgroundColor: theme.card }]}>
           <Text style={[styles.sectionTitle, { color: theme.text }]}>Asset Allocation</Text>
 
-          <PieChart
-            data={pieData}
-            width={width - 40}
-            height={200}
-            chartConfig={{
-              backgroundColor: theme.card,
-              backgroundGradientFrom: theme.card,
-              backgroundGradientTo: theme.card,
-              color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
-            }}
-            accessor="population"
-            backgroundColor="transparent"
-            paddingLeft="15"
-            center={[10, 10]}
-            absolute
+          <DataUnavailable
+            title="Allocation unavailable"
+            detail="Allocation is derived from live holdings."
           />
         </View>
 
@@ -182,7 +152,25 @@ export default function PortfolioScreen() {
             </TouchableOpacity>
           </View>
 
-          {mockPositions.map((position, index) => (
+          {holdings.length === 0 ? (
+            // Same reasoning as HomeScreen: until the query resolves, the app
+            // does not know whether the account holds anything, so it must not
+            // say it holds nothing.
+            <DataUnavailable
+              title={
+                positionsLoading
+                  ? 'Loading holdings…'
+                  : positionsError
+                    ? 'Holdings unavailable'
+                    : 'No holdings to display'
+              }
+              detail={
+                positionsError
+                  ? 'The positions service could not be reached.'
+                  : undefined
+              }
+            />
+          ) : holdings.map((position) => (
             <TouchableOpacity
               key={position.symbol}
               style={[styles.positionItem, { borderBottomColor: theme.border }]}
@@ -192,16 +180,22 @@ export default function PortfolioScreen() {
                   {position.symbol}
                 </Text>
                 <Text style={[styles.positionName, { color: theme.textSecondary }]}>
-                  {position.shares} shares
+                  {`${fmtQuantity(position.quantity)} shares`}
                 </Text>
               </View>
 
               <View style={styles.positionCenter}>
                 <Text style={[styles.positionValue, { color: theme.text }]}>
-                  ${position.value.toLocaleString()}
+                  {fmtMoney(position.currentPrice)}
                 </Text>
+                {/* Labelled explicitly: this is the per-share price the
+                    endpoint returns, not the position's market value. The
+                    style name reads as "value", which invited exactly that
+                    misreading. Market value is not derived here because
+                    quantity x price means different things for a long and a
+                    short, and /positions does not send a marketValue field. */}
                 <Text style={[styles.positionCompany, { color: theme.textSecondary }]}>
-                  {position.name}
+                  {`price · ${fmtText(position.side)}`}
                 </Text>
               </View>
 
@@ -209,18 +203,18 @@ export default function PortfolioScreen() {
                 <Text
                   style={[
                     styles.positionChange,
-                    { color: position.change >= 0 ? '#10b981' : '#ef4444' },
+                    { color: changeColor(position.unrealizedPnL, theme.textSecondary) },
                   ]}
                 >
-                  {position.change >= 0 ? '+' : ''}${position.change}
+                  {fmtSignedMoney(position.unrealizedPnL)}
                 </Text>
                 <Text
                   style={[
                     styles.positionPercent,
-                    { color: position.changePercent >= 0 ? '#10b981' : '#ef4444' },
+                    { color: theme.textSecondary },
                   ]}
                 >
-                  {position.changePercent >= 0 ? '+' : ''}{position.changePercent}%
+                  {`entry ${fmtMoney(position.entryPrice)}`}
                 </Text>
               </View>
             </TouchableOpacity>

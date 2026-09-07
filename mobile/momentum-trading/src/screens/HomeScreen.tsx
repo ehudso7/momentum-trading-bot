@@ -15,6 +15,15 @@ import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
+import {
+  fmtMoney,
+  fmtSignedMoney,
+  fmtPct,
+  fmtConfidence,
+  fmtText,
+  isUsableConfidence,
+} from '../utils/format';
+import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
 
@@ -28,7 +37,11 @@ export default function HomeScreen() {
     queryFn: api.getPortfolio,
   });
 
-  const { data: signals } = useQuery({
+  const {
+    data: signals,
+    isLoading: signalsLoading,
+    isError: signalsError,
+  } = useQuery({
     queryKey: ['signals', 'latest'],
     queryFn: api.getLatestSignals,
   });
@@ -39,12 +52,11 @@ export default function HomeScreen() {
     setTimeout(() => setRefreshing(false), 2000);
   }, []);
 
-  const chartData = {
-    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Today'],
-    datasets: [{
-      data: [98000, 99200, 98500, 101000, 102500, 105000],
-    }],
-  };
+  // No sample equity curve. The backend does not yet return a charted
+  // performance series, so the card shows an unavailable state instead of a
+  // fabricated one (see components/DataUnavailable.tsx).
+  const chartData: { labels: string[]; datasets: { data: number[] }[] } | null = null;
+
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -73,16 +85,16 @@ export default function HomeScreen() {
         >
           <Text style={styles.portfolioLabel}>Total Portfolio Value</Text>
           <Text style={styles.portfolioValue}>
-            ${portfolio?.totalValue?.toLocaleString() || '105,000'}
+            {fmtMoney(portfolio?.totalValue)}
           </Text>
           <View style={styles.portfolioStats}>
             <View style={styles.stat}>
               <Text style={styles.statLabel}>Today's P&L</Text>
-              <Text style={[styles.statValue, styles.profit]}>+$2,500</Text>
+              <Text style={styles.statValue}>{fmtSignedMoney(portfolio?.dayChange)}</Text>
             </View>
             <View style={styles.stat}>
               <Text style={styles.statLabel}>Return</Text>
-              <Text style={[styles.statValue, styles.profit]}>+2.44%</Text>
+              <Text style={styles.statValue}>{fmtPct(portfolio?.dayChangePercent)}</Text>
             </View>
           </View>
         </LinearGradient>
@@ -92,27 +104,27 @@ export default function HomeScreen() {
           <Text style={[styles.sectionTitle, { color: theme.text }]}>
             Performance
           </Text>
-          <LineChart
-            data={chartData}
-            width={width - 40}
-            height={200}
-            chartConfig={{
-              backgroundColor: theme.card,
-              backgroundGradientFrom: theme.card,
-              backgroundGradientTo: theme.card,
-              decimalPlaces: 0,
-              color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
-              labelColor: (opacity = 1) => theme.textSecondary,
-              style: { borderRadius: 16 },
-              propsForDots: {
-                r: '4',
-                strokeWidth: '2',
-                stroke: '#667eea',
-              },
-            }}
-            bezier
-            style={styles.chart}
-          />
+          {chartData ? (
+            <LineChart
+              data={chartData}
+              width={width - 40}
+              height={200}
+              chartConfig={{
+                backgroundColor: theme.card,
+                backgroundGradientFrom: theme.card,
+                backgroundGradientTo: theme.card,
+                decimalPlaces: 0,
+                color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
+                labelColor: () => theme.textSecondary,
+                style: { borderRadius: 16 },
+                propsForDots: { r: '4', strokeWidth: '2', stroke: '#667eea' },
+              }}
+              bezier
+              style={styles.chart}
+            />
+          ) : (
+            <DataUnavailable title="Performance history unavailable" />
+          )}
         </View>
 
         {/* Active Signals */}
@@ -126,9 +138,9 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
 
-          {signals?.map((signal: any, index: number) => (
+          {signals?.length ? signals.map((signal) => (
             <TouchableOpacity
-              key={index}
+              key={signal.id}
               style={[styles.signalItem, { borderColor: theme.border }]}
             >
               <View style={styles.signalLeft}>
@@ -136,27 +148,49 @@ export default function HomeScreen() {
                   {signal.symbol}
                 </Text>
                 <Text style={[styles.signalType, { color: theme.textSecondary }]}>
-                  {signal.type}
+                  {fmtText(signal.type)}
                 </Text>
               </View>
               <View style={styles.signalRight}>
                 <Text style={[styles.signalPrice, { color: theme.text }]}>
-                  ${signal.price}
+                  {fmtMoney(signal.price)}
                 </Text>
                 <Text
                   style={[
                     styles.signalConfidence,
-                    { color: signal.confidence > 0.8 ? '#10b981' : '#f59e0b' },
+                    {
+                      color: !isUsableConfidence(signal.confidence)
+                        ? theme.textSecondary
+                        : (signal.confidence as number) > 0.8
+                          ? '#10b981'
+                          : '#f59e0b',
+                    },
                   ]}
                 >
-                  {(signal.confidence * 100).toFixed(0)}% confidence
+                  {`${fmtConfidence(signal.confidence)} confidence`}
                 </Text>
               </View>
             </TouchableOpacity>
-          )) || (
-            <Text style={[styles.noSignals, { color: theme.textSecondary }]}>
-              No active signals
-            </Text>
+          )) : (
+            // "No active signals" is a claim about the user's account. While
+            // the query is loading, or after it fails, the app does not know
+            // whether there are signals, and saying there are none would be
+            // asserting something unverified — the same defect as showing a
+            // fabricated number.
+            <DataUnavailable
+              title={
+                signalsLoading
+                  ? 'Loading signals…'
+                  : signalsError
+                    ? 'Signals unavailable'
+                    : 'No active signals'
+              }
+              detail={
+                signalsError
+                  ? 'The signals service could not be reached.'
+                  : undefined
+              }
+            />
           )}
         </View>
 
