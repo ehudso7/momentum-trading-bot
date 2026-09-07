@@ -293,6 +293,10 @@ class AgentGate:
                 reasons.append("scout_required_but_disabled")
             elif scout.status == SCOUT_STATUS_FAILED:
                 reasons.append(f"scout_required_but_failed:{scout.failure}")
+        # Toxic blocking is on when block_toxic_catalysts is true OR when the
+        # scout is required: an operator who makes the scout mandatory has
+        # asked for its verdict to be honoured, not merely recorded. This
+        # matches the documented policy in config.yaml and README.
         if (
             scout.status == SCOUT_STATUS_OK
             and scout.is_toxic

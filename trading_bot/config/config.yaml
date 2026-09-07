@@ -109,7 +109,9 @@ data:
 agents:
   enabled: true
   require_scout: false         # true = a failed/disabled scout blocks entries
+                               # AND high-confidence toxic catalysts block
   block_toxic_catalysts: true  # high-confidence pump/dilution/offering blocks
+                               # (also enforced whenever require_scout is true)
   llm:
     enabled: false             # default OFF; scout returns "llm_disabled"
     provider: "openai"         # openai | anthropic

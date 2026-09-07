@@ -183,6 +183,16 @@ class TestGatePolicy:
         decision = _evaluate(gate)
         assert decision.decision == "allow"
 
+    def test_require_scout_honours_toxic_verdict_even_with_block_policy_off(self, tmp_path):
+        agents = AgentsConfig(
+            llm=AgentLLMConfig(enabled=True), require_scout=True, block_toxic_catalysts=False
+        )
+        client = FakeScoutClient('{"catalyst": "pump", "confidence": 0.9, "risk_note": ""}')
+        gate = _gate(tmp_path, agents=agents, scout=CatalystScout(agents.llm, client=client))
+        decision = _evaluate(gate)
+        assert decision.decision == "block"
+        assert "toxic_catalyst:pump(0.90)" in decision.reasons
+
     def test_scout_failure_does_not_block_unless_required(self, tmp_path):
         agents = AgentsConfig(llm=AgentLLMConfig(enabled=True), require_scout=False)
         client = FakeScoutClient("garbage")

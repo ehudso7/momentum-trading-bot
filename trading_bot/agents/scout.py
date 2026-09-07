@@ -19,7 +19,9 @@ Safety properties:
   process environment (``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY``) inside
   the client factory, the same way Alpaca keys come from the environment,
   and is never placed in the prompt, logs, or decision record.
-- One shot, no streaming, hard per-call timeout, hard daily call budget.
+- One shot, no streaming, hard per-call timeout, hard daily call budget
+  that counts only requests actually sent to the model (client construction
+  failures such as a missing key or SDK do not consume it).
 - The prompt carries only ticker, gap %, relative volume, catalyst keywords
   from the scan, and advisor reasons — all already-public market context.
 
@@ -249,13 +251,20 @@ class CatalystScout:
         if not self._config.enabled:
             return ScoutResult(status=SCOUT_STATUS_DISABLED, catalyst="unknown")
 
+        # Build the client before touching the budget: a missing SDK or key
+        # is a configuration failure, not a model call, and must not burn
+        # the day's budget on every candidate.
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            return self._failed(symbol, f"{type(exc).__name__}:{_clip(exc, 120)}")
+
         if not self._reserve_call():
             return self._failed(
                 symbol, f"daily_call_budget_exceeded:{self._config.daily_call_budget}"
             )
 
         try:
-            client = self._get_client()
             prompt = self.build_prompt(
                 symbol=symbol,
                 gap_pct=gap_pct,

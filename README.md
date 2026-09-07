@@ -77,7 +77,8 @@ broker. Every decision (allow, reduce, or block) is written to
   candidate under a hard timeout and a daily call budget, and fails closed on
   any error. A failed scout only blocks when `agents.require_scout: true`; a
   high-confidence `pump` / `dilution` / `offering` blocks when
-  `agents.block_toxic_catalysts: true` (the default).
+  `agents.block_toxic_catalysts: true` (the default) or when
+  `agents.require_scout: true` (a mandatory scout's verdict is honoured).
 - **AgentBrief** — one human-readable log line plus one structured record.
 
 Defaults ship with the gate on and the LLM off (`agents:` in `config.yaml`).

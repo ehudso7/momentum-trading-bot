@@ -41,6 +41,11 @@
       "node_id": "test",
       "reason": "First run of tests/agents had 7 failures caused by the tests themselves (a now_et monkeypatch that recursed, a fixture that did not set _running=True so _tick returned before scanning, and two assertions with the wrong symbol / sizing-tier arithmetic). All were corrected in the tests; no production code changed as a result.",
       "recovered": true
+    },
+    {
+      "node_id": "review-fixes",
+      "reason": "Second Copilot review found the scout budget was decremented before client construction, so configuration failures burned the daily budget; fixed by ordering client construction before the budget reservation, with regression tests.",
+      "recovered": true
     }
   ],
   "files_changed": [
@@ -137,6 +142,16 @@
       "command": "git diff --check",
       "exit_code": 0,
       "summary": "no whitespace errors"
+    },
+    {
+      "command": "python -m pytest tests/agents tests/test_config_validation.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "107 passed after the second Copilot pass (3 new tests: budget not consumed on client-construction failure, budget consumed only when a request is sent, require_scout honours a toxic verdict with block_toxic_catalysts=false)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed"
     }
   ],
   "tests": {
@@ -205,7 +220,7 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "823bbc7a3b44bd45bdf052b80d11d1ed9f6a7ef25a6d47c479068a40f865bdc2"
+      "sha256": "cf7f56bd875b5389c1ffd04d6a86954d52d5a8e958c67d4c653a24763ff84de7"
     },
     {
       "id": "agent-models",
@@ -223,7 +238,7 @@
       "id": "catalyst-scout",
       "path": "trading_bot/agents/scout.py",
       "produced_by_node": "implement",
-      "sha256": "c6984723eac0e57190ad311f4470f6a9522447a729817a7406340fa1c018869f"
+      "sha256": "bdca63fb8d4f2a670042e320ea22f39619cdecfd0faaaf8a53c3156479025434"
     },
     {
       "id": "agent-brief",
@@ -235,7 +250,7 @@
       "id": "agent-gate",
       "path": "trading_bot/agents/gate.py",
       "produced_by_node": "implement",
-      "sha256": "1bd867a2520d8b8f520cd5ce1ac5ba28a63cd7e820c805b725ce25e4e1685ade"
+      "sha256": "1fbeb1a6e2c1215c42bb9f378891f3900596fdf12a54a38b2c6feb58fbda03e8"
     },
     {
       "id": "main-wiring",
@@ -247,7 +262,7 @@
       "id": "settings",
       "path": "trading_bot/config/settings.py",
       "produced_by_node": "implement",
-      "sha256": "578e1f0693723f8ac5a52a01135b149f5a3541d7909929e0fe7aa22853be0fab"
+      "sha256": "dbaae9e75b570af58e864e25cf2b1d810690de512f5254a0fb20970867dc1edf"
     },
     {
       "id": "veto-tests",
@@ -259,13 +274,13 @@
       "id": "scout-tests",
       "path": "tests/agents/test_scout.py",
       "produced_by_node": "test",
-      "sha256": "5cfe38cccabeacbf15e28ea8b5ed87ecff33b71a7eed0d533e14731654b1cac3"
+      "sha256": "08c5ac7c9ec20916ce67650428a641ca8e499c83304d681c6e02cf0e18225027"
     },
     {
       "id": "gate-tests",
       "path": "tests/agents/test_gate.py",
       "produced_by_node": "test",
-      "sha256": "779f71b68a16db6ead0b857f4c6796e5afd62c50d322f8139ff88db0eeb7c6af"
+      "sha256": "b631ff80721cb6bf272ad2bf8226e0635b19b0d80717ecbf18400fa52d41e891"
     }
   ],
   "completion_status": "tested",
@@ -282,5 +297,5 @@
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "d0dce369238feb9962ecbe77d56d0e247a68d309089abb13e732560321a030df"
+  "content_hash": "9f0b19180b48b962479ec7d53aad8dfc9296d57d295a0b21b064c070c8165f4c"
 }

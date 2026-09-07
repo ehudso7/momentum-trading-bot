@@ -152,6 +152,32 @@ class TestBudget:
         assert _evaluate(scout).status == SCOUT_STATUS_OK
         assert len(client.calls) == 3
 
+    def test_client_construction_failure_does_not_consume_budget(self):
+        """A missing key/SDK is configuration, not a model call."""
+        attempts = {"n": 0}
+
+        def _factory(_cfg):
+            attempts["n"] += 1
+            raise RuntimeError("OPENAI_API_KEY is not set")
+
+        scout = CatalystScout(
+            AgentLLMConfig(enabled=True, daily_call_budget=1), client_factory=_factory
+        )
+        for _ in range(3):
+            result = _evaluate(scout)
+            assert result.status == SCOUT_STATUS_FAILED
+            assert "OPENAI_API_KEY is not set" in result.failure
+        assert attempts["n"] == 3
+        assert scout.calls_today == 0
+
+    def test_budget_is_consumed_only_when_request_is_sent(self):
+        client = FakeClient(TimeoutError("read timed out"))
+        scout = CatalystScout(AgentLLMConfig(enabled=True, daily_call_budget=1), client=client)
+        assert _evaluate(scout).failure.startswith("TimeoutError")
+        assert scout.calls_today == 1  # the request went out, so it counts
+        assert _evaluate(scout).failure == "daily_call_budget_exceeded:1"
+        assert len(client.calls) == 1
+
     def test_zero_budget_never_calls_model(self):
         client = FakeClient('{"catalyst": "earnings", "confidence": 0.6, "risk_note": ""}')
         scout = CatalystScout(AgentLLMConfig(enabled=True, daily_call_budget=0), client=client)

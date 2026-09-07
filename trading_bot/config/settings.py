@@ -243,7 +243,9 @@ class AgentsConfig(BaseModel):
     """
 
     enabled: bool = Field(True)
-    # When true, a failed or disabled scout blocks the entry.
+    # When true, a failed or disabled scout blocks the entry, and a
+    # high-confidence toxic classification blocks regardless of
+    # block_toxic_catalysts (a mandatory scout's verdict is honoured).
     require_scout: bool = Field(False)
     # When true, a high-confidence pump/dilution/offering classification
     # blocks the entry even if require_scout is false.
