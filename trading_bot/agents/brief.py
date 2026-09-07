@@ -117,7 +117,7 @@ class AgentBrief:
     def _flatten(self, decision: AgentDecision) -> dict[str, Any]:
         raw = decision.raw
         timestamp = self._clock()
-        return {
+        row = {
             "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": raw.get("symbol", ""),
             "decision": decision.decision,
@@ -134,6 +134,11 @@ class AgentBrief:
             "reasons": "; ".join(decision.reasons),
             "scout_notes": decision.scout_notes,
         }
+        # Neutralise spreadsheet formula triggers in every text field. The
+        # scout fields can carry model-controlled text, and the CSV is meant
+        # to be opened in Excel/Sheets. Applied once here so the CSV row and
+        # the in-memory/dashboard copy stay identical.
+        return {k: _neutralize_formula(v) if isinstance(v, str) else v for k, v in row.items()}
 
     def _ensure_header(self) -> None:
         assert self._csv_path is not None
@@ -158,6 +163,18 @@ class AgentBrief:
             log.debug(
                 "agent.brief_write_error", path=str(self._csv_path), error=str(exc)
             )
+
+
+# Leading characters that Excel / Google Sheets interpret as a formula or
+# a control sequence when a CSV cell is opened. A leading apostrophe forces
+# the cell to be read as text and is the conventional mitigation.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def _neutralize_formula(value: str) -> str:
+    if value and value[0] in _FORMULA_TRIGGERS:
+        return "'" + value
+    return value
 
 
 def _round_or_blank(value: Any, digits: int = 4) -> Any:

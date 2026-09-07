@@ -360,6 +360,33 @@ class TestBrief:
         assert set(recent[0]) >= {"timestamp", "decision", "reasons", "size_multiplier"}
 
 
+    def test_text_fields_are_neutralised_against_formula_injection(self, tmp_path):
+        """Model-controlled text must not become a live formula in Excel/Sheets."""
+        from trading_bot.agents.brief import _neutralize_formula
+        from trading_bot.agents.models import AgentDecision
+
+        brief = AgentBrief(csv_path=tmp_path / "agent_decisions.csv")
+        decision = AgentDecision(
+            decision="allow",
+            source="gate",
+            reasons=["=HYPERLINK(\"http://evil\")", "+1", "-1", "@cmd", "\tlead"],
+            size_multiplier=1.0,
+            scout_notes="=cmd|' /C calc'!A0",
+            raw={"symbol": "=ABCD", "advisor_action": "enter"},
+        )
+        row = brief.record(decision)
+        assert row["scout_notes"].startswith("'=")
+        assert row["reasons"].startswith("'=")
+        assert row["symbol"] == "'=ABCD"
+        csv_row = _csv_rows(tmp_path / "agent_decisions.csv")[0]
+        assert csv_row["scout_notes"] == row["scout_notes"]  # CSV and in-memory identical
+        assert brief.recent()[0]["scout_notes"] == row["scout_notes"]
+        for trigger in ("=", "+", "-", "@", "\t"):
+            assert _neutralize_formula(trigger + "x") == "'" + trigger + "x"
+        assert _neutralize_formula("safe") == "safe"
+        assert _neutralize_formula("") == ""
+
+
 # ---------------------------------------------------------------------------
 # Paper-path wiring through TradingBot._tick
 # ---------------------------------------------------------------------------

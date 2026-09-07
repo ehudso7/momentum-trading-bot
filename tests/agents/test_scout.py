@@ -178,6 +178,35 @@ class TestBudget:
         assert _evaluate(scout).failure == "daily_call_budget_exceeded:1"
         assert len(client.calls) == 1
 
+    def test_budget_exhaustion_warns_once_per_day(self):
+        import structlog.testing
+
+        client = FakeClient('{"catalyst": "earnings", "confidence": 0.6, "risk_note": ""}')
+        today = {"value": date(2026, 9, 7)}
+        scout = CatalystScout(
+            AgentLLMConfig(enabled=True, daily_call_budget=1),
+            client=client,
+            today_fn=lambda: today["value"],
+        )
+        assert _evaluate(scout).status == SCOUT_STATUS_OK
+        with structlog.testing.capture_logs() as logs:
+            for _ in range(5):
+                result = _evaluate(scout)
+                assert result.status == SCOUT_STATUS_FAILED
+                assert result.failure == "daily_call_budget_exceeded:1"
+        warnings = [e for e in logs if e["log_level"] == "warning"]
+        assert [e["event"] for e in warnings] == ["agent.scout_budget_exhausted"]
+        assert len(client.calls) == 1
+
+        # A new day resets both the budget and the once-per-day warning.
+        today["value"] = date(2026, 9, 8)
+        assert _evaluate(scout).status == SCOUT_STATUS_OK
+        with structlog.testing.capture_logs() as logs:
+            _evaluate(scout)
+        assert [e["event"] for e in logs if e["log_level"] == "warning"] == [
+            "agent.scout_budget_exhausted"
+        ]
+
     def test_zero_budget_never_calls_model(self):
         client = FakeClient('{"catalyst": "earnings", "confidence": 0.6, "risk_note": ""}')
         scout = CatalystScout(AgentLLMConfig(enabled=True, daily_call_budget=0), client=client)

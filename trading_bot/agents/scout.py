@@ -219,6 +219,7 @@ class CatalystScout:
         self._lock = threading.Lock()
         self._budget_day: Optional[date] = None
         self._calls_today = 0
+        self._budget_warned_day: Optional[date] = None
 
     # ------------------------------------------------------------------
     # Introspection
@@ -260,9 +261,7 @@ class CatalystScout:
             return self._failed(symbol, f"{type(exc).__name__}:{_clip(exc, 120)}")
 
         if not self._reserve_call():
-            return self._failed(
-                symbol, f"daily_call_budget_exceeded:{self._config.daily_call_budget}"
-            )
+            return self._budget_exhausted(symbol)
 
         try:
             prompt = self.build_prompt(
@@ -355,6 +354,31 @@ class CatalystScout:
                 return False
             self._calls_today += 1
             return True
+
+    def _budget_exhausted(self, symbol: str) -> ScoutResult:
+        """
+        Budget-exhausted failure that warns once per day, then goes quiet.
+
+        Late in a session every remaining candidate takes this path; the
+        failure string is already carried in each decision record, so a
+        per-candidate warning would only be log spam.
+        """
+        failure = f"daily_call_budget_exceeded:{self._config.daily_call_budget}"
+        with self._lock:
+            today = self._today_fn()
+            first_time = self._budget_warned_day != today
+            if first_time:
+                self._budget_warned_day = today
+        if first_time:
+            log.warning(
+                "agent.scout_budget_exhausted",
+                symbol=symbol,
+                daily_call_budget=self._config.daily_call_budget,
+                detail="scout disabled for the rest of the UTC day; further hits logged at debug",
+            )
+        else:
+            log.debug("agent.scout_failed", symbol=symbol, failure=failure)
+        return ScoutResult(status=SCOUT_STATUS_FAILED, catalyst="unknown", failure=failure)
 
     @staticmethod
     def _failed(symbol: str, failure: str) -> ScoutResult:

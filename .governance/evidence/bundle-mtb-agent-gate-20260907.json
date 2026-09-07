@@ -172,6 +172,16 @@
       "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
       "exit_code": 0,
       "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "93 passed after the fifth Copilot pass (CSV formula-injection neutralisation in AgentBrief; scout budget-exhausted warning once per day)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed"
     }
   ],
   "tests": {
@@ -233,6 +243,11 @@
       "check": "excluded-modules",
       "outcome": "pass",
       "detail": "No import of trading_bot/crypto or trading_bot/ai/quantum_predictor; no Robinhood, memecoin, Solana, DEX, or wallet references."
+    },
+    {
+      "check": "csv-formula-injection",
+      "outcome": "pass",
+      "detail": "AgentBrief neutralises leading =, +, -, @, tab, CR and LF in every text field of the decision record before it reaches agent_decisions.csv or the dashboard; test_text_fields_are_neutralised_against_formula_injection covers model-controlled scout_notes and reasons."
     }
   ],
   "artifacts": [
@@ -240,7 +255,7 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "da686572f591f755dd44d7979f4ac3d989f7c8132ef85d3be017789344b86c6e"
+      "sha256": "785a0c6d6f94eeb17572cce41578117b68736afa2744509c4017a7c7ac139cff"
     },
     {
       "id": "agent-models",
@@ -258,13 +273,13 @@
       "id": "catalyst-scout",
       "path": "trading_bot/agents/scout.py",
       "produced_by_node": "implement",
-      "sha256": "bdca63fb8d4f2a670042e320ea22f39619cdecfd0faaaf8a53c3156479025434"
+      "sha256": "b9036e17e782e639ac5b736eb1e685a7ec122c35229c9a9aaee25df8b073fb05"
     },
     {
       "id": "agent-brief",
       "path": "trading_bot/agents/brief.py",
       "produced_by_node": "implement",
-      "sha256": "fefc665a229ee380000c3af38c3a04def4df5ad54c8149e7801d2c8cbf126922"
+      "sha256": "e46b516f9d54b0202ba764277b146a1c1a64425be0b146dddec06832a4603097"
     },
     {
       "id": "agent-gate",
@@ -294,13 +309,13 @@
       "id": "scout-tests",
       "path": "tests/agents/test_scout.py",
       "produced_by_node": "test",
-      "sha256": "08c5ac7c9ec20916ce67650428a641ca8e499c83304d681c6e02cf0e18225027"
+      "sha256": "91207cbe53c2b7fece7cf618254211c39b1b8f2c94eec5a75c8bd2265e24b72a"
     },
     {
       "id": "gate-tests",
       "path": "tests/agents/test_gate.py",
       "produced_by_node": "test",
-      "sha256": "7aab41e0f3c2347804aaa8a348e5eca0e43c5ff4b3f3d3902a92037a443777f4"
+      "sha256": "34abd03f7cc8d43d42fd650e688eb68e4d6b032c13d32173f1c8d1e9677d1461"
     }
   ],
   "completion_status": "tested",
@@ -317,5 +332,5 @@
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "29077825f31d68fde972a8f48193c45baa36723c222c431c1b67e09abfb8ccd1"
+  "content_hash": "f3908f7ba88d9113caf60e6adaa86f7f11bf1f620e5d5ac583a21b29d156a21a"
 }
