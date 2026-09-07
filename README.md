@@ -63,9 +63,11 @@ order placement (`trading_bot/agents/`). It is a blocking-only review, not
 autonomous trading: it can veto or shrink an entry that the circuit breaker,
 risk engine, correlation check, and advisor have already approved, and it can
 never approve a rejected entry, increase size, pick symbols, or touch the
-broker. Every decision (allow, reduce, or block) is written to
-`data/agent_decisions.csv`, logged via structlog, and exposed at
-`/api/agent-decisions`.
+broker. While the gate is enabled, each decision (allow, reduce, or block) is
+logged via structlog, appended to `data/agent_decisions.csv` on a
+best-effort basis (a disk error is logged, never fatal), and exposed at
+`/api/agent-decisions`. With `agents.enabled: false` the gate is a no-op
+and records nothing, so the CSV is not created.
 
 - **RuleVeto** — deterministic, no network. Blocks on circuit state, session
   validity, advisor skip / low advisor confidence, max positions, duplicate

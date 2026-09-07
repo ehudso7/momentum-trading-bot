@@ -182,6 +182,16 @@
       "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
       "exit_code": 0,
       "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "93 passed after the sixth Copilot pass (documentation wording only)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed"
     }
   ],
   "tests": {
@@ -255,7 +265,7 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "785a0c6d6f94eeb17572cce41578117b68736afa2744509c4017a7c7ac139cff"
+      "sha256": "3275de2ed9bd7cd698a2594a60cee44d5ef62f17efa85c9fd32b94ba42b11ff9"
     },
     {
       "id": "agent-models",
@@ -291,7 +301,7 @@
       "id": "main-wiring",
       "path": "trading_bot/main.py",
       "produced_by_node": "implement",
-      "sha256": "430244cccfe691a21d22d91f7e20c1c792dc1e7881bce005b2b48930cec47178"
+      "sha256": "58ff4385f90ab5d58f676f1fec0f8f178f0cef996058f98b1bd1f9dd990a929c"
     },
     {
       "id": "settings",
@@ -332,5 +342,5 @@
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "f3908f7ba88d9113caf60e6adaa86f7f11bf1f620e5d5ac583a21b29d156a21a"
+  "content_hash": "c043b834ca06a1b17239b8a9372141a308976b124a7d07cf150bd22f50da1ba2"
 }

@@ -1091,8 +1091,10 @@ class TradingBot:
                 reasons=advisor_rec.reasons,
             )
             # Agent gate (Scout / Veto / Brief). Evaluated for EVERY advisor
-            # outcome so a structured AgentDecision is always persisted, but
-            # it can only block or shrink — the advisor skip below and every
+            # outcome so that, while the gate is enabled, each outcome gets a
+            # structured AgentDecision (logged, and appended to the decisions
+            # CSV on a best-effort basis; a disabled gate records nothing).
+            # It can only block or shrink — the advisor skip below and every
             # earlier risk rail keep their existing authority.
             agent_decision = self._agent_gate.evaluate(
                 signal=signal,
