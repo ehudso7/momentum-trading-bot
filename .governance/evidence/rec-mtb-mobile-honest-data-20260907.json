@@ -1,0 +1,156 @@
+{
+  "record_id": "rec-mtb-mobile-honest-data-20260907",
+  "project_id": "momentum-trading-bot",
+  "task_id": "bug-mobile-fabricated-data-20260907",
+  "graph_id": "bug-resolution",
+  "graph_version": "1.0.0",
+  "governance_version": "2.4.0",
+  "started_at": "2026-09-07T03:20:00Z",
+  "completed_at": "2026-09-07T05:10:00Z",
+  "actor": "ehudso7",
+  "agent": "claude-code",
+  "status": "completed",
+  "terminal_node": "done",
+  "classification": "multi-step",
+  "node_executions": [
+    {
+      "node_id": "intake",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Follow-on from the question 'is the mobile app TestFlight-ready'. Answer was no. This run executes the unblocked prerequisite tranche: remove fabricated financial data from the native client, align the Expo dependency set so a build is possible at all, put the client under CI, and replace the qualitative blocker list with an evidenced one. Explicitly out of scope and left for a human decision: the authentication contract, un-gating the mobile API, the billing/checkout flow, and EAS production profiles or signing credentials."
+    },
+    {
+      "node_id": "reproduce",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Confirmed by reading the tree, not by inference. PortfolioScreen rendered $112,450.73 / +$2,450 / +12.45% with a 65/20/10/5 allocation pie and an AAPL/TSLA/NVDA/MSFT holdings list; HomeScreen fell back to '105,000' with a 6-point equity curve; SignalsScreen rendered mockSignals (AAPL 'Momentum Breakout' at 0.95 confidence with invented aiReasoning) plus a '95.2% Accuracy / +24.8% Avg Return' card and an 'AI Market Insights' block asserting a BULLISH regime and a 15% volatility rise 'due to FOMC'; TradingScreen rendered $150.25/+2.5% for every watchlist symbol, 'Apple Inc.' regardless of selection, fixed OHLC/volume and a sample price series while discarding the real getMarketData query; ProfileScreen rendered '$12,450 total gains / 156 trades won / 87% win rate' for every account. All were indistinguishable on screen from the signed-in user's own money."
+    },
+    {
+      "node_id": "diagnose",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Two independent root causes. (1) The screens were written as UI prototypes with fixtures inline and never rewired; the real useQuery calls existed in three of them and their results were discarded, so the fixtures were not even a fallback path. (2) There was no test harness in mobile/momentum-trading at all - no jest, no __tests__ - so nothing could have caught it. A third, separate cause was found in the backend and NOT fixed here: trading_bot/api/mobile_routes.py returns canned constants (get_market_data returns price 150.25 for every symbol), so the fabrication exists on both sides of the wire."
+    },
+    {
+      "node_id": "fix",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Added src/components/DataUnavailable.tsx as the single honest empty state. Every screen now renders from its own query with typed formatters that return an em dash for missing or non-finite values, and falls back to DataUnavailable rather than to figures. Typed the response shapes the backend declares (AuthUser, AuthResponse, Position, PortfolioResponse, Signal, Quote) in src/services/api.ts and confined the axios response-interceptor unsoundness to three private helpers (get, send, remove) instead of spreading 'any' across call sites; delete needed its own helper because axios types its second argument as a request config, not a body. SignalsScreen's tabs were reduced to Latest/History, which map one-to-one onto the two endpoints, because the backend publishes no signal lifecycle status and a client-side active/triggered split would have invented one. TradingScreen's watchlist chips lost their price and change lines because only the selected symbol is fetched. Its 'Trade Now' button was removed: the SDK deliberately exposes no order placement, so the label promised something the app does not do. Fixed the React Navigation 7 tabBarTestID -> tabBarButtonTestID rename in TabBar.tsx."
+    },
+    {
+      "node_id": "dependency-alignment",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "14 packages were pinned to versions that do not exist for SDK 54 (expo-constants ^55.0.16, expo-notifications ^55.0.22, expo-updates ^55.0.21, @react-native-async-storage/async-storage ^3.0.2 and others). All aligned to the SDK 54 bundled versions from bundledNativeModules.json; react-native-worklets 0.5.1 added as a required peer. Six declared-but-never-imported native modules removed (victory-native, lottie-react-native, expo-blur, expo-haptics, expo-device, zustand) rather than adding @shopify/react-native-skia to satisfy a peer of a package nothing imports. expo-notifications, expo-updates and expo-dev-client were kept because app.json declares them as plugins."
+    },
+    {
+      "node_id": "regression-test",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-mobile-honest-data-20260907.json"
+      ],
+      "notes": "There was no mobile test harness, so one was added: jest-expo (the Expo-supported preset) with @testing-library/react-native, jest.config.js and a jest.setup.js that mocks only the native modules that cannot run under jsdom (AsyncStorage via its official mock, chart-kit, linear-gradient, safe-area-context). No application code is mocked. 13 tests across the five screens, each asserting both directions: the screen renders the values its API actually returns, and with an empty or failing API it renders an explicit unavailable state containing none of the previously hardcoded literals. FABRICATED_LITERALS in renderScreen.tsx is the append-only guard list."
+    },
+    {
+      "node_id": "ci",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "The repository had zero mobile references in CI. Added a 'mobile' job to .github/workflows/ci.yml mirroring the existing 'web' job: npm ci, a blocking production audit, an informational high-severity audit, a blocking typecheck, a blocking test run, and a non-blocking expo-doctor. .github/workflows/** is a sensitive path under CLAUDE.md and is flagged as such in the pull request; the job adds validation only and grants no permissions, touches no secret, and changes no existing job."
+    },
+    {
+      "node_id": "verify",
+      "status": "completed",
+      "attempts": 1,
+      "confidence": 0.8,
+      "notes": "State is 'tested', not 'verified'. What is proven: the client typechecks, its dependency tree installs from the lockfile, 13 screen tests pass, and the guards were shown to fail when a fabricated literal was reintroduced. What is NOT proven: no build was produced (no EAS production profile and no signing credentials exist in this container), no device or simulator ran the app, and no screen was exercised against a live backend because the mobile API is gated off and its handlers return constants. expo-doctor could not complete two network checks from this container."
+    },
+    {
+      "node_id": "document",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "PRIVATE_BETA_STATUS.md rewritten. Its blocker list was qualitative ('legacy fixture screens', 'Expo dependency alignment'); it now names each blocker with the file and line that establishes it, marks two closed, and separates backend, billing, release-engineering and store/legal blockers so the dependency order is visible."
+    },
+    {
+      "node_id": "done",
+      "status": "completed",
+      "attempts": 1,
+      "notes": "Ready for a draft pull request and human review. No deployment, no store submission, no build, and no change to any backend, risk, auth or billing path."
+    }
+  ],
+  "files_changed": [
+    ".github/workflows/ci.yml",
+    "mobile/momentum-trading/PRIVATE_BETA_STATUS.md",
+    "mobile/momentum-trading/package.json",
+    "mobile/momentum-trading/package-lock.json",
+    "mobile/momentum-trading/jest.config.js",
+    "mobile/momentum-trading/jest.setup.js",
+    "mobile/momentum-trading/src/components/DataUnavailable.tsx",
+    "mobile/momentum-trading/src/components/TabBar.tsx",
+    "mobile/momentum-trading/src/services/api.ts",
+    "mobile/momentum-trading/src/screens/HomeScreen.tsx",
+    "mobile/momentum-trading/src/screens/PortfolioScreen.tsx",
+    "mobile/momentum-trading/src/screens/ProfileScreen.tsx",
+    "mobile/momentum-trading/src/screens/SignalsScreen.tsx",
+    "mobile/momentum-trading/src/screens/TradingScreen.tsx",
+    "mobile/momentum-trading/src/screens/__tests__/renderScreen.tsx",
+    "mobile/momentum-trading/src/screens/__tests__/HomeScreen.test.tsx",
+    "mobile/momentum-trading/src/screens/__tests__/PortfolioScreen.test.tsx",
+    "mobile/momentum-trading/src/screens/__tests__/ProfileScreen.test.tsx",
+    "mobile/momentum-trading/src/screens/__tests__/SignalsScreen.test.tsx",
+    "mobile/momentum-trading/src/screens/__tests__/TradingScreen.test.tsx",
+    ".governance/evidence/rec-mtb-mobile-honest-data-20260907.json",
+    ".governance/evidence/bundle-mtb-mobile-honest-data-20260907.json"
+  ],
+  "commands_executed": [
+    {
+      "command": "npx tsc --noEmit",
+      "exit_code": 0,
+      "node_id": "implement",
+      "summary": "mobile client typechecks clean after every screen rewrite (was 10 errors before this tranche)"
+    },
+    {
+      "command": "npm ci",
+      "exit_code": 0,
+      "node_id": "implement",
+      "summary": "package-lock.json is consistent with package.json after the SDK 54 alignment and the jest devDependencies"
+    },
+    {
+      "command": "npm audit --omit=dev --audit-level=critical",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "0 critical advisories"
+    },
+    {
+      "command": "npm audit --omit=dev --audit-level=high",
+      "exit_code": 1,
+      "node_id": "affected-area-tests",
+      "summary": "9 high advisories remain (postcss x4, image-size x2 and dependants), all reached only through Expo's build toolchain; npm reports the sole fix as expo@57, an SDK 54->57 major upgrade that is out of scope for this change and is recorded as an unresolved risk"
+    },
+    {
+      "command": "npm run test:ci",
+      "exit_code": 0,
+      "node_id": "test",
+      "summary": "13 passed, 5 suites - HomeScreen, PortfolioScreen, ProfileScreen, SignalsScreen, TradingScreen"
+    },
+    {
+      "command": "npx jest src/screens/__tests__/SignalsScreen.test.tsx (with '95.2% Accuracy' reintroduced into the header)",
+      "exit_code": 1,
+      "node_id": "test",
+      "summary": "MUTATION CHECK: 2 failed, 2 passed - confirms the fabricated-literal guards fail on regression rather than passing vacuously; the literal was reverted and the suite returned to 4 passed"
+    },
+    {
+      "command": "npx expo-doctor",
+      "exit_code": 1,
+      "node_id": "affected-area-tests",
+      "summary": "16/18 checks pass (was 14/18). The 2 failures are this container's egress proxy blocking Expo's schema endpoint and the React Native directory API, confirmed by the response body 'Host not i...' rather than JSON; not project defects, which is why the CI step is non-blocking"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "3058 passed, 3 warnings in 63.87s - the complete backend suite is unaffected by this change, which touches only mobile/momentum-trading/**, .github/workflows/ci.yml and .governance/evidence/**"
+    }
+  ],
+  "content_hash": "6401c998e2d7b610dda29f4be285a83fe07d1cd2cf03af5a67520ff0d46182f6"
+}

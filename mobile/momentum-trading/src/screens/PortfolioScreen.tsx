@@ -14,6 +14,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { PieChart, LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { api } from '../services/api';
+import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
 
@@ -44,26 +45,19 @@ export default function PortfolioScreen() {
 
   const periods = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
 
-  const pieData = [
-    { name: 'Stocks', population: 65, color: '#667eea', legendFontColor: theme.text },
-    { name: 'Crypto', population: 20, color: '#10b981', legendFontColor: theme.text },
-    { name: 'Cash', population: 10, color: '#f59e0b', legendFontColor: theme.text },
-    { name: 'Bonds', population: 5, color: '#ef4444', legendFontColor: theme.text },
-  ];
+  // Holdings come from the API only. There is deliberately no sample
+  // fallback here: see components/DataUnavailable.tsx.
+  const holdings = positions ?? [];
 
-  const chartData = {
-    labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'],
-    datasets: [{
-      data: [100000, 102000, 98500, 105000, 108000, 112000],
-    }],
-  };
+  // The performance series the chart needs is not yet returned in a charted
+  // shape by the backend, so the chart renders an unavailable state rather
+  // than a fabricated curve.
+  const performanceSeries: { labels: string[]; datasets: { data: number[] }[] } | null = null;
 
-  const mockPositions = [
-    { symbol: 'AAPL', name: 'Apple Inc.', shares: 50, value: 8500, change: 2.5, changePercent: 3.2 },
-    { symbol: 'TSLA', name: 'Tesla Inc.', shares: 25, value: 6250, change: -125, changePercent: -2.0 },
-    { symbol: 'NVDA', name: 'NVIDIA Corp.', shares: 15, value: 7800, change: 150, changePercent: 1.96 },
-    { symbol: 'MSFT', name: 'Microsoft Corp.', shares: 30, value: 9600, change: 75, changePercent: 0.79 },
-  ];
+  const fmtMoney = (n: number | undefined) =>
+    typeof n === 'number' ? `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—';
+  const fmtPct = (n: number | undefined) =>
+    typeof n === 'number' ? `${n >= 0 ? '+' : ''}${n.toFixed(2)}%` : '—';
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -87,16 +81,16 @@ export default function PortfolioScreen() {
           style={styles.summaryCard}
         >
           <Text style={styles.summaryLabel}>Total Portfolio Value</Text>
-          <Text style={styles.summaryValue}>$112,450.73</Text>
+          <Text style={styles.summaryValue}>{fmtMoney(portfolio?.totalValue)}</Text>
 
           <View style={styles.summaryStats}>
             <View style={styles.stat}>
-              <Text style={styles.statValue}>+$2,450</Text>
+              <Text style={styles.statValue}>{fmtMoney(portfolio?.dayChange)}</Text>
               <Text style={styles.statLabel}>Today's Gain</Text>
             </View>
             <View style={styles.stat}>
-              <Text style={styles.statValue}>+12.45%</Text>
-              <Text style={styles.statLabel}>Total Return</Text>
+              <Text style={styles.statValue}>{fmtPct(portfolio?.dayChangePercent)}</Text>
+              <Text style={styles.statLabel}>Today's Change</Text>
             </View>
           </View>
         </LinearGradient>
@@ -128,48 +122,39 @@ export default function PortfolioScreen() {
             </View>
           </View>
 
-          <LineChart
-            data={chartData}
-            width={width - 40}
-            height={200}
-            chartConfig={{
-              backgroundColor: theme.card,
-              backgroundGradientFrom: theme.card,
-              backgroundGradientTo: theme.card,
-              decimalPlaces: 0,
-              color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
-              labelColor: (opacity = 1) => theme.textSecondary,
-              style: { borderRadius: 16 },
-              propsForDots: {
-                r: '4',
-                strokeWidth: '2',
-                stroke: '#667eea',
-              },
-            }}
-            bezier
-            style={styles.chart}
-          />
+          {performanceSeries ? (
+            <LineChart
+              data={performanceSeries}
+              width={width - 40}
+              height={200}
+              chartConfig={{
+                backgroundColor: theme.card,
+                backgroundGradientFrom: theme.card,
+                backgroundGradientTo: theme.card,
+                decimalPlaces: 0,
+                color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
+                labelColor: () => theme.textSecondary,
+                style: { borderRadius: 16 },
+                propsForDots: { r: '4', strokeWidth: '2', stroke: '#667eea' },
+              }}
+              bezier
+              style={styles.chart}
+            />
+          ) : (
+            <DataUnavailable
+              title="Performance history unavailable"
+              detail="Connect an account to chart real performance."
+            />
+          )}
         </View>
 
         {/* Asset Allocation */}
         <View style={[styles.allocationCard, { backgroundColor: theme.card }]}>
           <Text style={[styles.sectionTitle, { color: theme.text }]}>Asset Allocation</Text>
 
-          <PieChart
-            data={pieData}
-            width={width - 40}
-            height={200}
-            chartConfig={{
-              backgroundColor: theme.card,
-              backgroundGradientFrom: theme.card,
-              backgroundGradientTo: theme.card,
-              color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
-            }}
-            accessor="population"
-            backgroundColor="transparent"
-            paddingLeft="15"
-            center={[10, 10]}
-            absolute
+          <DataUnavailable
+            title="Allocation unavailable"
+            detail="Allocation is derived from live holdings."
           />
         </View>
 
@@ -182,7 +167,9 @@ export default function PortfolioScreen() {
             </TouchableOpacity>
           </View>
 
-          {mockPositions.map((position, index) => (
+          {holdings.length === 0 ? (
+            <DataUnavailable title="No holdings to display" />
+          ) : holdings.map((position) => (
             <TouchableOpacity
               key={position.symbol}
               style={[styles.positionItem, { borderBottomColor: theme.border }]}
