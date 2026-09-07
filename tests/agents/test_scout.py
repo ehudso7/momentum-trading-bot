@@ -77,6 +77,26 @@ class TestEnabledParsing:
     @pytest.mark.parametrize(
         "reply",
         [
+            # Trailing braces after the real object (greedy regex used to over-capture).
+            '{"catalyst": "fda", "confidence": 0.8, "risk_note": "x"} }}',
+            # Two objects: the first complete one wins.
+            '{"catalyst": "fda", "confidence": 0.8, "risk_note": "x"}\n{"catalyst": "pump", "confidence": 0.1}',
+            # Prose containing a stray brace before the object.
+            'Sure { here is it: {"catalyst": "fda", "confidence": 0.8, "risk_note": "x"} done',
+            # Nested braces inside a string value.
+            '{"catalyst": "fda", "confidence": 0.8, "risk_note": "see {note}"}',
+        ],
+    )
+    def test_extra_braces_do_not_break_parsing(self, reply):
+        scout = CatalystScout(AgentLLMConfig(enabled=True), client=FakeClient(reply))
+        result = _evaluate(scout)
+        assert result.status == SCOUT_STATUS_OK
+        assert result.catalyst == "fda"
+        assert result.confidence == 0.8
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
             "",
             "not json at all",
             '{"catalyst": "moon", "confidence": 0.9}',  # outside vocabulary

@@ -43,10 +43,11 @@ class AgentDecision:
     """
     One gate outcome for one candidate entry.
 
-    ``size_multiplier`` is 1.0 for allow, 0.0 for block, and within
-    [0.25, 0.75] for reduce. It is only ever applied multiplicatively to a
-    share count the risk engine already approved, so it can shrink but never
-    grow a position.
+    ``size_multiplier`` is 1.0 for allow, 0.0 for block, and strictly
+    between 0 and 1 for reduce (enforced in ``__post_init__``; the gate
+    additionally clamps its own reduce decisions to no lower than 0.25). It
+    is only ever applied multiplicatively to a share count the risk engine
+    already approved, so it can shrink but never grow a position.
     """
 
     decision: str  # "allow" | "block" | "reduce"

@@ -229,6 +229,25 @@ class TestGatePolicy:
         assert decision.reasons == ["agents_disabled"]
         assert gate.recent_decisions() == []
 
+    def test_from_config_disabled_has_no_filesystem_side_effect(self, tmp_path):
+        config = AppConfig(
+            journal_csv_path=str(tmp_path / "data" / "journal.csv"),
+            agents=AgentsConfig(enabled=False),
+        )
+        gate = AgentGate.from_config(config)
+        assert not gate.enabled
+        assert not (tmp_path / "data" / "agent_decisions.csv").exists()
+        assert not (tmp_path / "data").exists()
+        decision = _evaluate(gate, rec=_rec(action="skip"))
+        assert decision.decision == "allow"
+        assert not (tmp_path / "data").exists()
+
+    def test_from_config_enabled_creates_decision_csv(self, tmp_path):
+        config = AppConfig(journal_csv_path=str(tmp_path / "data" / "journal.csv"))
+        gate = AgentGate.from_config(config)
+        assert gate.enabled
+        assert (tmp_path / "data" / "agent_decisions.csv").exists()
+
     def test_unexpected_error_fails_closed(self, tmp_path):
         gate = _gate(tmp_path)
         gate._veto = Mock()

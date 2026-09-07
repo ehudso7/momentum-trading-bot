@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 from datetime import date, datetime, timezone
 from typing import Callable, Optional, Protocol
@@ -178,6 +177,26 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def _first_json_object(text: str) -> Optional[object]:
+    """
+    Return the first complete JSON value that starts at a ``{`` in ``text``.
+
+    ``json.JSONDecoder.raw_decode`` stops at the end of the first complete
+    value, so fences, prose, trailing braces, or a second object after the
+    real one do not break parsing. Each ``{`` is tried in order; the first
+    that decodes wins. Returns ``None`` when nothing decodes.
+    """
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            value, _end = decoder.raw_decode(text, start)
+            return value
+        except ValueError:
+            start = text.find("{", start + 1)
+    return None
+
+
 class CatalystScout:
     """
     Optional catalyst classifier. Safe to construct and call with the LLM
@@ -284,17 +303,7 @@ class CatalystScout:
         """
         if not text:
             return None
-        candidate = text.strip()
-        try:
-            data = json.loads(candidate)
-        except (TypeError, ValueError):
-            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-            if not match:
-                return None
-            try:
-                data = json.loads(match.group(0))
-            except (TypeError, ValueError):
-                return None
+        data = _first_json_object(text)
         if not isinstance(data, dict):
             return None
 

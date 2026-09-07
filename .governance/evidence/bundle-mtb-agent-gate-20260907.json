@@ -19,6 +19,7 @@
     "affected-area-tests",
     "collect-evidence",
     "verify",
+    "review-fixes",
     "done"
   ],
   "nodes_completed": [
@@ -30,6 +31,7 @@
     "affected-area-tests",
     "collect-evidence",
     "verify",
+    "review-fixes",
     "done"
   ],
   "nodes_skipped": [],
@@ -120,6 +122,21 @@
       "command": "cd frontend && npm audit --omit=dev --audit-level=high",
       "exit_code": 0,
       "summary": "found 0 vulnerabilities after the port"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "85 passed after addressing the three Copilot review findings (6 new regression tests: 4 brace-robust parse cases, 2 from_config side-effect cases)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed, 3 warnings in 44.08s"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "summary": "no whitespace errors"
     }
   ],
   "tests": {
@@ -188,13 +205,13 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "40aebf4a189a1214dd7b2cceb12c89319527a01b6e56c5bd5d3b07397ef3511e"
+      "sha256": "823bbc7a3b44bd45bdf052b80d11d1ed9f6a7ef25a6d47c479068a40f865bdc2"
     },
     {
       "id": "agent-models",
       "path": "trading_bot/agents/models.py",
       "produced_by_node": "implement",
-      "sha256": "505c903dffbb8cb4bcbe8721cf97eb635938ca8545db011ceab4acd90b572897"
+      "sha256": "c0494242ee93dd302ae5adcec8a4628e0b6d14ae463f4dc1e6050cf6750d3429"
     },
     {
       "id": "rule-veto",
@@ -206,7 +223,7 @@
       "id": "catalyst-scout",
       "path": "trading_bot/agents/scout.py",
       "produced_by_node": "implement",
-      "sha256": "ad6c2e8701acb076b464bc0cf05730fc843af75eb54b9fc1fb4589619aa41e05"
+      "sha256": "c6984723eac0e57190ad311f4470f6a9522447a729817a7406340fa1c018869f"
     },
     {
       "id": "agent-brief",
@@ -218,7 +235,7 @@
       "id": "agent-gate",
       "path": "trading_bot/agents/gate.py",
       "produced_by_node": "implement",
-      "sha256": "72d77e1fd84b2a06fa8f1e5c71bdac503066544919e2402267e143c1ae24c2df"
+      "sha256": "1bd867a2520d8b8f520cd5ce1ac5ba28a63cd7e820c805b725ce25e4e1685ade"
     },
     {
       "id": "main-wiring",
@@ -242,13 +259,13 @@
       "id": "scout-tests",
       "path": "tests/agents/test_scout.py",
       "produced_by_node": "test",
-      "sha256": "38b73989fcb9ddeed5035c7d3a60a1b701c97ed98dd7a6478b86151680607a15"
+      "sha256": "5cfe38cccabeacbf15e28ea8b5ed87ecff33b71a7eed0d533e14731654b1cac3"
     },
     {
       "id": "gate-tests",
       "path": "tests/agents/test_gate.py",
       "produced_by_node": "test",
-      "sha256": "86dcb55c7bfdd731bb3b9bf6bcee0a72bf9da30eb6842f7e1d81f29dab140ee5"
+      "sha256": "779f71b68a16db6ead0b857f4c6796e5afd62c50d322f8139ff88db0eeb7c6af"
     }
   ],
   "completion_status": "tested",
@@ -265,5 +282,5 @@
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "09b8e8fcb8a5c2117e3d169ee95cea62c3822114259e81e2751422d7958a5164"
+  "content_hash": "d0dce369238feb9962ecbe77d56d0e247a68d309089abb13e732560321a030df"
 }

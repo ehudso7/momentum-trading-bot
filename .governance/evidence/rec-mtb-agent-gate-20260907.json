@@ -69,6 +69,15 @@
       "notes": "Agent-side state is 'tested', not 'verified'. No independent UIE verification exists. The LLM provider clients (OpenAI chat completions, Anthropic messages) are exercised only through the injected fake client; no real model call was made in this run and no provider SDK was installed."
     },
     {
+      "node_id": "review-fixes",
+      "status": "completed",
+      "attempts": 1,
+      "evidence_refs": [
+        ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
+      ],
+      "notes": "Copilot PR review (PR #84, 'changes recommended', 3 comments) verified and fixed: (1) AgentGate.from_config created data/agent_decisions.csv even with agents.enabled=false, contradicting the no-side-effect guarantee -> a disabled gate now gets a path-less AgentBrief; (2) AgentDecision docstring claimed reduce multipliers lie in [0.25, 0.75] while the enforced invariant is 0 < x < 1 -> docstring corrected; (3) CatalystScout.parse_response used a greedy {.*} regex that over-captured when the reply contained extra braces, turning a valid reply into a fail-closed scout failure -> replaced with json.JSONDecoder.raw_decode from each '{' so the first complete object wins. All three are inside the new agent modules; no risk rail or main.py behaviour changed."
+    },
+    {
       "node_id": "done",
       "status": "completed",
       "attempts": 1,
@@ -165,7 +174,25 @@
       "exit_code": 0,
       "node_id": "affected-area-tests",
       "summary": "found 0 vulnerabilities after the port"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "85 passed after addressing the three Copilot review findings (6 new regression tests: 4 brace-robust parse cases, 2 from_config side-effect cases)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "2959 passed, 3 warnings in 44.08s"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "no whitespace errors"
     }
   ],
-  "content_hash": "e1b45b49ba89f49bdbe6b3adc09c0f799dd95f13e67fe73bd0d5b9dbcdae3cb3"
+  "content_hash": "337d6f1e87453ed79e3106bb709a26a8bb77eefe71c2a8a171103e531c965914"
 }

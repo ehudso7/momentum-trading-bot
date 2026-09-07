@@ -94,11 +94,14 @@ class AgentGate:
         if data_dir is None:
             data_dir = Path(config.journal_csv_path).parent
         agents = config.agents
+        # A disabled gate must have no side effects at all, including the
+        # CSV header AgentBrief writes eagerly, so it gets a path-less brief.
+        csv_path = data_dir / "agent_decisions.csv" if agents.enabled else None
         return cls(
             agents,
             veto=RuleVeto(min_advisor_confidence=agents.veto.min_advisor_confidence),
             scout=CatalystScout(agents.llm),
-            brief=AgentBrief(csv_path=data_dir / "agent_decisions.csv"),
+            brief=AgentBrief(csv_path=csv_path),
             risk_config=config.risk,
             scanner_config=config.scanner,
         )
