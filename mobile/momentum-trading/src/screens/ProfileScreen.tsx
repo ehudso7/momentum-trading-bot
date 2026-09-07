@@ -9,7 +9,6 @@ import {
   Switch,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useQuery } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -38,15 +37,10 @@ export default function ProfileScreen() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [biometricEnabled, setBiometricEnabled] = useState(true);
 
-  const { data: subscription } = useQuery({
-    queryKey: ['subscription'],
-    queryFn: api.getSubscription,
-  });
-
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-  });
+  // The /subscription and /settings queries used to run here and their
+  // results were never rendered — the same dead-request defect as the
+  // /performance query on PortfolioScreen. Re-add them alongside the UI that
+  // actually displays them.
 
   const handleLogout = () => {
     Alert.alert(
@@ -67,7 +61,7 @@ export default function ProfileScreen() {
 
   const handleUpgrade = async () => {
     try {
-      const checkoutSession = await api.createCheckoutSession('price_1TQC0vBVIDu5AoABCJOLlQID');
+      await api.createCheckoutSession('price_1TQC0vBVIDu5AoABCJOLlQID');
       // In real app, open checkout URL
       Alert.alert('Upgrade', 'Redirecting to payment...');
     } catch (error) {
