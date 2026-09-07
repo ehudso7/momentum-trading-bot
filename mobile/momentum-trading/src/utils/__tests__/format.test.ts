@@ -8,6 +8,7 @@ import {
   fmtConfidence,
   fmtTime,
   changeColor,
+  isUsableConfidence,
 } from '../format';
 
 // Every formatter must reject non-finite input. NaN and Infinity are `typeof
@@ -76,6 +77,25 @@ describe('formatting of real values', () => {
 
   it('renders confidence as a whole percentage', () => {
     expect(fmtConfidence(0.71)).toBe('71%');
+    expect(fmtConfidence(0)).toBe('0%');
+    expect(fmtConfidence(1)).toBe('100%');
+  });
+
+  // A confidence outside 0..1 means the producer is wrong. Rendering "150%",
+  // or silently clamping to "100%", would present that bug to the user as a
+  // real reading.
+  it('treats an out-of-range confidence as unavailable, not clamped', () => {
+    expect(fmtConfidence(1.5)).toBe(DASH);
+    expect(fmtConfidence(-0.2)).toBe(DASH);
+    expect(fmtConfidence(100)).toBe(DASH);
+    expect(fmtConfidence(1.0001)).toBe(DASH);
+
+    expect(isUsableConfidence(1.5)).toBe(false);
+    expect(isUsableConfidence(-0.2)).toBe(false);
+    expect(isUsableConfidence(Number.NaN)).toBe(false);
+    expect(isUsableConfidence(0.71)).toBe(true);
+    expect(isUsableConfidence(0)).toBe(true);
+    expect(isUsableConfidence(1)).toBe(true);
   });
 
   it('returns an em dash for an unparseable or absent timestamp', () => {

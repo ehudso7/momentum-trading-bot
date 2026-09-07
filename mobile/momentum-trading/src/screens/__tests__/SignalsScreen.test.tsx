@@ -1,14 +1,19 @@
 import React from 'react';
-import { waitFor } from '@testing-library/react-native';
+import { fireEvent, waitFor } from '@testing-library/react-native';
 import SignalsScreen from '../SignalsScreen';
 import { renderScreen, renderedText, FABRICATED_LITERALS } from './renderScreen';
-import { fmtMoney } from '../../utils/format';
+import { fmtMoney, fmtSignedMoney, fmtPct } from '../../utils/format';
 
 jest.mock('../../contexts/WebSocketContext', () => ({
   useWebSocket: () => ({ subscribe: jest.fn(), lastMessage: null, send: jest.fn() }),
 }));
 
+// Only the network client is mocked. Spreading requireActual keeps the real
+// type guards and helpers the screen imports from this module — mocking the
+// whole module replaced isHistoricalSignal with undefined, which threw during
+// render and surfaced as "Unable to find node on an unmounted component".
 jest.mock('../../services/api', () => ({
+  ...jest.requireActual('../../services/api'),
   api: {
     getLatestSignals: jest.fn(),
     getSignalHistory: jest.fn(),
@@ -65,6 +70,68 @@ describe('SignalsScreen', () => {
     expect(screen.getByText(fmtMoney(4.32))).toBeOnTheScreen();
     expect(screen.getByText('71%')).toBeOnTheScreen();
     expect(screen.getByText('Held VWAP on the third test.')).toBeOnTheScreen();
+  });
+
+  // /signals/history returns entryPrice/exitPrice/profit/profitPercent/result
+  // and carries neither `price` nor `reasoning`. An earlier revision typed
+  // both endpoints with one shape, so history rows would have read undefined
+  // from fields the endpoint never sends.
+  it('renders history rows from the history payload', async () => {
+    getLatestSignals.mockResolvedValue([]);
+    getSignalHistory.mockResolvedValue([
+      {
+        id: 'hist-1',
+        symbol: 'HIST',
+        type: 'Support Bounce',
+        action: 'BUY',
+        confidence: 0.88,
+        entryPrice: 380,
+        exitPrice: 385.6,
+        profit: 5.6,
+        profitPercent: 1.47,
+        result: 'win',
+        timestamp: '2026-09-07T14:15:00Z',
+      },
+    ]);
+
+    const screen = renderScreen(<SignalsScreen />);
+
+    fireEvent.press(screen.getByText('History'));
+
+    await waitFor(() => expect(screen.getByText('HIST')).toBeOnTheScreen());
+    expect(screen.getByText(fmtMoney(380))).toBeOnTheScreen();
+    expect(screen.getByText(fmtMoney(385.6))).toBeOnTheScreen();
+    expect(
+      screen.getByText(`${fmtSignedMoney(5.6)} (${fmtPct(1.47)})`),
+    ).toBeOnTheScreen();
+
+    const text = renderedText(screen.toJSON());
+    expect(text).not.toContain('undefined');
+    expect(text).not.toContain('NaN');
+  });
+
+  // A confidence outside 0..1 is a producer bug; showing "150%" would present
+  // it to the user as a real reading.
+  it('shows an em dash for an out-of-range confidence', async () => {
+    getLatestSignals.mockResolvedValue([
+      {
+        id: 'sig-3',
+        symbol: 'BADC',
+        type: 'Breakout',
+        action: 'BUY',
+        confidence: 1.5,
+        price: 10,
+        timestamp: '2026-09-07T14:31:00Z',
+      },
+    ]);
+    getSignalHistory.mockResolvedValue([]);
+
+    const screen = renderScreen(<SignalsScreen />);
+
+    await waitFor(() => expect(screen.getByText('BADC')).toBeOnTheScreen());
+    const text = renderedText(screen.toJSON());
+    expect(text).not.toContain('150%');
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
   });
 
   it('does not claim a performance record', async () => {

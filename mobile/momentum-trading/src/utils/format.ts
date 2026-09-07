@@ -59,10 +59,23 @@ export function fmtQuantity(value: number | null | undefined): string {
   return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
-/** `71%` from a 0..1 confidence. */
+/**
+ * `71%` from a 0..1 confidence.
+ *
+ * Values outside 0..1 are unavailable, not clamped. A confidence of 1.5 means
+ * the producer is wrong, and "150%" — or a silently clamped "100%" — would
+ * present that bug to the user as a real reading. An em dash says the value
+ * could not be trusted, which is the honest rendering.
+ */
 export function fmtConfidence(value: number | null | undefined): string {
   if (!isRenderableNumber(value)) return DASH;
+  if (value < 0 || value > 1) return DASH;
   return `${(value * 100).toFixed(0)}%`;
+}
+
+/** True when a confidence is usable for the 0..100% progress bar. */
+export function isUsableConfidence(value: number | null | undefined): boolean {
+  return isRenderableNumber(value) && value >= 0 && value <= 1;
 }
 
 /** Local `HH:MM` from an ISO timestamp, or an em dash if unparseable. */

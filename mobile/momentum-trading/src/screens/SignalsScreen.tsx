@@ -12,8 +12,15 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { api, Signal } from '../services/api';
-import { fmtMoney, fmtConfidence, fmtTime } from '../utils/format';
+import { api, Signal, isHistoricalSignal } from '../services/api';
+import {
+  fmtMoney,
+  fmtSignedMoney,
+  fmtPct,
+  fmtConfidence,
+  fmtTime,
+  isUsableConfidence,
+} from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 type TabKey = 'latest' | 'history';
@@ -74,14 +81,24 @@ export default function SignalsScreen() {
   const loading = activeTab === 'latest' ? signalsLoading : historyLoading;
   const errored = activeTab === 'latest' ? signalsError : historyError;
 
-  const getSignalColor = (action: string) =>
+  const getSignalColor = (action: string | undefined) =>
     action?.toUpperCase() === 'BUY' ? '#10b981' : '#ef4444';
 
-  const getConfidenceColor = (confidence: number) => {
-    if (confidence >= 0.9) return '#10b981';
-    if (confidence >= 0.8) return '#f59e0b';
+  // An unusable confidence gets the muted colour, not a red "low confidence"
+  // band — the value is unknown, not bad.
+  const getConfidenceColor = (confidence: number | undefined) => {
+    if (!isUsableConfidence(confidence)) return theme.textSecondary;
+    if ((confidence as number) >= 0.9) return '#10b981';
+    if ((confidence as number) >= 0.8) return '#f59e0b';
     return '#ef4444';
   };
+
+  const confidenceBarWidth = (
+    confidence: number | undefined,
+  ): `${number}%` =>
+    isUsableConfidence(confidence)
+      ? (`${(confidence as number) * 100}%` as `${number}%`)
+      : '0%';
 
   const handleSubscribeToSignal = (signalId: string) => {
     subscribeToSignalMutation.mutate(signalId);
@@ -170,14 +187,43 @@ export default function SignalsScreen() {
                 </View>
 
                 <View style={styles.signalBody}>
-                  <View style={styles.priceInfo}>
-                    <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
-                      Reference Price
-                    </Text>
-                    <Text style={[styles.priceValue, { color: theme.text }]}>
-                      {fmtMoney(signal.price)}
-                    </Text>
-                  </View>
+                  {isHistoricalSignal(signal) ? (
+                    <>
+                      <View style={styles.priceInfo}>
+                        <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                          Entry
+                        </Text>
+                        <Text style={[styles.priceValue, { color: theme.text }]}>
+                          {fmtMoney(signal.entryPrice)}
+                        </Text>
+                      </View>
+                      <View style={styles.priceInfo}>
+                        <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                          Exit
+                        </Text>
+                        <Text style={[styles.priceValue, { color: theme.text }]}>
+                          {fmtMoney(signal.exitPrice)}
+                        </Text>
+                      </View>
+                      <View style={styles.priceInfo}>
+                        <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                          Result
+                        </Text>
+                        <Text style={[styles.priceValue, { color: theme.text }]}>
+                          {`${fmtSignedMoney(signal.profit)} (${fmtPct(signal.profitPercent)})`}
+                        </Text>
+                      </View>
+                    </>
+                  ) : (
+                    <View style={styles.priceInfo}>
+                      <Text style={[styles.priceLabel, { color: theme.textSecondary }]}>
+                        Reference Price
+                      </Text>
+                      <Text style={[styles.priceValue, { color: theme.text }]}>
+                        {fmtMoney(signal.price)}
+                      </Text>
+                    </View>
+                  )}
                 </View>
 
                 <View style={styles.signalFooter}>
@@ -190,11 +236,8 @@ export default function SignalsScreen() {
                         style={[
                           styles.confidenceFill,
                           {
-                            width: `${Math.max(
-                              0,
-                              Math.min(1, signal.confidence ?? 0),
-                            ) * 100}%`,
-                            backgroundColor: getConfidenceColor(signal.confidence ?? 0),
+                            width: confidenceBarWidth(signal.confidence),
+                            backgroundColor: getConfidenceColor(signal.confidence),
                           },
                         ]}
                       />
@@ -202,14 +245,14 @@ export default function SignalsScreen() {
                     <Text
                       style={[
                         styles.confidenceText,
-                        { color: getConfidenceColor(signal.confidence ?? 0) },
+                        { color: getConfidenceColor(signal.confidence) },
                       ]}
                     >
                       {fmtConfidence(signal.confidence)}
                     </Text>
                   </View>
 
-                  {signal.reasoning ? (
+                  {!isHistoricalSignal(signal) && signal.reasoning ? (
                     <View style={styles.reasoningContainer}>
                       <Text style={[styles.reasoningLabel, { color: theme.textSecondary }]}>
                         Reasoning:

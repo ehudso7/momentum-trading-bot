@@ -82,15 +82,48 @@ export interface Quote {
   timestamp: string;
 }
 
-export interface Signal {
+// As with positions, the two signal endpoints return DIFFERENT shapes and an
+// earlier revision typed both with one `Signal` that declared `price` and
+// `reasoning` as required. History rows carry neither, so TypeScript would
+// have let a call site read `signal.price` on a history row and get
+// undefined. Note also that `/signals/latest` has no `response_model`, so the
+// `SignalResponse` model declared in mobile_routes.py is not applied to it —
+// these fields come from the handler's literal, hence all optional.
+
+interface SignalBase {
   id: string;
   symbol: string;
-  type: string;
-  action: string;
-  confidence: number;
-  price: number;
-  timestamp: string;
-  reasoning: string;
+  type?: string;
+  action?: string;
+  /** 0..1. Values outside that range are treated as unavailable on render. */
+  confidence?: number;
+  timestamp?: string;
+}
+
+/** An entry from `/signals/latest`. */
+export interface LatestSignal extends SignalBase {
+  price?: number;
+  stopLoss?: number;
+  takeProfit?: number[];
+  reasoning?: string;
+}
+
+/** An entry from `/signals/history`, which reports a closed result. */
+export interface HistoricalSignal extends SignalBase {
+  entryPrice?: number;
+  exitPrice?: number;
+  profit?: number;
+  profitPercent?: number;
+  result?: string;
+}
+
+export type Signal = LatestSignal | HistoricalSignal;
+
+/** Narrows a signal to the history shape. */
+export function isHistoricalSignal(
+  signal: Signal,
+): signal is HistoricalSignal {
+  return 'entryPrice' in signal || 'result' in signal;
 }
 
 class ApiService {
@@ -198,11 +231,11 @@ class ApiService {
   }
 
   // Signals endpoints
-  async getLatestSignals(): Promise<Signal[]> {
+  async getLatestSignals(): Promise<LatestSignal[]> {
     return this.get('/signals/latest');
   }
 
-  async getSignalHistory(): Promise<Signal[]> {
+  async getSignalHistory(): Promise<HistoricalSignal[]> {
     return this.get('/signals/history');
   }
 

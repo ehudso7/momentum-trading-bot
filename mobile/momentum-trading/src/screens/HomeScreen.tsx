@@ -15,7 +15,13 @@ import { LineChart } from 'react-native-chart-kit';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
-import { fmtMoney, fmtSignedMoney, fmtPct } from '../utils/format';
+import {
+  fmtMoney,
+  fmtSignedMoney,
+  fmtPct,
+  fmtConfidence,
+  isUsableConfidence,
+} from '../utils/format';
 import DataUnavailable from '../components/DataUnavailable';
 
 const { width } = Dimensions.get('window');
@@ -142,15 +148,21 @@ export default function HomeScreen() {
               </View>
               <View style={styles.signalRight}>
                 <Text style={[styles.signalPrice, { color: theme.text }]}>
-                  ${signal.price}
+                  {fmtMoney(signal.price)}
                 </Text>
                 <Text
                   style={[
                     styles.signalConfidence,
-                    { color: signal.confidence > 0.8 ? '#10b981' : '#f59e0b' },
+                    {
+                      color: !isUsableConfidence(signal.confidence)
+                        ? theme.textSecondary
+                        : (signal.confidence as number) > 0.8
+                          ? '#10b981'
+                          : '#f59e0b',
+                    },
                   ]}
                 >
-                  {(signal.confidence * 100).toFixed(0)}% confidence
+                  {`${fmtConfidence(signal.confidence)} confidence`}
                 </Text>
               </View>
             </TouchableOpacity>
