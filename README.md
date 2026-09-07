@@ -284,11 +284,11 @@ Data Sources (merged):
                            ↓
                     Strategy Evaluate (5 setups × 3 bar lookback)
                            ↓
+                    Risk Check (position sizer) → Correlation Check
+                           ↓
                     AI Advisor (entry recommendation)
                            ↓
                     Agent Gate (rule veto → optional scout → brief)
-                           ↓
-                    Correlation Check → Risk Check (position sizer)
                            ↓
                     Execution (Alpaca broker)
                            ↓

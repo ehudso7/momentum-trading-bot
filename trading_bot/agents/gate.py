@@ -47,7 +47,7 @@ from trading_bot.agents.models import (
     VetoContext,
 )
 from trading_bot.agents.scout import CatalystScout
-from trading_bot.agents.veto import ADVISOR_REDUCE, RuleVeto
+from trading_bot.agents.veto import ADVISOR_REDUCE, ADVISOR_SKIP, RuleVeto
 from trading_bot.config.settings import AgentsConfig, AppConfig, RiskConfig, ScannerConfig
 from trading_bot.utils.helpers import is_market_open, is_near_close
 
@@ -343,12 +343,16 @@ class AgentGate:
 
         equity_value = _float_or_none(equity)
         pdt_threshold = self._risk.pdt_equity_threshold if self._risk else None
-        # PDT can only bind below the equity threshold. Probing the broker
-        # above it would be a wasted account API call per candidate (on
-        # Alpaca, get_day_trade_count() is a get_account() round trip), so
-        # the probe is skipped unless the check can actually apply.
+        # PDT can only bind below the equity threshold, and it cannot change
+        # the outcome when the advisor already said skip (the veto blocks on
+        # that alone). Probing the broker in either case would be a wasted
+        # account API call per candidate (on Alpaca, get_day_trade_count()
+        # is a get_account() round trip), so the probe runs only when the
+        # check can actually matter.
+        advisor_action = getattr(advisor_rec, "action", None)
         pdt_may_apply = (
-            equity_value is not None
+            advisor_action != ADVISOR_SKIP
+            and equity_value is not None
             and pdt_threshold is not None
             and equity_value < pdt_threshold
         )
@@ -358,7 +362,7 @@ class AgentGate:
 
         return VetoContext(
             symbol=symbol or None,
-            advisor_action=getattr(advisor_rec, "action", None),
+            advisor_action=advisor_action,
             advisor_confidence=_float_or_none(getattr(advisor_rec, "confidence", None)),
             advisor_reasons=tuple(getattr(advisor_rec, "reasons", []) or []),
             circuit_ok=circuit_ok,

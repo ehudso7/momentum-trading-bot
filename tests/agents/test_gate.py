@@ -323,6 +323,17 @@ class TestContextBuilding:
         assert decision.decision == "allow"
         assert broker.mock_calls == []
 
+    def test_pdt_probe_skipped_when_advisor_already_skips(self, tmp_path):
+        """An advisor skip blocks on its own; no broker round trip is needed."""
+        broker = Mock()
+        broker.get_day_trade_count.return_value = 3
+        decision = _evaluate(
+            _gate(tmp_path), rec=_rec(action="skip"), broker=broker, equity=10_000.0
+        )
+        assert decision.decision == "block"
+        assert "advisor_skip" in decision.reasons
+        assert broker.mock_calls == []
+
     def test_pdt_probe_skipped_without_risk_config(self, tmp_path):
         broker = Mock()
         broker.get_day_trade_count.return_value = 3
