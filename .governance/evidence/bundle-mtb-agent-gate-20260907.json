@@ -55,6 +55,7 @@
     "trading_bot/dashboard/state.py",
     "trading_bot/dashboard/app.py",
     "pyproject.toml",
+    "frontend/package-lock.json",
     "README.md",
     "CLAUDE.md",
     "tests/agents/__init__.py",
@@ -104,6 +105,21 @@
       "command": "git diff --check",
       "exit_code": 0,
       "summary": "no whitespace errors"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 34077713182 / web (job 101606985600)",
+      "exit_code": 1,
+      "summary": "npm audit --omit=dev --audit-level=high failed on browserslist <=4.28.6 (GHSA-c83g-rgw3-j3cx, GHSA-73wf-gq98-2v4g) and fast-uri 3.0.0-3.1.5 (GHSA-5jgf-p345-68v8 et al.) in frontend/package-lock.json, a file this feature does not touch; Dependabot PRs #82 and #83 carry the fix"
+    },
+    {
+      "command": "cd frontend && npm update browserslist fast-uri --package-lock-only --no-audit --no-fund",
+      "exit_code": 0,
+      "summary": "ported the Dependabot fix with the repo's own tooling: browserslist 4.28.2->4.28.9, fast-uri 3.1.5->3.1.7 plus browserslist's data subdependencies; identical versions to PRs #82/#83, 26 insertions / 26 deletions"
+    },
+    {
+      "command": "cd frontend && npm audit --omit=dev --audit-level=high",
+      "exit_code": 0,
+      "summary": "found 0 vulnerabilities after the port"
     }
   ],
   "tests": {
@@ -172,7 +188,7 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "31303310370040381a81f7c99d35162985fa2b9a7a6196506c961f968db318bd"
+      "sha256": "40aebf4a189a1214dd7b2cceb12c89319527a01b6e56c5bd5d3b07397ef3511e"
     },
     {
       "id": "agent-models",
@@ -242,12 +258,12 @@
     "The OpenAI and Anthropic client wrappers are covered only by an injected fake; a real one-shot call against each provider in a paper session is still outstanding before agents.llm.enabled=true is used.",
     "The veto's min_advisor_confidence (0.55) is applied to the advisor's ADJUSTED confidence, which is lower than the raw signal confidence (e.g. x0.85 with no catalyst). With the gate on this tightens paper entries relative to the pre-gate bot; the operator should review data/agent_decisions.csv after the first paper sessions and tune the threshold deliberately.",
     "Fail-closed gate_error blocks mean a defect inside the agent layer stops all new entries (never lets one through). This is intended, but it is a new way for the bot to go quiet; the agent.gate_error log event should be alerted on.",
-    "The frontend lockfile audit blocker recorded in bundle-mtb-order-lifecycle-20260810 is unrelated to and unchanged by this run."
+    "frontend/package-lock.json carries the same browserslist/fast-uri bump as Dependabot PRs #82 and #83 so the web audit passes; it no-ops once those merge. The web job's lint and build steps were not run locally and are proven by CI only."
   ],
   "rollback": {
     "available": true,
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "c64d3e89c80d13a2e08b1756febc281cab346ddd9a33039e1117f5e31030d6e2"
+  "content_hash": "09b8e8fcb8a5c2117e3d169ee95cea62c3822114259e81e2751422d7958a5164"
 }

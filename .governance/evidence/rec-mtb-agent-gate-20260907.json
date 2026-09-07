@@ -53,7 +53,7 @@
       "evidence_refs": [
         ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
       ],
-      "notes": "Targeted suites (273) and the complete pre-existing backend suite (2959) pass with the gate wired in."
+      "notes": "Targeted suites (273) and the complete pre-existing backend suite (2959) pass with the gate wired in. CI web job then failed on a production npm audit of the untouched frontend lockfile (browserslist, fast-uri); the existing Dependabot fix (#82, #83) was ported with npm --package-lock-only and the audit passes locally."
     },
     {
       "node_id": "collect-evidence",
@@ -89,6 +89,7 @@
     "trading_bot/dashboard/state.py",
     "trading_bot/dashboard/app.py",
     "pyproject.toml",
+    "frontend/package-lock.json",
     "README.md",
     "CLAUDE.md",
     "tests/agents/__init__.py",
@@ -146,7 +147,25 @@
       "exit_code": 0,
       "node_id": "implement",
       "summary": "no whitespace errors"
+    },
+    {
+      "command": "GitHub Actions Launch validation run 34077713182 / web (job 101606985600)",
+      "exit_code": 1,
+      "node_id": "affected-area-tests",
+      "summary": "npm audit --omit=dev --audit-level=high failed on browserslist <=4.28.6 (GHSA-c83g-rgw3-j3cx, GHSA-73wf-gq98-2v4g) and fast-uri 3.0.0-3.1.5 (GHSA-5jgf-p345-68v8 et al.) in frontend/package-lock.json, a file this feature does not touch; Dependabot PRs #82 and #83 carry the fix"
+    },
+    {
+      "command": "cd frontend && npm update browserslist fast-uri --package-lock-only --no-audit --no-fund",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "ported the Dependabot fix with the repo's own tooling: browserslist 4.28.2->4.28.9, fast-uri 3.1.5->3.1.7 plus browserslist's data subdependencies; identical versions to PRs #82/#83, 26 insertions / 26 deletions"
+    },
+    {
+      "command": "cd frontend && npm audit --omit=dev --audit-level=high",
+      "exit_code": 0,
+      "node_id": "affected-area-tests",
+      "summary": "found 0 vulnerabilities after the port"
     }
   ],
-  "content_hash": "12d563de6ea3e893392cbf88e78982790fd8a3769b6eeb7202a67facb5781130"
+  "content_hash": "e1b45b49ba89f49bdbe6b3adc09c0f799dd95f13e67fe73bd0d5b9dbcdae3cb3"
 }
