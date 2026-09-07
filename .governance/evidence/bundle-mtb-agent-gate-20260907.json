@@ -152,6 +152,16 @@
       "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
       "exit_code": 0,
       "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "summary": "90 passed after the third Copilot pass (PDT probe gated on equity < threshold; 2 new tests assert zero broker calls above the threshold and without risk config)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "summary": "2959 passed"
     }
   ],
   "tests": {
@@ -220,7 +230,7 @@
       "id": "execution-record",
       "path": ".governance/evidence/rec-mtb-agent-gate-20260907.json",
       "produced_by_node": "collect-evidence",
-      "sha256": "cf7f56bd875b5389c1ffd04d6a86954d52d5a8e958c67d4c653a24763ff84de7"
+      "sha256": "556bd0a191db55a3baa0caec81e7953f48cbdf778db944615be754d19eeadfac"
     },
     {
       "id": "agent-models",
@@ -250,7 +260,7 @@
       "id": "agent-gate",
       "path": "trading_bot/agents/gate.py",
       "produced_by_node": "implement",
-      "sha256": "1fbeb1a6e2c1215c42bb9f378891f3900596fdf12a54a38b2c6feb58fbda03e8"
+      "sha256": "ae106ae483a5ef3b2235ccc3cf84c4dde9ea32ca5b05ae4c87001ad4d3daa3c1"
     },
     {
       "id": "main-wiring",
@@ -280,7 +290,7 @@
       "id": "gate-tests",
       "path": "tests/agents/test_gate.py",
       "produced_by_node": "test",
-      "sha256": "b631ff80721cb6bf272ad2bf8226e0635b19b0d80717ecbf18400fa52d41e891"
+      "sha256": "4e39612572a2c28c53b76a110fd87240bfb0254eca1d558b6f8614ccff1832ed"
     }
   ],
   "completion_status": "tested",
@@ -297,5 +307,5 @@
     "procedure": "Runtime: set TRADING_AGENTS__ENABLED=false (gate becomes a no-op allow; behaviour identical to the pre-gate bot). Code: revert the feature commit; no schema or data migration is involved. data/agent_decisions.csv can be deleted freely.",
     "tested": true
   },
-  "content_hash": "9f0b19180b48b962479ec7d53aad8dfc9296d57d295a0b21b064c070c8165f4c"
+  "content_hash": "a1700abaab48b02474ba4f35f0bbd4fbc21c761de40c131d0981450155665ec9"
 }

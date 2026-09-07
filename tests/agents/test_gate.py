@@ -308,11 +308,29 @@ class TestContextBuilding:
         assert decision.decision == "allow"
 
     def test_gate_never_calls_order_methods_on_broker(self, tmp_path):
+        """Below the PDT threshold the only broker touch is the read-only probe."""
         broker = Mock()
         broker.get_day_trade_count.return_value = 0
-        _evaluate(_gate(tmp_path), broker=broker)
+        _evaluate(_gate(tmp_path), broker=broker, equity=10_000.0)
         used = {name for name, *_ in broker.mock_calls}
         assert used == {"get_day_trade_count"}
+
+    def test_pdt_probe_skipped_above_threshold(self, tmp_path):
+        """Above the threshold PDT cannot bind, so the broker is not touched at all."""
+        broker = Mock()
+        broker.get_day_trade_count.return_value = 3
+        decision = _evaluate(_gate(tmp_path), broker=broker, equity=100_000.0)
+        assert decision.decision == "allow"
+        assert broker.mock_calls == []
+
+    def test_pdt_probe_skipped_without_risk_config(self, tmp_path):
+        broker = Mock()
+        broker.get_day_trade_count.return_value = 3
+        gate = _gate(tmp_path)
+        gate._risk = None
+        decision = _evaluate(gate, broker=broker, equity=10_000.0)
+        assert decision.decision == "allow"
+        assert broker.mock_calls == []
 
 
 class TestBrief:

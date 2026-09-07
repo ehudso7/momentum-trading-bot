@@ -71,11 +71,11 @@
     {
       "node_id": "review-fixes",
       "status": "retried-then-completed",
-      "attempts": 2,
+      "attempts": 3,
       "evidence_refs": [
         ".governance/evidence/bundle-mtb-agent-gate-20260907.json"
       ],
-      "notes": "Copilot PR review (PR #84, 'changes recommended', 3 comments) verified and fixed: (1) AgentGate.from_config created data/agent_decisions.csv even with agents.enabled=false, contradicting the no-side-effect guarantee -> a disabled gate now gets a path-less AgentBrief; (2) AgentDecision docstring claimed reduce multipliers lie in [0.25, 0.75] while the enforced invariant is 0 < x < 1 -> docstring corrected; (3) CatalystScout.parse_response used a greedy {.*} regex that over-captured when the reply contained extra braces, turning a valid reply into a fail-closed scout failure -> replaced with json.JSONDecoder.raw_decode from each '{' so the first complete object wins. All three are inside the new agent modules; no risk rail or main.py behaviour changed. Second Copilot pass raised two suppressed findings: (4) daily_call_budget was reserved before the client was built, so a missing key/SDK consumed budget without any model call -> client is now built first and the budget is reserved only when a request is about to be sent; (5) toxic-catalyst blocking also applies when require_scout=true even if block_toxic_catalysts=false. That is the specified behaviour (block when require_scout OR block_toxic_catalysts), so the code was kept and config.yaml, settings.py, README, and an inline comment now state it explicitly."
+      "notes": "Copilot PR review (PR #84, 'changes recommended', 3 comments) verified and fixed: (1) AgentGate.from_config created data/agent_decisions.csv even with agents.enabled=false, contradicting the no-side-effect guarantee -> a disabled gate now gets a path-less AgentBrief; (2) AgentDecision docstring claimed reduce multipliers lie in [0.25, 0.75] while the enforced invariant is 0 < x < 1 -> docstring corrected; (3) CatalystScout.parse_response used a greedy {.*} regex that over-captured when the reply contained extra braces, turning a valid reply into a fail-closed scout failure -> replaced with json.JSONDecoder.raw_decode from each '{' so the first complete object wins. All three are inside the new agent modules; no risk rail or main.py behaviour changed. Second Copilot pass raised two suppressed findings: (4) daily_call_budget was reserved before the client was built, so a missing key/SDK consumed budget without any model call -> client is now built first and the budget is reserved only when a request is about to be sent; (5) toxic-catalyst blocking also applies when require_scout=true even if block_toxic_catalysts=false. That is the specified behaviour (block when require_scout OR block_toxic_catalysts), so the code was kept and config.yaml, settings.py, README, and an inline comment now state it explicitly. Third Copilot pass: (6) build_context probed broker.get_day_trade_count() for every candidate, an Alpaca get_account() round trip even when equity was far above the PDT threshold -> the probe now runs only when equity is known and below pdt_equity_threshold (or is skipped when risk config is absent)."
     },
     {
       "node_id": "done",
@@ -204,7 +204,19 @@
       "exit_code": 0,
       "node_id": "review-fixes",
       "summary": "2959 passed"
+    },
+    {
+      "command": "python -m pytest tests/agents -q -p no:cacheprovider",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "90 passed after the third Copilot pass (PDT probe gated on equity < threshold; 2 new tests assert zero broker calls above the threshold and without risk config)"
+    },
+    {
+      "command": "python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/agents",
+      "exit_code": 0,
+      "node_id": "review-fixes",
+      "summary": "2959 passed"
     }
   ],
-  "content_hash": "1532f30d78c53509a807eb1be4718c248e9dd82b391856b4b152d1f19d22584d"
+  "content_hash": "e569b084165e609b0cce1d465a97b92281b991f4905cb3bf965ffb0f6c4f3c54"
 }

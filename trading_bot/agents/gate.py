@@ -326,7 +326,11 @@ class AgentGate:
         circuit_status: Optional[dict],
         broker: Any,
     ) -> VetoContext:
-        """Project tick objects onto the pure ``VetoContext``. No I/O except PDT."""
+        """Project tick objects onto the pure ``VetoContext``.
+
+        The only I/O is the read-only PDT probe, and only when equity is
+        below the PDT threshold so the check can bind.
+        """
         circuit_state = None
         circuit_ok: Optional[bool] = None
         if isinstance(circuit_status, dict) and circuit_status.get("state") is not None:
@@ -337,7 +341,20 @@ class AgentGate:
             str(getattr(p, "symbol", "")) for p in (positions or []) if getattr(p, "symbol", "")
         )
 
-        day_trade_count = self._day_trade_count(broker, symbol)
+        equity_value = _float_or_none(equity)
+        pdt_threshold = self._risk.pdt_equity_threshold if self._risk else None
+        # PDT can only bind below the equity threshold. Probing the broker
+        # above it would be a wasted account API call per candidate (on
+        # Alpaca, get_day_trade_count() is a get_account() round trip), so
+        # the probe is skipped unless the check can actually apply.
+        pdt_may_apply = (
+            equity_value is not None
+            and pdt_threshold is not None
+            and equity_value < pdt_threshold
+        )
+        day_trade_count = (
+            self._day_trade_count(broker, symbol) if pdt_may_apply else None
+        )
 
         return VetoContext(
             symbol=symbol or None,
@@ -367,8 +384,8 @@ class AgentGate:
             # the veto will pick it up, otherwise the check is skipped.
             spread_pct=_float_or_none(getattr(scan_result, "spread_pct", None)),
             max_spread_pct=None,
-            equity=_float_or_none(equity),
-            pdt_equity_threshold=self._risk.pdt_equity_threshold if self._risk else None,
+            equity=equity_value,
+            pdt_equity_threshold=pdt_threshold,
             day_trade_count=day_trade_count,
         )
 
