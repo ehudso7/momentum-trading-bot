@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Zap } from "lucide-react";
+import { TrendingUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { createClient, isSupabaseConfigured } from "@/lib/supabase/client";
@@ -32,7 +32,7 @@ export function AuthForm({ mode, privateMode = false, initialError = null }: Aut
     try {
       if (!isSupabaseConfigured()) {
         throw new Error(
-          "Supabase is not configured. Add credentials to .env.local — see .env.example."
+          "Owner authentication is not configured for this deployment."
         );
       }
       const supabase = createClient();
@@ -48,14 +48,12 @@ export function AuthForm({ mode, privateMode = false, initialError = null }: Aut
         });
         if (error) throw error;
 
-        // Supabase autoconfirm is enabled — session returned means instant access
         if (data.session) {
           router.push("/");
           router.refresh();
           return;
         }
 
-        // Fallback: try signing in (handles autoconfirm without session in response)
         const { error: signInError } = await supabase.auth.signInWithPassword({
           email,
           password,
@@ -66,17 +64,14 @@ export function AuthForm({ mode, privateMode = false, initialError = null }: Aut
           return;
         }
 
-        setMessage(
-          "Account created. You can sign in now — no email confirmation required."
-        );
+        setMessage("Account created. You can sign in now.");
       } else {
         const { error } = await supabase.auth.signInWithPassword({
           email,
           password,
         });
         if (error) {
-          // Surface a user-friendly message instead of raw fetch error
-          throw new Error(error.message || "Sign in failed. Check your credentials and Supabase configuration.");
+          throw new Error(error.message || "Sign in failed. Check your credentials.");
         }
         router.push("/");
         router.refresh();
@@ -89,27 +84,27 @@ export function AuthForm({ mode, privateMode = false, initialError = null }: Aut
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
+    <div className="flex min-h-screen items-center justify-center bg-[#0f1211] px-4">
       <div className="w-full max-w-md">
         <div className="mb-8 text-center">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-500 to-blue-600 shadow-xl shadow-cyan-500/30">
-            <Zap className="h-7 w-7 text-white" />
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-xl border border-white/10 bg-[#171c1a]">
+            <TrendingUp className="h-7 w-7 text-[#9fb2a9]" aria-hidden="true" />
           </div>
-          <h1 className="text-2xl font-bold text-white">
-            {mode === "login" ? "Welcome back" : "Create your account"}
+          <h1 className="text-2xl font-semibold tracking-tight text-[#f2f0e8]">
+            {mode === "login" ? "MomentumForge" : "Create account"}
           </h1>
           <p className="mt-2 text-sm text-zinc-400">
             {mode === "login"
               ? privateMode
                 ? "Owner-only paper-trading control room"
-                : "Sign in to access your trading dashboard"
-              : "Start your momentum trading journey"}
+                : "Sign in to your trading dashboard"
+              : "Create an account"}
           </p>
         </div>
 
         <form
           onSubmit={handleSubmit}
-          className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur-xl"
+          className="space-y-4 rounded-xl border border-white/10 bg-[#141817] p-6 shadow-sm"
         >
           {mode === "signup" && (
             <div>
@@ -129,6 +124,7 @@ export function AuthForm({ mode, privateMode = false, initialError = null }: Aut
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
+              autoComplete="email"
               required
             />
           </div>
@@ -139,48 +135,51 @@ export function AuthForm({ mode, privateMode = false, initialError = null }: Aut
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
               minLength={6}
               required
             />
           </div>
 
           {error && (
-            <p className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">
+            <p className="rounded-md border border-red-900/50 bg-red-950/30 px-3 py-2 text-sm text-red-200">
               {error}
             </p>
           )}
           {message && (
-            <p className="rounded-lg bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
+            <p className="rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-sm text-emerald-200">
               {message}
             </p>
           )}
 
           <Button type="submit" className="w-full" disabled={loading}>
             {loading
-              ? "Please wait..."
+              ? "Signing in…"
               : mode === "login"
                 ? "Sign in"
                 : "Create account"}
           </Button>
         </form>
 
-        {!privateMode && <p className="mt-6 text-center text-sm text-zinc-500">
-          {mode === "login" ? (
-            <>
-              Don&apos;t have an account?{" "}
-              <Link href="/signup" className="text-cyan-400 hover:text-cyan-300">
-                Sign up
-              </Link>
-            </>
-          ) : (
-            <>
-              Already have an account?{" "}
-              <Link href="/login" className="text-cyan-400 hover:text-cyan-300">
-                Sign in
-              </Link>
-            </>
-          )}
-        </p>}
+        {!privateMode && (
+          <p className="mt-6 text-center text-sm text-zinc-500">
+            {mode === "login" ? (
+              <>
+                Don&apos;t have an account?{" "}
+                <Link href="/signup" className="text-[#9fb2a9] hover:text-[#bdcbc5]">
+                  Sign up
+                </Link>
+              </>
+            ) : (
+              <>
+                Already have an account?{" "}
+                <Link href="/login" className="text-[#9fb2a9] hover:text-[#bdcbc5]">
+                  Sign in
+                </Link>
+              </>
+            )}
+          </p>
+        )}
       </div>
     </div>
   );

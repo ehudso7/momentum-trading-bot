@@ -2,36 +2,23 @@ import { ImageResponse } from "next/og";
 
 import { SITE_TAGLINE, SITE_URL } from "@/lib/site";
 
-export const alt = "MomentumForge AI — Real-time momentum signals & AI-powered trading dashboard";
+export const alt = "MomentumForge — Private paper-trading operations dashboard";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
 /**
- * Brand mark embedded as a data URI so the card renders identically to
- * src/app/icon.svg without any filesystem access at request time.
+ * Restrained chart mark for private operations. The card intentionally avoids
+ * AI-style gradients, glow effects, or claims about predictive intelligence.
  */
 const MARK_SVG = `<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="mf-arrow" x1="96" y1="416" x2="424" y2="180" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#06b6d4"/>
-      <stop offset="1" stop-color="#8b5cf6"/>
-    </linearGradient>
-    <linearGradient id="mf-bars" x1="118" y1="440" x2="394" y2="116" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#0891b2"/>
-      <stop offset="1" stop-color="#7c3aed"/>
-    </linearGradient>
-  </defs>
-  <rect width="512" height="512" rx="120" fill="#11131f"/>
-  <g opacity="0.45" fill="url(#mf-bars)">
-    <rect x="139" y="268" width="12" height="172" rx="6"/>
-    <rect x="118" y="296" width="54" height="112" rx="14"/>
-    <rect x="250" y="196" width="12" height="192" rx="6"/>
-    <rect x="229" y="224" width="54" height="136" rx="14"/>
-    <rect x="361" y="116" width="12" height="216" rx="6"/>
-    <rect x="340" y="144" width="54" height="156" rx="14"/>
+  <rect width="512" height="512" rx="92" fill="#151918"/>
+  <path d="M96 386 L188 294 L254 344 L346 252 L416 182" stroke="#D9E3DD" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M416 182 L393 260 L337 204 Z" fill="#D9E3DD"/>
+  <g fill="#6F837A">
+    <rect x="122" y="280" width="22" height="126" rx="6"/>
+    <rect x="236" y="224" width="22" height="160" rx="6"/>
+    <rect x="350" y="160" width="22" height="166" rx="6"/>
   </g>
-  <path d="M100 400 L200 300 L256 356 L346 266" stroke="url(#mf-arrow)" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M424 180 L395 293 L311 209 Z" fill="url(#mf-arrow)"/>
 </svg>`;
 
 const MARK_DATA_URI = `data:image/svg+xml;base64,${Buffer.from(MARK_SVG).toString("base64")}`;
@@ -49,37 +36,35 @@ export default function OpengraphImage() {
           flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
-          backgroundColor: "#0a0b14",
-          backgroundImage:
-            "radial-gradient(circle at 78% 18%, rgba(139, 92, 246, 0.28) 0%, rgba(139, 92, 246, 0) 46%), radial-gradient(circle at 18% 84%, rgba(6, 182, 212, 0.22) 0%, rgba(6, 182, 212, 0) 44%)",
-          color: "#f8fafc",
+          backgroundColor: "#0F1211",
+          color: "#F2F0E8",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 40 }}>
           <img
             src={MARK_DATA_URI}
-            width={168}
-            height={168}
+            width={156}
+            height={156}
             alt=""
-            style={{ borderRadius: 40 }}
+            style={{ borderRadius: 28 }}
           />
           <div
             style={{
-              fontSize: 92,
+              fontSize: 88,
               fontWeight: 700,
               letterSpacing: -3,
               display: "flex",
+              color: "#F2F0E8",
             }}
           >
-            <span style={{ color: "#f8fafc" }}>MomentumForge</span>
-            <span style={{ color: "#8b5cf6", marginLeft: 24 }}>AI</span>
+            MomentumForge
           </div>
         </div>
         <div
           style={{
-            marginTop: 44,
-            fontSize: 36,
-            color: "#94a3b8",
+            marginTop: 42,
+            fontSize: 34,
+            color: "#A8B0AC",
             textAlign: "center",
             maxWidth: 960,
           }}
@@ -88,10 +73,10 @@ export default function OpengraphImage() {
         </div>
         <div
           style={{
-            marginTop: 52,
-            fontSize: 26,
-            color: "#22d3ee",
-            letterSpacing: 2,
+            marginTop: 50,
+            fontSize: 24,
+            color: "#7F9389",
+            letterSpacing: 1,
           }}
         >
           {host}

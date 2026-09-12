@@ -1,29 +1,10 @@
 <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="mf-arrow" x1="96" y1="416" x2="424" y2="180" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#06b6d4"/>
-      <stop offset="1" stop-color="#8b5cf6"/>
-    </linearGradient>
-    <linearGradient id="mf-bars" x1="118" y1="440" x2="394" y2="116" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#0891b2"/>
-      <stop offset="1" stop-color="#7c3aed"/>
-    </linearGradient>
-    <radialGradient id="mf-glow" cx="0.72" cy="0.28" r="0.9">
-      <stop stop-color="#8b5cf6" stop-opacity="0.22"/>
-      <stop offset="0.55" stop-color="#06b6d4" stop-opacity="0.08"/>
-      <stop offset="1" stop-color="#0a0b14" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect width="512" height="512" rx="120" fill="#0a0b14"/>
-  <rect width="512" height="512" rx="120" fill="url(#mf-glow)"/>
-  <g opacity="0.38" fill="url(#mf-bars)">
-    <rect x="139" y="268" width="12" height="172" rx="6"/>
-    <rect x="118" y="296" width="54" height="112" rx="14"/>
-    <rect x="250" y="196" width="12" height="192" rx="6"/>
-    <rect x="229" y="224" width="54" height="136" rx="14"/>
-    <rect x="361" y="116" width="12" height="216" rx="6"/>
-    <rect x="340" y="144" width="54" height="156" rx="14"/>
+  <rect width="512" height="512" rx="92" fill="#151918"/>
+  <g fill="#6F837A">
+    <rect x="122" y="280" width="22" height="126" rx="6"/>
+    <rect x="236" y="224" width="22" height="160" rx="6"/>
+    <rect x="350" y="160" width="22" height="166" rx="6"/>
   </g>
-  <path d="M100 400 L200 300 L256 356 L346 266" stroke="url(#mf-arrow)" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M424 180 L395 293 L311 209 Z" fill="url(#mf-arrow)"/>
+  <path d="M96 386 L188 294 L254 344 L346 252 L416 182" stroke="#D9E3DD" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M416 182 L393 260 L337 204 Z" fill="#D9E3DD"/>
 </svg>
